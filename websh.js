@@ -199,6 +199,7 @@ function splitPane(id, dir) {
     connectByName(serverConfig.connections[0].name);
   } else {
     connectingFor = np.id;
+    if (selectedPrompt) clearPromptSelection();
     showOverlay();
     $('btnCancel').classList.remove('h');
     if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
