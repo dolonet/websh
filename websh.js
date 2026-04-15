@@ -567,7 +567,14 @@ function connectSaved(c) {
   hideErr();
   let p = targetPane(); if(!p) return;
   let label = c.name||(c.user+'@'+c.host);
-  let body = {host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  let body;
+  if(c.connection) {
+    // Saved from a Prompt card — reconnect via named path so restrict_hosts
+    // and allowed_users/denied_users are enforced server-side.
+    body={connection:c.connection,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  } else {
+    body={host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  }
   if(c.key) body.key=c.key;
   connectPane(p, {body:body, label:label});
 }
@@ -604,6 +611,7 @@ function doConnect() {
     let list=loadSaved();
     let entry={name:label,host:host,port:port,user:username,auth:authMode};
     if(authMode==='pw') entry.pass=password; else entry.key=key;
+    if(selectedPrompt) entry.connection=selectedPrompt.name;
     list=list.filter(c => {return c.name!==label}); list.unshift(entry);
     saveSaved(list); $('iSave').checked=false; toggleSaveName();
   }
@@ -722,7 +730,8 @@ function renderServerConnections() {
   });
   el.onclick=e => {let row=e.target.closest('.sv');if(!row)return;connectByName(row.getAttribute('data-name'))};
   // restrict_hosts: no free-form — hide manual form until a Prompt card is clicked.
-  if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h');$('localSection').classList.add('h')}
+  // Saved connections stay visible (they reconnect through the named path).
+  if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h')}
 }
 
 // ── File upload (background SSH session) ────────────────────────────
