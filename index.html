@@ -35,8 +35,9 @@
     .ov{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px)}
     .ov.h{display:none}
     .panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:24px 28px;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto}
-    .panel h2{font-size:17px;margin-bottom:4px;font-weight:600}
-    .slogan{font-size:12px;color:var(--dim);margin-bottom:16px}
+    .panel-title{display:flex;align-items:baseline;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+    .panel-title h2{font-size:17px;font-weight:600;margin:0}
+    .panel-title .slogan{font-size:12px;color:var(--dim)}
 
     /* ── Saved / server connections ── */
     .saved-section{margin-bottom:20px}
@@ -178,8 +179,7 @@
 <!-- Connect overlay -->
 <div id="ov" class="ov h">
   <div class="panel">
-    <h2>websh</h2>
-    <div class="slogan">Lightweight but powerful web terminal</div>
+    <div class="panel-title"><h2>websh</h2><span class="slogan">Lightweight but powerful web terminal</span></div>
 
     <div id="serverSection" class="saved-section h">
       <div class="saved-label">Server connections</div>
