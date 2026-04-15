@@ -139,11 +139,30 @@ def _check_rate_limit(ip):
 
 _config_cache = None
 _config_mtime = 0
-_CONFIG_EMPTY = {"connections": [], "restrict_hosts": False, "isolate_storage": False}
+_CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
+                 "isolate_storage": False}
+
+
+def _normalize_user_list(value):
+    """Accept a list of usernames; return a clean list or None if absent."""
+    if not isinstance(value, list):
+        return None
+    clean = [str(u).strip() for u in value if str(u).strip()]
+    return clean or None
 
 
 def load_config():
-    """Load websh.json config with mtime-based caching."""
+    """Load websh.json config with mtime-based caching.
+
+    Each connection entry is classified into one of two kinds:
+
+      - "ready":  password or key is stored server-side. Clicking the card
+                  connects immediately — no user input required.
+      - "prompt": no password and no key are stored. The user must supply
+                  credentials at connect time. Optional allowed_users /
+                  denied_users lists constrain which usernames may connect,
+                  but only when no fixed username is set on the entry.
+    """
     global _config_cache, _config_mtime
     path = os.environ.get("WEBSH_CONFIG", "")
     if not path or not os.path.isfile(path):
@@ -160,6 +179,11 @@ def load_config():
             c.setdefault("host", "")
             c.setdefault("port", 22)
             c.setdefault("username", "")
+            has_creds = bool(c.get("password")) or bool(c.get("key"))
+            c["kind"] = "ready" if has_creds else "prompt"
+            c["allowed_users"] = _normalize_user_list(c.get("allowed_users"))
+            c["denied_users"] = _normalize_user_list(c.get("denied_users"))
+
         result = {
             "connections": conns,
             "restrict_hosts": bool(cfg.get("restrict_hosts", False)),
@@ -178,12 +202,19 @@ def config_public():
     cfg = load_config()
     safe = []
     for c in cfg["connections"]:
-        safe.append({
+        item = {
             "name": c.get("name", ""),
             "host": c.get("host", ""),
             "port": c.get("port", 22),
             "username": c.get("username", ""),
-        })
+            "kind": c.get("kind", "ready"),
+        }
+        if c.get("kind") == "prompt":
+            if c.get("allowed_users") is not None:
+                item["allowed_users"] = c["allowed_users"]
+            if c.get("denied_users") is not None:
+                item["denied_users"] = c["denied_users"]
+        safe.append(item)
     return {
         "connections": safe,
         "restrict_hosts": cfg["restrict_hosts"],
@@ -203,16 +234,34 @@ def find_config_connection(name):
 
 
 def is_host_allowed(host, port, username):
-    """Check if a host is allowed when restrict_hosts is on."""
+    """Manual-connect gate when restrict_hosts is on.
+
+    Kept deliberately strict: when restrict_hosts is true, raw manual
+    (host, port, username) POSTs are always rejected — callers must go
+    through a named connection. The arguments are kept so the enforcement
+    site can pass them in unchanged.
+    """
     cfg = load_config()
-    if not cfg["restrict_hosts"]:
-        return True
-    for c in cfg["connections"]:
-        if (c.get("host", "") == host
-                and c.get("port", 22) == port
-                and c.get("username", "") == username):
-            return True
-    return False
+    return not cfg["restrict_hosts"]
+
+
+def check_prompt_user(entry, username):
+    """Enforce allowed_users / denied_users on a Prompt connection.
+
+    Returns (True, None) when the username is permitted, otherwise
+    (False, error_message). The rule is ignored when the entry has a
+    fixed username (the caller should not even call us in that case).
+    """
+    au = entry.get("allowed_users")
+    du = entry.get("denied_users")
+    if au:
+        if username not in au:
+            return False, "username is not in the allowed list for this connection"
+        return True, None
+    if du:
+        if username in du:
+            return False, "username is not allowed on this connection"
+    return True, None
 
 
 # ─── Validation ──────────────────────────────────────────────────────
@@ -600,10 +649,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             host = entry.get("host", "")
             port = clamp(entry.get("port"), MIN_PORT, MAX_PORT, 22)
-            username = entry.get("username", "")
-            password = entry.get("password", "")
-            key = entry.get("key", "")
             ssh_options = entry.get("ssh_options", {})
+            if entry.get("kind") == "prompt":
+                # User supplies credentials at connect time.
+                fixed_user = entry.get("username", "")
+                username = fixed_user or body.get("username", "").strip()
+                password = body.get("password", "")
+                key = body.get("key", "")
+                if not username:
+                    self._json({"error": "username is required"}, 400)
+                    return
+                if not password and not key:
+                    self._json({"error": "password or key is required"}, 400)
+                    return
+                if not fixed_user:
+                    ok, err = check_prompt_user(entry, username)
+                    if not ok:
+                        self._json({"error": err}, 403)
+                        return
+            else:
+                username = entry.get("username", "")
+                password = entry.get("password", "")
+                key = entry.get("key", "")
         else:
             host = body.get("host", "").strip()
             username = body.get("username", "").strip()
@@ -620,7 +687,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid host or username"}, 400)
             return
 
-        # Enforce restrict_hosts
+        # Free-form manual connect is unrestricted unless restrict_hosts
+        # pins the user to a ready server-side connection.
         if not conn_name and not is_host_allowed(host, port, username):
             self._json({"error": "connections to this host are not allowed"}, 403)
             return

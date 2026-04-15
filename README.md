@@ -162,11 +162,51 @@ Override default SSH behavior for specific connections:
 }
 ```
 
+### Connection kinds: Ready vs Prompt
+
+Each `connections[]` entry is one of two kinds, auto-detected by whether
+a `password` or `key` is present:
+
+- **Ready** — credentials (`password` or `key`) are stored server-side.
+  The user clicks the card and connects. The browser never sees the
+  credentials.
+- **Prompt** — no `password` and no `key`. The entry acts as an
+  allowlisted target: the user clicks the card, the manual form appears
+  pre-filled (host/port locked, username locked if fixed) and the user
+  types their own password or key.
+
+Prompt entries may carry optional `allowed_users` (whitelist) or
+`denied_users` (blacklist) to restrict which usernames may connect.
+`allowed_users` wins if both are set. These rules are ignored when the
+entry has a fixed `username` (there's no choice to police). Saving the
+typed credentials locally via the "Save this connection" checkbox works
+the same as with the free manual form.
+
+```json
+{
+  "name": "Shared DB",
+  "host": "db.example.com",
+  "port": 2222,
+  "allowed_users": ["alice", "bob"]
+}
+```
+
 ### Restrict mode
 
-Set `"restrict_hosts": true` to only allow connections to hosts defined in
-the config. The manual connection form will be hidden, and the backend will
-reject any connection attempt to a host not in the list.
+Set `"restrict_hosts": true` to hide the free-form manual connection form
+entirely. Users can only go through a configured connection card. Raw
+manual-path POSTs to `/api/connect` (bypassing the UI) are also rejected.
+With a single connection, the UI auto-selects it on load — Ready connects
+immediately, Prompt surfaces the locked form ready for a password.
+
+### Security note on user lists
+
+`allowed_users` / `denied_users` apply only inside the **named** connection
+flow (`{connection: "<name>"}` on `/api/connect`). When `restrict_hosts`
+is off, the free manual form and raw manual-path POSTs are not bound by
+those lists — they're a UX-guided allowlist for your team, not a hardening
+boundary against a determined caller. Combine with `restrict_hosts: true`
+if you need the rules to be enforced against direct API access too.
 
 ### URL anchors
 

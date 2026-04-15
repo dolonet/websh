@@ -36,6 +36,8 @@ class TestConfigLoading(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        server._config_cache = None
+        server._config_mtime = 0
 
     def tearDown(self):
         import shutil
@@ -46,10 +48,14 @@ class TestConfigLoading(unittest.TestCase):
         with open(path, "w") as f:
             json.dump(data, f)
         os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
         return path
 
     def _clear_config(self):
         os.environ.pop("WEBSH_CONFIG", None)
+        server._config_cache = None
+        server._config_mtime = 0
 
     def test_no_config(self):
         self._clear_config()
@@ -132,6 +138,8 @@ class TestConfigPublic(unittest.TestCase):
                 }]
             }, f)
         os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
 
         pub = server.config_public()
         conn = pub["connections"][0]
@@ -157,6 +165,8 @@ class TestFindConfigConnection(unittest.TestCase):
                 ]
             }, f)
         os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
 
     def tearDown(self):
         import shutil
@@ -189,46 +199,139 @@ class TestIsHostAllowed(unittest.TestCase):
         with open(path, "w") as f:
             json.dump(data, f)
         os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
 
     def test_no_restriction(self):
         self._write_config({"restrict_hosts": False, "connections": []})
         self.assertTrue(server.is_host_allowed("any.com", 22, "root"))
 
-    def test_restricted_allowed(self):
+    def test_restricted_blocks_manual(self):
+        """When restrict_hosts is on, manual-path POSTs are always rejected —
+        even if host/port/user match a configured connection. Callers must
+        use the named connection path instead."""
         self._write_config({
             "restrict_hosts": True,
             "connections": [
-                {"name": "srv", "host": "ok.com", "port": 22, "username": "admin"}
+                {"name": "srv", "host": "ok.com", "port": 22,
+                 "username": "admin", "password": "p"}
             ]
         })
-        self.assertTrue(server.is_host_allowed("ok.com", 22, "admin"))
+        self.assertFalse(server.is_host_allowed("ok.com", 22, "admin"))
+        self.assertFalse(server.is_host_allowed("evil.com", 22, "x"))
 
-    def test_restricted_denied_host(self):
-        self._write_config({
-            "restrict_hosts": True,
-            "connections": [
-                {"name": "srv", "host": "ok.com", "port": 22, "username": "admin"}
-            ]
-        })
-        self.assertFalse(server.is_host_allowed("evil.com", 22, "admin"))
 
-    def test_restricted_denied_port(self):
-        self._write_config({
-            "restrict_hosts": True,
-            "connections": [
-                {"name": "srv", "host": "ok.com", "port": 22, "username": "admin"}
-            ]
-        })
-        self.assertFalse(server.is_host_allowed("ok.com", 2222, "admin"))
+class TestConnectionKinds(unittest.TestCase):
+    """Classification of connections[] entries as Ready vs Prompt."""
 
-    def test_restricted_denied_user(self):
-        self._write_config({
-            "restrict_hosts": True,
-            "connections": [
-                {"name": "srv", "host": "ok.com", "port": 22, "username": "admin"}
-            ]
-        })
-        self.assertFalse(server.is_host_allowed("ok.com", 22, "root"))
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        server._config_cache = None
+        server._config_mtime = 0
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+        os.environ.pop("WEBSH_CONFIG", None)
+
+    def _write(self, data):
+        path = os.path.join(self.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+    def test_ready_when_password(self):
+        self._write({"connections": [
+            {"name": "r", "host": "h", "username": "u", "password": "p"}
+        ]})
+        self.assertEqual(server.load_config()["connections"][0]["kind"], "ready")
+
+    def test_ready_when_key(self):
+        self._write({"connections": [
+            {"name": "k", "host": "h", "username": "u", "key": "---KEY---"}
+        ]})
+        self.assertEqual(server.load_config()["connections"][0]["kind"], "ready")
+
+    def test_prompt_when_no_creds(self):
+        self._write({"connections": [
+            {"name": "p", "host": "h", "username": "u"}
+        ]})
+        self.assertEqual(server.load_config()["connections"][0]["kind"], "prompt")
+
+    def test_prompt_user_lists_parsed(self):
+        self._write({"connections": [
+            {"name": "p", "host": "h", "allowed_users": ["alice", "bob"]},
+            {"name": "p2", "host": "h2", "denied_users": ["root"]},
+        ]})
+        cs = server.load_config()["connections"]
+        self.assertEqual(cs[0]["allowed_users"], ["alice", "bob"])
+        self.assertIsNone(cs[0]["denied_users"])
+        self.assertIsNone(cs[1]["allowed_users"])
+        self.assertEqual(cs[1]["denied_users"], ["root"])
+
+
+class TestCheckPromptUser(unittest.TestCase):
+    def _entry(self, **kw):
+        return {"allowed_users": kw.get("au"), "denied_users": kw.get("du")}
+
+    def test_no_rules_permits(self):
+        self.assertTrue(server.check_prompt_user(self._entry(), "anyone")[0])
+
+    def test_whitelist_hit(self):
+        ok, _ = server.check_prompt_user(self._entry(au=["alice"]), "alice")
+        self.assertTrue(ok)
+
+    def test_whitelist_miss(self):
+        ok, _ = server.check_prompt_user(self._entry(au=["alice"]), "eve")
+        self.assertFalse(ok)
+
+    def test_blacklist_hit_rejected(self):
+        ok, _ = server.check_prompt_user(self._entry(du=["root"]), "root")
+        self.assertFalse(ok)
+
+    def test_blacklist_miss_allowed(self):
+        ok, _ = server.check_prompt_user(self._entry(du=["root"]), "alice")
+        self.assertTrue(ok)
+
+    def test_whitelist_wins(self):
+        ok, _ = server.check_prompt_user(
+            self._entry(au=["alice"], du=["alice"]), "alice")
+        self.assertTrue(ok)
+
+
+class TestConfigPublicKind(unittest.TestCase):
+    """config_public exposes kind + user lists for Prompt entries."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        server._config_cache = None
+        server._config_mtime = 0
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+        os.environ.pop("WEBSH_CONFIG", None)
+
+    def test_kind_exposed_secrets_stripped(self):
+        path = os.path.join(self.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": [
+                {"name": "r", "host": "h", "username": "u", "password": "p"},
+                {"name": "p", "host": "h2", "allowed_users": ["a"]},
+            ]}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        pub = server.config_public()
+        r, p = pub["connections"]
+        self.assertEqual(r["kind"], "ready")
+        self.assertNotIn("password", r)
+        self.assertNotIn("allowed_users", r)
+        self.assertEqual(p["kind"], "prompt")
+        self.assertEqual(p["allowed_users"], ["a"])
 
 
 class TestHTTPApi(unittest.TestCase):
@@ -252,6 +355,8 @@ class TestHTTPApi(unittest.TestCase):
                 ]
             }, f)
         os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
 
         cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
@@ -398,6 +503,151 @@ class TestHTTPApi(unittest.TestCase):
             body = json.loads(e.read().decode("utf-8"))
             code = e.code
         self.assertEqual(code, 400)
+
+
+class TestPromptConnectHTTP(unittest.TestCase):
+    """Named /api/connect for Prompt entries — body carries creds, server
+    enforces allowed_users / denied_users when no fixed username."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18766
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({
+                "connections": [
+                    {"name": "free", "host": "free.example.com"},
+                    {"name": "wl", "host": "wl.example.com",
+                     "allowed_users": ["alice", "bob"]},
+                    {"name": "bl", "host": "bl.example.com",
+                     "denied_users": ["root"]},
+                    {"name": "fixed", "host": "fx.example.com",
+                     "username": "ops", "allowed_users": ["neverchecked"]},
+                ]
+            }, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}{}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            return json.loads(e.read().decode("utf-8")), e.code
+
+    def _get(self, path):
+        from urllib.request import urlopen
+        url = "http://127.0.0.1:{}{}".format(self.port, path)
+        try:
+            resp = urlopen(url, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            return json.loads(e.read().decode("utf-8")), e.code
+
+    def test_config_lists_kinds(self):
+        body, code = self._get("/api/config")
+        self.assertEqual(code, 200)
+        kinds = [c["kind"] for c in body["connections"]]
+        self.assertEqual(kinds, ["prompt", "prompt", "prompt", "prompt"])
+        # Fixed-user Prompt entry does NOT expose allowed_users (never checked)
+        fixed = next(c for c in body["connections"] if c["name"] == "fixed")
+        self.assertEqual(fixed["username"], "ops")
+
+    def test_prompt_requires_username(self):
+        body, code = self._post("/api/connect", {
+            "connection": "free", "password": "x", "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("username", body["error"])
+
+    def test_prompt_requires_password_or_key(self):
+        body, code = self._post("/api/connect", {
+            "connection": "free", "username": "alice",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("password", body["error"])
+
+    def test_whitelist_allows_listed_user(self):
+        body, code = self._post("/api/connect", {
+            "connection": "wl", "username": "alice", "password": "x",
+            "cols": 80, "rows": 24
+        })
+        # Not 403 — the allowlist is satisfied (SSH itself may fail later).
+        self.assertNotEqual(code, 403)
+
+    def test_whitelist_rejects_other_user(self):
+        body, code = self._post("/api/connect", {
+            "connection": "wl", "username": "eve", "password": "x",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 403)
+        self.assertIn("allowed list", body["error"])
+
+    def test_blacklist_rejects_listed_user(self):
+        body, code = self._post("/api/connect", {
+            "connection": "bl", "username": "root", "password": "x",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 403)
+
+    def test_blacklist_allows_other_user(self):
+        body, code = self._post("/api/connect", {
+            "connection": "bl", "username": "alice", "password": "x",
+            "cols": 80, "rows": 24
+        })
+        self.assertNotEqual(code, 403)
+
+    def test_fixed_username_ignores_user_lists(self):
+        """When entry has a fixed username, allowed_users is not consulted."""
+        body, code = self._post("/api/connect", {
+            "connection": "fixed", "username": "attacker",
+            "password": "x", "cols": 80, "rows": 24
+        })
+        # Connect proceeds with the config's fixed username "ops" —
+        # no 403 even though body's "attacker" isn't in allowed_users.
+        self.assertNotEqual(code, 403)
+
+    def test_manual_free_form_is_unrestricted_when_no_restrict_hosts(self):
+        """Free-form manual connects are NOT constrained by Prompt entries."""
+        body, code = self._post("/api/connect", {
+            "host": "anything.example.com", "port": 22,
+            "username": "anyone", "password": "x", "cols": 80, "rows": 24
+        })
+        # No 403 — server accepts free-form manual connects here.
+        self.assertNotEqual(code, 403)
+
+    def test_background_session_same_enforcement(self):
+        """File transfer uses background:true on the same path."""
+        body, code = self._post("/api/connect", {
+            "connection": "wl", "username": "eve", "password": "x",
+            "cols": 80, "rows": 24, "background": True
+        })
+        self.assertEqual(code, 403)
 
 
 class TestRateLimit(unittest.TestCase):

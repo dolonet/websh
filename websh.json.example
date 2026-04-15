@@ -3,21 +3,21 @@
   "isolate_storage": false,
   "connections": [
     {
-      "name": "Production",
+      "name": "Production (one-click)",
       "host": "server.example.com",
       "port": 22,
       "username": "deploy",
       "password": "your-password-here"
     },
     {
-      "name": "Dev (SSH key)",
+      "name": "Dev (one-click, SSH key)",
       "host": "dev.example.com",
       "port": 22,
       "username": "admin",
       "key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
     },
     {
-      "name": "Bastion (custom SSH options)",
+      "name": "Bastion (one-click, custom SSH options)",
       "host": "bastion.example.com",
       "port": 22,
       "username": "ops",
@@ -26,6 +26,24 @@
         "StrictHostKeyChecking": "yes",
         "ProxyJump": "jump.example.com"
       }
+    },
+    {
+      "name": "Staging (BYO password, fixed user)",
+      "host": "staging.example.com",
+      "port": 22,
+      "username": "deploy"
+    },
+    {
+      "name": "Shared DB (BYO creds, whitelist)",
+      "host": "db.example.com",
+      "port": 2222,
+      "allowed_users": ["alice", "bob"]
+    },
+    {
+      "name": "Jumpbox (BYO creds, blacklist)",
+      "host": "jumpbox.example.com",
+      "port": 22,
+      "denied_users": ["root"]
     }
   ]
 }
