@@ -203,7 +203,8 @@ function splitPane(id, dir) {
     showOverlay();
     $('btnCancel').classList.remove('h');
     if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
-        && serverConfig.connections[0].kind === 'prompt') {
+        && serverConfig.connections[0].kind === 'prompt'
+        && loadSaved().length === 0) {
       selectPromptConnection(serverConfig.connections[0].name);
     }
     renderSaved();
@@ -1306,11 +1307,12 @@ function doAutoConnect() {
   // Single server connection with restrict_hosts:
   //   - Ready  → connect immediately (no overlay, no form).
   //   - Prompt → show the overlay with the form pre-locked, password focused.
+  //     Skip the pre-lock if saved connections exist — user can click one.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1) {
     let only = serverConfig.connections[0];
     if (only.kind === 'prompt') {
       showOverlay();
-      selectPromptConnection(only.name);
+      if (loadSaved().length === 0) selectPromptConnection(only.name);
       return;
     }
     connectByName(only.name);
