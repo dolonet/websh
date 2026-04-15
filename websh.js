@@ -567,11 +567,16 @@ function connectSaved(c) {
   hideErr();
   let p = targetPane(); if(!p) return;
   let label = c.name||(c.user+'@'+c.host);
+  // Auto-match legacy entries (saved before we tagged with connection name)
+  // to a config entry by host:port so they still work under restrict_hosts.
+  let connName = c.connection;
+  if(!connName && serverConfig && serverConfig.connections) {
+    let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
+    if(m) connName = m.name;
+  }
   let body;
-  if(c.connection) {
-    // Saved from a Prompt card — reconnect via named path so restrict_hosts
-    // and allowed_users/denied_users are enforced server-side.
-    body={connection:c.connection,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  if(connName) {
+    body={connection:connName,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
   } else {
     body={host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
   }
