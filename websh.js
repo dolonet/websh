@@ -323,7 +323,7 @@ function newConnectionPane(id) {
   connectingFor = p.id;
   showOverlay();
   let hasOthers = Object.keys(panes).length > 1;
-  $('btnCancel').className = hasOthers ? 'btn btn-cancel' : 'btn btn-cancel h';
+  $('btnCancel').classList.toggle('h', !hasOthers);
   prefillForm(p);
   renderSaved();
 }
@@ -644,7 +644,7 @@ function doDisconnect() {
   // Show cancel only if there are other panes with active sessions
   let hasOthers=false;
   Object.keys(panes).forEach(k => {if(k!==p.id && panes[k].sid) hasOthers=true});
-  $('btnCancel').className = hasOthers || Object.keys(panes).length>1 ? 'btn btn-cancel' : 'btn btn-cancel h';
+  $('btnCancel').classList.toggle('h', !(hasOthers || Object.keys(panes).length>1));
   renderSaved();
 }
 
