@@ -30,18 +30,22 @@
     .btn-d{border-color:var(--dg);color:var(--dg)}
     .btn-d:hover{background:rgba(248,81,73,.15)}
     .btn-cancel{margin-left:8px}
+    .panel{position:relative}
+    .panel-close{position:absolute;top:10px;right:12px;background:transparent;border:none;color:var(--dim);font-size:22px;line-height:1;cursor:pointer;padding:4px 8px;border-radius:6px;transition:.15s}
+    .panel-close:hover{color:var(--fg);background:rgba(255,255,255,.06)}
 
     /* ── Overlay ── */
     .ov{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px)}
     .ov.h{display:none}
     .panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:24px 28px;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto}
-    .panel h2{font-size:17px;margin-bottom:4px;font-weight:600}
-    .slogan{font-size:12px;color:var(--dim);margin-bottom:16px}
+    .panel-title{display:flex;align-items:baseline;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+    .panel-title h2{font-size:17px;font-weight:600;margin:0}
+    .panel-title .slogan{font-size:12px;color:var(--dim)}
 
     /* ── Saved / server connections ── */
     .saved-section{margin-bottom:20px}
     .saved-label{font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
-    .saved-list{max-height:176px;overflow-y:auto;border:1px solid var(--bd);border-radius:var(--radius)}
+    .saved-list{max-height:260px;overflow-y:auto;border:1px solid var(--bd);border-radius:var(--radius)}
     .saved-list:empty{display:none}
     .saved-section:has(.saved-list:empty){display:none}
     .sv{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--bd);transition:background .1s;cursor:pointer}
@@ -66,6 +70,12 @@
     .fg label{display:block;font-size:11px;font-weight:600;color:var(--dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
     .fg input{width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:14px;font-family:inherit;outline:none;transition:border-color .15s}
     .fg input:focus{border-color:var(--ac)}
+    .fg input:disabled{opacity:.7;cursor:not-allowed}
+    .sv-kind{font-size:10px;padding:1px 6px;border-radius:8px;background:var(--bd);color:var(--dim);margin-left:6px}
+    .prompt-target{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;margin-bottom:12px;border:1px solid var(--ac);border-radius:var(--radius);background:rgba(88,166,255,.06)}
+    .prompt-target-info{font-size:12px;color:var(--tx)}
+    .prompt-target-change{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;line-height:1;padding:0 4px}
+    .prompt-target-change:hover{color:var(--dg)}
     .row{display:flex;gap:10px}.row .fg{flex:1}
     .save-row{display:flex;align-items:center;gap:8px;margin:12px 0 4px}
     .save-row input[type=checkbox]{accent-color:var(--ac);width:14px;height:14px;cursor:pointer}
@@ -172,8 +182,8 @@
 <!-- Connect overlay -->
 <div id="ov" class="ov h">
   <div class="panel">
-    <h2>websh</h2>
-    <div class="slogan">Lightweight but powerful web terminal</div>
+    <button id="btnCancel" class="panel-close h" onclick="cancelConnect()" title="Cancel" aria-label="Cancel">&times;</button>
+    <div class="panel-title"><h2>websh</h2><span class="slogan">Lightweight but powerful web terminal</span></div>
 
     <div id="serverSection" class="saved-section h">
       <div class="saved-label">Server connections</div>
@@ -188,6 +198,10 @@
     <div id="divider" class="divider"><span>Connect</span></div>
 
     <div id="manualForm">
+    <div id="promptTarget" class="prompt-target h">
+      <div class="prompt-target-info">Connecting to <b><span id="promptTargetLabel"></span></b></div>
+      <button type="button" class="prompt-target-change" onclick="clearPromptSelection()" title="Change">&times;</button>
+    </div>
     <div class="row">
       <div class="fg"><label>Host</label><input id="iH" placeholder="example.com"></div>
       <div class="fg" style="max-width:90px"><label>Port</label><input id="iP" type="number" value="22"></div>
@@ -223,7 +237,6 @@
       <button class="btn btn-p" onclick="doConnect()">Connect</button>
     </div>
     </div><!-- /manualForm -->
-    <button id="btnCancel" class="btn btn-cancel h" onclick="cancelConnect()">Cancel</button>
     <div id="err" class="err"></div>
   </div>
 </div>

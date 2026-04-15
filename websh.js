@@ -192,13 +192,21 @@ function splitPane(id, dir) {
   let np = createPane(wrap);
   activatePane(np.id);
 
-  // Auto-connect if single restricted host, otherwise show overlay
-  if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1) {
+  // Auto-connect if single restricted host, otherwise show overlay.
+  // For Prompt-kind entries we need user input, so we surface the overlay.
+  if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
+      && serverConfig.connections[0].kind !== 'prompt') {
     connectByName(serverConfig.connections[0].name);
   } else {
     connectingFor = np.id;
+    if (selectedPrompt) clearPromptSelection();
     showOverlay();
     $('btnCancel').classList.remove('h');
+    if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
+        && serverConfig.connections[0].kind === 'prompt'
+        && loadSaved().length === 0) {
+      selectPromptConnection(serverConfig.connections[0].name);
+    }
     renderSaved();
   }
 }
@@ -316,7 +324,7 @@ function newConnectionPane(id) {
   connectingFor = p.id;
   showOverlay();
   let hasOthers = Object.keys(panes).length > 1;
-  $('btnCancel').className = hasOthers ? 'btn btn-cancel' : 'btn btn-cancel h';
+  $('btnCancel').classList.toggle('h', !hasOthers);
   prefillForm(p);
   renderSaved();
 }
@@ -560,14 +568,25 @@ function connectSaved(c) {
   hideErr();
   let p = targetPane(); if(!p) return;
   let label = c.name||(c.user+'@'+c.host);
-  let body = {host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  // Auto-match legacy entries (saved before we tagged with connection name)
+  // to a config entry by host:port so they still work under restrict_hosts.
+  let connName = c.connection;
+  if(!connName && serverConfig && serverConfig.connections) {
+    let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
+    if(m) connName = m.name;
+  }
+  let body;
+  if(connName) {
+    body={connection:connName,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  } else {
+    body={host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
+  }
   if(c.key) body.key=c.key;
   connectPane(p, {body:body, label:label});
 }
 
 function connectByName(name) {
   hideErr();
-  let p = targetPane(); if(!p) return;
   let c=null;
   if(serverConfig && serverConfig.connections){
     for(let i=0;i<serverConfig.connections.length;i++){
@@ -575,6 +594,9 @@ function connectByName(name) {
     }
   }
   if(!c) return;
+  // Prompt connections need user input — switch the form into locked mode.
+  if(c.kind === 'prompt') { selectPromptConnection(name); return; }
+  let p = targetPane(); if(!p) return;
   connectPane(p, {
     body:{connection:name,cols:p.term.cols,rows:p.term.rows},
     label:name
@@ -595,11 +617,21 @@ function doConnect() {
     let list=loadSaved();
     let entry={name:label,host:host,port:port,user:username,auth:authMode};
     if(authMode==='pw') entry.pass=password; else entry.key=key;
+    if(selectedPrompt) entry.connection=selectedPrompt.name;
     list=list.filter(c => {return c.name!==label}); list.unshift(entry);
     saveSaved(list); $('iSave').checked=false; toggleSaveName();
   }
-  let body={host:host,port:port,username:username,password:password,cols:p.term.cols,rows:p.term.rows};
-  if(key) body.key=key;
+  let body;
+  if(selectedPrompt) {
+    // Named prompt connect: server supplies host/port, we supply creds
+    // (and username when not fixed). Server enforces allowed_users/denied_users.
+    body={connection:selectedPrompt.name,username:username,password:password,cols:p.term.cols,rows:p.term.rows};
+    if(key) body.key=key;
+    label = $('iName').value.trim() || (username+'@'+host+' ('+selectedPrompt.name+')');
+  } else {
+    body={host:host,port:port,username:username,password:password,cols:p.term.cols,rows:p.term.rows};
+    if(key) body.key=key;
+  }
   connectPane(p, {body:body, label:label});
 }
 
@@ -612,12 +644,13 @@ function doDisconnect() {
   let labelEl=p.el.querySelector('[data-pane-label]'); if(labelEl) labelEl.textContent='';
   updatePaneBadge(p);
   p.term.reset();
+  if (selectedPrompt) clearPromptSelection();
   connectingFor=p.id;
   showOverlay();
   // Show cancel only if there are other panes with active sessions
   let hasOthers=false;
   Object.keys(panes).forEach(k => {if(k!==p.id && panes[k].sid) hasOthers=true});
-  $('btnCancel').className = hasOthers || Object.keys(panes).length>1 ? 'btn btn-cancel' : 'btn btn-cancel h';
+  $('btnCancel').classList.toggle('h', !(hasOthers || Object.keys(panes).length>1));
   renderSaved();
 }
 
@@ -638,18 +671,73 @@ function loadServerConfig() {
   });
 }
 
+// ── Prompt-kind selection (free-form ↔ locked-form transitions) ────
+// selectedPrompt is null for free-form mode, or the config entry when a
+// prompt card is active. The form fields are kept in sync for doConnect.
+let selectedPrompt = null;
+
+function selectPromptConnection(name) {
+  if(!serverConfig || !serverConfig.connections) return;
+  let entry = serverConfig.connections.find(c => c.name === name && c.kind === 'prompt');
+  if(!entry) return;
+  selectedPrompt = entry;
+  hideErr();
+
+  // Free manual form becomes card-locked: unhide it even when
+  // restrict_hosts is on (it was hidden by renderServerConnections).
+  $('manualForm').classList.remove('h');
+  $('divider').classList.remove('h');
+
+  // Banner with a × to go back.
+  let fixedUser = entry.username && entry.username.length;
+  let oneAllowed = entry.allowed_users && entry.allowed_users.length === 1;
+  $('promptTargetLabel').textContent =
+    (fixedUser ? entry.username + '@' : (oneAllowed ? entry.allowed_users[0] + '@' : '')) +
+    entry.host + ':' + entry.port + '  (' + esc(entry.name) + ')';
+  $('promptTarget').classList.remove('h');
+
+  // Lock host/port; lock username if fixed or whitelist has one entry.
+  $('iH').value = entry.host; $('iH').disabled = true;
+  $('iP').value = entry.port; $('iP').disabled = true;
+  if(fixedUser) { $('iU').value = entry.username; $('iU').disabled = true; }
+  else if(oneAllowed) { $('iU').value = entry.allowed_users[0]; $('iU').disabled = true; }
+  else { $('iU').value = ''; $('iU').disabled = false; }
+
+  // Clear any stale creds; focus the password field.
+  $('iPw').value = ''; $('iKey').value = ''; $('iKeyPw').value = '';
+  setAuthTab('pw');
+  setTimeout(() => $('iPw').focus(), 0);
+}
+
+function clearPromptSelection() {
+  selectedPrompt = null;
+  $('promptTarget').classList.add('h');
+  $('iH').disabled = false; $('iP').disabled = false; $('iU').disabled = false;
+  $('iH').value = ''; $('iP').value = '22'; $('iU').value = '';
+  // Restore restrict_hosts kiosk mode if configured.
+  if(serverConfig && serverConfig.restrict_hosts) {
+    $('manualForm').classList.add('h');
+    $('divider').classList.add('h');
+  }
+  hideErr();
+}
+
 function renderServerConnections() {
   if(!serverConfig||!serverConfig.connections||!serverConfig.connections.length){$('serverSection').className='saved-section h';return}
   $('serverSection').className='saved-section';
   let el=$('serverList'); el.innerHTML='';
   serverConfig.connections.forEach(c => {
     let div=document.createElement('div'); div.className='sv'; div.setAttribute('data-name',c.name);
-    div.innerHTML=`<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
-      `<div class="sv-host">${esc(c.username)}@${esc(c.host)}:${c.port}</div></div>`;
+    let userDisplay = c.username || (c.allowed_users && c.allowed_users.length===1 ? c.allowed_users[0] : '<em>user</em>');
+    let kindBadge = c.kind === 'prompt' ? `<span class="sv-kind" title="Password required on click">prompt</span>` : '';
+    div.innerHTML=`<div class="sv-info"><div class="sv-name">${esc(c.name)}${kindBadge}</div>`+
+      `<div class="sv-host">${userDisplay}@${esc(c.host)}:${c.port}</div></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {let row=e.target.closest('.sv');if(!row)return;connectByName(row.getAttribute('data-name'))};
-  if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h');$('localSection').classList.add('h')}
+  // restrict_hosts: no free-form — hide manual form until a Prompt card is clicked.
+  // Saved connections stay visible (they reconnect through the named path).
+  if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h')}
 }
 
 // ── File upload (background SSH session) ────────────────────────────
@@ -1216,9 +1304,18 @@ function doAutoConnect() {
     let found = serverConfig.connections.some(c => c.name===name);
     if (found) { connectByName(name); return; }
   }
-  // Single server connection with restrict_hosts → connect immediately
+  // Single server connection with restrict_hosts:
+  //   - Ready  → connect immediately (no overlay, no form).
+  //   - Prompt → show the overlay with the form pre-locked, password focused.
+  //     Skip the pre-lock if saved connections exist — user can click one.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1) {
-    connectByName(serverConfig.connections[0].name);
+    let only = serverConfig.connections[0];
+    if (only.kind === 'prompt') {
+      showOverlay();
+      if (loadSaved().length === 0) selectPromptConnection(only.name);
+      return;
+    }
+    connectByName(only.name);
     return;
   }
   showOverlay();
