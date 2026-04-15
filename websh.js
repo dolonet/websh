@@ -107,8 +107,12 @@ function createPane(container) {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
-    label:'', resizeTimer:null, upload:null, download:null, connectBody:null,
-    idleTimer:null, idleWarnEl:null
+    label:'', resizeTimer:null, upload:null, download:null,
+    idleTimer:null, idleWarnEl:null,
+    // Connection identity — set once per connect, used for save/restore/reconnect.
+    host:'', port:22, user:'', connection:null,
+    auth:'pw', password:'', key:'', keyPass:'',
+    persistent:false, slotId:null
   };
   panes[id] = p;
 
@@ -173,6 +177,7 @@ function updatePaneBadge(p) {
   if (ub) ub.disabled = !p.sid || busy;
   let db = p.el.querySelector('[data-download-btn]');
   if (db) db.disabled = !p.sid || busy;
+  updatePaneTag(p);
 }
 
 // ── Split / Close ───────────────────────────────────────────────────
@@ -191,6 +196,7 @@ function splitPane(id, dir) {
   // Create new pane placeholder
   let np = createPane(wrap);
   activatePane(np.id);
+  saveSessions();
 
   // Auto-connect if single restricted host, otherwise show overlay.
   // For Prompt-kind entries we need user input, so we surface the overlay.
@@ -313,9 +319,9 @@ function hideReconnectBar(p) {
   if (bar) bar.classList.add('h');
 }
 function reconnectPane(id) {
-  let p = panes[id]; if (!p || !p.connectBody) return;
+  let p = panes[id]; if (!p || (!p.host && !p.connection)) return;
   hideReconnectBar(p);
-  connectPane(p, {body: p.connectBody, label: p.label});
+  connectPane(p, {label: p.label, resume: p.persistent});
 }
 function newConnectionPane(id) {
   let p = panes[id]; if (!p) return;
@@ -358,31 +364,156 @@ function keepAlive(id) {
   resetIdleTimer(p);
 }
 
-// ── Session persistence (sessionStorage) ────────────────────────────
-function saveSessions() {
-  let data = {};
-  Object.keys(panes).forEach(k => {
-    let p = panes[k];
-    if (p.sid && p.connectBody) {
-      data[k] = {sid: p.sid, label: p.label, connectBody: p.connectBody};
-    }
-  });
-  try { sessionStorage.setItem('websh_sessions', JSON.stringify(data)); } catch(e) {}
+// ── Session persistence (localStorage) ──────────────────────────────
+// Persistent panes wrap their remote shell in tmux; on refresh we resume
+// by slot_id so the layout + running processes come back intact. Layout
+// tree is serialized from the DOM so we can rebuild splits verbatim.
+const PANES_KEY = 'websh_panes';
+const PANES_VERSION = 2;
+
+function slotIdFor(user, host, port) {
+  // Human-readable + unique. Sanitize to backend's [A-Za-z0-9_-]{1,64}.
+  let base = (user || 'u') + '_' + (host || 'h') + '_' + (port || 22);
+  let rand = Math.random().toString(36).slice(2, 8);
+  let raw = base + '_' + rand;
+  return raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
 }
-function loadSessions() {
-  try { return JSON.parse(sessionStorage.getItem('websh_sessions') || '{}'); } catch(e) { return {}; }
+
+function paneRecord(p) {
+  // Flat, self-contained record persisted per open pane. Has everything
+  // needed to rebuild the wire request — no lookups at restore time.
+  if (!p.host && !p.connection) return null;
+  return {
+    label:      p.label || '',
+    host:       p.host || '',
+    port:       p.port || 22,
+    user:       p.user || '',
+    connection: p.connection || null,
+    auth:       p.auth || (p.key ? 'key' : 'pw'),
+    password:   p.password || '',
+    key:        p.key || '',
+    key_pass:   p.keyPass || '',
+    persistent: !!p.persistent,
+    slot_id:    p.slotId || null,
+    cols:       p.term.cols,
+    rows:       p.term.rows
+  };
+}
+
+function buildConnectBody(rec, termCols, termRows) {
+  // Translate a pane record into the shape server.py /api/connect wants.
+  let b = {
+    username: rec.user,
+    cols: termCols || rec.cols || 80,
+    rows: termRows || rec.rows || 24
+  };
+  if (rec.connection) b.connection = rec.connection;
+  else { b.host = rec.host; b.port = rec.port || 22; }
+  if (rec.auth === 'key') {
+    if (rec.key) b.key = rec.key;
+    if (rec.key_pass) b.password = rec.key_pass;
+  } else if (rec.password) {
+    b.password = rec.password;
+  }
+  if (rec.persistent) {
+    b.persistent = true;
+    b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
+  }
+  return b;
+}
+
+function serializeLayout(rootEl) {
+  // rootEl is #panes; walk its single child (pane or split wrapper).
+  let first = null;
+  for (let i = 0; i < rootEl.children.length; i++) {
+    let ch = rootEl.children[i];
+    if (ch.classList.contains('pane') || ch.classList.contains('split-h') || ch.classList.contains('split-v')) {
+      first = ch; break;
+    }
+  }
+  return first ? serializeNode(first) : null;
+}
+function serializeNode(el) {
+  let flex = el.style.flex || '';
+  if (el.classList.contains('pane')) {
+    return {type: 'leaf', pane: el.getAttribute('data-pane'), flex: flex};
+  }
+  let dir = el.classList.contains('split-h') ? 'h' : 'v';
+  let kids = [];
+  for (let i = 0; i < el.children.length; i++) {
+    let c = el.children[i];
+    if (c.classList.contains('split-handle')) continue;
+    kids.push(serializeNode(c));
+  }
+  return {type: 'split', dir: dir, flex: flex, a: kids[0], b: kids[1]};
+}
+
+function saveSessions() {
+  let out = {};
+  Object.keys(panes).forEach(k => {
+    let rec = paneRecord(panes[k]);
+    if (rec) out[k] = rec;
+  });
+  let manifest = {
+    version: PANES_VERSION,
+    layout: serializeLayout($('panes')),
+    panes: out
+  };
+  try { localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(manifest)); } catch(e) {}
+}
+function loadManifest() {
+  // Load v2 directly, or migrate from the legacy v1 "websh_manifest" key.
+  try {
+    let raw = localStorage.getItem(storageKey(PANES_KEY));
+    if (raw) {
+      let m = JSON.parse(raw);
+      if (m && m.version === PANES_VERSION) return m;
+    }
+  } catch(e) {}
+  // Migrate v1 → v2, then drop the old key.
+  try {
+    let raw = localStorage.getItem(storageKey('websh_manifest'));
+    if (!raw) return null;
+    let old = JSON.parse(raw);
+    if (!old || old.version !== 1 || !old.slots) return null;
+    let panes = {};
+    Object.keys(old.slots).forEach(k => {
+      let s = old.slots[k];
+      let b = s.connect_body || {};
+      panes[k] = {
+        label: s.label || '',
+        host: b.host || '',
+        port: b.port || 22,
+        user: b.username || '',
+        connection: b.connection || null,
+        auth: b.key ? 'key' : 'pw',
+        password: b.password || '',
+        key: b.key || '',
+        key_pass: '',
+        persistent: !!s.persistent_requested,
+        slot_id: s.slot_id || null,
+        cols: b.cols || 80,
+        rows: b.rows || 24
+      };
+    });
+    let migrated = { version: PANES_VERSION, layout: old.layout, panes };
+    localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(migrated));
+    localStorage.removeItem(storageKey('websh_manifest'));
+    return migrated;
+  } catch(e) { return null; }
 }
 function clearSavedSessions() {
+  try { localStorage.removeItem(storageKey(PANES_KEY)); } catch(e) {}
+  try { localStorage.removeItem(storageKey('websh_manifest')); } catch(e) {}
   try { sessionStorage.removeItem('websh_sessions'); } catch(e) {}
 }
 
 // ── Pre-fill form from last connection ──────────────────────────────
 function prefillForm(p) {
-  if (!p || !p.connectBody) return;
-  let b = p.connectBody;
-  if (b.host) $('iH').value = b.host;
-  if (b.port) $('iP').value = b.port;
-  if (b.username) $('iU').value = b.username;
+  if (!p) return;
+  if (p.host) $('iH').value = p.host;
+  if (p.port) $('iP').value = p.port;
+  if (p.user) $('iU').value = p.user;
 }
 
 // ── Export terminal ─────────────────────────────────────────────────
@@ -411,13 +542,14 @@ function pollOutput(p) {
   api('output',{query:'&session_id='+p.sid}).then(r => {
     p.pollRetries=0;
     if(r.error){
-      // Session not found — stale restore or server restarted
+      // Session not found — stale restore or server restarted. Persistent
+      // panes try to re-attach via tmux; short-lived panes just reconnect.
       console.log('poll: session error:', r.error);
       stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null; p.connecting=false;
-      clearSavedSessions();
       updatePaneBadge(p);
-      if(p.connectBody) { connectPane(p, {body:p.connectBody, label:p.label}); }
-      else { doAutoConnect(); }
+      if(p.host || p.connection) {
+        connectPane(p, {label:p.label, resume:p.persistent});
+      } else { doAutoConnect(); }
       return;
     }
     p.connecting=false;
@@ -431,7 +563,7 @@ function pollOutput(p) {
       p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
       stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null;
       saveSessions();
-      if(p.connectBody) showReconnectBar(p);
+      if(p.host || p.connection) showReconnectBar(p);
       if(activeId===p.id) updatePaneBadge(p);
       return;
     }
@@ -446,7 +578,7 @@ function pollOutput(p) {
       p.term.write(msg);
       stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null;
       saveSessions();
-      if(p.connectBody) showReconnectBar(p);
+      if(p.host || p.connection) showReconnectBar(p);
       if(activeId===p.id) updatePaneBadge(p);
       return;
     }
@@ -467,30 +599,54 @@ function queueInput(p, data) {
 }
 
 // ── Unified connect ─────────────────────────────────────────────────
+// opts = { label, host, port, user, connection, auth, password, key, keyPass,
+//          persistent, slotId?, resume? }
+// `resume` flag triggers attach-by-slot_id on the backend.
 function connectPane(p, opts) {
-  p.label = opts.label;
-  p.connectBody = opts.body; // store for background sessions (upload)
+  p.label = opts.label || '';
+  if (opts.host !== undefined) p.host = opts.host || '';
+  if (opts.port !== undefined) p.port = opts.port || 22;
+  if (opts.user !== undefined) p.user = opts.user || '';
+  if (opts.connection !== undefined) p.connection = opts.connection || null;
+  if (opts.auth !== undefined) p.auth = opts.auth || 'pw';
+  if (opts.password !== undefined) p.password = opts.password || '';
+  if (opts.key !== undefined) p.key = opts.key || '';
+  if (opts.keyPass !== undefined) p.keyPass = opts.keyPass || '';
+  if (opts.persistent !== undefined) p.persistent = !!opts.persistent;
+  if (opts.slotId) p.slotId = opts.slotId;
+  else if (p.persistent && !p.slotId) p.slotId = slotIdFor(p.user, p.host, p.port);
+
   hideReconnectBar(p);
   p.connecting = true;
   let labelEl = p.el.querySelector('[data-pane-label]');
-  if (labelEl) labelEl.textContent = opts.label;
+  if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(opts.label);
+  setTitle(p.label);
   updatePaneBadge(p);
 
-  api('connect', {body: opts.body})
+  let body = buildConnectBody(paneRecord(p), p.term.cols, p.term.rows);
+  if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
+
+  api('connect', {body: body})
     .then(r => {
       console.log('connect result:', r);
       p.connecting = false;
       if (r.error) { showErr(r.error); updatePaneBadge(p); return }
       if (r.alive === false) { showErr('SSH process exited immediately'); updatePaneBadge(p); return }
       p.sid = r.session_id;
+      if (r.slot_id) p.slotId = r.slot_id;
       hideOverlay();
       $('btnCancel').classList.add('h');
       connectingFor = null;
       p.term.focus();
       p.polling = true;
       p.pollRetries = 0;
+      // Force a resize so resumed tmux sessions redraw at the real size.
+      p.fitAddon.fit();
+      let dims = p.fitAddon.proposeDimensions();
+      let cols = (dims && dims.cols) || p.term.cols;
+      let rows = (dims && dims.rows) || p.term.rows;
+      api('resize', {body:{session_id:p.sid, cols:cols, rows:rows}}).catch(() => {});
       startKeepalive(p);
       resetIdleTimer(p);
       saveSessions();
@@ -501,6 +657,20 @@ function connectPane(p, opts) {
       showErr('Connection failed: ' + e.message);
       updatePaneBadge(p);
     });
+}
+
+function updatePaneTag(p) {
+  let labelEl = p.el.querySelector('[data-pane-label]');
+  if (!labelEl) return;
+  let old = p.el.querySelector('.pane-tag'); if (old) old.remove();
+  if (!p.host && !p.connection) return;
+  let tag = document.createElement('span');
+  tag.className = 'pane-tag ' + (p.persistent ? 'persistent' : 'ephemeral');
+  tag.textContent = p.persistent ? 'persistent' : 'short-lived';
+  tag.title = p.persistent
+    ? 'This pane is wrapped in remote tmux and will survive browser refresh.'
+    : 'This pane is NOT persistent — it will be lost on refresh.';
+  labelEl.after(tag);
 }
 
 function targetPane() {
@@ -575,14 +745,16 @@ function connectSaved(c) {
     let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
     if(m) connName = m.name;
   }
-  let body;
-  if(connName) {
-    body={connection:connName,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
-  } else {
-    body={host:c.host,port:c.port,username:c.user,password:c.pass||'',cols:p.term.cols,rows:p.term.rows};
-  }
-  if(c.key) body.key=c.key;
-  connectPane(p, {body:body, label:label});
+  connectPane(p, {
+    label: label,
+    host: c.host, port: c.port || 22, user: c.user,
+    connection: connName,
+    auth: c.key ? 'key' : 'pw',
+    password: c.pass || '',
+    key: c.key || '',
+    persistent: c.persistent !== false,
+    slotId: null
+  });
 }
 
 function connectByName(name) {
@@ -598,8 +770,12 @@ function connectByName(name) {
   if(c.kind === 'prompt') { selectPromptConnection(name); return; }
   let p = targetPane(); if(!p) return;
   connectPane(p, {
-    body:{connection:name,cols:p.term.cols,rows:p.term.rows},
-    label:name
+    label: name,
+    host: c.host || '', port: c.port || 22, user: c.username || '',
+    connection: name,
+    auth: 'pw',
+    persistent: c.persistent !== false,
+    slotId: null
   });
 }
 
@@ -613,26 +789,29 @@ function doConnect() {
   if(authMode==='pw'&&!password){showErr('Password is required');return}
   if(authMode==='key'&&!key){showErr('Private key is required');return}
   let label = $('iName').value.trim() || (username+'@'+host);
+  let wantPersistent = $('iPersistent') ? $('iPersistent').checked : true;
   if($('iSave').checked){
     let list=loadSaved();
-    let entry={name:label,host:host,port:port,user:username,auth:authMode};
+    let entry={name:label,host:host,port:port,user:username,auth:authMode,persistent:wantPersistent};
     if(authMode==='pw') entry.pass=password; else entry.key=key;
     if(selectedPrompt) entry.connection=selectedPrompt.name;
     list=list.filter(c => {return c.name!==label}); list.unshift(entry);
     saveSaved(list); $('iSave').checked=false; toggleSaveName();
   }
-  let body;
-  if(selectedPrompt) {
-    // Named prompt connect: server supplies host/port, we supply creds
-    // (and username when not fixed). Server enforces allowed_users/denied_users.
-    body={connection:selectedPrompt.name,username:username,password:password,cols:p.term.cols,rows:p.term.rows};
-    if(key) body.key=key;
-    label = $('iName').value.trim() || (username+'@'+host+' ('+selectedPrompt.name+')');
-  } else {
-    body={host:host,port:port,username:username,password:password,cols:p.term.cols,rows:p.term.rows};
-    if(key) body.key=key;
+  let opts = {
+    label: label,
+    host: host, port: port, user: username,
+    connection: selectedPrompt ? selectedPrompt.name : null,
+    auth: authMode,
+    persistent: wantPersistent,
+    slotId: null
+  };
+  if (authMode === 'pw') opts.password = password;
+  else { opts.key = key; opts.keyPass = $('iKeyPw').value; }
+  if (selectedPrompt && !$('iName').value.trim()) {
+    opts.label = username + '@' + host + ' (' + selectedPrompt.name + ')';
   }
-  connectPane(p, {body:body, label:label});
+  connectPane(p, opts);
 }
 
 function doDisconnect() {
@@ -756,13 +935,13 @@ function bgDlSend(p, data) {
 
 function triggerUpload(id) {
   let p = panes[id];
-  if (!p || !p.sid || p.upload || !p.connectBody) return;
+  if (!p || !p.sid || p.upload || (!p.host && !p.connection)) return;
   p.el.querySelector(`[data-upload-input="${id}"]`).click();
 }
 
 function handleUpload(id, input) {
   let p = panes[id];
-  if (!p || !p.sid || !input.files.length || !p.connectBody) return;
+  if (!p || !p.sid || !input.files.length || (!p.host && !p.connection)) return;
   let files = Array.prototype.slice.call(input.files);
   input.value = '';
   let totalSize = 0;
@@ -775,10 +954,9 @@ function handleUpload(id, input) {
   showUploadProgress(p);
   updatePaneBadge(p);
 
-  // Create background SSH session with same credentials
-  let body = {};
-  for (let k in p.connectBody) body[k] = p.connectBody[k];
-  body.cols = 80; body.rows = 24;
+  // Create background SSH session with same credentials (no tmux wrap).
+  let body = buildConnectBody(paneRecord(p), 80, 24);
+  delete body.persistent; delete body.slot_id;
   body.background = true;
   api('connect', {body: body}).then(r => {
     if (!p.upload || p.upload.cancelled) return;
@@ -992,7 +1170,7 @@ function cancelTransfer(id) {
 // ── File download (background SSH session) ─────────────────────────
 function triggerDownload(id) {
   let p = panes[id];
-  if (!p || !p.sid || p.upload || p.download || !p.connectBody) return;
+  if (!p || !p.sid || p.upload || p.download || (!p.host && !p.connection)) return;
   // Use terminal selection as filename, or prompt
   let sel = (p.term.getSelection() || '').trim().replace(/^['"]|['"]$/g, '');
   if (sel && sel.indexOf('\n') === -1 && sel.length < 256) {
@@ -1010,10 +1188,9 @@ function startDownload(p, filename) {
   showUploadProgress(p);
   updatePaneBadge(p);
 
-  // Create background session
-  let body = {};
-  for (let k in p.connectBody) body[k] = p.connectBody[k];
-  body.cols = 80; body.rows = 24;
+  // Create background session (no tmux wrap).
+  let body = buildConnectBody(paneRecord(p), 80, 24);
+  delete body.persistent; delete body.slot_id;
   body.background = true;
   api('connect', {body: body}).then(r => {
     if (!p.download || p.download.cancelled) return;
@@ -1251,6 +1428,7 @@ function toggleTheme(){
     document.body.classList.remove('resizing','resizing-v');
     dragging=null;
     Object.keys(panes).forEach(k => {panes[k].fitAddon.fit()});
+    saveSessions();
   }
   // Mouse events
   document.addEventListener('mousedown', e => {
@@ -1321,10 +1499,57 @@ function doAutoConnect() {
   showOverlay();
 }
 
-// ── Session restore (disabled — fresh connect is more reliable) ─────
+// ── Session restore ─────────────────────────────────────────────────
+// Rebuild layout + reconnect every pane from the localStorage manifest.
+// Persistent panes attach via tmux (resume_slot_id); short-lived panes
+// just re-run a plain connect with the saved credentials.
 function tryRestoreSessions() {
-  clearSavedSessions();
-  return false;
+  let m = loadManifest();
+  if (!m || !m.layout || !m.panes || !Object.keys(m.panes).length) return false;
+
+  let restored = {};
+  let root = $('panes');
+  Object.keys(panes).forEach(k => { try { panes[k].term.dispose(); } catch(e) {} delete panes[k]; });
+  root.innerHTML = '';
+
+  function build(parent, node) {
+    if (!node) return null;
+    if (node.type === 'leaf') {
+      let p = createPane(parent);
+      if (node.flex) p.el.style.flex = node.flex;
+      restored[node.pane] = p;
+      return p.el;
+    }
+    let wrap = document.createElement('div');
+    wrap.className = 'split-' + (node.dir === 'v' ? 'v' : 'h');
+    if (node.flex) wrap.style.flex = node.flex;
+    parent.appendChild(wrap);
+    build(wrap, node.a);
+    let handle = document.createElement('div');
+    handle.className = 'split-handle';
+    wrap.appendChild(handle);
+    build(wrap, node.b);
+    return wrap;
+  }
+  build(root, m.layout);
+
+  let ids = Object.keys(restored);
+  if (!ids.length) return false;
+  activatePane(restored[ids[0]].id);
+
+  Object.keys(m.panes).forEach(oldId => {
+    let rec = m.panes[oldId];
+    let p = restored[oldId];
+    if (!p || !rec) return;
+    connectPane(p, {
+      label: rec.label, host: rec.host, port: rec.port, user: rec.user,
+      connection: rec.connection, auth: rec.auth,
+      password: rec.password, key: rec.key, keyPass: rec.key_pass,
+      persistent: rec.persistent, slotId: rec.slot_id,
+      resume: !!rec.persistent
+    });
+  });
+  return true;
 }
 
 // ── Init ────────────────────────────────────────────────────────────

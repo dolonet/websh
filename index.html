@@ -103,6 +103,9 @@
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
     .pane-badge{font-size:10px;padding:1px 6px;border-radius:10px;font-weight:500}
     .pane-label{font-size:11px;color:var(--dim);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .pane-tag{font-size:9px;padding:1px 5px;border-radius:6px;margin-left:4px;background:var(--bd);color:var(--dim);text-transform:uppercase;letter-spacing:.3px;font-weight:600}
+    .pane-tag.ephemeral{background:rgba(210,153,34,.15);color:var(--wn)}
+    .pane-tag.persistent{background:rgba(63,185,80,.15);color:var(--ok)}
     .pane-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:.15s}
     .pane-btn:hover{color:var(--tx);background:rgba(255,255,255,.08)}
     .pane-btn:disabled{opacity:.3;cursor:default;pointer-events:none}
@@ -203,10 +206,10 @@
       <button type="button" class="prompt-target-change" onclick="clearPromptSelection()" title="Change">&times;</button>
     </div>
     <div class="row">
-      <div class="fg"><label>Host</label><input id="iH" placeholder="example.com"></div>
-      <div class="fg" style="max-width:90px"><label>Port</label><input id="iP" type="number" value="22"></div>
+      <div class="fg"><label>Host</label><input id="iH" placeholder="example.com" autocomplete="off"></div>
+      <div class="fg" style="max-width:90px"><label>Port</label><input id="iP" type="number" value="22" autocomplete="off"></div>
     </div>
-    <div class="fg"><label>Username</label><input id="iU" placeholder="root"></div>
+    <div class="fg"><label>Username</label><input id="iU" placeholder="root" autocomplete="off" name="websh-user" data-lpignore="true" data-1p-ignore="true"></div>
 
     <div class="auth-tabs">
       <button id="tabPw" class="auth-tab active" onclick="setAuthTab('pw')">Password</button>
@@ -214,17 +217,21 @@
     </div>
     <div id="authPw" class="fg">
       <label>Password</label>
-      <input id="iPw" type="password">
+      <input id="iPw" type="password" autocomplete="new-password" name="websh-pw" data-lpignore="true" data-1p-ignore="true">
     </div>
     <div id="authKey" class="fg h">
       <label>Private Key</label>
-      <textarea id="iKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----" rows="4"></textarea>
+      <textarea id="iKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----" rows="4" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></textarea>
       <div style="margin-top:4px">
         <label class="fg-hint">Passphrase (if any)</label>
-        <input id="iKeyPw" type="password" placeholder="optional">
+        <input id="iKeyPw" type="password" placeholder="optional" autocomplete="new-password" name="websh-keypw" data-lpignore="true" data-1p-ignore="true">
       </div>
     </div>
 
+    <div class="save-row">
+      <input type="checkbox" id="iPersistent" checked>
+      <label for="iPersistent" title="Wraps the remote shell in tmux so this pane survives browser refresh and server restart.">Persistent session (tmux)</label>
+    </div>
     <div class="save-row">
       <input type="checkbox" id="iSave" onchange="toggleSaveName()">
       <label for="iSave">Save this connection</label>

@@ -100,6 +100,11 @@ RATE_LIMIT_MAX = 10       # max connect attempts per IP per window
 # Session ID format
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
+# Persistent-session slot id (used as remote tmux session name `websh-<slot>`).
+# Restricted to characters that are safe both as tmux session names and as
+# shell tokens without quoting.
+_SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
 # Static file serving (Python-only mode, without PHP proxy)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_FILES = {
@@ -285,7 +290,8 @@ class SSHSession(object):
     """Manages a single SSH connection via PTY subprocess."""
 
     def __init__(self, session_id, host, port, username, password, cols, rows,
-                 key=None, ssh_options=None, is_background=False):
+                 key=None, ssh_options=None, is_background=False,
+                 persistent=False, slot_id=None):
         self.id = session_id
         self.master_fd = None
         self.pid = None
@@ -299,6 +305,8 @@ class SSHSession(object):
         self._pw_buf = b""
         self._key_file = None
         self._ssh_options = ssh_options or {}
+        self.persistent = bool(persistent and slot_id)
+        self.slot_id = slot_id if self.persistent else None
 
         if key:
             self._key_file = self._write_key(key)
@@ -339,6 +347,11 @@ class SSHSession(object):
             "-l", username,
         ]
 
+        if self.persistent:
+            # Force remote TTY allocation — required when ssh has a trailing
+            # remote command (default is no TTY, but tmux needs one).
+            ssh_cmd.insert(1, "-tt")
+
         if self._key_file:
             ssh_cmd.extend(["-i", self._key_file])
 
@@ -348,6 +361,16 @@ class SSHSession(object):
 
         ssh_cmd.append("--")
         ssh_cmd.append(host)
+
+        if self.persistent:
+            # tmux on the target: attach if exists (-A), detach any stale
+            # client (-D). First-time creation starts a login shell.
+            # slot_id is validated against _SLOT_ID_RE so no escaping needed.
+            tmux_name = "websh-" + self.slot_id
+            ssh_cmd.append(
+                "exec tmux new-session -A -D -s " + tmux_name
+                + ' -- "$SHELL" -l'
+            )
 
         pid, fd = pty.fork()
         if pid == 0:
@@ -639,6 +662,20 @@ class Handler(BaseHTTPRequestHandler):
         rows = clamp(body.get("rows"), MIN_ROWS, MAX_ROWS, 24)
         is_bg = bool(body.get("background", False))
 
+        # Persistent session flags. `resume_slot_id` implies persistent=true and
+        # reuses the existing tmux session on the target. `slot_id` + persistent
+        # starts a new session that later refreshes can resume.
+        resume_slot_id = (body.get("resume_slot_id") or "").strip()
+        slot_id_in = (body.get("slot_id") or "").strip()
+        persistent = bool(body.get("persistent", False)) or bool(resume_slot_id)
+        if persistent:
+            slot_id = resume_slot_id or slot_id_in
+            if not _SLOT_ID_RE.match(slot_id):
+                self._json({"error": "invalid slot_id"}, 400)
+                return
+        else:
+            slot_id = None
+
         # Resolve credentials: by config connection name, or from request body
         conn_name = body.get("connection", "").strip()
         ssh_options = {}
@@ -721,17 +758,22 @@ class Handler(BaseHTTPRequestHandler):
                 key=key,
                 ssh_options=ssh_options,
                 is_background=is_bg,
+                persistent=persistent,
+                slot_id=slot_id,
             )
             with sessions_lock:
                 sessions[sid] = session
 
             time.sleep(CONNECT_SETTLE_TIME)
-            _log("INFO", "new session {} for {}@{}:{}".format(
-                sid, username, host, port))
+            _log("INFO", "new session {} for {}@{}:{}{}".format(
+                sid, username, host, port,
+                " [persistent slot=" + slot_id + "]" if persistent else ""))
             self._json({
                 "session_id": sid,
                 "status": "connecting",
                 "alive": session.alive,
+                "persistent": persistent,
+                "slot_id": slot_id,
             })
         except Exception as e:
             if session:
