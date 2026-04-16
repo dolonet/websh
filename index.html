@@ -134,6 +134,19 @@
     .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:4px 8px;background:rgba(248,81,73,.08);border-bottom:1px solid var(--bd);flex-shrink:0}
     .reconnect-bar .btn{font-size:11px;padding:3px 12px}
 
+    /* ── tmux-failed fallback bar ── */
+    .tmux-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:4px 8px;background:rgba(210,153,34,.1);border-bottom:1px solid var(--wn);flex-shrink:0;font-size:12px;color:var(--wn)}
+    .tmux-bar .btn{font-size:11px;padding:3px 12px}
+
+    /* ── tmux probe modal ── */
+    .tm-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:20px 24px;width:480px;max-width:95vw;display:flex;flex-direction:column}
+    .tm-panel h2{font-size:16px;font-weight:600;margin:0 0 6px}
+    .tm-panel .tm-sub{font-size:13px;color:var(--dim);margin-bottom:4px;line-height:1.5}
+    .tm-row{display:flex;gap:8px;margin-top:12px;justify-content:flex-end}
+    .tm-row .btn{font-size:13px;padding:7px 14px}
+    .tm-status{font-size:12px;color:var(--dim);margin-top:10px;min-height:16px}
+    .tm-status.err{color:var(--dg)}
+
     /* ── Idle warning ── */
     .idle-warn{position:absolute;bottom:8px;right:12px;z-index:50;background:var(--sf);border:1px solid var(--wn);border-radius:var(--radius);padding:6px 12px;font-size:12px;color:var(--wn);display:flex;align-items:center;gap:8px}
     .idle-warn .btn{font-size:11px;padding:3px 10px;border-color:var(--wn);color:var(--wn)}
@@ -200,31 +213,40 @@
 
     <div id="divider" class="divider"><span>Connect</span></div>
 
-    <div id="manualForm">
+    <form id="manualForm" autocomplete="off" onsubmit="return false;" spellcheck="false">
+    <!-- Chaff inputs: Chrome/Safari autofill the first visible username+password
+         pair in a form. Give them decoys to soak up the autofill so the real
+         fields stay untouched. -->
+    <input type="text" name="fake-user" autocomplete="username"
+           tabindex="-1" aria-hidden="true"
+           style="position:absolute;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none">
+    <input type="password" name="fake-pass" autocomplete="current-password"
+           tabindex="-1" aria-hidden="true"
+           style="position:absolute;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none">
     <div id="promptTarget" class="prompt-target h">
       <div class="prompt-target-info">Connecting to <b><span id="promptTargetLabel"></span></b></div>
       <button type="button" class="prompt-target-change" onclick="clearPromptSelection()" title="Change">&times;</button>
     </div>
     <div class="row">
-      <div class="fg"><label>Host</label><input id="iH" placeholder="example.com" autocomplete="off"></div>
-      <div class="fg" style="max-width:90px"><label>Port</label><input id="iP" type="number" value="22" autocomplete="off"></div>
+      <div class="fg"><label>Host</label><input id="iH" placeholder="example.com" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>
+      <div class="fg" style="max-width:90px"><label>Port</label><input id="iP" type="number" value="22" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>
     </div>
-    <div class="fg"><label>Username</label><input id="iU" placeholder="root" autocomplete="off" name="websh-user" data-lpignore="true" data-1p-ignore="true"></div>
+    <div class="fg"><label>Username</label><input id="iU" placeholder="root" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>
 
     <div class="auth-tabs">
-      <button id="tabPw" class="auth-tab active" onclick="setAuthTab('pw')">Password</button>
-      <button id="tabKey" class="auth-tab" onclick="setAuthTab('key')">SSH Key</button>
+      <button type="button" id="tabPw" class="auth-tab active" onclick="setAuthTab('pw')">Password</button>
+      <button type="button" id="tabKey" class="auth-tab" onclick="setAuthTab('key')">SSH Key</button>
     </div>
     <div id="authPw" class="fg">
       <label>Password</label>
-      <input id="iPw" type="password" autocomplete="new-password" name="websh-pw" data-lpignore="true" data-1p-ignore="true">
+      <input id="iPw" type="password" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true">
     </div>
     <div id="authKey" class="fg h">
       <label>Private Key</label>
       <textarea id="iKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----" rows="4" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></textarea>
       <div style="margin-top:4px">
         <label class="fg-hint">Passphrase (if any)</label>
-        <input id="iKeyPw" type="password" placeholder="optional" autocomplete="new-password" name="websh-keypw" data-lpignore="true" data-1p-ignore="true">
+        <input id="iKeyPw" type="password" placeholder="optional" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true">
       </div>
     </div>
 
@@ -237,14 +259,27 @@
       <label for="iSave">Save this connection</label>
     </div>
     <div id="saveNameWrap" class="save-name h">
-      <div class="fg"><label>Connection name</label><input id="iName" placeholder="my-server"></div>
+      <div class="fg"><label>Connection name</label><input id="iName" placeholder="my-server" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>
     </div>
 
     <div class="btn-row">
-      <button class="btn btn-p" onclick="doConnect()">Connect</button>
+      <button type="button" class="btn btn-p" onclick="doConnect()">Connect</button>
     </div>
-    </div><!-- /manualForm -->
+    </form><!-- /manualForm -->
     <div id="err" class="err"></div>
+  </div>
+</div>
+
+<!-- tmux probe modal -->
+<div id="tmuxOv" class="ov h">
+  <div class="tm-panel">
+    <h2 id="tmTitle">tmux</h2>
+    <div id="tmSub" class="tm-sub"></div>
+    <div id="tmStatus" class="tm-status"></div>
+    <div class="tm-row">
+      <button id="tmCancel" class="btn" onclick="tmuxCancel()">Cancel</button>
+      <button id="tmSkip" class="btn btn-p" onclick="tmuxSkip()">Connect short-lived</button>
+    </div>
   </div>
 </div>
 

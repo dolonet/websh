@@ -24,6 +24,15 @@ const panes = {};
 let activeId = null;
 let paneCounter = 0;
 let connectingFor = null; // pane ID the overlay is connecting for
+// overlayMode tracks why the login form is open:
+//   'initial' — no panes yet (fresh app, last pane closed). Modal.
+//   'split'   — user clicked split. Dismissable; dismiss is a no-op
+//               before materialize, undoes the split after.
+//   null      — form not driving a new-pane flow (e.g. not shown).
+// A pane is only added to the DOM on successful connect (materialize step),
+// so dismissing before connect cleanly leaves the layout untouched.
+let overlayMode = null;
+let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materialize
 let serverConfig = null;
 let sessionTimeout = 300; // updated from server config
 let fontSize = 14;
@@ -76,7 +85,6 @@ function createPane(container) {
     `<div class="reconnect-bar h" data-reconnect="${id}">` +
       `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
       `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
-      `<button class="btn" onclick="newConnectionPane('${id}')">New connection</button>` +
     `</div>` +
     `<div class="pane-term"></div>` +
     `<div class="search-bar h" data-search="${id}">` +
@@ -112,7 +120,8 @@ function createPane(container) {
     // Connection identity — set once per connect, used for save/restore/reconnect.
     host:'', port:22, user:'', connection:null,
     auth:'pw', password:'', key:'', keyPass:'',
-    persistent:false, slotId:null
+    persistent:false, slotId:null, tmuxCmd:'tmux',
+    connectedAt:0 // ms timestamp of last successful /api/connect resolve
   };
   panes[id] = p;
 
@@ -181,68 +190,103 @@ function updatePaneBadge(p) {
 }
 
 // ── Split / Close ───────────────────────────────────────────────────
+// Split does NOT mutate the DOM. It records the intent and opens the
+// login form. The new pane is materialized only on successful connect
+// (materializeTarget). Refreshing before connecting leaves layout intact.
 function splitPane(id, dir) {
-  let p = panes[id];
-  if (!p) return;
-  let parent = p.el.parentNode;
-  let wrap = document.createElement('div');
-  wrap.className = 'split-' + dir;
-  let handle = document.createElement('div');
-  handle.className = 'split-handle';
-  parent.replaceChild(wrap, p.el);
-  wrap.appendChild(p.el);
-  wrap.appendChild(handle);
+  if (!panes[id]) return;
+  pendingSplit = {fromId: id, dir: dir};
+  overlayMode = 'split';
+  connectingFor = null;
 
-  // Create new pane placeholder
-  let np = createPane(wrap);
-  activatePane(np.id);
-  saveSessions();
-
-  // Auto-connect if single restricted host, otherwise show overlay.
-  // For Prompt-kind entries we need user input, so we surface the overlay.
+  // Auto-connect shortcut for a single ready host — materialize happens
+  // inside connectByName via materializeTarget.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
       && serverConfig.connections[0].kind !== 'prompt') {
     connectByName(serverConfig.connections[0].name);
-  } else {
-    connectingFor = np.id;
-    if (selectedPrompt) clearPromptSelection();
-    showOverlay();
-    $('btnCancel').classList.remove('h');
-    if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
-        && serverConfig.connections[0].kind === 'prompt'
-        && loadSaved().length === 0) {
-      selectPromptConnection(serverConfig.connections[0].name);
-    }
-    renderSaved();
+    return;
   }
+
+  if (selectedPrompt) clearPromptSelection();
+  showOverlay();
+  if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
+      && serverConfig.connections[0].kind === 'prompt'
+      && loadSaved().length === 0) {
+    selectPromptConnection(serverConfig.connections[0].name);
+  }
+  renderSaved();
+}
+
+// Materialize a new pane for the pending 'initial' or 'split' overlay
+// mode. Creates the DOM + term, places it in the layout, returns it.
+// For 'reauth'/null mode, returns the existing target pane.
+function materializeTarget() {
+  if (overlayMode === 'initial') {
+    let root = $('panes');
+    let np = createPane(root);
+    activatePane(np.id);
+    connectingFor = np.id;
+    return np;
+  }
+  if (overlayMode === 'split' && pendingSplit) {
+    let from = panes[pendingSplit.fromId];
+    if (!from) { pendingSplit = null; return targetPane(); }
+    let dir = pendingSplit.dir;
+    let parent = from.el.parentNode;
+    let wrap = document.createElement('div');
+    wrap.className = 'split-' + dir;
+    let handle = document.createElement('div');
+    handle.className = 'split-handle';
+    parent.replaceChild(wrap, from.el);
+    wrap.appendChild(from.el);
+    wrap.appendChild(handle);
+    let np = createPane(wrap);
+    activatePane(np.id);
+    connectingFor = np.id;
+    pendingSplit = null;
+    return np;
+  }
+  return targetPane();
 }
 
 function cancelConnect() {
-  if (!connectingFor) return;
-  let np = panes[connectingFor];
-  if (np && !np.sid) {
-    // Undo split: remove the wrapper, put the sibling back
+  if (!overlayDismissable()) return;
+  let np = connectingFor ? panes[connectingFor] : null;
+  // If we got as far as materializing a pane for this overlay session
+  // (user clicked Connect, auth failed, form stayed open, user now
+  // dismisses), remove it. For pure intent (no materialize yet) there's
+  // nothing to clean up.
+  if (np && !np.sid && (overlayMode === 'initial' || overlayMode === 'split')) {
     let wrap = np.el.parentNode;
-    let parent = wrap.parentNode;
-    let sibling = null;
-    for (let i=0; i<wrap.children.length; i++) {
-      let ch = wrap.children[i];
-      if (ch !== np.el && ch.classList.contains('pane')) { sibling = ch; break; }
-      if (ch !== np.el && (ch.classList.contains('split-h') || ch.classList.contains('split-v'))) { sibling = ch; break; }
+    if (wrap && wrap.id === 'panes') {
+      // Initial case: pane sits directly in #panes root.
+      np.term.dispose();
+      delete panes[np.id];
+      np.el.remove();
+    } else if (wrap) {
+      // Split case: unwrap and restore the sibling.
+      let parent = wrap.parentNode;
+      let sibling = null;
+      for (let i=0; i<wrap.children.length; i++) {
+        let ch = wrap.children[i];
+        if (ch !== np.el && ch.classList.contains('pane')) { sibling = ch; break; }
+        if (ch !== np.el && (ch.classList.contains('split-h') || ch.classList.contains('split-v'))) { sibling = ch; break; }
+      }
+      np.term.dispose();
+      delete panes[np.id];
+      if (sibling && parent) {
+        sibling.style.flex = '';
+        parent.replaceChild(sibling, wrap);
+      }
     }
-    np.term.dispose();
-    delete panes[np.id];
-    if (sibling && parent) {
-      sibling.style.flex = '';
-      parent.replaceChild(sibling, wrap);
-    }
+    saveSessions();
   }
+  pendingSplit = null;
+  overlayMode = null;
   connectingFor = null;
   hideOverlay();
-  $('btnCancel').classList.add('h');
-  // Activate remaining pane
   let ids = Object.keys(panes);
-  if (ids.length) activatePane(ids[ids.length - 1]);
+  if (ids.length && !panes[activeId]) activatePane(ids[ids.length - 1]);
 }
 
 function closePane(id) {
@@ -259,21 +303,20 @@ function closePane(id) {
     api('disconnect', {body:{session_id:p.sid}}).catch(() => {});
   }
   p.term.dispose();
-  saveSessions();
 
   let wrap = p.el.parentNode;
   delete panes[id];
 
-  // If no panes left, create a fresh one and show auth overlay
+  // No panes left → back to the initial-login flow. No pane is
+  // materialized yet; the form drives creation on submit.
   if (!Object.keys(panes).length) {
-    let root = $('panes');
-    root.innerHTML = '';
-    let np = createPane(root);
-    activatePane(np.id);
-    connectingFor = np.id;
+    $('panes').innerHTML = '';
+    overlayMode = 'initial';
+    pendingSplit = null;
+    connectingFor = null;
     showOverlay();
-    $('btnCancel').classList.add('h');
     renderSaved();
+    saveSessions();
     return;
   }
 
@@ -298,21 +341,38 @@ function closePane(id) {
 
   // Refit all terminals after layout change
   Object.keys(panes).forEach(k => { panes[k].fitAddon.fit() });
+  saveSessions();
 }
 
 // ── Per-pane session helpers ────────────────────────────────────────
 function startKeepalive(p) {
   stopKeepalive(p);
-  p.keepaliveTimer = setInterval(() => { if(p.sid) api('ping').catch(() => {}) }, 30000);
+  // Empty input bumps the server's last_activity, so sessions stay alive
+  // as long as any tab is open. When the tab closes the interval stops
+  // and the server's idle timeout reaps the PTY normally.
+  p.keepaliveTimer = setInterval(() => {
+    if (p.sid) api('input', {body: {session_id: p.sid, data: ''}}).catch(() => {});
+  }, 30000);
 }
 function stopKeepalive(p) {
   if(p.keepaliveTimer){ clearInterval(p.keepaliveTimer); p.keepaliveTimer=null }
 }
 
 // ── Reconnect ────────────────────────────────────────────────────────
-function showReconnectBar(p) {
+function showReconnectBar(p, reason) {
   let bar = p.el.querySelector('[data-reconnect]');
-  if (bar) bar.classList.remove('h');
+  if (!bar) return;
+  let msg = bar.querySelector('span');
+  if (msg) {
+    if (reason === 'auth_failed') {
+      msg.textContent = 'Authentication failed';
+      msg.style.color = 'var(--dg)';
+    } else {
+      msg.textContent = 'Disconnected';
+      msg.style.color = 'var(--dim)';
+    }
+  }
+  bar.classList.remove('h');
 }
 function hideReconnectBar(p) {
   let bar = p.el.querySelector('[data-reconnect]');
@@ -323,18 +383,6 @@ function reconnectPane(id) {
   hideReconnectBar(p);
   connectPane(p, {label: p.label, resume: p.persistent});
 }
-function newConnectionPane(id) {
-  let p = panes[id]; if (!p) return;
-  hideReconnectBar(p);
-  p.term.reset();
-  connectingFor = p.id;
-  showOverlay();
-  let hasOthers = Object.keys(panes).length > 1;
-  $('btnCancel').classList.toggle('h', !hasOthers);
-  prefillForm(p);
-  renderSaved();
-}
-
 // ── Idle timeout warning ────────────────────────────────────────────
 function resetIdleTimer(p) {
   clearIdleTimer(p);
@@ -395,6 +443,7 @@ function paneRecord(p) {
     key_pass:   p.keyPass || '',
     persistent: !!p.persistent,
     slot_id:    p.slotId || null,
+    tmux_cmd:   p.tmuxCmd || 'tmux',
     cols:       p.term.cols,
     rows:       p.term.rows
   };
@@ -419,6 +468,7 @@ function buildConnectBody(rec, termCols, termRows) {
     b.persistent = true;
     b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
   }
+  if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
   return b;
 }
 
@@ -492,6 +542,7 @@ function loadManifest() {
         key_pass: '',
         persistent: !!s.persistent_requested,
         slot_id: s.slot_id || null,
+        tmux_cmd: 'tmux',
         cols: b.cols || 80,
         rows: b.rows || 24
       };
@@ -506,14 +557,6 @@ function clearSavedSessions() {
   try { localStorage.removeItem(storageKey(PANES_KEY)); } catch(e) {}
   try { localStorage.removeItem(storageKey('websh_manifest')); } catch(e) {}
   try { sessionStorage.removeItem('websh_sessions'); } catch(e) {}
-}
-
-// ── Pre-fill form from last connection ──────────────────────────────
-function prefillForm(p) {
-  if (!p) return;
-  if (p.host) $('iH').value = p.host;
-  if (p.port) $('iP').value = p.port;
-  if (p.user) $('iU').value = p.user;
 }
 
 // ── Export terminal ─────────────────────────────────────────────────
@@ -537,6 +580,22 @@ function exportTerminal() {
   URL.revokeObjectURL(a.href);
 }
 
+function commitPendingSave(p) {
+  if (!p.pendingSave) return;
+  let entry = Object.assign({}, p.pendingSave);
+  // Overwrite persistent with the actual live mode (handles tmux-skip
+  // and any other downgrade paths). Also capture a discovered tmux_cmd.
+  entry.persistent = !!p.persistent;
+  if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
+  let list = loadSaved();
+  list = list.filter(c => c.name !== entry.name);
+  list.unshift(entry);
+  saveSaved(list);
+  p.pendingSave = null;
+  if ($('iSave').checked) { $('iSave').checked = false; toggleSaveName(); }
+  renderSaved();
+}
+
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
   api('output',{query:'&session_id='+p.sid}).then(r => {
@@ -553,17 +612,58 @@ function pollOutput(p) {
       return;
     }
     p.connecting=false;
-    console.log('poll:', p.id, 'data_len:', (r.data||'').length, 'alive:', r.alive);
+    console.log('poll:', p.id, 'data_len:', (r.data||'').length,
+                'alive:', r.alive, 'auth_failed:', r.auth_failed);
     if(r.data){
       updatePaneBadge(p);
-      p.term.write(Uint8Array.from(atob(r.data), c => c.charCodeAt(0)));
+      let chunk = atob(r.data);
+      p.term.write(Uint8Array.from(chunk, c => c.charCodeAt(0)));
+      // Keep a short tail of decoded output only while we're still
+      // within the tmux-death detection window on a persistent pane.
+      if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
+        p.recentOutput = ((p.recentOutput || '') + chunk).slice(-4096);
+      }
       resetIdleTimer(p);
+    }
+    // SSH auth rejected our password/key: stop the loop cleanly and
+    // do NOT save the entry. Surface the failure on the pane itself
+    // (reconnect placeholder). The login form never reopens on its own.
+    if (r.auth_failed) {
+      p.pendingSave = null;
+      p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+      stopKeepalive(p); clearIdleTimer(p); p.polling = false;
+      if (p.sid) {
+        api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
+        p.sid = null;
+      }
+      p.recentOutput = '';
+      updatePaneBadge(p);
+      if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
+      saveSessions();
+      return;
+    }
+    // Commit the deferred save once the session has proven healthy
+    // (alive and no auth failure for ≥2.5 s).
+    if (p.pendingSave && r.alive !== false &&
+        p.connectedAt && (Date.now() - p.connectedAt) >= 2500) {
+      commitPendingSave(p);
     }
     if(r.alive===false){
       p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
       stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null;
       saveSessions();
-      if(p.host || p.connection) showReconnectBar(p);
+      // Smart tmux fallback: a persistent pane whose session dies quickly
+      // with a "not found" shape in the output is almost certainly a
+      // missing tmux binary on the target. Offer re-probe / short-lived.
+      let quick = p.connectedAt && (Date.now() - p.connectedAt) < 5000;
+      let tail = p.recentOutput || '';
+      let hit = /tmux: not found|tmux: command not found|No such file|command not found/i.test(tail);
+      if (p.persistent && quick && hit) {
+        showTmuxBar(p, 'tmux seems missing on ' + (p.host || 'target') + '.');
+      } else if (p.host || p.connection) {
+        showReconnectBar(p);
+      }
+      p.recentOutput = '';
       if(activeId===p.id) updatePaneBadge(p);
       return;
     }
@@ -615,6 +715,8 @@ function connectPane(p, opts) {
   if (opts.persistent !== undefined) p.persistent = !!opts.persistent;
   if (opts.slotId) p.slotId = opts.slotId;
   else if (p.persistent && !p.slotId) p.slotId = slotIdFor(p.user, p.host, p.port);
+  if (opts.tmuxCmd !== undefined) p.tmuxCmd = opts.tmuxCmd || 'tmux';
+  if (opts.saveEntry !== undefined) p.pendingSave = opts.saveEntry;
 
   hideReconnectBar(p);
   p.connecting = true;
@@ -627,17 +729,64 @@ function connectPane(p, opts) {
   let body = buildConnectBody(paneRecord(p), p.term.cols, p.term.rows);
   if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
 
+  console.log('connectPane: host=' + body.host + ' user=' + body.username +
+              ' persistent=' + !!body.persistent +
+              ' pw len=' + ((body.password || '').length) +
+              ' key len=' + ((body.key || '').length));
+
   api('connect', {body: body})
     .then(r => {
       console.log('connect result:', r);
       p.connecting = false;
-      if (r.error) { showErr(r.error); updatePaneBadge(p); return }
-      if (r.alive === false) { showErr('SSH process exited immediately'); updatePaneBadge(p); return }
+      if (r.error) { p.pendingSave = null; showErr(r.error); updatePaneBadge(p); return }
+      if (r.auth_failed) {
+        p.pendingSave = null;
+        updatePaneBadge(p);
+        // If the form is still open (user just clicked Connect), keep it
+        // visible with an error so they can retry or dismiss. Otherwise
+        // (refresh re-auth, reconnect retry) surface on the pane.
+        let formOpen = !$('ov').classList.contains('h');
+        if (formOpen) {
+          showErr('Authentication failed — check password or key.');
+        } else {
+          p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+          if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
+          connectingFor = null;
+          overlayMode = null;
+          pendingSplit = null;
+        }
+        return;
+      }
+      if (r.alive === false) {
+        p.pendingSave = null;
+        showErr('SSH process exited immediately');
+        updatePaneBadge(p);
+        if (p.persistent) showTmuxBar(p, 'Connection died immediately — tmux may be missing on ' + (p.host || 'target') + '.');
+        return;
+      }
       p.sid = r.session_id;
       if (r.slot_id) p.slotId = r.slot_id;
+      if (r.tmux_cmd) p.tmuxCmd = r.tmux_cmd;
+      p.connectedAt = Date.now();
+      p.recentOutput = '';
+      // Persist a non-default tmux path on the matching saved entry so
+      // future connects skip the probe and use the right binary path.
+      if (p.persistent && p.tmuxCmd && p.tmuxCmd !== 'tmux') {
+        let list = loadSaved();
+        let dirty = false;
+        for (let i = 0; i < list.length; i++) {
+          let c = list[i];
+          if (c.host === p.host && c.port === (p.port || 22) && c.user === p.user && c.tmux_cmd !== p.tmuxCmd) {
+            c.tmux_cmd = p.tmuxCmd; dirty = true;
+          }
+        }
+        if (dirty) saveSaved(list);
+      }
+      hideTmuxBar(p);
       hideOverlay();
-      $('btnCancel').classList.add('h');
       connectingFor = null;
+      overlayMode = null;
+      pendingSplit = null;
       p.term.focus();
       p.polling = true;
       p.pollRetries = 0;
@@ -680,14 +829,295 @@ function targetPane() {
   return null;
 }
 
+// ── tmux fallback bar ──────────────────────────────────────────────
+// Shown over a persistent pane whose connect died fast with a tmux-
+// shaped error ("not found"). Prompts the user to retry or switch the
+// pane to a plain (short-lived) session so they can install tmux.
+function showTmuxBar(p, note) {
+  hideReconnectBar(p);
+  let bar = p.el.querySelector('[data-tmux-bar]');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.className = 'tmux-bar';
+    bar.setAttribute('data-tmux-bar', p.id);
+    let msg = document.createElement('span');
+    msg.setAttribute('data-tmux-msg', '1');
+    bar.appendChild(msg);
+    let reBtn = document.createElement('button');
+    reBtn.className = 'btn btn-p';
+    reBtn.textContent = 'Retry';
+    reBtn.onclick = () => { tmuxRetry(p.id); };
+    bar.appendChild(reBtn);
+    let shortBtn = document.createElement('button');
+    shortBtn.className = 'btn';
+    shortBtn.textContent = 'Connect short-lived';
+    shortBtn.onclick = () => { tmuxSwitchToShortLived(p.id); };
+    bar.appendChild(shortBtn);
+    let panebar = p.el.querySelector('.pane-bar');
+    panebar.after(bar);
+  }
+  bar.querySelector('[data-tmux-msg]').textContent = note || 'tmux failed on this target';
+  bar.classList.remove('h');
+}
+function hideTmuxBar(p) {
+  let bar = p.el.querySelector('[data-tmux-bar]');
+  if (bar) bar.classList.add('h');
+}
+function tmuxRetry(id) {
+  let p = panes[id]; if (!p) return;
+  hideTmuxBar(p);
+  connectPane(p, {label: p.label, persistent: true});
+}
+function tmuxSwitchToShortLived(id) {
+  let p = panes[id]; if (!p) return;
+  hideTmuxBar(p);
+  p.persistent = false;
+  p.slotId = null;
+  connectPane(p, {label: p.label, persistent: false});
+}
+
+// ── tmux probe ─────────────────────────────────────────────────────
+// On a manual connect with Persistent checked, we open a background
+// SSH session (same mechanism as file upload/download), ask the remote
+// shell whether tmux is installed, and report back its path. If the
+// user has already said "connect short-lived" for this target, we
+// skip the probe next time — they've opted out.
+
+const TMUX_MARKER = '__WEBSH_TMUX__';
+
+function probeScript() {
+  // One-liner that prints a marker line our parser can find. Checks
+  // both $PATH and ~/.local/bin — a common user-space install location.
+  // The marker is assembled from two halves so the typed command itself
+  // (which the remote shell echoes back to our buffer) does not contain
+  // the full marker string — only the expanded output does.
+  return (
+    'PATH="$HOME/.local/bin:$PATH"; ' +
+    'CMD=""; ' +
+    'if command -v tmux >/dev/null 2>&1; then CMD="$(command -v tmux)"; ' +
+    'elif [ -x "$HOME/.local/bin/tmux" ]; then CMD="$HOME/.local/bin/tmux"; fi; ' +
+    'WTA=__WEBSH; WTB=_TMUX__; ' +
+    'printf "%s%s:installed=%s:cmd=%s\\n" "$WTA" "$WTB" "${CMD:+yes}${CMD:-no}" "$CMD"'
+  );
+}
+
+function parseProbeOutput(text) {
+  let m = text.match(new RegExp(TMUX_MARKER + ':installed=(\\S+?):cmd=(\\S*)'));
+  if (!m) return null;
+  return {
+    installed: m[1].indexOf('yes') === 0,
+    tmux_cmd: m[2] || ''
+  };
+}
+
+function openBgSession(p) {
+  // Spins up a non-persistent, background-tagged SSH session that
+  // borrows the pane's saved creds. Used only for the probe.
+  let body = buildConnectBody(paneRecord(p), 80, 24);
+  delete body.persistent; delete body.slot_id; delete body.tmux_cmd;
+  body.background = true;
+  return api('connect', {body: body}).then(r => {
+    if (r.error || r.alive === false) throw new Error(r.error || 'bg connect failed');
+    return r.session_id;
+  });
+}
+
+function drainOutput(sid, shouldStop) {
+  // Long-poll /api/output until shouldStop(buf) returns truthy or
+  // the session dies. Returns the accumulated decoded output.
+  let buf = '';
+  function step() {
+    return api('output', {query: '&session_id=' + sid}).then(r => {
+      if (r.error) return {buf: buf, reason: 'error', error: r.error};
+      if (r.data) buf += atob(r.data);
+      if (r.auth_failed) return {buf: buf, reason: 'auth_failed'};
+      let stop = shouldStop ? shouldStop(buf) : null;
+      if (stop) return {buf: buf, reason: stop};
+      if (r.alive === false) return {buf: buf, reason: 'closed'};
+      return step();
+    });
+  }
+  return step();
+}
+
+function probeTmux(p) {
+  // Returns a Promise<{installed, tmux_cmd} | null>. Opens a bg
+  // session, runs the probe one-liner, reads until the marker,
+  // disconnects. Caps at 20 s total.
+  let bgSid = null;
+  let timeoutId = null;
+  let timed = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('probe timeout')), 20000);
+  });
+  let work = openBgSession(p).then(sid => {
+    bgSid = sid;
+    return delay(2500); // let MOTD / login banner drain
+  }).then(() => {
+    return api('input', {body: {session_id: bgSid, data: probeScript() + '\n'}});
+  }).then(() => {
+    return drainOutput(bgSid, buf => buf.indexOf(TMUX_MARKER + ':') !== -1 ? 'marker' : null);
+  }).then(res => {
+    if (res.reason === 'auth_failed') {
+      let err = new Error('authentication failed');
+      err.authFailed = true;
+      throw err;
+    }
+    return parseProbeOutput(res.buf);
+  });
+  return Promise.race([work, timed]).finally(() => {
+    clearTimeout(timeoutId);
+    if (bgSid) api('disconnect', {body: {session_id: bgSid}}).catch(() => {});
+  });
+}
+
+// ── tmux probe modal ───────────────────────────────────────────────
+// Shows "checking…" while the probe runs; if tmux is missing the user
+// picks [Cancel] or [Connect short-lived]. Install-it-yourself flow:
+// the user connects short-lived to the same host, installs tmux (apt,
+// dnf, conda, whatever works on that target), then reconnects with
+// Persistent — the probe runs again and finds it.
+let tmuxState = null;
+
+function setTmuxSub(text) { $('tmSub').textContent = text; }
+function setTmuxStatus(text, cls) {
+  let el = $('tmStatus'); el.textContent = text || '';
+  el.className = 'tm-status' + (cls ? ' ' + cls : '');
+}
+function setTmuxButtons(cancel, skip) {
+  $('tmCancel').classList.toggle('h', !cancel);
+  $('tmSkip').classList.toggle('h', !skip);
+}
+
+function openTmuxModal(p, cfg) {
+  tmuxCleanup();
+  tmuxState = { p: p, opts: cfg.opts, cancelled: false };
+  $('tmuxOv').classList.remove('h');
+  $('tmTitle').textContent = 'tmux on ' + (p.host || 'target');
+  setTmuxStatus('', '');
+  setTmuxButtons(true, false);
+  setTmuxSub('Checking if tmux is installed on ' + p.host + '…');
+  startTmuxProbe();
+}
+
+function startTmuxProbe() {
+  let st = tmuxState; if (!st) return;
+  probeTmux(st.p).then(res => {
+    if (!tmuxState || tmuxState !== st || st.cancelled) return;
+    if (!res) {
+      setTmuxSub(
+        'Could not detect tmux on ' + st.p.host + ' — the probe did ' +
+        'not return a recognisable answer. Connect short-lived and try ' +
+        'tmux manually.'
+      );
+      setTmuxStatus('', '');
+      setTmuxButtons(true, true);
+      return;
+    }
+    if (res.installed) {
+      let opts = Object.assign({}, st.opts, {tmuxCmd: res.tmux_cmd || 'tmux'});
+      let p = st.p;
+      closeTmuxModal();
+      connectPane(p, opts);
+      return;
+    }
+    setTmuxSub(
+      'tmux is not installed on ' + st.p.host + '. ' +
+      'Connect short-lived, install tmux yourself, then reconnect with Persistent.'
+    );
+    setTmuxButtons(true, true);
+  }).catch(e => {
+    if (!tmuxState || tmuxState !== st || st.cancelled) return;
+    if (e && e.authFailed) {
+      setTmuxSub(
+        'Could not log in to ' + st.p.host + ' — authentication failed.'
+      );
+      setTmuxStatus('Check your password or key and try again.', 'err');
+      setTmuxButtons(true, false);
+      return;
+    }
+    let msg = (e && e.message) || '' + e;
+    if (msg.indexOf('timeout') !== -1) {
+      setTmuxSub(
+        'Probe timed out on ' + st.p.host + ' — likely missing tmux or a ' +
+        'slow target. You can connect short-lived instead.'
+      );
+      setTmuxStatus('', '');
+    } else {
+      setTmuxSub('Probe error on ' + st.p.host + '.');
+      setTmuxStatus(msg, 'err');
+    }
+    setTmuxButtons(true, true);
+  });
+}
+
+function tmuxSkip() {
+  let st = tmuxState; if (!st) return;
+  let p = st.p;
+  let opts = Object.assign({}, st.opts, {persistent: false, slotId: null, tmuxCmd: 'tmux'});
+  // If the user was about to save this entry, record the downgraded
+  // mode (short-lived) so we don't lie to future sessions.
+  if (opts.saveEntry) {
+    opts.saveEntry = Object.assign({}, opts.saveEntry, {persistent: false});
+  }
+  console.log('tmuxSkip: password len=' + ((opts.password || '').length) +
+              ' key len=' + ((opts.key || '').length) +
+              ' auth=' + opts.auth);
+  closeTmuxModal();
+  connectPane(p, opts);
+}
+
+function tmuxCancel() { closeTmuxModal(); }
+
+function closeTmuxModal() {
+  $('tmuxOv').classList.add('h');
+  tmuxCleanup();
+}
+
+function tmuxCleanup() {
+  let st = tmuxState;
+  tmuxState = null;
+  if (!st) return;
+  st.cancelled = true;
+}
+
+// Prime a pane's credentials so the probe bg-session can auth, before
+// we've called connectPane. Mirrors the subset connectPane touches.
+function primePaneForProbe(p, opts) {
+  p.label = opts.label || '';
+  if (opts.host !== undefined) p.host = opts.host || '';
+  if (opts.port !== undefined) p.port = opts.port || 22;
+  if (opts.user !== undefined) p.user = opts.user || '';
+  if (opts.connection !== undefined) p.connection = opts.connection || null;
+  if (opts.auth !== undefined) p.auth = opts.auth || 'pw';
+  if (opts.password !== undefined) p.password = opts.password || '';
+  if (opts.key !== undefined) p.key = opts.key || '';
+  if (opts.keyPass !== undefined) p.keyPass = opts.keyPass || '';
+}
+
 // ── UI ──────────────────────────────────────────────────────────────
 function setTitle(label) {
   document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Lightweight but powerful web terminal';
 }
 
 
-function showOverlay(){ $('ov').classList.remove('h'); focusFirst() }
-function hideOverlay(){ $('ov').classList.add('h') }
+// Dismissable iff the user has somewhere to retreat to:
+//   'split'   — the source pane exists (and always will), so yes.
+//   'initial' — there's no other pane; they must complete auth.
+function overlayDismissable() { return overlayMode === 'split'; }
+function showOverlay(){
+  $('ov').classList.remove('h');
+  $('btnCancel').classList.toggle('h', !overlayDismissable());
+  hideErr();
+  focusFirst();
+}
+function hideOverlay(){
+  $('ov').classList.add('h');
+  // Scrub credentials from the DOM once the overlay is closed so the
+  // browser has nothing to offer to save/sync.
+  $('iPw').value = '';
+  $('iKey').value = '';
+  $('iKeyPw').value = '';
+}
 function showErr(m){ let e=$('err'); e.textContent=m; e.classList.add('on') }
 function hideErr(){ $('err').classList.remove('on') }
 
@@ -736,7 +1166,7 @@ function renderSaved() {
 
 function connectSaved(c) {
   hideErr();
-  let p = targetPane(); if(!p) return;
+  let p = materializeTarget(); if(!p) return;
   let label = c.name||(c.user+'@'+c.host);
   // Auto-match legacy entries (saved before we tagged with connection name)
   // to a config entry by host:port so they still work under restrict_hosts.
@@ -753,7 +1183,8 @@ function connectSaved(c) {
     password: c.pass || '',
     key: c.key || '',
     persistent: c.persistent !== false,
-    slotId: null
+    slotId: null,
+    tmuxCmd: c.tmux_cmd || 'tmux'
   });
 }
 
@@ -768,7 +1199,7 @@ function connectByName(name) {
   if(!c) return;
   // Prompt connections need user input — switch the form into locked mode.
   if(c.kind === 'prompt') { selectPromptConnection(name); return; }
-  let p = targetPane(); if(!p) return;
+  let p = materializeTarget(); if(!p) return;
   connectPane(p, {
     label: name,
     host: c.host || '', port: c.port || 22, user: c.username || '',
@@ -781,7 +1212,7 @@ function connectByName(name) {
 
 function doConnect() {
   hideErr();
-  let p = targetPane(); if(!p) return;
+  let p = materializeTarget(); if(!p) return;
   let host=$('iH').value.trim(), port=parseInt($('iP').value)||22, username=$('iU').value.trim();
   let password=authMode==='pw'?$('iPw').value:$('iKeyPw').value;
   let key=authMode==='key'?$('iKey').value.trim():'';
@@ -790,13 +1221,16 @@ function doConnect() {
   if(authMode==='key'&&!key){showErr('Private key is required');return}
   let label = $('iName').value.trim() || (username+'@'+host);
   let wantPersistent = $('iPersistent') ? $('iPersistent').checked : true;
-  if($('iSave').checked){
-    let list=loadSaved();
-    let entry={name:label,host:host,port:port,user:username,auth:authMode,persistent:wantPersistent};
-    if(authMode==='pw') entry.pass=password; else entry.key=key;
-    if(selectedPrompt) entry.connection=selectedPrompt.name;
-    list=list.filter(c => {return c.name!==label}); list.unshift(entry);
-    saveSaved(list); $('iSave').checked=false; toggleSaveName();
+  // Build the save-intent but defer writing: we only commit after the
+  // connect is confirmed stable (no auth failure, still alive). If the
+  // user downgrades persistent→short-lived via the tmux modal, the
+  // saved entry records the actual outcome (persistent=false).
+  let saveEntry = null;
+  if ($('iSave').checked) {
+    saveEntry = {name: label, host: host, port: port, user: username,
+                 auth: authMode, persistent: wantPersistent};
+    if (authMode === 'pw') saveEntry.pass = password; else saveEntry.key = key;
+    if (selectedPrompt) saveEntry.connection = selectedPrompt.name;
   }
   let opts = {
     label: label,
@@ -804,33 +1238,24 @@ function doConnect() {
     connection: selectedPrompt ? selectedPrompt.name : null,
     auth: authMode,
     persistent: wantPersistent,
-    slotId: null
+    slotId: null,
+    saveEntry: saveEntry
   };
   if (authMode === 'pw') opts.password = password;
   else { opts.key = key; opts.keyPass = $('iKeyPw').value; }
   if (selectedPrompt && !$('iName').value.trim()) {
     opts.label = username + '@' + host + ' (' + selectedPrompt.name + ')';
   }
+  // Manual-connect probe gate: persistent panes get a tmux probe first.
+  // Saved / restored panes skip this — they fall back on tmux-bar instead.
+  // If the user previously clicked "Connect short-lived" for this target,
+  // honor that preference and don't probe again.
+  if (wantPersistent) {
+    primePaneForProbe(p, opts);
+    openTmuxModal(p, {opts: opts});
+    return;
+  }
   connectPane(p, opts);
-}
-
-function doDisconnect() {
-  let p=panes[activeId]; if(!p) return;
-  p.polling=false; stopKeepalive(p); clearIdleTimer(p);
-  if(p.sid){api('disconnect',{body:{session_id:p.sid}}).catch(() => {});p.sid=null}
-  saveSessions();
-  p.label='';
-  let labelEl=p.el.querySelector('[data-pane-label]'); if(labelEl) labelEl.textContent='';
-  updatePaneBadge(p);
-  p.term.reset();
-  if (selectedPrompt) clearPromptSelection();
-  connectingFor=p.id;
-  showOverlay();
-  // Show cancel only if there are other panes with active sessions
-  let hasOthers=false;
-  Object.keys(panes).forEach(k => {if(k!==p.id && panes[k].sid) hasOthers=true});
-  $('btnCancel').classList.toggle('h', !(hasOthers || Object.keys(panes).length>1));
-  renderSaved();
 }
 
 // ── Server config ───────────────────────────────────────────────────
@@ -841,11 +1266,15 @@ function loadServerConfig() {
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
     renderServerConnections();
     renderSaved();
-    // Try to restore sessions from page reload
+    // Try to restore sessions from page reload. If there's nothing to
+    // restore, kick off the initial-login flow — materialize happens on
+    // submit, so the user sees the overlay on an empty workspace.
     if(!tryRestoreSessions()) {
+      overlayMode = 'initial';
       doAutoConnect();
     }
   }).catch(() => {
+    overlayMode = 'initial';
     showOverlay();
   });
 }
@@ -1465,6 +1894,16 @@ document.addEventListener('keydown', e => {
   if(e.key==='F11'){e.preventDefault();toggleFullscreen()}
   // Ctrl+Tab / Ctrl+Shift+Tab to switch panes
   if(e.ctrlKey&&e.key==='Tab'){e.preventDefault();cyclePanes(e.shiftKey)}
+  // Escape dismisses the login overlay when it's dismissable and is the
+  // topmost visible dialog (don't steal Escape from the tmux modal).
+  if(e.key==='Escape' && !$('ov').classList.contains('h')
+     && $('tmuxOv').classList.contains('h') && overlayDismissable()){
+    e.preventDefault(); cancelConnect();
+  }
+});
+// Backdrop click on the overlay also dismisses (same dismissable rule).
+$('ov').addEventListener('click', e => {
+  if(e.target === e.currentTarget && overlayDismissable()) cancelConnect();
 });
 
 // ── Enter to connect ────────────────────────────────────────────────
@@ -1546,6 +1985,7 @@ function tryRestoreSessions() {
       connection: rec.connection, auth: rec.auth,
       password: rec.password, key: rec.key, keyPass: rec.key_pass,
       persistent: rec.persistent, slotId: rec.slot_id,
+      tmuxCmd: rec.tmux_cmd || 'tmux',
       resume: !!rec.persistent
     });
   });
@@ -1558,11 +1998,9 @@ function tryRestoreSessions() {
   if(saved==='light') document.documentElement.setAttribute('data-theme','light');
 })();
 
-let rootPane = createPane($('panes'));
-activatePane(rootPane.id);
-connectingFor = rootPane.id;
-$('btnCancel').classList.add('h'); // no cancel on first connect
-
+// No pane is created eagerly. loadServerConfig drives next step:
+// either tryRestoreSessions rebuilds the saved layout, or overlayMode is
+// set to 'initial' and the user sees the login form on an empty canvas.
 loadServerConfig();
 renderSaved();
 focusFirst();

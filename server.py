@@ -93,6 +93,12 @@ TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
 # Password prompt patterns (lowercase, checked against lowered PTY output)
 PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 
+# Auth-failure patterns — if we see any of these AFTER we auto-typed the
+# password, ssh rejected our attempt and we should not keep the session
+# limping in an endless retry loop.
+AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
+                      "access denied", "too many authentication failures")
+
 # Rate limiting for /api/connect
 RATE_LIMIT_WINDOW = 60    # seconds
 RATE_LIMIT_MAX = 10       # max connect attempts per IP per window
@@ -104,6 +110,11 @@ _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # Restricted to characters that are safe both as tmux session names and as
 # shell tokens without quoting.
 _SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+# tmux invocation path / command. Covers "tmux", "/usr/local/bin/tmux",
+# "~/.local/bin/tmux". Rejects shell metacharacters so it's safe to
+# interpolate into the remote-command string without escaping.
+_TMUX_CMD_RE = re.compile(r'^[A-Za-z0-9_./~-]{1,128}$')
 
 # Static file serving (Python-only mode, without PHP proxy)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -291,7 +302,7 @@ class SSHSession(object):
 
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
-                 persistent=False, slot_id=None):
+                 persistent=False, slot_id=None, tmux_cmd="tmux"):
         self.id = session_id
         self.master_fd = None
         self.pid = None
@@ -303,10 +314,21 @@ class SSHSession(object):
         self._password = password
         self._password_sent = False
         self._pw_buf = b""
+        self.auth_failed = False
+        self._auth_buf = b""
+        # Number of PTY bytes already scanned for auth-fail patterns.
+        # Once we pass a small post-password window without hitting a
+        # rejection, assume auth succeeded so later shell output can't
+        # accidentally trip the detector.
+        self._auth_bytes_seen = 0
+        # Raw waitpid() status of the ssh child — used after exit to
+        # classify auth vs network failure via the 255 exit code.
+        self._exit_status = None
         self._key_file = None
         self._ssh_options = ssh_options or {}
         self.persistent = bool(persistent and slot_id)
         self.slot_id = slot_id if self.persistent else None
+        self.tmux_cmd = tmux_cmd if _TMUX_CMD_RE.match(tmux_cmd or "") else "tmux"
 
         if key:
             self._key_file = self._write_key(key)
@@ -343,6 +365,10 @@ class SSHSession(object):
             "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
+            # Cap password retries at one — on rejection ssh exits 255
+            # cleanly instead of looping on the PTY, giving us a
+            # locale-proof primary auth-failure signal.
+            "-o", "NumberOfPasswordPrompts=1",
             "-p", str(port),
             "-l", username,
         ]
@@ -365,10 +391,10 @@ class SSHSession(object):
         if self.persistent:
             # tmux on the target: attach if exists (-A), detach any stale
             # client (-D). First-time creation starts a login shell.
-            # slot_id is validated against _SLOT_ID_RE so no escaping needed.
+            # slot_id + tmux_cmd are validated so no escaping needed.
             tmux_name = "websh-" + self.slot_id
             ssh_cmd.append(
-                "exec tmux new-session -A -D -s " + tmux_name
+                "exec " + self.tmux_cmd + " new-session -A -D -s " + tmux_name
                 + ' -- "$SHELL" -l'
             )
 
@@ -420,9 +446,50 @@ class SSHSession(object):
                                          (self._password + "\n").encode())
                             except OSError:
                                 break
+                            _log("INFO", "session {} auto-typed password ({} chars){}".format(
+                                self.id, len(self._password),
+                                " [bg]" if self.is_background else ""))
                             self._password_sent = True
                             self._password = None
                             self._pw_buf = b""
+
+                    # After we sent the password, watch for ssh's
+                    # "Permission denied" so we don't loop on bad creds.
+                    # Scope the scan to the first 4 KB post-password so
+                    # later shell output (e.g. `sudo: permission denied`
+                    # from a user's command) can't kill the session.
+                    # We also treat a *second* "password:" prompt as a
+                    # rejection signal — some targets phrase the failure
+                    # differently and the second prompt is unambiguous.
+                    elif (self._password_sent and not self.auth_failed
+                          and self._auth_bytes_seen < 4096):
+                        self._auth_bytes_seen += len(data)
+                        self._auth_buf += data
+                        if len(self._auth_buf) > 512:
+                            self._auth_buf = self._auth_buf[-512:]
+                        atext = self._auth_buf.decode(
+                            "latin-1", errors="replace").lower()
+                        fail = (any(p in atext for p in AUTH_FAIL_PATTERNS)
+                                or any(p in atext for p in PASSWORD_PROMPTS))
+                        if fail:
+                            self.auth_failed = True
+                            _log("INFO", "session {} auth failed{}".format(
+                                self.id,
+                                " [bg]" if self.is_background else ""))
+                            # Append this final chunk so the client sees
+                            # *why* (the rejection message + the re-prompt)
+                            # before we tear down.
+                            with self.buf_lock:
+                                self.output_buf += data
+                                if len(self.output_buf) > OUTPUT_BUF_MAX:
+                                    self.output_buf = (
+                                        self.output_buf[-OUTPUT_BUF_KEEP:])
+                            self._auth_buf = b""
+                            try:
+                                os.kill(self.pid, signal.SIGTERM)
+                            except Exception:
+                                pass
+                            break
 
                     with self.buf_lock:
                         self.output_buf += data
@@ -431,8 +498,9 @@ class SSHSession(object):
 
                 # Check if child exited
                 try:
-                    pid, _ = os.waitpid(self.pid, os.WNOHANG)
+                    pid, status = os.waitpid(self.pid, os.WNOHANG)
                     if pid != 0:
+                        self._exit_status = status
                         break
                 except ChildProcessError:
                     break
@@ -456,6 +524,27 @@ class SSHSession(object):
             except Exception:
                 pass
 
+            # ssh exit status 255 = anything ssh itself rejected: auth
+            # failure, connection refused, host key mismatch, etc. If the
+            # output tail contains an auth-shaped phrase, classify as
+            # auth_failed so the client can re-prompt for credentials.
+            # This complements the inline text scan: the exit-code path
+            # is locale-proof, catches key-only auth rejection (which
+            # never reaches a "password:" prompt), and is impossible to
+            # miss on slow or chatty targets.
+            if (not self.auth_failed
+                    and self._exit_status is not None
+                    and os.WIFEXITED(self._exit_status)
+                    and os.WEXITSTATUS(self._exit_status) == 255):
+                with self.buf_lock:
+                    tail = self.output_buf[-2048:].decode(
+                        "latin-1", errors="replace").lower()
+                if any(p in tail for p in AUTH_FAIL_PATTERNS):
+                    self.auth_failed = True
+                    _log("INFO", "session {} auth failed (exit 255){}".format(
+                        self.id,
+                        " [bg]" if self.is_background else ""))
+
             # Append terminal reset so the frontend restores normal screen
             with self.buf_lock:
                 self.output_buf += TERM_RESET
@@ -467,7 +556,11 @@ class SSHSession(object):
         with self.buf_lock:
             data = self.output_buf
             self.output_buf = b""
-        self.last_activity = time.time()
+        # Only count non-empty reads as activity. Long-poll calls read()
+        # in a tight loop, so bumping on every call would freshen
+        # last_activity ~100×/s and defeat the server-side idle timeout.
+        if data:
+            self.last_activity = time.time()
         return data
 
     def write(self, data):
@@ -676,6 +769,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             slot_id = None
 
+        tmux_cmd = (body.get("tmux_cmd") or "tmux").strip()
+        if not _TMUX_CMD_RE.match(tmux_cmd):
+            self._json({"error": "invalid tmux_cmd"}, 400)
+            return
+
         # Resolve credentials: by config connection name, or from request body
         conn_name = body.get("connection", "").strip()
         ssh_options = {}
@@ -760,6 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                 is_background=is_bg,
                 persistent=persistent,
                 slot_id=slot_id,
+                tmux_cmd=tmux_cmd,
             )
             with sessions_lock:
                 sessions[sid] = session
@@ -772,8 +871,10 @@ class Handler(BaseHTTPRequestHandler):
                 "session_id": sid,
                 "status": "connecting",
                 "alive": session.alive,
+                "auth_failed": session.auth_failed,
                 "persistent": persistent,
                 "slot_id": slot_id,
+                "tmux_cmd": session.tmux_cmd,
             })
         except Exception as e:
             if session:
@@ -827,14 +928,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({
                     "data": base64.b64encode(data).decode("ascii"),
                     "alive": session.alive,
+                    "auth_failed": session.auth_failed,
                 })
                 return
             if not session.alive:
-                self._json({"data": "", "alive": False})
+                self._json({"data": "", "alive": False,
+                            "auth_failed": session.auth_failed})
                 return
             time.sleep(POLL_INTERVAL)
 
-        self._json({"data": "", "alive": session.alive})
+        self._json({"data": "", "alive": session.alive,
+                    "auth_failed": session.auth_failed})
 
     def _resize(self):
         try:
