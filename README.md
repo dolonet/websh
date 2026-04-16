@@ -23,42 +23,69 @@ On shared hosting where you can't run a long-lived process, an optional PHP prox
 - **Browser:** Any modern browser (Chrome, Firefox, Safari, Edge)
 - **Frontend:** Loads [xterm.js](https://xtermjs.org/) from CDN (no npm, no build step)
 
+## Highlights
+
+### 🖥️ Full terminal in the browser
+A real [xterm.js](https://xtermjs.org/) terminal — not a toy. Feels
+like iTerm2 or Terminal.app.
+
+- Split panes, horizontal or vertical, with draggable resize handles
+- Keyboard pane switching (`Ctrl+Tab` / `Ctrl+Shift+Tab`)
+- Search scrollback (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`)
+- Copy-on-select, right-click paste
+- Dark and light themes, persisted
+
+### 🔁 Sessions that survive
+Close the tab, reboot, keep your shell. Persistent panes are wrapped
+in a tmux session on the target host — reopen the browser and you're
+back where you left off with scrollback and running processes intact.
+
+- Optional per-pane: tick **Persistent session** on connect
+- One-click reconnect when a session drops; red banner on auth fail
+- Keep-alive while any tab is open; expires naturally after close
+- URL anchors (`#connect=Production`) for direct links and bookmarks
+- Saved connections in browser `localStorage`
+
+### 📁 File transfer in the terminal
+No `scp` dance. Move files without leaving the browser.
+
+- **Upload** — pick files, they stream up over a background SSH session
+  (atomic writes, auto-increment on name conflicts)
+- **Download** — select a filename in the terminal, click download
+- **Export scrollback** — save the current terminal buffer as a text file
+
+### 🔐 Flexible connection management
+From free-form "type a host and go" to strictly allowlisted
+click-to-connect — pick the model that fits your team.
+
+- Password and SSH key authentication
+- Server-side profiles in `websh.json` — credentials stay on the server,
+  browser never sees them
+- **Ready** (saved creds) or **Prompt** (allowlisted target, user types
+  own password) connection kinds
+- `allowed_users` / `denied_users` per connection
+- Per-connection SSH options (`ProxyJump`, `StrictHostKeyChecking`, …)
+- `restrict_hosts` mode hides the free-form form entirely
+
+### 🚀 Deploy anywhere
+Made to fit where other web terminals can't.
+
+- **Shared hosting** — upload 4 files via FTP, `api.php` auto-starts
+  the backend. No SSH access to the host needed
+- **Python-only mode** — backend serves the frontend directly, zero extras
+- Docker, systemd, reverse proxy examples included
+- HTTP long-polling — works through corporate HTTPS, no WebSocket required
+- Python 3.5+ stdlib only — no pip install, no npm, no build step
+
 ## Use cases
 
-- **Shared hosting** — no SSH client on the server? Upload 3 files via FTP, open in browser, done.
+- **Shared hosting** — no SSH client on the server? Upload 4 files via FTP, open in browser, done.
 - **Corporate networks** — SSH port blocked, but HTTPS is open? websh tunnels SSH through standard HTTPS.
 - **Chromebooks & tablets** — any device with a browser becomes a terminal.
 - **Customer support / managed servers** — give clients browser-based access to their servers without teaching them PuTTY or terminal. Use URL anchors (`#connect=ServerName`) for direct links.
 - **Jump host UI** — put websh on a bastion host, access internal servers through it from any browser.
 - **Emergency access** — any browser, any computer, just open a URL.
 - **Teaching & workshops** — provide students with browser-based terminal access, no local setup required.
-
-## Features
-
-- Full terminal emulator in the browser ([xterm.js](https://xtermjs.org/))
-- **Split panes** — divide the screen horizontally or vertically, each pane is an independent SSH session
-- Draggable resize handles between panes (mouse and touch)
-- **Reconnect on disconnect** — one-click reconnect when a session closes, red "Authentication failed" banner when SSH rejects credentials
-- **Persistent sessions (tmux)** — optional per-pane. The remote shell is wrapped in a tmux session on the target, so browser refresh or `server.py` restart resume the pane with scrollback and running processes intact. See [Persistent sessions](#persistent-sessions-tmux) below
-- **Auto keep-alive** — sessions stay alive as long as any browser tab is open; they expire naturally once the tab closes (server-side default: 5 min idle after tab close)
-- **Keyboard pane switching** — Ctrl+Tab / Ctrl+Shift+Tab to cycle between panes
-- Password and SSH key authentication
-- Server-side connection config — users click to connect, no passwords on the client
-- Per-connection SSH options (ProxyJump, StrictHostKeyChecking, etc.)
-- Restrict mode — limit connections to pre-configured hosts only
-- Auto-start — PHP launches the backend automatically, no SSH needed for setup
-- Saved connections (browser localStorage)
-- **File upload** — click the upload button, pick files, they upload via background SSH session (atomic writes, auto-increment on name conflict)
-- **File download** — select filename in terminal, click download, file saves to your browser
-- **Export terminal** — save scrollback buffer as text file
-- **URL anchors** — `#connect=ServerName` for direct links to server-side connections
-- Copy on select, right-click paste
-- Search terminal buffer (Ctrl+Shift+F)
-- Zoom (Ctrl+/-)
-- Dark / light theme toggle (persisted)
-- Fullscreen mode (F11)
-- Rate limiting on connection attempts
-- Session timeout, auto-cleanup, terminal resize
 
 ## Quick start (your machine)
 
