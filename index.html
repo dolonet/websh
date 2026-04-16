@@ -147,11 +147,6 @@
     .tm-status{font-size:12px;color:var(--dim);margin-top:10px;min-height:16px}
     .tm-status.err{color:var(--dg)}
 
-    /* ── Idle warning ── */
-    .idle-warn{position:absolute;bottom:8px;right:12px;z-index:50;background:var(--sf);border:1px solid var(--wn);border-radius:var(--radius);padding:6px 12px;font-size:12px;color:var(--wn);display:flex;align-items:center;gap:8px}
-    .idle-warn .btn{font-size:11px;padding:3px 10px;border-color:var(--wn);color:var(--wn)}
-    .idle-warn .btn:hover{background:rgba(210,153,34,.15)}
-
     /* ── Search bar ── */
     .search-bar{position:absolute;top:28px;right:12px;display:flex;gap:4px;z-index:50;background:var(--sf);border:1px solid var(--bd);border-radius:var(--radius);padding:4px 6px;align-items:center}
     .search-bar.h{display:none}
@@ -267,6 +262,19 @@
     </div>
     </form><!-- /manualForm -->
     <div id="err" class="err"></div>
+  </div>
+</div>
+
+<!-- Terminate-session confirm modal (for [x] on a live tmux pane) -->
+<div id="confirmOv" class="ov h">
+  <div class="tm-panel">
+    <h2 id="cfTitle">Terminate session?</h2>
+    <div class="tm-sub">This will terminate the tmux session on the server for good. The session and any processes inside it will be lost. Are you sure?</div>
+    <div class="tm-row">
+      <button class="btn" onclick="confirmCancel()">Cancel</button>
+      <button class="btn" onclick="confirmTerminate(true)">Terminate session and never ask again</button>
+      <button class="btn btn-d" onclick="confirmTerminate(false)">Terminate session</button>
+    </div>
   </div>
 </div>
 

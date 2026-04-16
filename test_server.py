@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 # Import server module
 sys.path.insert(0, os.path.dirname(__file__))
@@ -695,6 +696,520 @@ class TestIntEnv(unittest.TestCase):
 
     def test_missing(self):
         self.assertEqual(server._int_env("_TEST_MISSING_XYZ", "99"), 99)
+
+
+# ── Input validation regexes (slot_id, tmux_cmd) ───────────────────────
+# These guard the remote ssh command string, so any hole here is a
+# potential RCE on the target. Tests the regex in isolation and then the
+# HTTP layer in TestHTTPApi below.
+
+class TestSlotIdRegex(unittest.TestCase):
+
+    def test_valid_simple(self):
+        self.assertTrue(server._SLOT_ID_RE.match("alexey_prod-1"))
+
+    def test_valid_all_allowed_chars(self):
+        self.assertTrue(server._SLOT_ID_RE.match("ABCxyz_-09"))
+
+    def test_valid_max_length(self):
+        self.assertTrue(server._SLOT_ID_RE.match("a" * 64))
+
+    def test_invalid_empty(self):
+        self.assertIsNone(server._SLOT_ID_RE.match(""))
+
+    def test_invalid_too_long(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("a" * 65))
+
+    def test_invalid_at_sign(self):
+        # The logical slot identity is "user@host#n" but we sanitize it
+        # into the regex-safe form before feeding it to the backend;
+        # raw "@" must not slip through.
+        self.assertIsNone(server._SLOT_ID_RE.match("alexey@host"))
+
+    def test_invalid_space(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("slot 1"))
+
+    def test_invalid_semicolon(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("x;rm -rf"))
+
+    def test_invalid_dollar(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("x$(id)"))
+
+    def test_invalid_backtick(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("x`id`"))
+
+    def test_invalid_newline(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("x\ny"))
+
+    def test_invalid_unicode(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("caf\u00e9"))
+
+    def test_invalid_null_byte(self):
+        self.assertIsNone(server._SLOT_ID_RE.match("x\x00y"))
+
+
+class TestTmuxCmdRegex(unittest.TestCase):
+
+    def test_valid_default(self):
+        self.assertTrue(server._TMUX_CMD_RE.match("tmux"))
+
+    def test_valid_absolute_path(self):
+        self.assertTrue(server._TMUX_CMD_RE.match("/usr/local/bin/tmux"))
+
+    def test_valid_tilde_path(self):
+        self.assertTrue(server._TMUX_CMD_RE.match("~/.local/bin/tmux"))
+
+    def test_valid_dotted(self):
+        self.assertTrue(server._TMUX_CMD_RE.match("./tmux"))
+
+    def test_valid_max_length(self):
+        self.assertTrue(server._TMUX_CMD_RE.match("a" * 128))
+
+    def test_invalid_empty(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match(""))
+
+    def test_invalid_too_long(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("a" * 129))
+
+    def test_invalid_space(self):
+        # Shell metacharacter — would let a user append arbitrary flags
+        # or chain commands on the target.
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux -vvv"))
+
+    def test_invalid_semicolon(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux;id"))
+
+    def test_invalid_pipe(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux|id"))
+
+    def test_invalid_ampersand(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux&id"))
+
+    def test_invalid_dollar(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux$HOME"))
+
+    def test_invalid_backtick(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match("tmux`id`"))
+
+    def test_invalid_quote(self):
+        self.assertIsNone(server._TMUX_CMD_RE.match('tmux"x"'))
+
+
+# ── Auth-failure pattern matching ──────────────────────────────────────
+# AUTH_FAIL_PATTERNS is scanned against lowered PTY output. Wrong hits
+# kill live sessions on benign text; wrong misses loop on bad creds.
+
+class TestAuthFailPatterns(unittest.TestCase):
+
+    def _hit(self, text):
+        t = text.lower()
+        return any(p in t for p in server.AUTH_FAIL_PATTERNS)
+
+    def test_permission_denied(self):
+        self.assertTrue(self._hit(
+            "Permission denied, please try again."))
+
+    def test_permission_denied_uppercase(self):
+        self.assertTrue(self._hit("PERMISSION DENIED"))
+
+    def test_authentication_failed(self):
+        self.assertTrue(self._hit("ssh: Authentication failed"))
+
+    def test_access_denied(self):
+        self.assertTrue(self._hit("Access denied for user"))
+
+    def test_too_many_auth_failures(self):
+        self.assertTrue(self._hit(
+            "Received disconnect from 1.2.3.4: Too many "
+            "authentication failures"))
+
+    def test_benign_login_banner(self):
+        self.assertFalse(self._hit(
+            "Welcome to Ubuntu 24.04.1 LTS\nLast login: Tue Apr 15"))
+
+    def test_benign_shell_prompt(self):
+        self.assertFalse(self._hit("user@host:~$ "))
+
+
+# ── SSHSession idle-timer semantics ────────────────────────────────────
+# After the fix, SSHSession.read() only bumps last_activity on non-empty
+# reads. Previously every call (~100/s during long-poll) reset it and
+# defeated the server-side idle timeout.
+
+class TestIdleTimer(unittest.TestCase):
+
+    def _fake_session(self, age_seconds=10):
+        """Build a minimal SSHSession without spawning ssh."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s.output_buf = b""
+        s.last_activity = time.time() - age_seconds
+        s.alive = True
+        s.master_fd = None
+        return s
+
+    def test_empty_read_does_not_bump(self):
+        s = self._fake_session(age_seconds=100)
+        before = s.last_activity
+        out = s.read()
+        self.assertEqual(out, b"")
+        self.assertEqual(s.last_activity, before)
+
+    def test_many_empty_reads_keep_last_activity_stale(self):
+        """Long-poll regression: 500 empty reads must not freshen the timer."""
+        s = self._fake_session(age_seconds=1000)
+        before = s.last_activity
+        for _ in range(500):
+            s.read()
+        self.assertEqual(s.last_activity, before)
+
+    def test_nonempty_read_bumps(self):
+        s = self._fake_session(age_seconds=1000)
+        before = s.last_activity
+        s.output_buf = b"hello"
+        out = s.read()
+        self.assertEqual(out, b"hello")
+        self.assertGreater(s.last_activity, before)
+
+    def test_is_expired_true_when_idle(self):
+        s = self._fake_session(age_seconds=server.SESSION_TIMEOUT + 1)
+        # Drain empty — must stay expired.
+        s.read()
+        self.assertTrue(s.is_expired())
+
+    def test_is_expired_false_after_nonempty_read(self):
+        s = self._fake_session(age_seconds=server.SESSION_TIMEOUT + 1)
+        s.output_buf = b"x"
+        s.read()
+        self.assertFalse(s.is_expired())
+
+
+# ── HTTP-level validation of slot_id + tmux_cmd ────────────────────────
+# Separate class so we can start the server *without* restrict_hosts;
+# slot_id/tmux_cmd validation happens before any host/connection check,
+# so responses are deterministic 400s.
+
+class TestConnectValidation(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18767
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        # No restrict_hosts, no connections — tests only exercise the
+        # early-validation codepath.
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        # Rate limiter is process-global; clear it between tests so a
+        # handful of POSTs don't exhaust the budget.
+        server._rate_limits.clear()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, 'read'):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_persistent_without_slot_id_rejected(self):
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "persistent": True, "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("slot_id", body["error"])
+
+    def test_slot_id_with_shell_chars_rejected(self):
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "persistent": True, "slot_id": "a;rm -rf /",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("slot_id", body["error"])
+
+    def test_slot_id_too_long_rejected(self):
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "persistent": True, "slot_id": "a" * 65,
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+
+    def test_resume_slot_id_implies_persistent(self):
+        """resume_slot_id alone must trigger the slot_id validator."""
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "resume_slot_id": "bad id with spaces",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("slot_id", body["error"])
+
+    def test_tmux_cmd_with_shell_chars_rejected(self):
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "persistent": True, "slot_id": "ok",
+            "tmux_cmd": "tmux; cat /etc/shadow",
+            "cols": 80, "rows": 24
+        })
+        self.assertEqual(code, 400)
+        self.assertIn("tmux_cmd", body["error"])
+
+    def test_tmux_cmd_valid_absolute_accepted(self):
+        """Valid tmux_cmd passes validation; later failure is fine."""
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "persistent": True, "slot_id": "ok",
+            "tmux_cmd": "/usr/local/bin/tmux",
+            "cols": 80, "rows": 24
+        })
+        # Connect may fail downstream (no real ssh target), but must NOT
+        # fail validation.
+        self.assertNotEqual(code, 400)
+
+    def test_non_persistent_ignores_slot_id(self):
+        """Without persistent flag, any slot_id value is ignored."""
+        body, code = self._post("/api/connect", {
+            "host": "example.com", "username": "u", "password": "p",
+            "slot_id": "anything goes ;$`",
+            "cols": 80, "rows": 24
+        })
+        # Not 400 from slot_id validator — request proceeds to spawn.
+        self.assertNotEqual(code, 400)
+
+
+# ── terminate_remote_tmux + /api/disconnect terminate flag ─────────────
+
+class TestTerminateRemoteTmux(unittest.TestCase):
+    """Direct unit tests for SSHSession.terminate_remote_tmux()."""
+
+    def _fake_session(self, persistent=True, slot_id="alice_host_22_xy",
+                      alive=True, master_fd=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = alive
+        s.master_fd = master_fd
+        return s
+
+    def test_noop_when_not_persistent(self):
+        # No master_fd: a write would raise. Passes only if early-returned.
+        s = self._fake_session(persistent=False)
+        s.terminate_remote_tmux()
+
+    def test_noop_when_no_slot_id(self):
+        s = self._fake_session(slot_id=None)
+        s.terminate_remote_tmux()
+
+    def test_noop_when_dead(self):
+        s = self._fake_session(alive=False)
+        s.terminate_remote_tmux()
+
+    def test_writes_both_kill_channels(self):
+        r, w = os.pipe()
+        try:
+            s = self._fake_session(slot_id="alice_host_22_xy", master_fd=w)
+            # Skip the real sleeps to keep the test fast.
+            with unittest.mock.patch.object(time, "sleep", lambda _: None):
+                s.terminate_remote_tmux()
+            os.set_blocking(r, False)
+            try:
+                data = os.read(r, 8192)
+            except (BlockingIOError, OSError):
+                data = b""
+            self.assertIn(
+                b"\x02:kill-session -t websh-alice_host_22_xy\r", data)
+            self.assertIn(
+                b"\x03tmux kill-session -t websh-alice_host_22_xy\r", data)
+        finally:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_skips_second_write_when_session_died_after_first(self):
+        r, w = os.pipe()
+        try:
+            s = self._fake_session(slot_id="ok", master_fd=w)
+            # First sleep flips alive=False so the second write is skipped.
+            calls = {"n": 0}
+            def fake_sleep(_):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    s.alive = False
+            with unittest.mock.patch.object(time, "sleep", fake_sleep):
+                s.terminate_remote_tmux()
+            os.set_blocking(r, False)
+            try:
+                data = os.read(r, 8192)
+            except (BlockingIOError, OSError):
+                data = b""
+            self.assertIn(b"\x02:kill-session -t websh-ok\r", data)
+            self.assertNotIn(b"\x03tmux kill-session", data)
+        finally:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_oserror_on_write_is_swallowed(self):
+        r, w = os.pipe()
+        os.close(w)
+        try:
+            s = self._fake_session(slot_id="ok", master_fd=w)
+            # Must not raise even though the FD is closed.
+            with unittest.mock.patch.object(time, "sleep", lambda _: None):
+                s.terminate_remote_tmux()
+        finally:
+            try:
+                os.close(r)
+            except OSError:
+                pass
+
+
+class TestDisconnectTerminateFlag(unittest.TestCase):
+    """HTTP-level: /api/disconnect routes the terminate flag correctly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18768
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        with server.sessions_lock:
+            server.sessions.clear()
+
+    def tearDown(self):
+        with server.sessions_lock:
+            server.sessions.clear()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def _seed_fake(self, sid, persistent=True):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = sid
+        s.persistent = persistent
+        s.slot_id = "ok" if persistent else None
+        s.alive = True
+        s.master_fd = None
+        s._key_file = None
+        s.terminate_calls = 0
+        s.close_calls = 0
+        def fake_terminate():
+            s.terminate_calls += 1
+        def fake_close():
+            s.close_calls += 1
+        s.terminate_remote_tmux = fake_terminate
+        s.close = fake_close
+        with server.sessions_lock:
+            server.sessions[sid] = s
+        return s
+
+    def test_terminate_true_calls_terminate_then_close(self):
+        sid = "fake-sess-1"
+        s = self._seed_fake(sid, persistent=True)
+        body, code = self._post("/api/disconnect",
+                                {"session_id": sid, "terminate": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(s.terminate_calls, 1)
+        self.assertEqual(s.close_calls, 1)
+
+    def test_terminate_false_skips_terminate(self):
+        sid = "fake-sess-2"
+        s = self._seed_fake(sid, persistent=True)
+        body, code = self._post("/api/disconnect",
+                                {"session_id": sid, "terminate": False})
+        self.assertEqual(code, 200)
+        self.assertEqual(s.terminate_calls, 0)
+        self.assertEqual(s.close_calls, 1)
+
+    def test_default_no_terminate(self):
+        sid = "fake-sess-3"
+        s = self._seed_fake(sid, persistent=True)
+        # No terminate field at all → defaults to no-terminate.
+        body, code = self._post("/api/disconnect", {"session_id": sid})
+        self.assertEqual(code, 200)
+        self.assertEqual(s.terminate_calls, 0)
+        self.assertEqual(s.close_calls, 1)
+
+    def test_terminate_on_non_persistent_still_calls_method(self):
+        # The handler doesn't filter on persistent — the method itself
+        # is the no-op gate. This documents that contract.
+        sid = "fake-sess-4"
+        s = self._seed_fake(sid, persistent=False)
+        body, code = self._post("/api/disconnect",
+                                {"session_id": sid, "terminate": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(s.terminate_calls, 1)
+        self.assertEqual(s.close_calls, 1)
+
+    def test_unknown_session_id_is_ok(self):
+        body, code = self._post("/api/disconnect",
+                                {"session_id": "no-such-session",
+                                 "terminate": True})
+        self.assertEqual(code, 200)
 
 
 if __name__ == "__main__":

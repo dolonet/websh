@@ -38,10 +38,10 @@ On shared hosting where you can't run a long-lived process, an optional PHP prox
 - Full terminal emulator in the browser ([xterm.js](https://xtermjs.org/))
 - **Split panes** — divide the screen horizontally or vertically, each pane is an independent SSH session
 - Draggable resize handles between panes (mouse and touch)
-- **Reconnect on disconnect** — one-click reconnect when a session closes
-- **Session persistence** — sessions survive page reload (while the backend keeps them alive)
+- **Reconnect on disconnect** — one-click reconnect when a session closes, red "Authentication failed" banner when SSH rejects credentials
+- **Persistent sessions (tmux)** — optional per-pane. The remote shell is wrapped in a tmux session on the target, so browser refresh or `server.py` restart resume the pane with scrollback and running processes intact. See [Persistent sessions](#persistent-sessions-tmux) below
+- **Auto keep-alive** — sessions stay alive as long as any browser tab is open; they expire naturally once the tab closes (server-side default: 5 min idle after tab close)
 - **Keyboard pane switching** — Ctrl+Tab / Ctrl+Shift+Tab to cycle between panes
-- **Idle timeout warning** — notification 30 seconds before session expires, with a "Keep alive" button
 - Password and SSH key authentication
 - Server-side connection config — users click to connect, no passwords on the client
 - Per-connection SSH options (ProxyJump, StrictHostKeyChecking, etc.)

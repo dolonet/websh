@@ -579,6 +579,38 @@ class SSHSession(object):
         self.last_activity = time.time()
         self._set_winsize(cols, rows)
 
+    def terminate_remote_tmux(self):
+        """Best-effort: kill the remote tmux session via the existing PTY.
+
+        We're inside `tmux new-session -A -D -s websh-<slot>` on the
+        target. To make sure the session goes away — not just our client
+        — we send a kill-session through two channels in sequence:
+
+          1. Default tmux prefix (Ctrl-B) + ":" + kill-session + Enter
+             → reaches tmux command mode regardless of foreground state
+               (works inside vim, less, htop) IF the user's prefix is
+               the default Ctrl-B, which is the common case.
+          2. Ctrl-C + `tmux kill-session ...` + Enter
+             → breaks any foreground process and runs the kill from a
+               shell prompt. Covers users who remapped their prefix.
+
+        If both miss (e.g. user is in vim with a non-default prefix),
+        the session leaks. Acceptable — the user explicitly chose
+        terminate; our SSH connection still tears down on close().
+        """
+        if not self.persistent or not self.slot_id or not self.alive:
+            return
+        target = ("websh-" + self.slot_id).encode()
+        try:
+            os.write(self.master_fd, b"\x02:kill-session -t " + target + b"\r")
+            time.sleep(0.4)
+            if self.alive:
+                os.write(self.master_fd,
+                         b"\x03tmux kill-session -t " + target + b"\r")
+                time.sleep(0.4)
+        except OSError:
+            pass
+
     def close(self):
         self.alive = False
         try:
@@ -970,9 +1002,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = body.get("session_id", "")
+        terminate = bool(body.get("terminate", False))
         with sessions_lock:
             session = sessions.pop(sid, None)
         if session:
+            if terminate:
+                session.terminate_remote_tmux()
             session.close()
         self._json({"ok": True})
 

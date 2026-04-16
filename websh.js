@@ -34,7 +34,6 @@ let connectingFor = null; // pane ID the overlay is connecting for
 let overlayMode = null;
 let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materialize
 let serverConfig = null;
-let sessionTimeout = 300; // updated from server config
 let fontSize = 14;
 const MAX_POLL_RETRIES = 5;
 let authMode = 'pw';
@@ -116,7 +115,6 @@ function createPane(container) {
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
     label:'', resizeTimer:null, upload:null, download:null,
-    idleTimer:null, idleWarnEl:null,
     // Connection identity — set once per connect, used for save/restore/reconnect.
     host:'', port:22, user:'', connection:null,
     auth:'pw', password:'', key:'', keyPass:'',
@@ -289,7 +287,27 @@ function cancelConnect() {
   if (ids.length && !panes[activeId]) activatePane(ids[ids.length - 1]);
 }
 
+// User-facing close. Persistent panes with a live tmux session need a
+// confirmation step (and a kill-on-server) so we don't quietly leak a
+// remote tmux that the UI can no longer reach.
+const TERMINATE_NO_ASK_KEY = 'websh_terminate_no_ask';
+
 function closePane(id) {
+  let p = panes[id];
+  if (!p) return;
+  let liveTmux = !!(p.persistent && p.sid && p.slotId);
+  if (!liveTmux) { _destroyPane(id, false); return; }
+  if (localStorage.getItem(TERMINATE_NO_ASK_KEY)) {
+    _destroyPane(id, true);
+    return;
+  }
+  showTerminateModal(p, neverAgain => {
+    if (neverAgain) localStorage.setItem(TERMINATE_NO_ASK_KEY, '1');
+    _destroyPane(id, true);
+  });
+}
+
+function _destroyPane(id, terminate) {
   let p = panes[id];
   if (!p) return;
   // Cancel active transfers
@@ -299,8 +317,9 @@ function closePane(id) {
   if (p.sid) {
     p.polling = false;
     stopKeepalive(p);
-    clearIdleTimer(p);
-    api('disconnect', {body:{session_id:p.sid}}).catch(() => {});
+    let body = {session_id: p.sid};
+    if (terminate) body.terminate = true;
+    api('disconnect', {body: body}).catch(() => {});
   }
   p.term.dispose();
 
@@ -383,35 +402,6 @@ function reconnectPane(id) {
   hideReconnectBar(p);
   connectPane(p, {label: p.label, resume: p.persistent});
 }
-// ── Idle timeout warning ────────────────────────────────────────────
-function resetIdleTimer(p) {
-  clearIdleTimer(p);
-  if (!p.sid || sessionTimeout <= 0) return;
-  let warnAt = Math.max(0, sessionTimeout - 30) * 1000;
-  p.idleTimer = setTimeout(() => { showIdleWarning(p); }, warnAt);
-}
-function clearIdleTimer(p) {
-  if (p.idleTimer) { clearTimeout(p.idleTimer); p.idleTimer = null; }
-  dismissIdleWarning(p);
-}
-function showIdleWarning(p) {
-  if (!p.sid) return;
-  let el = document.createElement('div');
-  el.className = 'idle-warn';
-  el.innerHTML = `Session idle — will disconnect in 30s <button class="btn" onclick="keepAlive('${p.id}')">Keep alive</button>`;
-  p.el.appendChild(el);
-  p.idleWarnEl = el;
-}
-function dismissIdleWarning(p) {
-  if (p.idleWarnEl) { p.idleWarnEl.remove(); p.idleWarnEl = null; }
-}
-function keepAlive(id) {
-  let p = panes[id]; if (!p || !p.sid) return;
-  // Send empty input to reset server-side activity timer
-  api('input', {body: {session_id: p.sid, data: ''}}).catch(() => {});
-  resetIdleTimer(p);
-}
-
 // ── Session persistence (localStorage) ──────────────────────────────
 // Persistent panes wrap their remote shell in tmux; on refresh we resume
 // by slot_id so the layout + running processes come back intact. Layout
@@ -604,7 +594,7 @@ function pollOutput(p) {
       // Session not found — stale restore or server restarted. Persistent
       // panes try to re-attach via tmux; short-lived panes just reconnect.
       console.log('poll: session error:', r.error);
-      stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null; p.connecting=false;
+      stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
       updatePaneBadge(p);
       if(p.host || p.connection) {
         connectPane(p, {label:p.label, resume:p.persistent});
@@ -623,7 +613,6 @@ function pollOutput(p) {
       if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
         p.recentOutput = ((p.recentOutput || '') + chunk).slice(-4096);
       }
-      resetIdleTimer(p);
     }
     // SSH auth rejected our password/key: stop the loop cleanly and
     // do NOT save the entry. Surface the failure on the pane itself
@@ -631,7 +620,7 @@ function pollOutput(p) {
     if (r.auth_failed) {
       p.pendingSave = null;
       p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
-      stopKeepalive(p); clearIdleTimer(p); p.polling = false;
+      stopKeepalive(p); p.polling = false;
       if (p.sid) {
         api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
         p.sid = null;
@@ -650,7 +639,7 @@ function pollOutput(p) {
     }
     if(r.alive===false){
       p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
-      stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null;
+      stopKeepalive(p); p.polling=false; p.sid=null;
       saveSessions();
       // Smart tmux fallback: a persistent pane whose session dies quickly
       // with a "not found" shape in the output is almost certainly a
@@ -676,7 +665,7 @@ function pollOutput(p) {
         ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
         : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
       p.term.write(msg);
-      stopKeepalive(p); clearIdleTimer(p); p.polling=false; p.sid=null;
+      stopKeepalive(p); p.polling=false; p.sid=null;
       saveSessions();
       if(p.host || p.connection) showReconnectBar(p);
       if(activeId===p.id) updatePaneBadge(p);
@@ -689,7 +678,6 @@ function pollOutput(p) {
 
 function queueInput(p, data) {
   p.inputQueue.push(data);
-  resetIdleTimer(p);
   if(!p.flushTimer) p.flushTimer = setTimeout(() => {
     p.flushTimer=null;
     if(!p.sid||!p.inputQueue.length) return;
@@ -797,7 +785,6 @@ function connectPane(p, opts) {
       let rows = (dims && dims.rows) || p.term.rows;
       api('resize', {body:{session_id:p.sid, cols:cols, rows:rows}}).catch(() => {});
       startKeepalive(p);
-      resetIdleTimer(p);
       saveSessions();
       pollOutput(p);
     })
@@ -968,6 +955,28 @@ function probeTmux(p) {
     clearTimeout(timeoutId);
     if (bgSid) api('disconnect', {body: {session_id: bgSid}}).catch(() => {});
   });
+}
+
+// ── Terminate-session confirm modal ────────────────────────────────
+// Shown only when [x] is clicked on a successful tmux-backed pane.
+// Three outcomes: cancel, terminate once, terminate + suppress prompt
+// for future closes (preference lives in localStorage).
+let pendingTerminate = null;
+
+function showTerminateModal(p, onConfirm) {
+  pendingTerminate = onConfirm;
+  $('cfTitle').textContent = 'Terminate session on ' + (p.host || 'server') + '?';
+  $('confirmOv').classList.remove('h');
+}
+function confirmCancel() {
+  $('confirmOv').classList.add('h');
+  pendingTerminate = null;
+}
+function confirmTerminate(neverAgain) {
+  $('confirmOv').classList.add('h');
+  let cb = pendingTerminate;
+  pendingTerminate = null;
+  if (cb) cb(!!neverAgain);
 }
 
 // ── tmux probe modal ───────────────────────────────────────────────
@@ -1262,7 +1271,6 @@ function doConnect() {
 function loadServerConfig() {
   api('config').then(cfg => {
     serverConfig=cfg;
-    if(cfg.session_timeout) sessionTimeout=cfg.session_timeout;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
     renderServerConnections();
     renderSaved();
