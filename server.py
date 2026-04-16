@@ -7,13 +7,16 @@ Designed to run on shared hosting with Python 3.5+, zero dependencies.
 Listens on 127.0.0.1 only — meant to be proxied through Apache/nginx via PHP.
 
 Environment variables:
-    PORT              — listen port (default: 8765)
-    HOST              — bind address (default: 127.0.0.1)
-    SESSION_TIMEOUT   — seconds of inactivity before cleanup (default: 300)
-    MAX_SESSIONS      — max concurrent SSH sessions (default: 10)
-    WEBSH_CONFIG      — path to websh.json config file (optional)
-    TRUSTED_PROXIES   — comma-separated IPs to trust X-Forwarded-For from (default: 127.0.0.1)
-    MAX_BG_SESSIONS   — max background SSH sessions for file transfer (default: 10)
+    PORT                  — listen port (default: 8765)
+    HOST                  — bind address (default: 127.0.0.1)
+    SESSION_TIMEOUT       — seconds of inactivity before cleanup (default: 300)
+    MAX_SESSIONS          — max concurrent SSH sessions (default: 10)
+    WEBSH_CONFIG          — path to websh.json config file (optional)
+    TRUSTED_PROXIES       — comma-separated IPs to trust X-Forwarded-For from (default: 127.0.0.1)
+    MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 10)
+    WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
+                            on the target before a watchdog kills it
+                            (default: 86400 = 24h, 0 disables)
 
 API endpoints:
     POST /api/connect     — start SSH session
@@ -126,6 +129,102 @@ _SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # "~/.local/bin/tmux". Rejects shell metacharacters so it's safe to
 # interpolate into the remote-command string without escaping.
 _TMUX_CMD_RE = re.compile(r'^[A-Za-z0-9_./~-]{1,128}$')
+
+# ─── Persistent-session TTL watchdog ─────────────────────────────────
+#
+# Problem: if a browser closes without clicking [x], the remote tmux
+# session survives detach (that's the whole point of persistent mode)
+# but nothing ever reaps it. Abandoned sessions accumulate and consume
+# RAM on the target host. We don't store SSH credentials on the websh
+# server, so we can't reach back to clean up autonomously.
+#
+# Fix: at session creation, the remote command spawns a detached
+# watchdog alongside the tmux session. The watchdog polls tmux and
+# calls `kill-session` once the session has been unattached for longer
+# than TMUX_IDLE_TTL seconds. The TTL clock is reset in two ways:
+#
+#   1. On every /api/connect: the orchestration shell stamps a
+#      per-slot "seen" file before spawning. So any reconnect — even
+#      one that predates the watchdog's next poll — resets the clock.
+#   2. On every watchdog poll where a client is currently attached:
+#      the watchdog refreshes the same "seen" file. Handles the case
+#      where a user stays attached for longer than TTL and then
+#      detaches briefly — without this, tmux's session_last_attached
+#      would be stale and the session would die seconds after detach.
+#
+# Idempotency across reconnects is via a pidfile (`kill -0 "$PID"`).
+# Stale pidfiles (dead PID) are silently overwritten by the new
+# watchdog.
+
+# How often the watchdog polls (seconds). Resolution of the TTL kill
+# is therefore TTL + WATCHDOG_POLL_SECONDS in the worst case.
+WATCHDOG_POLL_SECONDS = 300
+
+# Idle TTL for detached tmux sessions on the target (seconds).
+# 0 disables the watchdog — sessions live forever as before.
+TMUX_IDLE_TTL = max(0, _int_env("WEBSH_TMUX_IDLE_TTL", "86400"))
+
+
+def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
+                          poll_seconds=WATCHDOG_POLL_SECONDS):
+    """Shell command sent via ssh to create-or-attach the websh-<slot>
+    tmux session on the target.
+
+    When ttl_seconds > 0 the command also spawns a detached POSIX-sh
+    watchdog that kills the session once it has been unattached for
+    ttl_seconds. The watchdog is idempotent across reconnects via a
+    pidfile in $HOME.
+
+    slot_id and tmux_cmd MUST be pre-validated against _SLOT_ID_RE /
+    _TMUX_CMD_RE — they're interpolated directly into the shell
+    command without further escaping. The `tmux` format string below
+    uses double quotes and references tmux's own `#{...}` syntax, so
+    no user-controlled data is ever evaluated as shell.
+    """
+    tname = "websh-" + slot_id
+    attach = (tmux_cmd + " new-session -A -D -s " + tname
+              + ' -- "$SHELL" -l')
+    if ttl_seconds <= 0:
+        return "exec " + attach
+
+    pidfile = "$HOME/.websh-ttl-" + slot_id + ".pid"
+    seenfile = "$HOME/.websh-ttl-" + slot_id + ".seen"
+
+    # Watchdog loop body. Wrapped in `nohup sh -c '...'` below — must
+    # therefore contain NO single quotes (we use double quotes for the
+    # trap and the tmux format string, both safe inside outer '...').
+    body = (
+        "echo $$ > " + pidfile + "; "
+        'trap "rm -f ' + pidfile + " " + seenfile + '" EXIT; '
+        "while sleep " + str(poll_seconds) + "; do "
+          + tmux_cmd + " has-session -t " + tname + " 2>/dev/null || exit; "
+          "info=$(" + tmux_cmd + " display -p -t " + tname
+              + ' "#{session_attached} #{session_last_attached}" '
+              "2>/dev/null) || exit; "
+          "att=${info%% *}; last=${info##* }; "
+          'if [ "$att" != 0 ]; then date +%s > ' + seenfile + "; continue; fi; "
+          "seen=$(cat " + seenfile + " 2>/dev/null || echo 0); "
+          '[ "$seen" -gt "$last" ] && last=$seen; '
+          "now=$(date +%s); "
+          "[ $((now - last)) -gt " + str(ttl_seconds) + " ] && { "
+            + tmux_cmd + " kill-session -t " + tname + "; exit; "
+          "}; "
+        "done"
+    )
+
+    # Stamp the seen-file on every connect (resets the TTL clock even
+    # if a watchdog is already running from an earlier connect), then
+    # spawn the watchdog only if one isn't already alive for this slot.
+    # Parsing note: `a || b &` is `(a || b) &` in POSIX — the whole
+    # subshell is backgrounded, so the exec on the next line runs
+    # immediately regardless of which branch fires.
+    return (
+        "date +%s > " + seenfile + "\n"
+        "{ [ -f " + pidfile + " ] && "
+          'kill -0 "$(cat ' + pidfile + ' 2>/dev/null)" 2>/dev/null; } || '
+        "nohup sh -c '" + body + "' >/dev/null 2>&1 </dev/null &\n"
+        "exec " + attach
+    )
 
 # Static file serving (Python-only mode, without PHP proxy)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -430,12 +529,11 @@ class SSHSession(object):
         if self.persistent:
             # tmux on the target: attach if exists (-A), detach any stale
             # client (-D). First-time creation starts a login shell.
+            # When TMUX_IDLE_TTL > 0 the remote command also spawns a
+            # watchdog that reaps the session after TTL seconds idle.
             # slot_id + tmux_cmd are validated so no escaping needed.
-            tmux_name = "websh-" + self.slot_id
-            ssh_cmd.append(
-                "exec " + self.tmux_cmd + " new-session -A -D -s " + tmux_name
-                + ' -- "$SHELL" -l'
-            )
+            ssh_cmd.append(_build_remote_command(
+                self.slot_id, self.tmux_cmd, TMUX_IDLE_TTL))
 
         pid, fd = pty.fork()
         if pid == 0:

@@ -3,6 +3,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1006,6 +1007,284 @@ class TestConnectValidation(unittest.TestCase):
         })
         # Not 400 from slot_id validator — request proceeds to spawn.
         self.assertNotEqual(code, 400)
+
+
+# ── _build_remote_command (TTL watchdog) ───────────────────────────────
+
+class TestBuildRemoteCommand(unittest.TestCase):
+    """Static tests for the remote shell command that ssh runs on the
+    target to create-or-attach a persistent tmux session, with and
+    without the idle-TTL watchdog."""
+
+    def _sh_syntax_ok(self, script):
+        """Return (ok, stderr). Runs `sh -n` — parses but does not
+        execute the script. Catches quoting errors and other syntax
+        bugs in the generated string without actually spawning tmux."""
+        r = subprocess.run(
+            ["sh", "-n"], input=script, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return r.returncode == 0, r.stderr
+
+    def test_ttl_zero_returns_plain_exec(self):
+        cmd = server._build_remote_command("alice", "tmux", 0)
+        self.assertEqual(
+            cmd,
+            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l')
+
+    def test_ttl_negative_treated_as_disabled(self):
+        # The _build function is called with TMUX_IDLE_TTL which is
+        # already clamped, but defensive behavior matters if a caller
+        # passes a raw value.
+        cmd = server._build_remote_command("alice", "tmux", -1)
+        self.assertNotIn("kill-session", cmd)
+        self.assertNotIn("watchdog", cmd.lower())
+
+    def test_ttl_positive_spawns_watchdog_and_exec_attach(self):
+        cmd = server._build_remote_command("alice", "tmux", 3600)
+        # The watchdog is spawned in the background, then we exec tmux.
+        self.assertIn("nohup sh -c", cmd)
+        self.assertIn("kill-session -t websh-alice", cmd)
+        self.assertIn("-gt 3600", cmd)  # the TTL comparison
+        # Ends with the exec so the login shell doesn't linger.
+        self.assertTrue(cmd.rstrip().endswith(
+            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'))
+
+    def test_ttl_uses_session_last_attached(self):
+        """Watchdog must read session_last_attached so reconnects reset
+        the clock automatically (tmux updates it on attach)."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        self.assertIn("session_last_attached", cmd)
+        self.assertIn("session_attached", cmd)
+
+    def test_ttl_resets_on_every_connect(self):
+        """The orchestration shell stamps the seen-file before
+        spawning, so even a reconnect that finds an existing watchdog
+        still pushes the deadline forward."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        # First non-whitespace statement must be the seen-file stamp.
+        first_line = cmd.lstrip().split("\n", 1)[0]
+        self.assertIn("date +%s", first_line)
+        self.assertIn(".websh-ttl-ok.seen", first_line)
+
+    def test_ttl_resets_while_attached(self):
+        """Watchdog must refresh the seen-file whenever it sees
+        att > 0. Without this a user who stays attached longer than
+        TTL would be killed seconds after detaching."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        # The watchdog body contains a refresh of the seen-file gated
+        # on the attached-client count being non-zero.
+        self.assertIn('if [ "$att" != 0 ]; then date +%s >', cmd)
+
+    def test_ttl_idempotent_via_pidfile(self):
+        """Back-to-back connects must not stack watchdogs; the pidfile
+        + `kill -0` gate is how we enforce that."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        self.assertIn(".websh-ttl-ok.pid", cmd)
+        self.assertIn("kill -0", cmd)
+
+    def test_custom_tmux_cmd_used_everywhere(self):
+        cmd = server._build_remote_command(
+            "ok", "/usr/local/bin/tmux", 3600)
+        # Must use the custom path in all tmux invocations, including
+        # inside the watchdog loop. Count > 1 because of has-session,
+        # display, kill-session, and the final attach.
+        self.assertGreaterEqual(cmd.count("/usr/local/bin/tmux"), 4)
+        # And never the bare word `tmux ` (space-terminated) — would
+        # indicate a hardcoded fallback leaking through.
+        self.assertNotIn(" tmux ", " " + cmd)
+
+    def test_sh_syntax_valid_ttl_zero(self):
+        ok, err = self._sh_syntax_ok(
+            server._build_remote_command("slot_1", "tmux", 0))
+        self.assertTrue(ok, "sh -n rejected ttl=0 command: " + err)
+
+    def test_sh_syntax_valid_ttl_positive(self):
+        ok, err = self._sh_syntax_ok(
+            server._build_remote_command("slot_1", "tmux", 86400))
+        self.assertTrue(ok, "sh -n rejected ttl=86400 command: " + err)
+
+    def test_sh_syntax_valid_with_path_tmux(self):
+        ok, err = self._sh_syntax_ok(
+            server._build_remote_command(
+                "slot_1", "/usr/local/bin/tmux", 86400))
+        self.assertTrue(ok, "sh -n rejected custom tmux path: " + err)
+
+    def test_watchdog_body_has_no_single_quotes(self):
+        """The watchdog body is embedded inside `nohup sh -c '...'`.
+        A single quote inside would close the wrapper early. Keep this
+        guarantee pinned so future edits don't silently break it."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        # Extract the body between the first `sh -c '` and the
+        # closing `'` before the stderr redirection.
+        start = cmd.index("sh -c '") + len("sh -c '")
+        end = cmd.index("' >/dev/null 2>&1")
+        body = cmd[start:end]
+        self.assertNotIn("'", body)
+
+    def test_watchdog_loop_exits_when_session_dies(self):
+        """Watchdog must not outlive the tmux session it's guarding —
+        otherwise [x] would terminate tmux but the watchdog would keep
+        polling forever."""
+        cmd = server._build_remote_command("ok", "tmux", 3600)
+        self.assertIn("has-session -t websh-ok 2>/dev/null || exit", cmd)
+
+
+# Fake tmux used by TestWatchdogRuntime — simulates has-session,
+# display, kill-session, new-session using a files-on-disk state
+# store so we can inspect what the watchdog actually does.
+_FAKE_TMUX = r"""#!/bin/sh
+state=${TMUX_STATE:-/tmp/fake-tmux-state}
+sessions=$state/sessions
+mkdir -p "$state"; touch "$sessions"
+sub=$1; shift
+name=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|-s) shift; name=$1; shift ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+case "$sub" in
+  new-session)
+    grep -Fxq "$name" "$sessions" 2>/dev/null || echo "$name" >> "$sessions"
+    exit 0 ;;
+  has-session)
+    grep -Fxq "$name" "$sessions" 2>/dev/null ;;
+  display)
+    # Format we care about: "#{session_attached} #{session_last_attached}"
+    cat "$state/info-$name" 2>/dev/null || echo "0 0" ;;
+  kill-session)
+    grep -vxF "$name" "$sessions" > "$sessions.tmp" 2>/dev/null || :
+    mv "$sessions.tmp" "$sessions" 2>/dev/null || :
+    # Breadcrumb for the test to assert against.
+    echo "killed $name at $(date +%s)" >> "$state/kill.log"
+    ;;
+esac
+"""
+
+
+class TestWatchdogRuntime(unittest.TestCase):
+    """Integration test: run the actual shell command against a fake
+    tmux and verify the watchdog kills the session after TTL seconds.
+
+    This covers the behavior that sh -n can't — loop control, TTL
+    arithmetic, pidfile idempotency, seen-file freshness."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="websh-wd-test-")
+        self.state = os.path.join(self.tmpdir, "state")
+        os.makedirs(self.state)
+        self.fake_tmux = os.path.join(self.tmpdir, "tmux")
+        with open(self.fake_tmux, "w") as f:
+            f.write(_FAKE_TMUX)
+        os.chmod(self.fake_tmux, 0o755)
+        self.env = os.environ.copy()
+        self.env["HOME"] = self.tmpdir
+        self.env["TMUX_STATE"] = self.state
+        # Deliberately don't put fake tmux on PATH — _build_remote_command
+        # is called with the full path, so every tmux invocation uses it.
+
+    def tearDown(self):
+        # Reap any lingering watchdog so the test doesn't leak processes.
+        pidfile = os.path.join(self.tmpdir, ".websh-ttl-rt.pid")
+        try:
+            with open(pidfile) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run(self, cmd, timeout=5):
+        # The command ends with `exec <fake-tmux> new-session ...` which
+        # exits immediately (fake doesn't attach). The backgrounded
+        # watchdog keeps running — that's the process we actually want
+        # to observe.
+        p = subprocess.Popen(
+            ["sh", "-c", cmd], env=self.env, cwd=self.tmpdir,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p.wait(timeout=timeout)
+
+    def _sessions(self):
+        path = os.path.join(self.state, "sessions")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [ln.strip() for ln in f if ln.strip()]
+
+    def test_watchdog_kills_abandoned_session_after_ttl(self):
+        # Pre-seed info: att=0 (not attached), last_attached=0 (epoch).
+        # Combined with a seen-file that _build will stamp at NOW, the
+        # watchdog's baseline is NOW. It should kill after TTL seconds.
+        info = os.path.join(self.state, "info-websh-rt")
+        with open(info, "w") as f:
+            f.write("0 0")
+
+        cmd = server._build_remote_command(
+            "rt", self.fake_tmux, ttl_seconds=1, poll_seconds=1)
+        self._run(cmd)
+
+        # Session should exist right after creation.
+        self.assertIn("websh-rt", self._sessions())
+
+        # Wait for the watchdog to fire. TTL=1, poll=1 → kills no later
+        # than ~3s after connect (two polls to observe stale baseline).
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if "websh-rt" not in self._sessions():
+                break
+            time.sleep(0.2)
+        self.assertNotIn(
+            "websh-rt", self._sessions(),
+            "watchdog did not kill abandoned session within deadline")
+
+    def test_watchdog_keeps_alive_while_attached(self):
+        # Simulate a client staying attached: att=1.
+        info = os.path.join(self.state, "info-websh-rt")
+        with open(info, "w") as f:
+            f.write("1 0")
+
+        cmd = server._build_remote_command(
+            "rt", self.fake_tmux, ttl_seconds=1, poll_seconds=1)
+        self._run(cmd)
+
+        # Even past TTL, session must survive because the attached
+        # branch resets the seen-file each poll.
+        time.sleep(3.0)
+        self.assertIn(
+            "websh-rt", self._sessions(),
+            "watchdog killed a session that still had an attached client")
+
+    def test_watchdog_idempotent_across_reconnects(self):
+        # Two consecutive runs must not produce two watchdogs.
+        info = os.path.join(self.state, "info-websh-rt")
+        with open(info, "w") as f:
+            f.write("1 0")  # keep alive so we can observe pidfile
+
+        cmd = server._build_remote_command(
+            "rt", self.fake_tmux, ttl_seconds=60, poll_seconds=60)
+        self._run(cmd)
+
+        pidfile = os.path.join(self.tmpdir, ".websh-ttl-rt.pid")
+        # Give the bg watchdog a beat to write its pidfile.
+        deadline = time.time() + 2
+        while time.time() < deadline and not os.path.exists(pidfile):
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(pidfile), "pidfile not written")
+        with open(pidfile) as f:
+            first_pid = int(f.read().strip())
+
+        # Second "connect" — the idempotency check should keep the
+        # same watchdog; pidfile must still reference first_pid.
+        self._run(cmd)
+        time.sleep(0.3)
+        with open(pidfile) as f:
+            second_pid = int(f.read().strip())
+        self.assertEqual(
+            first_pid, second_pid,
+            "reconnect spawned a second watchdog instead of reusing the first")
 
 
 # ── terminate_remote_tmux + /api/disconnect terminate flag ─────────────
