@@ -272,21 +272,20 @@
     <div class="tm-sub">This will terminate the tmux session on the server for good. The session and any processes inside it will be lost. Are you sure?</div>
     <div class="tm-row">
       <button class="btn" onclick="confirmCancel()">Cancel</button>
-      <button class="btn" onclick="confirmTerminate(true)">Terminate session and never ask again</button>
-      <button class="btn btn-d" onclick="confirmTerminate(false)">Terminate session</button>
+      <button class="btn" onclick="confirmTerminate(true)">Terminate and never ask again</button>
+      <button class="btn btn-d" onclick="confirmTerminate(false)">Terminate</button>
     </div>
   </div>
 </div>
 
-<!-- tmux probe modal -->
+<!-- Connect-status modal (one popup, dynamic state) -->
 <div id="tmuxOv" class="ov h">
   <div class="tm-panel">
-    <h2 id="tmTitle">tmux</h2>
+    <h2 id="tmTitle">Connecting</h2>
     <div id="tmSub" class="tm-sub"></div>
     <div id="tmStatus" class="tm-status"></div>
     <div class="tm-row">
-      <button id="tmCancel" class="btn" onclick="tmuxCancel()">Cancel</button>
-      <button id="tmSkip" class="btn btn-p" onclick="tmuxSkip()">Connect short-lived</button>
+      <button id="tmCancel" class="btn" onclick="dismissConnectStatus()">Cancel</button>
     </div>
   </div>
 </div>

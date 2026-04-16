@@ -35,6 +35,7 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
@@ -109,6 +110,16 @@ _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # Persistent-session slot id (used as remote tmux session name `websh-<slot>`).
 # Restricted to characters that are safe both as tmux session names and as
 # shell tokens without quoting.
+#
+# Why this is not a security boundary: tmux's server socket lives in
+# `/tmp/tmux-$UID` on the target, so two different OS users on the same
+# host cannot see each other's sessions even if they pick the same
+# slot_id. The authentication boundary is ssh (username + key/password);
+# slot_id is a *label* attached to already-authenticated sessions, used
+# only to let the same browser resume the same target on reload. The
+# regex's job is to keep the label safe to interpolate into the remote
+# command ("tmux new-session -A -D -s websh-<slot>") — not to stop an
+# attacker from guessing it.
 _SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 # tmux invocation path / command. Covers "tmux", "/usr/local/bin/tmux",
@@ -330,6 +341,23 @@ class SSHSession(object):
         self.slot_id = slot_id if self.persistent else None
         self.tmux_cmd = tmux_cmd if _TMUX_CMD_RE.match(tmux_cmd or "") else "tmux"
 
+        # Connection coordinates kept for the ControlMaster side-channel
+        # (see terminate_remote_tmux). Only used in the persistent path.
+        self._host = host
+        self._port = port
+        self._username = username
+
+        # Per-session ssh ControlPath. Opened by the master ssh process
+        # (see _spawn) when persistent; a second `ssh -S <path> ...`
+        # invocation piggybacks on the same authenticated channel to
+        # run tmux kill-session without re-entering credentials and
+        # without depending on the user's tmux prefix.
+        self._control_path = None
+        if self.persistent:
+            self._control_path = os.path.join(
+                tempfile.gettempdir(),
+                "websh-mux-{}.sock".format(self.id.replace("-", "")[:16]))
+
         if key:
             self._key_file = self._write_key(key)
 
@@ -377,6 +405,17 @@ class SSHSession(object):
             # Force remote TTY allocation — required when ssh has a trailing
             # remote command (default is no TTY, but tmux needs one).
             ssh_cmd.insert(1, "-tt")
+            # ControlMaster: this ssh is the master; a later
+            # `ssh -S <sock> <host> tmux kill-session ...` reuses the
+            # already-authenticated channel. ControlPersist=no means the
+            # socket dies with the master process (no orphaned masters).
+            # Placed before user ssh_options so our values win (ssh uses
+            # first-wins semantics for -o).
+            ssh_cmd.extend([
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=" + self._control_path,
+                "-o", "ControlPersist=no",
+            ])
 
         if self._key_file:
             ssh_cmd.extend(["-i", self._key_file])
@@ -580,27 +619,55 @@ class SSHSession(object):
         self._set_winsize(cols, rows)
 
     def terminate_remote_tmux(self):
-        """Best-effort: kill the remote tmux session via the existing PTY.
+        """Kill the remote tmux session deterministically.
 
-        We're inside `tmux new-session -A -D -s websh-<slot>` on the
-        target. To make sure the session goes away — not just our client
-        — we send a kill-session through two channels in sequence:
+        Primary path: open a second ssh on the same ControlMaster socket
+        and run `tmux kill-session` directly on the target. This is
+        prefix-agnostic (doesn't care what the user's tmux prefix is or
+        whether they're inside vim), reuses the existing authentication
+        (no password re-prompt), and completes in one round trip.
 
-          1. Default tmux prefix (Ctrl-B) + ":" + kill-session + Enter
-             → reaches tmux command mode regardless of foreground state
-               (works inside vim, less, htop) IF the user's prefix is
-               the default Ctrl-B, which is the common case.
-          2. Ctrl-C + `tmux kill-session ...` + Enter
-             → breaks any foreground process and runs the kill from a
-               shell prompt. Covers users who remapped their prefix.
+        Fallback path: if the control socket isn't ready (master still
+        authenticating) or the side-channel ssh fails, poke the PTY
+        directly — first the default Ctrl-B prefix, then a Ctrl-C
+        followed by a shell-level `tmux kill-session`. This is only
+        best-effort (misses on non-default prefix + foreground editor),
+        but retained as a safety net.
 
-        If both miss (e.g. user is in vim with a non-default prefix),
-        the session leaks. Acceptable — the user explicitly chose
-        terminate; our SSH connection still tears down on close().
+        Safe to call on non-persistent sessions: it's a no-op.
         """
-        if not self.persistent or not self.slot_id or not self.alive:
+        if not self.persistent or not self.slot_id:
             return
-        target = ("websh-" + self.slot_id).encode()
+        target_name = "websh-" + self.slot_id
+
+        # Primary: ControlMaster side-channel.
+        if (self._control_path and os.path.exists(self._control_path)
+                and self._host and self._username):
+            try:
+                result = subprocess.run(
+                    ["ssh",
+                     "-o", "ControlPath=" + self._control_path,
+                     "-o", "BatchMode=yes",
+                     "-o", "ConnectTimeout=3",
+                     "-p", str(self._port),
+                     "-l", self._username,
+                     self._host,
+                     self.tmux_cmd, "kill-session", "-t", target_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    _log("INFO", "session {} tmux kill-session {} via mux ok"
+                         .format(self.id, target_name))
+                    return
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        # Fallback: poke the PTY if the master is still alive.
+        if not self.alive:
+            return
+        target = target_name.encode()
         try:
             os.write(self.master_fd, b"\x02:kill-session -t " + target + b"\r")
             time.sleep(0.4)
@@ -642,6 +709,15 @@ class SSHSession(object):
             except Exception:
                 pass
             self._key_file = None
+        if self._control_path:
+            # The master ssh owns the socket and cleans it up on exit,
+            # but if it died ungracefully (SIGKILL) the stale node
+            # remains. Unlink defensively.
+            try:
+                os.unlink(self._control_path)
+            except OSError:
+                pass
+            self._control_path = None
 
     def is_expired(self):
         return time.time() - self.last_activity > SESSION_TIMEOUT

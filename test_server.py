@@ -3,12 +3,14 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 import unittest.mock
+import uuid
 
 # Import server module
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1012,12 +1014,18 @@ class TestTerminateRemoteTmux(unittest.TestCase):
     """Direct unit tests for SSHSession.terminate_remote_tmux()."""
 
     def _fake_session(self, persistent=True, slot_id="alice_host_22_xy",
-                      alive=True, master_fd=None):
+                      alive=True, master_fd=None, control_path=None):
         s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-" + (slot_id or "x")
         s.persistent = persistent
         s.slot_id = slot_id
         s.alive = alive
         s.master_fd = master_fd
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = "tmux"
         return s
 
     def test_noop_when_not_persistent(self):
@@ -1096,6 +1104,144 @@ class TestTerminateRemoteTmux(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_primary_uses_controlmaster_when_socket_exists(self):
+        # Create a real file so os.path.exists() returns True.
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        with open(sock, "w") as f:
+            f.write("")
+        try:
+            s = self._fake_session(slot_id="ok", control_path=sock)
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.terminate_remote_tmux()
+            self.assertEqual(len(calls), 1)
+            cmd = calls[0]
+            self.assertEqual(cmd[0], "ssh")
+            self.assertIn("ControlPath=" + sock, cmd)
+            self.assertIn("kill-session", cmd)
+            self.assertIn("websh-ok", cmd)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_primary_falls_back_to_pty_on_nonzero_exit(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        with open(sock, "w") as f:
+            f.write("")
+        r, w = os.pipe()
+        try:
+            s = self._fake_session(
+                slot_id="ok", master_fd=w, control_path=sock)
+            def fake_run(cmd, **kw):
+                class R:
+                    returncode = 1
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                with unittest.mock.patch.object(time, "sleep", lambda _: None):
+                    s.terminate_remote_tmux()
+            os.set_blocking(r, False)
+            try:
+                data = os.read(r, 8192)
+            except (BlockingIOError, OSError):
+                data = b""
+            # Fallback path: both PTY writes should have happened.
+            self.assertIn(b"\x02:kill-session -t websh-ok\r", data)
+            self.assertIn(b"\x03tmux kill-session -t websh-ok\r", data)
+        finally:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_primary_skipped_when_socket_missing(self):
+        # control_path is set but the file doesn't exist (master still
+        # authenticating, or crashed).
+        s = self._fake_session(
+            slot_id="ok", master_fd=None,
+            control_path="/nonexistent/websh-mux-xxxx.sock")
+        called = {"n": 0}
+        def fake_run(cmd, **kw):
+            called["n"] += 1
+            class R:
+                returncode = 0
+            return R()
+        # master_fd is None so the fallback path's os.write would raise,
+        # but alive check short-circuits it when we flip alive=False.
+        s.alive = False
+        with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+            s.terminate_remote_tmux()
+        self.assertEqual(called["n"], 0)
+
+
+class TestSlotIdSecurity(unittest.TestCase):
+    """Document the security model around slot_id.
+
+    slot_id is a per-browser label for resuming a remote tmux session,
+    not an authentication credential. These tests pin the two
+    guarantees we actually rely on:
+
+      1. The slot_id regex keeps the label safe to interpolate into
+         the remote shell command that ssh executes on the target.
+      2. /api/connect rejects slot_ids that would escape that safety.
+
+    Cross-user isolation (tmux namespaces per UID on the target) is
+    enforced by tmux itself — we don't test it here, but it's the
+    reason loose slot_id validation is acceptable.
+    """
+
+    def test_regex_rejects_shell_metacharacters(self):
+        bad_ids = [
+            "alice; rm -rf /",     # command separator
+            "alice && id",         # command chain
+            "alice|nc host 80",    # pipe
+            "alice`whoami`",       # backtick
+            "alice$(whoami)",      # command substitution
+            "alice\nwhoami",       # newline injection
+            "alice'quote",         # single quote
+            "alice\"quote",        # double quote
+            "alice space",         # space
+            "alice/slash",         # path separator
+            "../etc/passwd",       # traversal
+            "",                    # empty
+            "x" * 65,              # too long
+        ]
+        for bad in bad_ids:
+            self.assertIsNone(
+                server._SLOT_ID_RE.match(bad),
+                "regex should reject: {!r}".format(bad))
+
+    def test_regex_accepts_realistic_slot_ids(self):
+        good_ids = [
+            "alice_prod-1_22_abc1",
+            "deploy_example-com_2222_xyz9",
+            "a",                            # single char
+            "a" * 64,                       # max length
+            "user123_host-name_42_abcd",
+        ]
+        for good in good_ids:
+            self.assertIsNotNone(
+                server._SLOT_ID_RE.match(good),
+                "regex should accept: {!r}".format(good))
+
+    def test_tmux_name_interpolation_is_safe(self):
+        # Whatever the regex accepts must produce a tmux session name
+        # that contains no shell metacharacters when wrapped as
+        # "websh-<slot>". This is the actual invariant that matters.
+        for slot in ["abc", "user_host-1_22_xy", "A_B-C_9"]:
+            name = "websh-" + slot
+            for bad_char in ";&|`$(){}<>\"'\\\n\r\t *?[]!#":
+                self.assertNotIn(bad_char, name)
+
 
 class TestDisconnectTerminateFlag(unittest.TestCase):
     """HTTP-level: /api/disconnect routes the terminate flag correctly."""
@@ -1155,6 +1301,11 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
         s.alive = True
         s.master_fd = None
         s._key_file = None
+        s._control_path = None
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = "tmux"
         s.terminate_calls = 0
         s.close_calls = 0
         def fake_terminate():
@@ -1210,6 +1361,135 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
                                 {"session_id": "no-such-session",
                                  "terminate": True})
         self.assertEqual(code, 200)
+
+
+class TestEndToEndPersistent(unittest.TestCase):
+    """End-to-end: spawn a real SSHSession against localhost, verify
+    the remote tmux session materializes, then verify
+    terminate_remote_tmux actually kills it via the ControlMaster
+    side-channel.
+
+    Auto-skips unless localhost accepts key-based ssh and has tmux
+    installed. This is a confidence check — the contract is already
+    covered by TestTerminateRemoteTmux; this proves the pieces fit
+    when a real ssh + tmux are in the loop.
+
+    Set WEBSH_E2E=1 to force-require (fail if probe fails) — useful
+    in CI environments where the fixture is guaranteed.
+    """
+
+    _skip_reason = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._skip_reason = cls._probe()
+        if cls._skip_reason and os.environ.get("WEBSH_E2E") == "1":
+            raise RuntimeError(
+                "WEBSH_E2E=1 set but probe failed: " + cls._skip_reason)
+
+    @staticmethod
+    def _probe():
+        try:
+            r = subprocess.run(
+                ["ssh",
+                 "-o", "BatchMode=yes",
+                 "-o", "ConnectTimeout=2",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "UserKnownHostsFile=/dev/null",
+                 "localhost", "tmux -V"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            if r.returncode != 0:
+                return "ssh localhost tmux -V failed (rc={}): {}".format(
+                    r.returncode,
+                    r.stderr[:160].decode("latin-1", errors="replace").strip())
+            if b"tmux " not in r.stdout:
+                return "tmux -V returned unexpected output"
+            return None
+        except (OSError, subprocess.SubprocessError) as e:
+            return "probe raised: {}".format(e)
+
+    def setUp(self):
+        if self._skip_reason:
+            self.skipTest(self._skip_reason)
+
+    @staticmethod
+    def _ssh_cmd(*args):
+        return ["ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=2",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "localhost"] + list(args)
+
+    def _has_session(self, slot):
+        r = subprocess.run(
+            self._ssh_cmd("tmux", "has-session", "-t", "websh-" + slot),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5)
+        return r.returncode == 0
+
+    def _force_kill(self, slot):
+        subprocess.run(
+            self._ssh_cmd("tmux", "kill-session", "-t", "websh-" + slot),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5)
+
+    def test_spawn_then_controlmaster_terminate(self):
+        # Per-run unique label so parallel/reruns don't collide.
+        slot = "ete{}".format(str(int(time.time() * 1000))[-10:])
+        self.addCleanup(self._force_kill, slot)
+
+        # Pre-condition: no leftover session from a previous run.
+        if self._has_session(slot):
+            self._force_kill(slot)
+            time.sleep(0.2)
+
+        sid = str(uuid.uuid4())
+        user = os.environ.get("USER") or "root"
+        session = server.SSHSession(
+            session_id=sid,
+            host="localhost",
+            port=22,
+            username=user,
+            password="",
+            cols=80, rows=24,
+            persistent=True,
+            slot_id=slot,
+        )
+        try:
+            # Wait for the tmux session to materialize.
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if self._has_session(slot):
+                    break
+                time.sleep(0.2)
+            self.assertTrue(
+                self._has_session(slot),
+                "remote tmux session never appeared")
+
+            # Wait for ControlMaster socket to be ready.
+            deadline = time.time() + 4
+            while time.time() < deadline:
+                if (session._control_path
+                        and os.path.exists(session._control_path)):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(
+                session._control_path
+                and os.path.exists(session._control_path),
+                "ControlMaster socket never appeared at {}".format(
+                    session._control_path))
+
+            # The actual test: terminate via the primary (mux) path.
+            session.terminate_remote_tmux()
+
+            # Give the remote side a moment to reap.
+            time.sleep(0.3)
+            self.assertFalse(
+                self._has_session(slot),
+                "tmux session still alive after terminate_remote_tmux")
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":

@@ -249,6 +249,14 @@ function materializeTarget() {
 
 function cancelConnect() {
   if (!overlayDismissable()) return;
+  // Abort any in-flight runConnect and dismiss the status popup so
+  // closing the form takes the ongoing attempt with it.
+  if (currentConnectRun) {
+    currentConnectRun.cancelled = true;
+    cleanupRun(currentConnectRun);
+    currentConnectRun = null;
+  }
+  $('tmuxOv').classList.add('h');
   let np = connectingFor ? panes[connectingFor] : null;
   // If we got as far as materializing a pane for this overlay session
   // (user clicked Connect, auth failed, form stayed open, user now
@@ -602,8 +610,6 @@ function pollOutput(p) {
       return;
     }
     p.connecting=false;
-    console.log('poll:', p.id, 'data_len:', (r.data||'').length,
-                'alive:', r.alive, 'auth_failed:', r.auth_failed);
     if(r.data){
       updatePaneBadge(p);
       let chunk = atob(r.data);
@@ -897,13 +903,18 @@ function parseProbeOutput(text) {
   };
 }
 
-function openBgSession(p) {
+function openBgSession(rec) {
   // Spins up a non-persistent, background-tagged SSH session that
-  // borrows the pane's saved creds. Used only for the probe.
-  let body = buildConnectBody(paneRecord(p), 80, 24);
+  // borrows the caller's creds. Used only for the probe.
+  let body = buildConnectBody(rec, 80, 24);
   delete body.persistent; delete body.slot_id; delete body.tmux_cmd;
   body.background = true;
   return api('connect', {body: body}).then(r => {
+    if (r.auth_failed) {
+      let err = new Error('authentication failed');
+      err.authFailed = true;
+      throw err;
+    }
     if (r.error || r.alive === false) throw new Error(r.error || 'bg connect failed');
     return r.session_id;
   });
@@ -927,7 +938,15 @@ function drainOutput(sid, shouldStop) {
   return step();
 }
 
-function probeTmux(p) {
+// Classify a chunk of PTY output as an auth failure. Mirrors the server's
+// AUTH_FAIL_PATTERNS so we don't depend solely on session.auth_failed
+// flag propagation (a poll can race ahead of the read loop's flag set).
+function looksLikeAuthFail(text) {
+  if (!text) return false;
+  return /permission denied|authentication failed|access denied|too many authentication failures/i.test(text);
+}
+
+function probeTmux(rec) {
   // Returns a Promise<{installed, tmux_cmd} | null>. Opens a bg
   // session, runs the probe one-liner, reads until the marker,
   // disconnects. Caps at 20 s total.
@@ -936,7 +955,7 @@ function probeTmux(p) {
   let timed = new Promise((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error('probe timeout')), 20000);
   });
-  let work = openBgSession(p).then(sid => {
+  let work = openBgSession(rec).then(sid => {
     bgSid = sid;
     return delay(2500); // let MOTD / login banner drain
   }).then(() => {
@@ -944,7 +963,7 @@ function probeTmux(p) {
   }).then(() => {
     return drainOutput(bgSid, buf => buf.indexOf(TMUX_MARKER + ':') !== -1 ? 'marker' : null);
   }).then(res => {
-    if (res.reason === 'auth_failed') {
+    if (res.reason === 'auth_failed' || looksLikeAuthFail(res.buf)) {
       let err = new Error('authentication failed');
       err.authFailed = true;
       throw err;
@@ -965,7 +984,10 @@ let pendingTerminate = null;
 
 function showTerminateModal(p, onConfirm) {
   pendingTerminate = onConfirm;
-  $('cfTitle').textContent = 'Terminate session on ' + (p.host || 'server') + '?';
+  // Prefer the human label (saved name or connection name) over the raw
+  // host IP — matches what the user sees in the pane's title bar.
+  let name = p.label || p.connection || p.host || 'server';
+  $('cfTitle').textContent = 'Terminate session on ' + name + '?';
   $('confirmOv').classList.remove('h');
 }
 function confirmCancel() {
@@ -979,128 +1001,291 @@ function confirmTerminate(neverAgain) {
   if (cb) cb(!!neverAgain);
 }
 
-// ── tmux probe modal ───────────────────────────────────────────────
-// Shows "checking…" while the probe runs; if tmux is missing the user
-// picks [Cancel] or [Connect short-lived]. Install-it-yourself flow:
-// the user connects short-lived to the same host, installs tmux (apt,
-// dnf, conda, whatever works on that target), then reconnects with
-// Persistent — the probe runs again and finds it.
-let tmuxState = null;
+// ── Unified connect flow ───────────────────────────────────────────
+// Single entry point for every connect attempt (manual form, saved
+// card, server-configured card). Rules:
+//
+//   1. No pane is created until the connection is confirmed. The login
+//      form stays visible behind a status popup during the attempt —
+//      on success we materialise the pane and close the form in one
+//      step; on failure the popup shows the reason and the form is
+//      still there, unchanged, for the user to retry.
+//   2. All failure states (auth, no-tmux, policy-deny, host-down,
+//      timeout, generic error) surface in the same popup with one
+//      [OK] button that just dismisses the popup.
+//   3. Saved cards run the same flow — clicking one does not bypass
+//      the form; the form remains the single "close me" control.
+//
+// The popup's DOM is #tmuxOv (kept for backwards-compat; the visible
+// title is "Connecting" by default). The probeTmux / openBgSession /
+// drainOutput helpers below stay as building blocks.
 
-function setTmuxSub(text) { $('tmSub').textContent = text; }
-function setTmuxStatus(text, cls) {
-  let el = $('tmStatus'); el.textContent = text || '';
-  el.className = 'tm-status' + (cls ? ' ' + cls : '');
-}
-function setTmuxButtons(cancel, skip) {
-  $('tmCancel').classList.toggle('h', !cancel);
-  $('tmSkip').classList.toggle('h', !skip);
+// Synthesize a paneRecord-shaped object from opts so probeTmux can run
+// before any pane exists. Probe is always non-persistent and uses a
+// fixed 80x24 PTY, so cols/rows/persistent fields don't matter.
+function recForProbe(opts) {
+  return {
+    label: opts.label || '',
+    host: opts.host || '',
+    port: opts.port || 22,
+    user: opts.user || '',
+    connection: opts.connection || null,
+    auth: opts.auth || (opts.key ? 'key' : 'pw'),
+    password: opts.password || '',
+    key: opts.key || '',
+    key_pass: opts.keyPass || '',
+    persistent: false,
+    slot_id: null,
+    tmux_cmd: opts.tmuxCmd || 'tmux',
+    cols: 80, rows: 24
+  };
 }
 
-function openTmuxModal(p, cfg) {
-  tmuxCleanup();
-  tmuxState = { p: p, opts: cfg.opts, cancelled: false };
-  $('tmuxOv').classList.remove('h');
-  $('tmTitle').textContent = 'tmux on ' + (p.host || 'target');
-  setTmuxStatus('', '');
-  setTmuxButtons(true, false);
-  setTmuxSub('Checking if tmux is installed on ' + p.host + '…');
-  startTmuxProbe();
-}
+// Tracks the active attempt so the popup's Cancel / form's × can abort
+// it and so we don't leak bg or half-connected sessions.
+let currentConnectRun = null;
 
-function startTmuxProbe() {
-  let st = tmuxState; if (!st) return;
-  probeTmux(st.p).then(res => {
-    if (!tmuxState || tmuxState !== st || st.cancelled) return;
-    if (!res) {
-      setTmuxSub(
-        'Could not detect tmux on ' + st.p.host + ' — the probe did ' +
-        'not return a recognisable answer. Connect short-lived and try ' +
-        'tmux manually.'
-      );
-      setTmuxStatus('', '');
-      setTmuxButtons(true, true);
-      return;
-    }
-    if (res.installed) {
-      let opts = Object.assign({}, st.opts, {tmuxCmd: res.tmux_cmd || 'tmux'});
-      let p = st.p;
-      closeTmuxModal();
-      connectPane(p, opts);
-      return;
-    }
-    setTmuxSub(
-      'tmux is not installed on ' + st.p.host + '. ' +
-      'Connect short-lived, install tmux yourself, then reconnect with Persistent.'
-    );
-    setTmuxButtons(true, true);
-  }).catch(e => {
-    if (!tmuxState || tmuxState !== st || st.cancelled) return;
-    if (e && e.authFailed) {
-      setTmuxSub(
-        'Could not log in to ' + st.p.host + ' — authentication failed.'
-      );
-      setTmuxStatus('Check your password or key and try again.', 'err');
-      setTmuxButtons(true, false);
-      return;
-    }
-    let msg = (e && e.message) || '' + e;
-    if (msg.indexOf('timeout') !== -1) {
-      setTmuxSub(
-        'Probe timed out on ' + st.p.host + ' — likely missing tmux or a ' +
-        'slow target. You can connect short-lived instead.'
-      );
-      setTmuxStatus('', '');
-    } else {
-      setTmuxSub('Probe error on ' + st.p.host + '.');
-      setTmuxStatus(msg, 'err');
-    }
-    setTmuxButtons(true, true);
+function runConnect(opts) {
+  // A second runConnect supersedes the first.
+  if (currentConnectRun) {
+    currentConnectRun.cancelled = true;
+    cleanupRun(currentConnectRun);
+  }
+  let run = { cancelled: false, connectSid: null, opts: opts };
+  currentConnectRun = run;
+
+  hideErr();
+  showConnectStatus('connecting', {host: opts.host, persistent: !!opts.persistent});
+
+  let step = opts.persistent
+    ? probeTmux(recForProbe(opts)).then(res => {
+        if (run.cancelled) return null;
+        if (!res) throw { kind: 'probe_unparseable' };
+        if (!res.installed) throw { kind: 'no_tmux' };
+        opts.tmuxCmd = res.tmux_cmd || 'tmux';
+        return true;
+      })
+    : Promise.resolve(true);
+
+  step.then(ok => {
+    if (run.cancelled || ok === null) return null;
+    return realConnect(opts, run);
+  }).then(result => {
+    if (run.cancelled || !result) return;
+    finalizeSuccess(opts, result, run);
+  }).catch(err => {
+    if (run.cancelled) return;
+    cleanupRun(run);
+    currentConnectRun = null;
+    let ctx = mapConnectError(err, opts);
+    showConnectStatus(ctx.kind, ctx);
   });
 }
 
-function tmuxSkip() {
-  let st = tmuxState; if (!st) return;
-  let p = st.p;
-  let opts = Object.assign({}, st.opts, {persistent: false, slotId: null, tmuxCmd: 'tmux'});
-  // If the user was about to save this entry, record the downgraded
-  // mode (short-lived) so we don't lie to future sessions.
-  if (opts.saveEntry) {
-    opts.saveEntry = Object.assign({}, opts.saveEntry, {persistent: false});
+function realConnect(opts, run) {
+  // Build connect body from opts (no pane yet, so cols/rows default to
+  // 80x24 and we /api/resize once the pane is materialised).
+  let rec = {
+    label: opts.label || '',
+    host: opts.host || '',
+    port: opts.port || 22,
+    user: opts.user || '',
+    connection: opts.connection || null,
+    auth: opts.auth || (opts.key ? 'key' : 'pw'),
+    password: opts.password || '',
+    key: opts.key || '',
+    key_pass: opts.keyPass || '',
+    persistent: !!opts.persistent,
+    slot_id: opts.slotId || (opts.persistent
+      ? slotIdFor(opts.user, opts.host, opts.port) : null),
+    tmux_cmd: opts.tmuxCmd || 'tmux',
+    cols: 80, rows: 24
+  };
+  opts.slotId = rec.slot_id;
+  let body = buildConnectBody(rec, 80, 24);
+  return api('connect', {body: body}).then(r => {
+    if (run.cancelled) {
+      if (r && r.session_id) api('disconnect', {body: {session_id: r.session_id}}).catch(() => {});
+      return null;
+    }
+    if (r && r.session_id) run.connectSid = r.session_id;
+    if (r.auth_failed) throw { kind: 'auth_failed' };
+    if (r.error) {
+      if (/not allowed|not in the allowed list/i.test(r.error)) {
+        throw { kind: 'policy_deny', msg: r.error };
+      }
+      throw { kind: 'error', msg: r.error };
+    }
+    if (r.alive === false) throw { kind: 'host_down' };
+    return r;
+  });
+}
+
+function finalizeSuccess(opts, result, run) {
+  // Connection confirmed — now it's safe to create the pane.
+  let p = materializeTarget();
+  if (!p) {
+    // No materialize target (shouldn't happen under normal flow) —
+    // tear down the stray session so it doesn't leak.
+    if (result.session_id) api('disconnect', {body: {session_id: result.session_id}}).catch(() => {});
+    currentConnectRun = null;
+    return;
   }
-  console.log('tmuxSkip: password len=' + ((opts.password || '').length) +
-              ' key len=' + ((opts.key || '').length) +
-              ' auth=' + opts.auth);
-  closeTmuxModal();
-  connectPane(p, opts);
-}
-
-function tmuxCancel() { closeTmuxModal(); }
-
-function closeTmuxModal() {
-  $('tmuxOv').classList.add('h');
-  tmuxCleanup();
-}
-
-function tmuxCleanup() {
-  let st = tmuxState;
-  tmuxState = null;
-  if (!st) return;
-  st.cancelled = true;
-}
-
-// Prime a pane's credentials so the probe bg-session can auth, before
-// we've called connectPane. Mirrors the subset connectPane touches.
-function primePaneForProbe(p, opts) {
   p.label = opts.label || '';
-  if (opts.host !== undefined) p.host = opts.host || '';
-  if (opts.port !== undefined) p.port = opts.port || 22;
-  if (opts.user !== undefined) p.user = opts.user || '';
-  if (opts.connection !== undefined) p.connection = opts.connection || null;
-  if (opts.auth !== undefined) p.auth = opts.auth || 'pw';
-  if (opts.password !== undefined) p.password = opts.password || '';
-  if (opts.key !== undefined) p.key = opts.key || '';
-  if (opts.keyPass !== undefined) p.keyPass = opts.keyPass || '';
+  p.host = opts.host || '';
+  p.port = opts.port || 22;
+  p.user = opts.user || '';
+  p.connection = opts.connection || null;
+  p.auth = opts.auth || (opts.key ? 'key' : 'pw');
+  p.password = opts.password || '';
+  p.key = opts.key || '';
+  p.keyPass = opts.keyPass || '';
+  p.persistent = !!opts.persistent;
+  p.slotId = result.slot_id || opts.slotId || null;
+  p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
+  p.sid = result.session_id;
+  p.connectedAt = Date.now();
+  p.recentOutput = '';
+  p.connecting = false;
+  // Deferred save: commitPendingSave writes it to localStorage once the
+  // session has proven healthy for ≥2.5s with no auth failure.
+  if (opts.saveEntry) {
+    let entry = Object.assign({}, opts.saveEntry);
+    entry.persistent = !!p.persistent;
+    if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
+    p.pendingSave = entry;
+  }
+
+  hideReconnectBar(p);
+  hideTmuxBar(p);
+  let labelEl = p.el.querySelector('[data-pane-label]');
+  if (labelEl) labelEl.textContent = p.label;
+  p.term.reset();
+  setTitle(p.label);
+  updatePaneBadge(p);
+
+  // Close the status popup and login form as a single success step.
+  $('tmuxOv').classList.add('h');
+  hideOverlay();
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+  currentConnectRun = null;
+
+  p.term.focus();
+  p.polling = true;
+  p.pollRetries = 0;
+  p.fitAddon.fit();
+  let dims = p.fitAddon.proposeDimensions();
+  let cols = (dims && dims.cols) || p.term.cols;
+  let rows = (dims && dims.rows) || p.term.rows;
+  api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}}).catch(() => {});
+  startKeepalive(p);
+  saveSessions();
+  pollOutput(p);
+}
+
+function cleanupRun(run) {
+  if (run && run.connectSid) {
+    api('disconnect', {body: {session_id: run.connectSid}}).catch(() => {});
+    run.connectSid = null;
+  }
+}
+
+function mapConnectError(err, opts) {
+  let host = (opts && opts.host) || '';
+  let user = (opts && opts.user) || '';
+  if (err && err.kind) {
+    return Object.assign({host, user}, err);
+  }
+  if (err && err.authFailed) {
+    return {kind: 'auth_failed', host, user};
+  }
+  let msg = (err && err.message) || String(err || '');
+  if (/not allowed|not in the allowed list/i.test(msg)) {
+    return {kind: 'policy_deny', host, user, msg};
+  }
+  if (/timeout/i.test(msg)) {
+    return {kind: 'timeout', host, user, msg};
+  }
+  return {kind: 'error', host, user, msg};
+}
+
+// One popup, many states. Only [OK]/[Cancel] (dismissConnectStatus).
+function showConnectStatus(kind, ctx) {
+  let title = $('tmTitle'), sub = $('tmSub'), status = $('tmStatus'), btn = $('tmCancel');
+  let host = ctx.host || 'target';
+  status.textContent = ''; status.className = 'tm-status';
+  btn.classList.remove('h');
+
+  if (kind === 'connecting') {
+    title.textContent = 'Connecting';
+    sub.textContent = ctx.persistent
+      ? 'Connecting to ' + host + ' and checking for tmux…'
+      : 'Connecting to ' + host + '…';
+    btn.textContent = 'Cancel';
+  } else if (kind === 'auth_failed') {
+    title.textContent = 'Authentication failed';
+    sub.textContent = 'Could not log in to ' + host + '.';
+    status.textContent = 'Check your password or key and try again.';
+    status.className = 'tm-status err';
+    btn.textContent = 'OK';
+  } else if (kind === 'no_tmux') {
+    title.textContent = 'tmux not found on ' + host;
+    sub.textContent =
+      'Uncheck "Persistent session" to connect short-lived, then ' +
+      'install tmux on the remote and try again with Persistent on.';
+    btn.textContent = 'OK';
+  } else if (kind === 'probe_unparseable') {
+    title.textContent = 'tmux check failed';
+    sub.textContent =
+      'The tmux probe on ' + host + ' returned no recognisable answer. ' +
+      'Uncheck "Persistent session" to connect short-lived.';
+    btn.textContent = 'OK';
+  } else if (kind === 'policy_deny') {
+    title.textContent = 'Connection not allowed';
+    sub.textContent =
+      "The username '" + (ctx.user || '?') +
+      "' is not authorized to connect to " + host + '.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+    btn.textContent = 'OK';
+  } else if (kind === 'host_down') {
+    title.textContent = 'Host unreachable';
+    sub.textContent = 'Could not reach ' + host + '.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+    btn.textContent = 'OK';
+  } else if (kind === 'timeout') {
+    title.textContent = 'Connection timed out';
+    sub.textContent = 'The connection to ' + host + ' timed out.';
+    btn.textContent = 'OK';
+  } else {
+    title.textContent = 'Connection error';
+    sub.textContent = 'Could not connect to ' + host + '.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+    btn.textContent = 'OK';
+  }
+  $('tmuxOv').classList.remove('h');
+}
+
+// Popup [OK]/[Cancel] handler: cancel the in-flight run (if any) and
+// hide the popup. The login form is never touched by this — it stays
+// open so the user can adjust credentials and retry. If dismissing
+// leaves the user on an empty screen (no panes, form also hidden —
+// happens when auto-connect fails), fall back to the login form so
+// they aren't stranded.
+function dismissConnectStatus() {
+  if (currentConnectRun) {
+    currentConnectRun.cancelled = true;
+    cleanupRun(currentConnectRun);
+    currentConnectRun = null;
+  }
+  $('tmuxOv').classList.add('h');
+  if (!Object.keys(panes).length && $('ov').classList.contains('h')) {
+    overlayMode = 'initial';
+    pendingSplit = null;
+    connectingFor = null;
+    showOverlay();
+  }
 }
 
 // ── UI ──────────────────────────────────────────────────────────────
@@ -1175,7 +1360,6 @@ function renderSaved() {
 
 function connectSaved(c) {
   hideErr();
-  let p = materializeTarget(); if(!p) return;
   let label = c.name||(c.user+'@'+c.host);
   // Auto-match legacy entries (saved before we tagged with connection name)
   // to a config entry by host:port so they still work under restrict_hosts.
@@ -1184,7 +1368,7 @@ function connectSaved(c) {
     let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
     if(m) connName = m.name;
   }
-  connectPane(p, {
+  runConnect({
     label: label,
     host: c.host, port: c.port || 22, user: c.user,
     connection: connName,
@@ -1208,8 +1392,7 @@ function connectByName(name) {
   if(!c) return;
   // Prompt connections need user input — switch the form into locked mode.
   if(c.kind === 'prompt') { selectPromptConnection(name); return; }
-  let p = materializeTarget(); if(!p) return;
-  connectPane(p, {
+  runConnect({
     label: name,
     host: c.host || '', port: c.port || 22, user: c.username || '',
     connection: name,
@@ -1221,7 +1404,6 @@ function connectByName(name) {
 
 function doConnect() {
   hideErr();
-  let p = materializeTarget(); if(!p) return;
   let host=$('iH').value.trim(), port=parseInt($('iP').value)||22, username=$('iU').value.trim();
   let password=authMode==='pw'?$('iPw').value:$('iKeyPw').value;
   let key=authMode==='key'?$('iKey').value.trim():'';
@@ -1255,16 +1437,7 @@ function doConnect() {
   if (selectedPrompt && !$('iName').value.trim()) {
     opts.label = username + '@' + host + ' (' + selectedPrompt.name + ')';
   }
-  // Manual-connect probe gate: persistent panes get a tmux probe first.
-  // Saved / restored panes skip this — they fall back on tmux-bar instead.
-  // If the user previously clicked "Connect short-lived" for this target,
-  // honor that preference and don't probe again.
-  if (wantPersistent) {
-    primePaneForProbe(p, opts);
-    openTmuxModal(p, {opts: opts});
-    return;
-  }
-  connectPane(p, opts);
+  runConnect(opts);
 }
 
 // ── Server config ───────────────────────────────────────────────────
@@ -1902,8 +2075,10 @@ document.addEventListener('keydown', e => {
   if(e.key==='F11'){e.preventDefault();toggleFullscreen()}
   // Ctrl+Tab / Ctrl+Shift+Tab to switch panes
   if(e.ctrlKey&&e.key==='Tab'){e.preventDefault();cyclePanes(e.shiftKey)}
-  // Escape dismisses the login overlay when it's dismissable and is the
-  // topmost visible dialog (don't steal Escape from the tmux modal).
+  // Escape: status popup first (topmost), then the login overlay.
+  if(e.key==='Escape' && !$('tmuxOv').classList.contains('h')){
+    e.preventDefault(); dismissConnectStatus(); return;
+  }
   if(e.key==='Escape' && !$('ov').classList.contains('h')
      && $('tmuxOv').classList.contains('h') && overlayDismissable()){
     e.preventDefault(); cancelConnect();
