@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  backend:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -18,3 +18,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python test_server.py -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install deps
+        working-directory: tests/frontend
+        run: npm install --no-audit --no-fund
+      - name: Run frontend tests
+        working-directory: tests/frontend
+        run: node test_connect.js
