@@ -26,8 +26,7 @@ On shared hosting where you can't run a long-lived process, an optional PHP prox
 ## Highlights
 
 ### 🖥️ Full terminal in the browser
-A real [xterm.js](https://xtermjs.org/) terminal — not a toy. Feels
-like iTerm2 or Terminal.app.
+A real xterm.js terminal — not a toy. Feels like iTerm2 or Terminal.app.
 
 - Split panes, horizontal or vertical, with draggable resize handles
 - Keyboard pane switching (`Ctrl+Tab` / `Ctrl+Shift+Tab`)
@@ -39,6 +38,7 @@ like iTerm2 or Terminal.app.
 Close the tab, reboot, keep your shell. Persistent panes are wrapped
 in a tmux session on the target host — reopen the browser and you're
 back where you left off with scrollback and running processes intact.
+See [Persistent sessions (tmux)](#persistent-sessions-tmux) below.
 
 - Optional per-pane: tick **Persistent session** on connect
 - One-click reconnect when a session drops; red banner on auth fail
@@ -79,7 +79,6 @@ Made to fit where other web terminals can't.
 
 ## Use cases
 
-- **Shared hosting** — no SSH client on the server? Upload 4 files via FTP, open in browser, done.
 - **Corporate networks** — SSH port blocked, but HTTPS is open? websh tunnels SSH through standard HTTPS.
 - **Chromebooks & tablets** — any device with a browser becomes a terminal.
 - **Customer support / managed servers** — give clients browser-based access to their servers without teaching them PuTTY or terminal. Use URL anchors (`#connect=ServerName`) for direct links.
@@ -92,12 +91,13 @@ Made to fit where other web terminals can't.
 ```bash
 git clone https://github.com/dolonet/websh.git
 cd websh
-HOST=0.0.0.0 python3 server.py
+python3 server.py
 ```
 
 Open http://localhost:8765 — that's it. No pip install, no npm, no build step.
 
-Requires Python 3.5+ and `ssh` in your PATH.
+Requires Python 3.5+ and `ssh` in your PATH. The server binds to
+`127.0.0.1` by default; set `HOST=0.0.0.0` to expose it on the LAN.
 
 ## Quick start (shared hosting)
 
@@ -245,6 +245,38 @@ https://your-host/console/#connect=Production
 
 This auto-connects on page load — useful for bookmarks and support links.
 
+## Persistent sessions (tmux)
+
+Tick **Persistent session** on the connect form and the remote shell is
+wrapped in a tmux session on the target host
+(`tmux new-session -A -D -s websh-<slot>`). Close the tab, refresh the
+page, or restart `server.py` — the pane re-attaches to the same session
+with scrollback and running processes intact.
+
+**Requirements.** `tmux` must be installed on the target (any recent
+version). If it isn't, the connect flow surfaces a popup offering to
+fall back to a short-lived (non-persistent) session instead.
+
+**How reattach works.** Each persistent pane stores its slot id in
+browser `localStorage` alongside the connection record. On refresh, the
+frontend re-opens the pane with the same slot id and tmux re-attaches
+you to the existing session. Slot ids are per pane instance — closing
+a pane with `[x]` does not free the slot for reuse.
+
+**Terminating a session.** Clicking `[x]` on a persistent pane pops a
+confirm modal (Cancel / Terminate session / Terminate and never ask
+again). "Terminate" sends `tmux kill-session` on the target before the
+pane closes. If you just close the browser tab without terminating,
+the session stays alive on the target and you can re-attach later.
+
+**Idle-TTL watchdog.** At session creation, a detached POSIX-sh
+watchdog is spawned alongside the shell. It polls tmux and kills the
+session once it has been unattached for `WEBSH_TMUX_IDLE_TTL` seconds
+(default 72 h; `0` disables). The watchdog reparents to init via
+`nohup` and survives `server.py` restarts. Active (attached) sessions
+refresh the clock each poll, so long-running work doesn't get reaped
+just because you had a brief disconnect.
+
 ## Configuration
 
 Environment variables for `server.py`:
@@ -258,6 +290,8 @@ Environment variables for `server.py`:
 | `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
 | `MAX_BG_SESSIONS` | `10` | Max background SSH sessions (file upload/download) |
+| `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
+| `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
 
 The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
 
@@ -284,21 +318,7 @@ HOST=0.0.0.0 python3 server.py
 
 Open `http://your-host:8765/` in a browser. The backend serves `index.html` and
 `websh.js` from the same directory as `server.py`, and handles API requests on
-the same port.
-
-Put nginx or Caddy in front for HTTPS:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name ssh.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8765;
-        proxy_read_timeout 60s;
-    }
-}
-```
+the same port. See [HTTPS via reverse proxy](#https-via-reverse-proxy) below.
 
 ### Docker
 
@@ -307,21 +327,8 @@ docker build -t websh .
 docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh
 ```
 
-Open `http://localhost:8765/` — the backend serves the frontend directly.
-
-For HTTPS, put a reverse proxy in front:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name ssh.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8765;
-        proxy_read_timeout 60s;
-    }
-}
-```
+Open `http://localhost:8765/` — the backend serves the frontend directly. See
+[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
 
 ### systemd
 
@@ -334,6 +341,26 @@ cp server.py index.html websh.js /opt/websh/
 cp websh.service /etc/systemd/system/
 systemctl enable --now websh
 ```
+
+### HTTPS via reverse proxy
+
+Put nginx or Caddy in front for TLS termination:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ssh.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_read_timeout 60s;
+    }
+}
+```
+
+`proxy_read_timeout` must comfortably exceed the long-poll window (30 s). If
+the proxy runs on a different host, add its IP to `TRUSTED_PROXIES` so rate
+limiting uses the real client IP — see [Rate limiting & proxies](#rate-limiting--proxies).
 
 ## Authentication & security
 
@@ -396,15 +423,30 @@ TRUSTED_PROXIES=127.0.0.1,10.0.0.5 python3 server.py
 ## Project structure
 
 ```
-index.html          Frontend — xterm.js terminal + connection UI
-websh.js            Frontend logic — pane management, file transfer, themes
-api.php             PHP proxy — forwards browser requests to backend (optional)
-server.py           Python backend — manages SSH sessions via PTY, serves frontend
-websh.json.example  Example server-side config
-test_server.py      Tests (40 unit + integration tests)
-Dockerfile          Container deployment
-websh.service       systemd unit file
+index.html                Frontend — xterm.js terminal + connection UI
+websh.js                  Frontend logic — pane management, file transfer, themes
+api.php                   PHP proxy — forwards browser requests to backend (optional)
+server.py                 Python backend — manages SSH sessions via PTY, serves frontend
+websh.json.example        Example server-side config
+test_server.py            Backend tests (unit + integration)
+tests/frontend/           jsdom-based frontend tests
+docs/                     Design notes (e.g. auth-fail-detection.md)
+Dockerfile                Container deployment
+websh.service             systemd unit file
+LICENSE                   MIT license
 ```
+
+## Tests
+
+```bash
+# Backend (Python, stdlib only — unittest)
+python3 test_server.py -v
+
+# Frontend (Node 20 + jsdom)
+cd tests/frontend && npm install && npm test
+```
+
+Both suites also run on every PR via GitHub Actions.
 
 ## License
 
