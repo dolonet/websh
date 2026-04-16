@@ -16,7 +16,7 @@ Environment variables:
     MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 10)
     WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
                             on the target before a watchdog kills it
-                            (default: 86400 = 24h, 0 disables)
+                            (default: 259200 = 72h, 0 disables)
     WEBSH_TMUX_WATCHDOG_POLL
                           — seconds between watchdog checks on the target
                             (default: 300; the effective kill window is
@@ -168,7 +168,7 @@ WATCHDOG_POLL_SECONDS = max(5, _int_env("WEBSH_TMUX_WATCHDOG_POLL", "300"))
 
 # Idle TTL for detached tmux sessions on the target (seconds).
 # 0 disables the watchdog — sessions live forever as before.
-TMUX_IDLE_TTL = max(0, _int_env("WEBSH_TMUX_IDLE_TTL", "86400"))
+TMUX_IDLE_TTL = max(0, _int_env("WEBSH_TMUX_IDLE_TTL", "259200"))
 
 
 def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
