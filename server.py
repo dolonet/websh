@@ -17,6 +17,11 @@ Environment variables:
     WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
                             on the target before a watchdog kills it
                             (default: 86400 = 24h, 0 disables)
+    WEBSH_TMUX_WATCHDOG_POLL
+                          — seconds between watchdog checks on the target
+                            (default: 300; the effective kill window is
+                            TTL + POLL in the worst case, so lower this
+                            when testing with a short TTL)
 
 API endpoints:
     POST /api/connect     — start SSH session
@@ -157,8 +162,9 @@ _TMUX_CMD_RE = re.compile(r'^[A-Za-z0-9_./~-]{1,128}$')
 # watchdog.
 
 # How often the watchdog polls (seconds). Resolution of the TTL kill
-# is therefore TTL + WATCHDOG_POLL_SECONDS in the worst case.
-WATCHDOG_POLL_SECONDS = 300
+# is therefore TTL + WATCHDOG_POLL_SECONDS in the worst case. Clamped
+# to >=5 so a misconfigured 0 can't busy-loop the target.
+WATCHDOG_POLL_SECONDS = max(5, _int_env("WEBSH_TMUX_WATCHDOG_POLL", "300"))
 
 # Idle TTL for detached tmux sessions on the target (seconds).
 # 0 disables the watchdog — sessions live forever as before.
@@ -206,7 +212,7 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
           "seen=$(cat " + seenfile + " 2>/dev/null || echo 0); "
           '[ "$seen" -gt "$last" ] && last=$seen; '
           "now=$(date +%s); "
-          "[ $((now - last)) -gt " + str(ttl_seconds) + " ] && { "
+          "[ $((now - last)) -ge " + str(ttl_seconds) + " ] && { "
             + tmux_cmd + " kill-session -t " + tname + "; exit; "
           "}; "
         "done"

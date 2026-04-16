@@ -1044,7 +1044,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         # The watchdog is spawned in the background, then we exec tmux.
         self.assertIn("nohup sh -c", cmd)
         self.assertIn("kill-session -t websh-alice", cmd)
-        self.assertIn("-gt 3600", cmd)  # the TTL comparison
+        self.assertIn("-ge 3600", cmd)  # the TTL comparison
         # Ends with the exec so the login shell doesn't linger.
         self.assertTrue(cmd.rstrip().endswith(
             'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'))
