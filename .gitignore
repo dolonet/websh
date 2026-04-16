@@ -6,3 +6,6 @@ __pycache__/
 *.swo
 *~
 .env
+
+# Local outreach / marketing notes — not part of the project
+outreach/

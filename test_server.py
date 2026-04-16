@@ -370,6 +370,7 @@ class TestHTTPApi(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.httpd.server_close()
         os.environ.pop("WEBSH_CONFIG", None)
         import shutil
         shutil.rmtree(cls.tmpdir)
@@ -544,6 +545,7 @@ class TestPromptConnectHTTP(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.httpd.server_close()
         os.environ.pop("WEBSH_CONFIG", None)
         import shutil
         shutil.rmtree(cls.tmpdir)
@@ -918,6 +920,7 @@ class TestConnectValidation(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.httpd.server_close()
         os.environ.pop("WEBSH_CONFIG", None)
         import shutil
         shutil.rmtree(cls.tmpdir)
@@ -1546,6 +1549,7 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.httpd.server_close()
         os.environ.pop("WEBSH_CONFIG", None)
         import shutil
         shutil.rmtree(cls.tmpdir)
