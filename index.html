@@ -6,6 +6,9 @@
   <title>websh — Lightweight but powerful web terminal</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='3' y='23' font-family='monospace' font-size='20' font-weight='bold' fill='%2358a6ff'>&gt;_</text></svg>">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;700&display=swap">
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{
@@ -164,6 +167,26 @@
     .pane.bell{animation:bellflash .15s}
     @keyframes bellflash{0%,100%{box-shadow:none}50%{box-shadow:inset 0 0 0 2px var(--wn)}}
 
+    /* ── Options panel ── */
+    .opt-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+    .opt-row label{font-size:12px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;flex-shrink:0}
+    .opt-ctl{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end}
+    .opt-ctl input[type=range]{flex:1;max-width:180px;accent-color:var(--ac)}
+    .opt-ctl input[type=number]{width:58px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:4px 6px;font:inherit;font-size:13px;text-align:right}
+    .opt-ctl .opt-val{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--dim);min-width:34px;text-align:right}
+    .opt-preview{margin-top:6px;margin-bottom:16px;border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden}
+    .opt-preview-hd{padding:5px 10px;background:var(--bg);border-bottom:1px solid var(--bd);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+    .opt-preview-body{padding:12px 14px;background:#0d1117;color:#e6edf3;white-space:pre;overflow-x:auto;max-height:200px}
+    [data-theme="light"] .opt-preview-body{background:#f6f8fa;color:#1f2328}
+    .opt-preview .c-green{color:#3fb950}.opt-preview .c-blue{color:#58a6ff}.opt-preview .c-red{color:#ff7b72}
+    .opt-preview .c-yel{color:#e3b341}.opt-preview .c-dim{color:#7d8590}
+    .opt-actions{display:flex;justify-content:space-between;gap:8px;margin-top:8px}
+    .opt-btn{padding:7px 14px;border-radius:6px;border:1px solid var(--bd);background:transparent;color:var(--tx);font-size:13px;cursor:pointer;transition:.15s}
+    .opt-btn:hover{background:rgba(255,255,255,.05);border-color:var(--ac)}
+    .opt-btn.primary{background:var(--ac);border-color:var(--ac);color:#fff}
+    .opt-btn.primary:hover{background:var(--ach);border-color:var(--ach)}
+    [data-theme="light"] .opt-btn:hover{background:rgba(0,0,0,.04)}
+
     /* ── Light theme ── */
     [data-theme="light"]{--bg:#fff;--sf:#f6f8fa;--bd:#d0d7de;--tx:#1f2328;--dim:#656d76;--ac:#0969da;--ach:#0550ae;--dg:#cf222e;--ok:#1a7f37;--wn:#9a6700}
     [data-theme="light"] .xterm{--xterm-bg:#fff}
@@ -183,12 +206,49 @@
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
     <button class="tbtn" onclick="exportTerminal()" title="Export terminal" aria-label="Export terminal">&#x1F4CB;</button>
     <button class="tbtn" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle theme" id="btnTheme">&#x25D1;</button>
+    <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options">&#x2699;</button>
     <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen">&#x26F6;</button>
   </div>
 </div>
 
 <!-- Pane container -->
 <div id="panes"></div>
+
+<!-- Options overlay -->
+<div id="ovOpt" class="ov h" onclick="if(event.target===this)closeOptions()">
+  <div class="panel">
+    <div class="panel-title"><h2>Options</h2><span class="slogan">Terminal appearance</span></div>
+    <div class="opt-row">
+      <label>Font size</label>
+      <div class="opt-ctl">
+        <input type="range" id="optSize" min="8" max="32" step="1">
+        <span class="opt-val" id="optSizeVal"></span>
+      </div>
+    </div>
+    <div class="opt-row">
+      <label>Line height</label>
+      <div class="opt-ctl">
+        <input type="range" id="optLineHeight" min="0.9" max="2" step="0.05">
+        <span class="opt-val" id="optLineHeightVal"></span>
+      </div>
+    </div>
+    <div class="opt-row">
+      <label>Font weight</label>
+      <div class="opt-ctl">
+        <input type="range" id="optWeight" min="100" max="700" step="100">
+        <span class="opt-val" id="optWeightVal"></span>
+      </div>
+    </div>
+    <div class="opt-preview">
+      <div class="opt-preview-hd">Preview</div>
+      <div class="opt-preview-body" id="optPreview"></div>
+    </div>
+    <div class="opt-actions">
+      <button class="opt-btn" onclick="resetOptions()">Reset to defaults</button>
+      <button class="opt-btn primary" onclick="closeOptions()">Done</button>
+    </div>
+  </div>
+</div>
 
 <!-- Connect overlay -->
 <div id="ov" class="ov h">

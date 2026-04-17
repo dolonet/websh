@@ -34,7 +34,22 @@ let connectingFor = null; // pane ID the overlay is connecting for
 let overlayMode = null;
 let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materialize
 let serverConfig = null;
-let fontSize = 14;
+// ── Terminal display settings (size / line-height / weight) ────────
+const SETTINGS_KEY = 'websh_settings';
+const DEFAULT_SETTINGS = { fontSize: 14, lineHeight: 1.0, fontWeight: 400 };
+const FONT_FAMILY = "'JetBrains Mono','Menlo','Monaco','SF Mono','Cascadia Code','Fira Code','Consolas',monospace";
+let settings = loadSettings();
+// Legacy alias: the rest of the code reads `fontSize` directly.
+let fontSize = settings.fontSize;
+function loadSettings() {
+  try {
+    let s = JSON.parse(localStorage.getItem(storageKey(SETTINGS_KEY)) || '{}');
+    return { ...DEFAULT_SETTINGS, ...s };
+  } catch(e) { return { ...DEFAULT_SETTINGS }; }
+}
+function saveSettings() {
+  try { localStorage.setItem(storageKey(SETTINGS_KEY), JSON.stringify(settings)); } catch(e) {}
+}
 const MAX_POLL_RETRIES = 5;
 let authMode = 'pw';
 
@@ -98,8 +113,12 @@ function createPane(container) {
   let fit = new FitAddon.FitAddon();
   let search = new SearchAddon.SearchAddon();
   let term = new Terminal({
-    cursorBlink:true, cursorStyle:'bar', fontSize:fontSize,
-    fontFamily:"'Menlo','Monaco','SF Mono','Cascadia Code','Fira Code','JetBrains Mono','Consolas',monospace",
+    cursorBlink:true, cursorStyle:'bar',
+    fontSize: settings.fontSize,
+    fontFamily: FONT_FAMILY,
+    fontWeight: settings.fontWeight,
+    fontWeightBold: Math.min(900, settings.fontWeight + 300),
+    lineHeight: settings.lineHeight,
     theme: currentTheme(),
     allowProposedApi:true, scrollback:50000
   });
@@ -109,6 +128,18 @@ function createPane(container) {
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
   term.open(termEl);
+  // xterm caches glyph metrics at open() — if a webfont loads later it's
+  // ignored unless we bump fontFamily to force a re-measure.
+  if (document.fonts && document.fonts.load) {
+    Promise.all([
+      document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px 'JetBrains Mono'`)
+    ]).then(() => {
+      let ff = term.options.fontFamily;
+      term.options.fontFamily = 'monospace';
+      term.options.fontFamily = ff;
+      try { fit.fit(); } catch(e){}
+    }).catch(()=>{});
+  }
 
   let p = {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
@@ -1984,11 +2015,84 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Zoom ────────────────────────────────────────────────────────────
-function zoomIn(){fontSize=Math.min(fontSize+2,32);applyZoom()}
-function zoomOut(){fontSize=Math.max(fontSize-2,8);applyZoom()}
-function applyZoom(){
-  Object.keys(panes).forEach(k => {panes[k].term.options.fontSize=fontSize;panes[k].fitAddon.fit()});
+function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings(); }
+function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings(); }
+function applySettings(){
+  Object.keys(panes).forEach(k => {
+    let t = panes[k].term;
+    t.options.fontSize = settings.fontSize;
+    t.options.fontWeight = settings.fontWeight;
+    t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
+    t.options.lineHeight = settings.lineHeight;
+    try { panes[k].fitAddon.fit(); } catch(e){}
+  });
 }
+
+// ── Options dialog ─────────────────────────────────────────────────
+const OPT_PREVIEW = [
+  ['c-dim','$ '],['','ls -la /usr/local/bin | head\n'],
+  ['c-dim','total 248\n'],
+  ['','-rwxr-xr-x 1 root root 12840 Apr 17 09:42 '],['c-green','claude\n'],
+  ['','-rwxr-xr-x 1 root root  8192 Feb 11 12:30 '],['c-green','tmux\n'],
+  ['c-dim','$ '],['','git log --oneline -2\n'],
+  ['c-red','81e8260 '],['','tests: close HTTPServer sockets\n'],
+  ['c-red','eaab909 '],['','README: polish — persistent-sessions docs\n'],
+  ['c-dim','# '],['','illiI1lO0o  {} [] () <> =>  "hello" ~!@#$%^&*\n'],
+  ['c-dim','# '],['','if (x === null) return obj?.value ?? 42;']
+];
+function renderOptPreview(){
+  let el = $('optPreview'); if (!el) return;
+  el.style.fontFamily = FONT_FAMILY;
+  el.style.fontSize = settings.fontSize + 'px';
+  el.style.fontWeight = settings.fontWeight;
+  el.style.lineHeight = settings.lineHeight;
+  el.textContent = '';
+  for (let [cls, txt] of OPT_PREVIEW) {
+    let s = document.createElement('span');
+    if (cls) s.className = cls;
+    s.textContent = txt;
+    el.appendChild(s);
+  }
+}
+function openOptions(){
+  $('optSize').value = settings.fontSize;
+  $('optSizeVal').textContent = settings.fontSize + 'px';
+  $('optLineHeight').value = settings.lineHeight;
+  $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
+  $('optWeight').value = settings.fontWeight;
+  $('optWeightVal').textContent = settings.fontWeight;
+  renderOptPreview();
+  $('ovOpt').classList.remove('h');
+}
+function closeOptions(){ $('ovOpt').classList.add('h'); }
+function resetOptions(){
+  settings = { ...DEFAULT_SETTINGS };
+  fontSize = settings.fontSize;
+  saveSettings();
+  applySettings();
+  openOptions();
+}
+function onOptInput(key, el, valEl, fmt){
+  let v = key === 'lineHeight' ? parseFloat(el.value) : parseInt(el.value, 10);
+  settings[key] = v;
+  if (key === 'fontSize') fontSize = v;
+  valEl.textContent = fmt(v);
+  saveSettings();
+  applySettings();
+  renderOptPreview();
+}
+document.addEventListener('DOMContentLoaded', () => {
+  let s = $('optSize'), sv = $('optSizeVal');
+  let lh = $('optLineHeight'), lhv = $('optLineHeightVal');
+  let w = $('optWeight'), wv = $('optWeightVal');
+  if (!s || !lh || !w) return;
+  s.addEventListener('input', () => onOptInput('fontSize', s, sv, v => v+'px'));
+  lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
+  w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('ovOpt').classList.contains('h')) closeOptions();
+  });
+});
 
 // ── Fullscreen ──────────────────────────────────────────────────────
 function toggleFullscreen(){
