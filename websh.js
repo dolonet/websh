@@ -34,10 +34,24 @@ let connectingFor = null; // pane ID the overlay is connecting for
 let overlayMode = null;
 let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materialize
 let serverConfig = null;
-// ── Terminal display settings (size / line-height / weight) ────────
+// ── Terminal display settings (size / line-height / weight / font) ─
 const SETTINGS_KEY = 'websh_settings';
-const DEFAULT_SETTINGS = { fontSize: 14, lineHeight: 1.0, fontWeight: 400 };
-const FONT_FAMILY = "'JetBrains Mono','Menlo','Monaco','SF Mono','Cascadia Code','Fira Code','Consolas',monospace";
+const DEFAULT_SETTINGS = { fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono' };
+// id → [label, webfont-name-or-null, fallback-stack]
+// webfont-name is the family loaded via Google Fonts; null = system only.
+const FONTS = {
+  'jetbrains-mono': ['JetBrains Mono', 'JetBrains Mono', "'Menlo','Monaco','Consolas',monospace"],
+  'fira-code':      ['Fira Code',      'Fira Code',      "'Menlo','Monaco','Consolas',monospace"],
+  'ibm-plex-mono':  ['IBM Plex Mono',  'IBM Plex Mono',  "'Menlo','Monaco','Consolas',monospace"],
+  'roboto-mono':    ['Roboto Mono',    'Roboto Mono',    "'Menlo','Monaco','Consolas',monospace"],
+  'source-code-pro':['Source Code Pro','Source Code Pro',"'Menlo','Monaco','Consolas',monospace"],
+  'inconsolata':    ['Inconsolata',    'Inconsolata',    "'Menlo','Monaco','Consolas',monospace"],
+  'system':         ['System default', null,             "ui-monospace,'Menlo','Monaco','SF Mono','Cascadia Code','Consolas',monospace"]
+};
+function fontStack(id) {
+  let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
+  return (f[1] ? `'${f[1]}',` : '') + f[2];
+}
 let settings = loadSettings();
 // Legacy alias: the rest of the code reads `fontSize` directly.
 let fontSize = settings.fontSize;
@@ -115,7 +129,7 @@ function createPane(container) {
   let term = new Terminal({
     cursorBlink:true, cursorStyle:'bar',
     fontSize: settings.fontSize,
-    fontFamily: FONT_FAMILY,
+    fontFamily: fontStack(settings.font),
     fontWeight: settings.fontWeight,
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
@@ -128,18 +142,7 @@ function createPane(container) {
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
   term.open(termEl);
-  // xterm caches glyph metrics at open() — if a webfont loads later it's
-  // ignored unless we bump fontFamily to force a re-measure.
-  if (document.fonts && document.fonts.load) {
-    Promise.all([
-      document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px 'JetBrains Mono'`)
-    ]).then(() => {
-      let ff = term.options.fontFamily;
-      term.options.fontFamily = 'monospace';
-      term.options.fontFamily = ff;
-      try { fit.fit(); } catch(e){}
-    }).catch(()=>{});
-  }
+  waitForFontThenRefresh(term, fit);
 
   let p = {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
@@ -2018,14 +2021,31 @@ document.addEventListener('keydown', e => {
 function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings(); }
 function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings(); }
 function applySettings(){
+  let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
     let t = panes[k].term;
     t.options.fontSize = settings.fontSize;
     t.options.fontWeight = settings.fontWeight;
     t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
     t.options.lineHeight = settings.lineHeight;
+    if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
+    waitForFontThenRefresh(t, panes[k].fitAddon);
     try { panes[k].fitAddon.fit(); } catch(e){}
   });
+}
+function waitForFontThenRefresh(term, fit){
+  let f = FONTS[settings.font];
+  let webfont = f && f[1];
+  if (!webfont || !document.fonts || !document.fonts.load) return;
+  document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
+    .then(() => {
+      // xterm caches glyph metrics — bump fontFamily through a throwaway value
+      // to force a re-measure once the webfont has arrived.
+      let ff = term.options.fontFamily;
+      term.options.fontFamily = 'monospace';
+      term.options.fontFamily = ff;
+      try { fit && fit.fit(); } catch(e){}
+    }).catch(()=>{});
 }
 
 // ── Options dialog ─────────────────────────────────────────────────
@@ -2042,7 +2062,7 @@ const OPT_PREVIEW = [
 ];
 function renderOptPreview(){
   let el = $('optPreview'); if (!el) return;
-  el.style.fontFamily = FONT_FAMILY;
+  el.style.fontFamily = fontStack(settings.font);
   el.style.fontSize = settings.fontSize + 'px';
   el.style.fontWeight = settings.fontWeight;
   el.style.lineHeight = settings.lineHeight;
@@ -2055,6 +2075,15 @@ function renderOptPreview(){
   }
 }
 function openOptions(){
+  let sel = $('optFont');
+  if (sel && !sel.options.length) {
+    Object.keys(FONTS).forEach(id => {
+      let o = document.createElement('option');
+      o.value = id; o.textContent = FONTS[id][0];
+      sel.appendChild(o);
+    });
+  }
+  sel.value = settings.font;
   $('optSize').value = settings.fontSize;
   $('optSizeVal').textContent = settings.fontSize + 'px';
   $('optLineHeight').value = settings.lineHeight;
@@ -2085,10 +2114,12 @@ document.addEventListener('DOMContentLoaded', () => {
   let s = $('optSize'), sv = $('optSizeVal');
   let lh = $('optLineHeight'), lhv = $('optLineHeightVal');
   let w = $('optWeight'), wv = $('optWeightVal');
-  if (!s || !lh || !w) return;
+  let f = $('optFont');
+  if (!s || !lh || !w || !f) return;
   s.addEventListener('input', () => onOptInput('fontSize', s, sv, v => v+'px'));
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
+  f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !$('ovOpt').classList.contains('h')) closeOptions();
   });

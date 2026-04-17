@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;700&family=Fira+Code:wght@300;400;500;700&family=IBM+Plex+Mono:wght@100;200;300;400;500;700&family=Roboto+Mono:wght@100;200;300;400;500;700&family=Source+Code+Pro:wght@200;300;400;500;700&family=Inconsolata:wght@200;300;400;700&display=swap">
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{
@@ -173,6 +173,8 @@
     .opt-ctl{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end}
     .opt-ctl input[type=range]{flex:1;max-width:180px;accent-color:var(--ac)}
     .opt-ctl input[type=number]{width:58px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:4px 6px;font:inherit;font-size:13px;text-align:right}
+    .opt-select{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font:inherit;font-size:13px;cursor:pointer;min-width:180px}
+    .opt-select:focus{outline:none;border-color:var(--ac)}
     .opt-ctl .opt-val{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--dim);min-width:34px;text-align:right}
     .opt-preview{margin-top:6px;margin-bottom:16px;border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden}
     .opt-preview-hd{padding:5px 10px;background:var(--bg);border-bottom:1px solid var(--bd);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
@@ -218,6 +220,12 @@
 <div id="ovOpt" class="ov h" onclick="if(event.target===this)closeOptions()">
   <div class="panel">
     <div class="panel-title"><h2>Options</h2><span class="slogan">Terminal appearance</span></div>
+    <div class="opt-row">
+      <label>Font family</label>
+      <div class="opt-ctl">
+        <select id="optFont" class="opt-select"></select>
+      </div>
+    </div>
     <div class="opt-row">
       <label>Font size</label>
       <div class="opt-ctl">
