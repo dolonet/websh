@@ -33,6 +33,9 @@ A real xterm.js terminal — not a toy. Feels like iTerm2 or Terminal.app.
 - Search scrollback (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`)
 - Copy-on-select, right-click paste
 - Dark and light themes, persisted
+- Customizable font family, size, line height, and weight (⚙ icon) with
+  live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono,
+  Source Code Pro, Inconsolata, or system default
 
 ### 🔁 Sessions that survive
 Close the tab, reboot, keep your shell. Persistent panes are wrapped
