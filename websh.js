@@ -607,11 +607,34 @@ function clearSavedSessions() {
 // ── Export terminal ─────────────────────────────────────────────────
 function exportTerminal() {
   let p = panes[activeId]; if (!p) return;
+  let filename = (p.label || 'terminal') + '.txt';
+  // Persistent panes run inside tmux, which keeps its own scrollback —
+  // xterm.js only sees the alt-screen, so its buffers are useless for
+  // export. Pull the real buffer over the ControlMaster side-channel.
+  if (p.persistent && p.sid) {
+    let url = `${API}?action=tmux_capture&session_id=${encodeURIComponent(p.sid)}`;
+    fetch(url).then(r => {
+      if (!r.ok) {
+        return r.json().catch(() => ({error: 'capture failed'}))
+          .then(j => Promise.reject(j.error || 'capture failed'));
+      }
+      return r.text();
+    }).then(text => {
+      // tmux capture-pane keeps trailing blank lines; trim them off so
+      // the file ends at the last real output.
+      text = text.replace(/\n+$/, '') + '\n';
+      saveTextAs(filename, text);
+    }).catch(err => {
+      console.warn('tmux capture failed, falling back to xterm buffer:', err);
+      saveTextAs(filename, dumpXtermBuffers(p));
+    });
+    return;
+  }
+  saveTextAs(filename, dumpXtermBuffers(p));
+}
+
+function dumpXtermBuffers(p) {
   let lines = [];
-  // Normal buffer holds the full scrollback (~50k lines); the alternate
-  // buffer (vim/less/htop) is only the visible screen. Take both: the
-  // full history, then — if the user is currently in an alt-screen app —
-  // the live visible content too, so the export is a complete record.
   let dump = (buf) => {
     if (!buf) return;
     for (let i = 0; i < buf.length; i++) {
@@ -626,11 +649,14 @@ function exportTerminal() {
     dump(p.term.buffer.alternate);
   }
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  let text = lines.join('\n') + '\n';
+  return lines.join('\n') + '\n';
+}
+
+function saveTextAs(filename, text) {
   let blob = new Blob([text], {type: 'text/plain'});
   let a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = (p.label || 'terminal') + '.txt';
+  a.download = filename;
   document.body.appendChild(a); a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(a.href);

@@ -832,6 +832,39 @@ class SSHSession(object):
         except OSError:
             pass
 
+    def tmux_capture(self):
+        """Capture the full tmux pane buffer (scrollback + visible) over
+        the ControlMaster channel. Only meaningful for persistent
+        sessions — xterm.js can't see tmux's own scrollback. Returns
+        (bytes, error)."""
+        if not self.persistent or not self.slot_id:
+            return None, "not a persistent session"
+        if not self._control_path or not os.path.exists(self._control_path):
+            return None, "control socket not ready"
+        # `-S -` reads from the very start of history, `-J` joins lines that
+        # tmux had wrapped to fit the pane width, `-p` prints to stdout.
+        # tmux_cmd and slot_id are pre-validated regex-restricted strings,
+        # safe to inline.
+        tname = "websh-" + self.slot_id
+        remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S - -t " + tname)
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(
+                ssh_cmd, capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return None, "tmux capture timeout"
+        except Exception as e:
+            return None, "ssh error: " + str(e)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()[:300]
+            return None, "tmux exit %d: %s" % (proc.returncode, err)
+        return proc.stdout, None
+
     def upload_file(self, rel_path, body_stream, length,
                     timeout=UPLOAD_TIMEOUT):
         """Stream `length` bytes from body_stream into $HOME/<rel_path> on the
@@ -1066,6 +1099,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(config_public())
         elif action == "ping":
             self._json({"ok": True, "version": __version__})
+        elif action == "tmux_capture":
+            self._tmux_capture()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1308,6 +1343,31 @@ class Handler(BaseHTTPRequestHandler):
         rows = clamp(body.get("rows"), MIN_ROWS, MAX_ROWS, 24)
         session.resize(cols, rows)
         self._json({"ok": True})
+
+    def _tmux_capture(self):
+        """GET /api/tmux_capture?session_id=...
+        Returns the full tmux pane buffer as text/plain; only valid for
+        persistent sessions."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+        data, err = session.tmux_capture()
+        if err:
+            self._json({"error": err}, 502)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _upload(self):
         """POST /api/upload?session_id=...&path=<rel_name>
