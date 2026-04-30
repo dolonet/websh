@@ -1563,9 +1563,7 @@ function renderServerConnections() {
   if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h')}
 }
 
-// ── File upload (background SSH session) ────────────────────────────
-const SLICE_SIZE = 32768; // 32KB file slices
-
+// ── File upload (binary stream via SSH ControlMaster) ───────────────
 function delay(ms) { return new Promise(r => { setTimeout(r, ms); }); }
 
 function bgSend(u, data) {
@@ -1593,42 +1591,23 @@ function handleUpload(id, input) {
   p.upload = {
     files:files, fileIndex:0, cancelled:false,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
-    bgSid:null, currentFile:null
+    currentFile:null, currentTmp:null, xhr:null
   };
   showUploadProgress(p);
   updatePaneBadge(p);
-
-  // Create background SSH session with same credentials (no tmux wrap).
-  let body = buildConnectBody(paneRecord(p), 80, 24);
-  delete body.persistent; delete body.slot_id;
-  body.background = true;
-  api('connect', {body: body}).then(r => {
-    if (!p.upload || p.upload.cancelled) return;
-    if (r.error || r.alive === false) { finishUpload(p, false); return; }
-    p.upload.bgSid = r.session_id;
-    // Wait for SSH to fully connect
-    return delay(2000);
-  }).then(() => {
-    if (!p.upload || p.upload.cancelled) return;
-    // Drain initial output (MOTD etc) so it doesn't interfere
-    return api('output', {query: '&session_id=' + p.upload.bgSid});
-  }).then(() => {
-    if (!p.upload || p.upload.cancelled) return;
-    uploadNextFile(p);
-  }).catch(() => { finishUpload(p, false); });
+  uploadNextFile(p);
 }
 
 // Encode filename as base64 to avoid ANY shell injection
 function safeShellName(name) { return btoa(unescape(encodeURIComponent(name))); }
 
-function makeRenamCmd(name) {
-  // Shell command: mv tmp → final, with auto-increment if final exists.
-  // All filenames base64-encoded to prevent injection.
-  let b64 = safeShellName(name);
-  let b64tmp = safeShellName('.' + name + '.websh.tmp');
-  // Decode names into shell vars, then increment if needed, then mv
-  return `t="$(echo ${b64tmp} | base64 -d)"; ` +
-    `f="$(echo ${b64} | base64 -d)"; ` +
+// Move uploaded tmp file from $HOME → cwd of foreground shell, with
+// auto-increment if a file with that name already exists.
+function makeUploadMvCmd(finalName, tmpName) {
+  let bf = safeShellName(finalName);
+  let bt = safeShellName(tmpName);
+  return `t="$HOME/$(echo ${bt} | base64 -d)"; ` +
+    `f="$(echo ${bf} | base64 -d)"; ` +
     'b="${f%.*}"; e="${f##*.}"; ' +
     'if [ "$b.$e" = "$f" ]; then ' +
       'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; ' +
@@ -1643,65 +1622,51 @@ function uploadNextFile(p) {
   if (!u || u.cancelled) return;
   if (u.fileIndex >= u.files.length) { finishUpload(p, true); return; }
   let file = u.files[u.fileIndex];
-  u.fileOffset = 0;
   u.fileSize = file.size;
+  u.fileOffset = 0;
   u.currentFile = file.name;
-  u.currentTmp = '.' + file.name + '.websh.tmp';
+  // Random tmp name in $HOME — avoids collisions and makes cleanup easy.
+  u.currentTmp = '.websh-tmp-' +
+    Math.random().toString(36).slice(2, 12) + '-' +
+    Date.now().toString(36);
 
-  let b64tmp = safeShellName(u.currentTmp);
-  // Start base64 decode into temp file (filename base64-encoded — injection-safe)
-  bgSend(u, `base64 -d > "$(echo ${b64tmp} | base64 -d)"\n`).then(() => {
+  let xhr = new XMLHttpRequest();
+  u.xhr = xhr;
+  let url = `${API}?action=upload` +
+    `&session_id=${encodeURIComponent(p.sid)}` +
+    `&path=${encodeURIComponent(u.currentTmp)}`;
+  xhr.open('POST', url, true);
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
-    return delay(50);
-  }).then(() => {
-    sendNextSlice(p, file);
-  }).catch(() => { finishUpload(p, false); });
-}
-
-function sendNextSlice(p, file) {
-  let u = p.upload;
-  if (!u || u.cancelled || !u.bgSid) return;
-
-  if (u.fileOffset >= file.size) {
-    // Send Ctrl+D to end base64, rename tmp → final, move to next file
-    bgSend(u, '\x04').then(() => {
-      return delay(50);
-    }).then(() => {
-      // Rename tmp → final (auto-increments if file already exists)
-      return bgSend(u, makeRenamCmd(u.currentFile));
-    }).then(() => {
-      u.sentBytes += file.size;
-      u.fileIndex++;
-      u.currentFile = null;
-      u.currentTmp = null;
-      updateUploadProgress(p);
-      return delay(100);
-    }).then(() => {
-      uploadNextFile(p);
-    }).catch(() => { finishUpload(p, false); });
-    return;
-  }
-
-  let end = Math.min(u.fileOffset + SLICE_SIZE, file.size);
-  let slice = file.slice(u.fileOffset, end);
-  let reader = new FileReader();
-  reader.onload = e => {
-    if (!u || u.cancelled) return;
-    let bytes = new Uint8Array(e.target.result);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    let b64 = btoa(binary);
-    let lines = '';
-    for (let j = 0; j < b64.length; j += 76) lines += b64.substring(j, j + 76) + '\n';
-    bgSend(u, lines).then(() => {
-      if (!u || u.cancelled) return;
-      u.fileOffset = end;
-      updateUploadProgress(p);
-      sendNextSlice(p, file);
-    }).catch(() => { finishUpload(p, false); });
+    u.fileOffset = e.loaded;
+    updateUploadProgress(p);
   };
-  reader.onerror = () => { finishUpload(p, false); };
-  reader.readAsArrayBuffer(slice);
+  xhr.onload = () => {
+    if (!u || u.cancelled) return;
+    let resp = null;
+    try { resp = JSON.parse(xhr.responseText); } catch(e) {}
+    if (xhr.status !== 200 || !resp || !resp.ok) {
+      finishUpload(p, false); return;
+    }
+    // Move tmp from $HOME → cwd of the foreground shell session.
+    api('input', { body: { session_id: p.sid,
+                           data: makeUploadMvCmd(u.currentFile, u.currentTmp) } })
+      .then(() => {
+        if (!u || u.cancelled) return;
+        u.sentBytes += file.size;
+        u.fileOffset = 0;
+        u.fileIndex++;
+        u.currentFile = null;
+        u.currentTmp = null;
+        u.xhr = null;
+        updateUploadProgress(p);
+        uploadNextFile(p);
+      })
+      .catch(() => { finishUpload(p, false); });
+  };
+  xhr.onerror = () => { if (u && !u.cancelled) finishUpload(p, false); };
+  xhr.send(file);
 }
 
 function showUploadProgress(p) {
@@ -1740,7 +1705,9 @@ function updateUploadProgress(p) {
 }
 
 function closeUploadSession(u) {
-  if (u && u.bgSid) {
+  if (!u) return;
+  if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
+  if (u.bgSid) {
     api('disconnect', {body: {session_id: u.bgSid}}).catch(() => {});
     u.bgSid = null;
   }
@@ -1775,21 +1742,16 @@ function cancelUpload(id) {
   let p = panes[id];
   if (!p || !p.upload) return;
   let u = p.upload;
-  let fileName = u.currentFile;
-  u.cancelled = true;
-
-  // Abort base64, delete temp file, close background session
   let tmpName = u.currentTmp;
-  if (u.bgSid) {
-    bgSend(u, '\x03\n').then(() => {
-      if (tmpName) { let b=safeShellName(tmpName); return bgSend(u, `rm -f "$(echo ${b} | base64 -d)"\n`); }
-    }).then(() => {
-      return delay(100);
-    }).then(() => {
-      closeUploadSession(u);
-    }).catch(() => {
-      closeUploadSession(u);
-    });
+  u.cancelled = true;
+  if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
+  // Best-effort cleanup of the partial $HOME/<tmp> file via the
+  // foreground shell.
+  if (tmpName) {
+    let bt = safeShellName(tmpName);
+    api('input', { body: { session_id: p.sid,
+                           data: `rm -f "$HOME/$(echo ${bt} | base64 -d)"\n` } })
+      .catch(() => {});
   }
 
   let el = p.el.querySelector('[data-upload-progress]');

@@ -29,6 +29,7 @@ API endpoints:
     GET  /api/output      — long-poll for terminal output
     POST /api/resize      — resize terminal
     POST /api/disconnect  — close session
+    POST /api/upload      — stream a file body to $HOME/<path> on remote
     GET  /api/config      — return server-side config (without secrets)
     GET  /api/ping        — health check
 """
@@ -70,6 +71,10 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "10")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "10")
+# Hard cap on a single binary upload via /api/upload (bytes).
+MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
+# How long a single upload may take before we kill the side-channel ssh.
+UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
 
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
@@ -453,15 +458,13 @@ class SSHSession(object):
         self._username = username
 
         # Per-session ssh ControlPath. Opened by the master ssh process
-        # (see _spawn) when persistent; a second `ssh -S <path> ...`
-        # invocation piggybacks on the same authenticated channel to
-        # run tmux kill-session without re-entering credentials and
-        # without depending on the user's tmux prefix.
-        self._control_path = None
-        if self.persistent:
-            self._control_path = os.path.join(
-                tempfile.gettempdir(),
-                "websh-mux-{}.sock".format(self.id.replace("-", "")[:16]))
+        # (see _spawn). A second `ssh -S <path> ...` invocation
+        # piggybacks on the same authenticated channel — used for
+        # tmux kill-session in persistent sessions and for binary
+        # file uploads (cat > $HOME/...) without PTY overhead.
+        self._control_path = os.path.join(
+            tempfile.gettempdir(),
+            "websh-mux-{}.sock".format(self.id.replace("-", "")[:16]))
 
         if key:
             self._key_file = self._write_key(key)
@@ -506,21 +509,22 @@ class SSHSession(object):
             "-l", username,
         ]
 
+        # ControlMaster on every session: the master ssh owns this socket,
+        # later `ssh -S <sock> <host> ...` invocations piggyback on the
+        # same authenticated channel (tmux kill-session for persistent;
+        # binary file uploads for any session). ControlPersist=no ties the
+        # socket lifetime to the master so no orphaned masters survive.
+        # Placed before user ssh_options so our values win (ssh uses
+        # first-wins semantics for -o).
+        ssh_cmd.extend([
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=" + self._control_path,
+            "-o", "ControlPersist=no",
+        ])
         if self.persistent:
             # Force remote TTY allocation — required when ssh has a trailing
             # remote command (default is no TTY, but tmux needs one).
             ssh_cmd.insert(1, "-tt")
-            # ControlMaster: this ssh is the master; a later
-            # `ssh -S <sock> <host> tmux kill-session ...` reuses the
-            # already-authenticated channel. ControlPersist=no means the
-            # socket dies with the master process (no orphaned masters).
-            # Placed before user ssh_options so our values win (ssh uses
-            # first-wins semantics for -o).
-            ssh_cmd.extend([
-                "-o", "ControlMaster=auto",
-                "-o", "ControlPath=" + self._control_path,
-                "-o", "ControlPersist=no",
-            ])
 
         if self._key_file:
             ssh_cmd.extend(["-i", self._key_file])
@@ -782,6 +786,87 @@ class SSHSession(object):
         except OSError:
             pass
 
+    def upload_file(self, rel_path, body_stream, length,
+                    timeout=UPLOAD_TIMEOUT):
+        """Stream `length` bytes from body_stream into $HOME/<rel_path> on the
+        remote host, riding on the existing ControlMaster channel — so no
+        re-auth and no PTY overhead. Returns (ok, error)."""
+        if not self.alive:
+            return False, "session is dead"
+        if not self._control_path or not os.path.exists(self._control_path):
+            return False, "control socket not ready"
+
+        # rel_path is base64-encoded and decoded inside the remote shell so
+        # it can never be parsed as shell metacharacters even if we got it
+        # wrong upstream.
+        b64name = base64.b64encode(
+            rel_path.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'n="$(printf %s ' + b64name + ' | base64 -d)" && '
+            'cat > "$HOME/$n"'
+        )
+
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        proc = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        BUF = 256 * 1024
+        remaining = length
+        deadline = time.time() + max(60, timeout)
+        try:
+            while remaining > 0:
+                if time.time() > deadline:
+                    raise IOError("upload timeout")
+                chunk = body_stream.read(min(BUF, remaining))
+                if not chunk:
+                    break
+                proc.stdin.write(chunk)
+                remaining -= len(chunk)
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return False, "stream error: " + str(e)
+
+        try:
+            proc.wait(timeout=max(60, timeout))
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False, "ssh side-channel timeout"
+
+        if proc.returncode != 0:
+            err = b""
+            try:
+                err = proc.stderr.read() or b""
+            except Exception:
+                pass
+            msg = err.decode("utf-8", "replace").strip()[:300]
+            return False, "ssh exit %d: %s" % (proc.returncode, msg)
+        if remaining > 0:
+            return False, "client sent fewer bytes than Content-Length"
+        return True, ""
+
     def close(self):
         self.alive = False
         try:
@@ -917,6 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
             self._resize()
         elif action == "disconnect":
             self._disconnect()
+        elif action == "upload":
+            self._upload()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1173,6 +1260,52 @@ class Handler(BaseHTTPRequestHandler):
         rows = clamp(body.get("rows"), MIN_ROWS, MAX_ROWS, 24)
         session.resize(cols, rows)
         self._json({"ok": True})
+
+    def _upload(self):
+        """POST /api/upload?session_id=...&path=<rel_name>
+        Body = raw file bytes. The file lands at $HOME/<rel_name> on the
+        remote host through the ControlMaster side-channel (binary, no
+        PTY, no base64). Path is interpreted relative to $HOME so the
+        client can't escape the user's account; we still reject `..`."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        rel_path = params.get("path", [""])[0]
+
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        if (not rel_path or len(rel_path) > 4096
+                or rel_path.startswith("/")
+                or ".." in rel_path.split("/")):
+            self._json({"error": "invalid path"}, 400)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._json({"error": "empty body"}, 400)
+            return
+        if length > MAX_UPLOAD_SIZE:
+            self._json({"error": "file too large"}, 413)
+            return
+
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        ok, err = session.upload_file(rel_path, self.rfile, length)
+        if not ok:
+            _log("WARN", "upload failed sid={} path={} err={}".format(
+                sid, rel_path, err))
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"ok": True, "bytes": length, "path": "$HOME/" + rel_path})
 
     def _disconnect(self):
         try:
