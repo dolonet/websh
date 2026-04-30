@@ -594,13 +594,24 @@ function clearSavedSessions() {
 // ── Export terminal ─────────────────────────────────────────────────
 function exportTerminal() {
   let p = panes[activeId]; if (!p) return;
-  let buf = p.term.buffer.active;
   let lines = [];
-  for (let i = 0; i <= buf.length - 1; i++) {
-    let line = buf.getLine(i);
-    if (line) lines.push(line.translateToString(true));
+  // Normal buffer holds the full scrollback (~50k lines); the alternate
+  // buffer (vim/less/htop) is only the visible screen. Take both: the
+  // full history, then — if the user is currently in an alt-screen app —
+  // the live visible content too, so the export is a complete record.
+  let dump = (buf) => {
+    if (!buf) return;
+    for (let i = 0; i < buf.length; i++) {
+      let line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+  };
+  dump(p.term.buffer.normal);
+  if (p.term.buffer.active.type === 'alternate') {
+    lines.push('');
+    lines.push('─── alternate screen ───');
+    dump(p.term.buffer.alternate);
   }
-  // Trim trailing empty lines
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   let text = lines.join('\n') + '\n';
   let blob = new Blob([text], {type: 'text/plain'});
