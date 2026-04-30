@@ -36,7 +36,13 @@ let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materi
 let serverConfig = null;
 // ── Terminal display settings (size / line-height / weight / font) ─
 const SETTINGS_KEY = 'websh_settings';
-const DEFAULT_SETTINGS = { fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono' };
+const DEFAULT_SETTINGS = {
+  fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono',
+  // tmux options sent on /api/connect when persistent. Defaults give a
+  // sensible "wheel scrolls" UX out of the box; users on hosts with their
+  // own .tmux.conf can uncheck them to fall back to that file.
+  tmuxMouse: true, tmuxClipboard: true, tmuxHistory: 100000
+};
 // id → [label, webfont-name-or-null, fallback-stack]
 // webfont-name is the family loaded via Google Fonts; null = system only.
 const FONTS = {
@@ -499,6 +505,13 @@ function buildConnectBody(rec, termCols, termRows) {
   if (rec.persistent) {
     b.persistent = true;
     b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
+    // tmux options from local settings, applied on every connect/resume.
+    // Server validates against an allow-list, so unexpected values are
+    // dropped silently rather than fail the connect.
+    b.tmux_mouse = !!settings.tmuxMouse;
+    b.tmux_set_clipboard = !!settings.tmuxClipboard;
+    let hl = parseInt(settings.tmuxHistory, 10);
+    if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
   }
   if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
   return b;
@@ -2063,6 +2076,9 @@ function openOptions(){
   $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
   $('optWeight').value = settings.fontWeight;
   $('optWeightVal').textContent = settings.fontWeight;
+  let cm = $('optTmuxMouse'); if (cm) cm.checked = !!settings.tmuxMouse;
+  let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
+  let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
   renderOptPreview();
   $('ovOpt').classList.remove('h');
 }
@@ -2093,10 +2109,42 @@ document.addEventListener('DOMContentLoaded', () => {
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
   f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
+  let cm = $('optTmuxMouse'), cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
+  if (cm) cm.addEventListener('change', () => { settings.tmuxMouse = cm.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
+  if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
+  if (ch) ch.addEventListener('change', () => {
+    let v = parseInt(ch.value, 10);
+    if (!Number.isFinite(v) || v < 100) v = DEFAULT_SETTINGS.tmuxHistory;
+    settings.tmuxHistory = v; ch.value = v; saveSettings();
+    pushTmuxOptionsToActiveSessions();
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !$('ovOpt').classList.contains('h')) closeOptions();
   });
 });
+
+// Ship the current tmux toggles into every running persistent pane so
+// the change takes effect immediately (no reconnect). We pipe the
+// `tmux set -g …` lines through the active shell — fast, no RTT cost,
+// and it lands in the same tmux server the pane is attached to.
+function pushTmuxOptionsToActiveSessions() {
+  let lines = [];
+  lines.push('tmux set -g mouse ' + (settings.tmuxMouse ? 'on' : 'off'));
+  lines.push('tmux set -g set-clipboard ' + (settings.tmuxClipboard ? 'on' : 'off'));
+  let hl = parseInt(settings.tmuxHistory, 10);
+  if (Number.isFinite(hl) && hl >= 100) {
+    lines.push('tmux set -g history-limit ' + hl);
+  }
+  // Wrap in a sub-shell so the commands don't appear in the user's
+  // visible prompt history (`{ … ; } >/dev/null 2>&1` keeps stdout/err
+  // off the screen but tmux still applies the options).
+  let payload = '{ ' + lines.join('; ') + '; } >/dev/null 2>&1\n';
+  Object.keys(panes).forEach(k => {
+    let p = panes[k];
+    if (!p || !p.sid || !p.persistent) return;
+    api('input', { body: { session_id: p.sid, data: payload } }).catch(() => {});
+  });
+}
 
 // ── Fullscreen ──────────────────────────────────────────────────────
 function toggleFullscreen(){

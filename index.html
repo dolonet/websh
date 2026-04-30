@@ -170,6 +170,9 @@
     /* ── Options panel ── */
     .opt-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
     .opt-row label{font-size:12px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;flex-shrink:0}
+    .opt-section-hd{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin:18px 0 10px;padding-top:14px;border-top:1px solid var(--bd)}
+    .opt-ctl input[type=checkbox]{accent-color:var(--ac);width:16px;height:16px;cursor:pointer;margin:0}
+    .opt-hint{font-size:11px;color:var(--dim);margin-top:-8px;margin-bottom:14px;line-height:1.4}
     .opt-ctl{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end}
     .opt-ctl input[type=range]{flex:1;max-width:180px;accent-color:var(--ac)}
     .opt-ctl input[type=number]{width:58px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:4px 6px;font:inherit;font-size:13px;text-align:right}
@@ -251,6 +254,29 @@
       <div class="opt-preview-hd">Preview</div>
       <div class="opt-preview-body" id="optPreview"></div>
     </div>
+    <div class="opt-section-hd">Persistent (tmux) sessions</div>
+    <div class="opt-row">
+      <label>Mouse</label>
+      <div class="opt-ctl">
+        <input type="checkbox" id="optTmuxMouse">
+      </div>
+    </div>
+    <div class="opt-hint">Wheel scrolls scrollback in shell; alt-screen apps (vim/htop) get mouse events. Hold Shift to select text for the browser clipboard.</div>
+    <div class="opt-row">
+      <label>Auto-copy</label>
+      <div class="opt-ctl">
+        <input type="checkbox" id="optTmuxClipboard">
+      </div>
+    </div>
+    <div class="opt-hint">Send tmux selections to the system clipboard via OSC52.</div>
+    <div class="opt-row">
+      <label>Scrollback</label>
+      <div class="opt-ctl">
+        <input type="number" id="optTmuxHistory" min="100" max="10000000" step="1000" style="width:120px">
+        <span class="opt-val">lines</span>
+      </div>
+    </div>
+    <div class="opt-hint">Lines tmux retains per pane. Applies on next connect.</div>
     <div class="opt-actions">
       <button class="opt-btn" onclick="resetOptions()">Reset to defaults</button>
       <button class="opt-btn primary" onclick="closeOptions()">Done</button>

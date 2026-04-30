@@ -177,6 +177,7 @@ TMUX_IDLE_TTL = max(0, _int_env("WEBSH_TMUX_IDLE_TTL", "259200"))
 
 
 def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
+                          tmux_options=None,
                           poll_seconds=WATCHDOG_POLL_SECONDS):
     """Shell command sent via ssh to create-or-attach the websh-<slot>
     tmux session on the target.
@@ -195,6 +196,14 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     tname = "websh-" + slot_id
     attach = (tmux_cmd + " new-session -A -D -s " + tname
               + ' -- "$SHELL" -l')
+    # Per-connect tmux options. Tuples are pre-validated against an
+    # allow-list (see _validate_tmux_options) so direct interpolation
+    # below is shell- and tmux-injection-safe. `\;` chains commands in
+    # the same tmux invocation so options apply to the global server
+    # state regardless of whether the session was newly created or
+    # re-attached via -A.
+    for opt, val in (tmux_options or ()):
+        attach += " \\; set -g " + opt + " " + val
     if ttl_seconds <= 0:
         return "exec " + attach
 
@@ -236,6 +245,40 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
         "nohup sh -c '" + body + "' >/dev/null 2>&1 </dev/null &\n"
         "exec " + attach
     )
+
+
+# tmux options the client may request per session. Strict allow-list:
+# any value not listed here is rejected, so the strings end up
+# interpolated into the tmux command line without escaping risk.
+_TMUX_BOOL_OPTS = ("mouse", "set-clipboard")
+_TMUX_INT_OPTS = (("history-limit", 100, 10_000_000),)
+
+
+def _validate_tmux_options(body):
+    """Build a list of (opt, val) tuples from a /api/connect body, dropping
+    anything that doesn't match the allow-list. Each value comes back as a
+    pre-formatted string ready for `tmux set -g <opt> <val>`."""
+    out = []
+    for opt in _TMUX_BOOL_OPTS:
+        key = "tmux_" + opt.replace("-", "_")
+        if key not in body:
+            continue
+        v = body.get(key)
+        if v is True or v == "on" or v == 1:
+            out.append((opt, "on"))
+        elif v is False or v == "off" or v == 0:
+            out.append((opt, "off"))
+    for opt, lo, hi in _TMUX_INT_OPTS:
+        key = "tmux_" + opt.replace("-", "_")
+        if key not in body:
+            continue
+        try:
+            iv = int(body.get(key))
+        except (TypeError, ValueError):
+            continue
+        if lo <= iv <= hi:
+            out.append((opt, str(iv)))
+    return out
 
 # Static file serving (Python-only mode, without PHP proxy)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -423,7 +466,8 @@ class SSHSession(object):
 
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
-                 persistent=False, slot_id=None, tmux_cmd="tmux"):
+                 persistent=False, slot_id=None, tmux_cmd="tmux",
+                 tmux_options=None):
         self.id = session_id
         self.master_fd = None
         self.pid = None
@@ -450,6 +494,7 @@ class SSHSession(object):
         self.persistent = bool(persistent and slot_id)
         self.slot_id = slot_id if self.persistent else None
         self.tmux_cmd = tmux_cmd if _TMUX_CMD_RE.match(tmux_cmd or "") else "tmux"
+        self._tmux_options = list(tmux_options or ())
 
         # Connection coordinates kept for the ControlMaster side-channel
         # (see terminate_remote_tmux). Only used in the persistent path.
@@ -543,7 +588,8 @@ class SSHSession(object):
             # watchdog that reaps the session after TTL seconds idle.
             # slot_id + tmux_cmd are validated so no escaping needed.
             ssh_cmd.append(_build_remote_command(
-                self.slot_id, self.tmux_cmd, TMUX_IDLE_TTL))
+                self.slot_id, self.tmux_cmd, TMUX_IDLE_TTL,
+                tmux_options=self._tmux_options))
 
         pid, fd = pty.fork()
         if pid == 0:
@@ -1072,6 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _TMUX_CMD_RE.match(tmux_cmd):
             self._json({"error": "invalid tmux_cmd"}, 400)
             return
+        tmux_options = _validate_tmux_options(body) if persistent else []
 
         # Resolve credentials: by config connection name, or from request body
         conn_name = body.get("connection", "").strip()
@@ -1158,6 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
                 persistent=persistent,
                 slot_id=slot_id,
                 tmux_cmd=tmux_cmd,
+                tmux_options=tmux_options,
             )
             with sessions_lock:
                 sessions[sid] = session
