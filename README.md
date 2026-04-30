@@ -52,10 +52,16 @@ See [Persistent sessions (tmux)](#persistent-sessions-tmux) below.
 ### 📁 File transfer in the terminal
 No `scp` dance. Move files without leaving the browser.
 
-- **Upload** — pick files, they stream up over a background SSH session
-  (atomic writes, auto-increment on name conflicts)
+- **Upload** — pick files, the browser streams the bytes verbatim through
+  a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>` with no
+  PTY, no base64, single HTTP POST per file). The active shell then
+  `mv`s the temp into your current directory with auto-increment on
+  name conflicts. Native xhr.upload progress, multi-file queue, cancel
+  mid-flight.
 - **Download** — select a filename in the terminal, click download
-- **Export scrollback** — save the current terminal buffer as a text file
+- **Export scrollback** — save the current terminal buffer as a text
+  file. In persistent panes the export pulls the real tmux scrollback
+  via `tmux capture-pane`, not just what xterm.js currently shows.
 
 ### 🔐 Flexible connection management
 From free-form "type a host and go" to strictly allowlisted
@@ -279,6 +285,25 @@ session once it has been unattached for `WEBSH_TMUX_IDLE_TTL` seconds
 `nohup` and survives `server.py` restarts. Active (attached) sessions
 refresh the clock each poll, so long-running work doesn't get reaped
 just because you had a brief disconnect.
+
+**Per-connect tmux options (Options panel).** Three toggles in the
+Options panel ride along on every persistent connect via
+`tmux new-session … \; set -g …` and are also pushed into running
+panes the moment you change them, so the new behaviour takes effect
+without a reconnect:
+
+- **Mouse** — wheel scrolls tmux scrollback in shell; alt-screen
+  apps (vim, less, htop) get raw mouse events. Hold Shift to bypass
+  tmux selection and use the browser's native text selection instead.
+- **Auto-copy** — `set-clipboard on`. tmux copy-mode selections are
+  pushed to the system clipboard via OSC52 (xterm.js ships them on).
+- **Scrollback** — `history-limit` (default 100 000). How many lines
+  per pane tmux retains.
+
+The server accepts these only via a fixed allow-list (`mouse`,
+`set-clipboard`, `history-limit` clamped to 100..10 M); anything else
+is silently dropped, so an out-of-date or hostile client can't
+inject extra `set -g` lines.
 
 ## Configuration
 

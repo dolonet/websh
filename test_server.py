@@ -1131,6 +1131,119 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("ok", "tmux", 3600)
         self.assertIn("has-session -t websh-ok 2>/dev/null || exit", cmd)
 
+    def test_tmux_options_chained_after_new_session(self):
+        """Per-connect tmux options are tacked onto the same `tmux …`
+        invocation via `\\;`, so they apply to the global tmux server
+        whether the session was newly created or re-attached."""
+        cmd = server._build_remote_command(
+            "ok", "tmux", 0,
+            tmux_options=[("mouse", "on"), ("set-clipboard", "on"),
+                          ("history-limit", "100000")])
+        self.assertIn(
+            'new-session -A -D -s websh-ok -- "$SHELL" -l'
+            ' \\; set -g mouse on'
+            ' \\; set -g set-clipboard on'
+            ' \\; set -g history-limit 100000',
+            cmd)
+
+    def test_tmux_options_none_leaves_command_unchanged(self):
+        baseline = server._build_remote_command("ok", "tmux", 0)
+        self.assertEqual(
+            server._build_remote_command("ok", "tmux", 0, tmux_options=None),
+            baseline)
+        self.assertEqual(
+            server._build_remote_command("ok", "tmux", 0, tmux_options=[]),
+            baseline)
+
+    def test_tmux_options_sh_syntax_valid_with_ttl(self):
+        ok, err = self._sh_syntax_ok(server._build_remote_command(
+            "ok", "tmux", 86400,
+            tmux_options=[("mouse", "off"), ("history-limit", "50000")]))
+        self.assertTrue(ok, "sh -n rejected with tmux_options: " + err)
+
+
+# ── _validate_tmux_options ─────────────────────────────────────────────
+
+class TestValidateTmuxOptions(unittest.TestCase):
+    """The /api/connect body is untrusted — only the keys/values listed
+    in _TMUX_BOOL_OPTS / _TMUX_INT_OPTS may flow into the tmux command,
+    and only with values that pass the type/range checks. Everything
+    else must be silently dropped (we don't want to fail a connect over
+    a stale toggle from a future client)."""
+
+    def test_bool_true_becomes_on(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_mouse": True}),
+            [("mouse", "on")])
+
+    def test_bool_false_becomes_off(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_mouse": False}),
+            [("mouse", "off")])
+
+    def test_bool_string_on_off(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_set_clipboard": "on"}),
+            [("set-clipboard", "on")])
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_set_clipboard": "off"}),
+            [("set-clipboard", "off")])
+
+    def test_bool_garbage_dropped(self):
+        # 'true', 2, None — none of these match the allow-list
+        for v in ("true", 2, None, "yes", [], {}):
+            self.assertEqual(
+                server._validate_tmux_options({"tmux_mouse": v}), [],
+                "value %r should have been dropped" % (v,))
+
+    def test_history_limit_in_range(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": 100000}),
+            [("history-limit", "100000")])
+
+    def test_history_limit_string_int_accepted(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": "5000"}),
+            [("history-limit", "5000")])
+
+    def test_history_limit_below_min_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": 50}), [])
+
+    def test_history_limit_above_max_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options(
+                {"tmux_history_limit": 99_999_999}),
+            [])
+
+    def test_history_limit_non_numeric_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options(
+                {"tmux_history_limit": "lots"}),
+            [])
+
+    def test_unknown_keys_ignored(self):
+        body = {
+            "tmux_evil": "rm -rf /",
+            "tmux_status": "on",  # not on the allow-list
+            "host": "ignored",
+            "tmux_mouse": True,
+        }
+        self.assertEqual(
+            server._validate_tmux_options(body), [("mouse", "on")])
+
+    def test_combined_body(self):
+        body = {
+            "tmux_mouse": True,
+            "tmux_set_clipboard": False,
+            "tmux_history_limit": 200000,
+        }
+        self.assertEqual(
+            server._validate_tmux_options(body),
+            [("mouse", "on"),
+             ("set-clipboard", "off"),
+             ("history-limit", "200000")])
+
 
 # Fake tmux used by TestWatchdogRuntime — simulates has-session,
 # display, kill-session, new-session using a files-on-disk state
