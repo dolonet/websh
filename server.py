@@ -501,7 +501,8 @@ class SSHSession(object):
         self._tmux_options = list(tmux_options or ())
 
         # Connection coordinates kept for the ControlMaster side-channel
-        # (see terminate_remote_tmux). Only used in the persistent path.
+        # (re-used by upload_file, finalize_upload, remove_remote_tmp,
+        # push_tmux_options, tmux_capture, terminate_remote_tmux).
         self._host = host
         self._port = port
         self._username = username
@@ -978,6 +979,10 @@ class SSHSession(object):
                 proc.kill()
             except Exception:
                 pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
             return False, "ssh side-channel timeout"
 
         if proc.returncode != 0:
@@ -1036,7 +1041,10 @@ class SSHSession(object):
             'if [ "$b.$e" = "$f" ]; then '
                 'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; '
             'else '
-                'n=1; while [ -e "$f" ]; do f="$f($n)"; n=$((n+1)); done; '
+                # Strip any prior "(n)" before appending the next one so
+                # repeated collisions on an extension-less name produce
+                # name(1), name(2), name(3) — not name(1)(2)(3).
+                'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; '
             'fi; '
             'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
         )

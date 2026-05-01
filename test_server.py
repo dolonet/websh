@@ -2026,6 +2026,37 @@ class TestFinalizeUpload(unittest.TestCase):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_no_extension_increment_strips_prior_suffix(self):
+        """Regression: the no-extension branch of the auto-increment
+        loop must strip a prior `(n)` before appending the next one,
+        matching the JS client's makeUploadMvCmd. Otherwise repeated
+        collisions on a name like `Makefile` produce `Makefile(1)(2)(3)`
+        instead of `Makefile(1)`, `Makefile(2)`, `Makefile(3)`."""
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            captured = {}
+            def fake_run(cmd, **kw):
+                captured["remote"] = cmd[-1]
+                class R:
+                    returncode = 0
+                    stdout = b""
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.finalize_upload("tmp", "Makefile")
+            remote = captured["remote"]
+            # The fixed pattern uses ${f%(*)} to drop any prior `(n)`
+            # before appending the new one.
+            self.assertIn('${f%(*)}($n)', remote)
+            # The buggy pattern f="$f($n)" must not be present.
+            self.assertNotIn('f="$f($n)"', remote)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestRemoveRemoteTmp(unittest.TestCase):
     """Direct unit tests for SSHSession.remove_remote_tmp() — the

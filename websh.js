@@ -1671,7 +1671,10 @@ function makeUploadMvCmd(finalName, tmpName) {
     'else ' +
       'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; ' +
     'fi; ' +
-    'mv "$t" "$f"\n';
+    // `--` plus `./` keep mv from parsing the destination as a flag if
+    // the user uploaded a file whose name starts with `-`. Mirrors the
+    // server-side finalize_upload path.
+    'mv -- "$t" "./$f"\n';
 }
 
 // After bytes have landed at $HOME/<tmp>, move them into the user's
