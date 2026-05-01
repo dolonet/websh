@@ -2668,5 +2668,297 @@ class TestEndToEndPersistent(unittest.TestCase):
             session.close()
 
 
+class TestListDir(unittest.TestCase):
+    """Unit tests for SSHSession.list_dir()."""
+
+    def _fake_session(self, control_path=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-ls"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def test_no_socket_errors(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        entries, path, err = s.list_dir("~")
+        self.assertIsNone(entries)
+        self.assertIn("control socket", err)
+
+    def test_parses_entries_and_path(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        stdout = (
+            "PWD:/home/alice\n"
+            "d\t4096\t1700000000\tdocs\n"
+            "f\t12345\t1700000001\tfile.txt\n"
+            "l\t0\t1700000002\tlink\n"
+        ).encode()
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = stdout
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", return_value=result):
+            entries, abs_path, err = s.list_dir("~")
+        self.assertIsNone(err)
+        self.assertEqual(abs_path, "/home/alice")
+        # dirs sorted before files
+        self.assertEqual(entries[0]["name"], "docs")
+        self.assertEqual(entries[0]["type"], "d")
+        self.assertEqual(entries[1]["name"], "file.txt")
+        self.assertEqual(entries[1]["size"], 12345)
+        self.assertEqual(entries[2]["type"], "l")
+
+    def test_nonzero_exit_returns_error(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        result = unittest.mock.MagicMock()
+        result.returncode = 1
+        result.stdout = b""
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", return_value=result):
+            entries, path, err = s.list_dir("/nonexistent")
+        self.assertIsNone(entries)
+        self.assertIsNotNone(err)
+
+    def test_timeout_returns_error(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run",
+                                 side_effect=subprocess.TimeoutExpired("ssh", 10)):
+            entries, path, err = s.list_dir("~")
+        self.assertIsNone(entries)
+        self.assertEqual(err, "timeout")
+
+    def test_dirs_sorted_before_files(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        stdout = (
+            "PWD:/home/alice\n"
+            "f\t100\t1700000000\taardvark.txt\n"
+            "d\t4096\t1700000000\tzebra_dir\n"
+            "f\t200\t1700000000\tbeta.py\n"
+        ).encode()
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = stdout
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", return_value=result):
+            entries, _, err = s.list_dir("~")
+        self.assertIsNone(err)
+        self.assertEqual(entries[0]["type"], "d")
+        self.assertEqual(entries[1]["type"], "f")
+        self.assertEqual(entries[2]["type"], "f")
+
+
+class TestDownloadFile(unittest.TestCase):
+    """Unit tests for SSHSession.download_file()."""
+
+    def _fake_session(self, control_path=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-dl"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def test_no_socket_errors(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        proc, err = s.download_file("/home/alice/file.txt")
+        self.assertIsNone(proc)
+        self.assertIn("control socket", err)
+
+    def test_returns_popen_on_success(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        fake_proc = unittest.mock.MagicMock()
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.Popen", return_value=fake_proc):
+            proc, err = s.download_file("/home/alice/file.txt")
+        self.assertIsNone(err)
+        self.assertIs(proc, fake_proc)
+
+    def test_popen_exception_returns_error(self):
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.Popen",
+                                 side_effect=OSError("no ssh")):
+            proc, err = s.download_file("/home/alice/file.txt")
+        self.assertIsNone(proc)
+        self.assertIn("no ssh", err)
+
+
+class TestLsHTTPDispatch(unittest.TestCase):
+    """HTTP-level tests for GET /api/ls."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18781
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _get(self, qs):
+        from urllib.request import urlopen
+        url = "http://127.0.0.1:{}/api/ls?{}".format(self.port, qs)
+        try:
+            with urlopen(url) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            if hasattr(e, 'read'):
+                return json.loads(e.read())
+            raise
+
+    def test_invalid_session_404(self):
+        r = self._get("session_id=not-a-uuid")
+        self.assertIn("error", r)
+
+    def test_nul_in_path_400(self):
+        from urllib.parse import quote
+        r = self._get("session_id={}&path={}".format(
+            str(uuid.uuid4()), quote("dir\x00bad")))
+        self.assertIn("error", r)
+
+    def test_unknown_session_id_404(self):
+        r = self._get("session_id=" + str(uuid.uuid4()))
+        self.assertIn("error", r)
+
+    def test_ls_dispatches_to_session(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.list_dir.return_value = (
+            [{"name": "file.txt", "type": "f", "size": 42, "mtime": 0}],
+            "/home/alice",
+            None,
+        )
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._get("session_id={}&path=~".format(sid))
+        self.assertEqual(r["path"], "/home/alice")
+        self.assertEqual(len(r["entries"]), 1)
+        self.assertEqual(r["entries"][0]["name"], "file.txt")
+
+    def test_session_error_propagated_502(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.list_dir.return_value = (None, None, "control socket not ready")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._get("session_id={}".format(sid))
+        self.assertIn("error", r)
+
+
+class TestDownloadHTTPDispatch(unittest.TestCase):
+    """HTTP-level tests for GET /api/download."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18782
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _url(self, qs):
+        return "http://127.0.0.1:{}/api/download?{}".format(self.port, qs)
+
+    def _get_json(self, qs):
+        from urllib.request import urlopen
+        try:
+            with urlopen(self._url(qs)) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            if hasattr(e, 'read'):
+                return json.loads(e.read())
+            raise
+
+    def test_invalid_session_404(self):
+        r = self._get_json("session_id=not-a-uuid&path=/etc/hosts")
+        self.assertIn("error", r)
+
+    def test_missing_path_400(self):
+        r = self._get_json("session_id=" + str(uuid.uuid4()))
+        self.assertIn("error", r)
+
+    def test_nul_in_path_400(self):
+        from urllib.parse import quote
+        r = self._get_json("session_id={}&path={}".format(
+            str(uuid.uuid4()), quote("/home/alice/bad\x00.txt")))
+        self.assertIn("error", r)
+
+    def test_unknown_session_404(self):
+        r = self._get_json("session_id={}&path=/tmp/x".format(str(uuid.uuid4())))
+        self.assertIn("error", r)
+
+    def test_file_not_found_returns_error(self):
+        sid = str(uuid.uuid4())
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout.read.side_effect = [b"E", b"R", b"R", b"\t",
+                                              b"F", b"i", b"l", b"e",
+                                              b" ", b"n", b"o", b"t",
+                                              b" ", b"f", b"o", b"u",
+                                              b"n", b"d", b"\n"]
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._get_json("session_id={}&path=/tmp/missing.txt".format(sid))
+        self.assertIn("error", r)
+
+    def test_successful_download_streams_binary(self):
+        from urllib.request import urlopen
+        sid = str(uuid.uuid4())
+        payload = b"hello world binary\x00\xff"
+        # Header: "OK\t<size>\n" then payload
+        header = "OK\t{}\n".format(len(payload)).encode()
+        all_bytes = header + payload
+        pos = [0]
+        def read_one(_=None):
+            if pos[0] >= len(all_bytes):
+                return b""
+            b = all_bytes[pos[0]:pos[0]+1]
+            pos[0] += 1
+            return b
+        # bulk read for the file body
+        def read_bulk(n):
+            chunk = all_bytes[pos[0]:pos[0]+n]
+            pos[0] += len(chunk)
+            return chunk
+        fake_proc = unittest.mock.MagicMock()
+        # read(1) calls consume header byte by byte; read(BUF) reads body
+        fake_proc.stdout.read.side_effect = (
+            [bytes([b]) for b in header[:-1]] +  # all header bytes except \n
+            [b"\n"] +                              # \n terminates header
+            [payload, b""]                         # body then EOF
+        )
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            url = self._url("session_id={}&path=/tmp/file.bin".format(sid))
+            with urlopen(url) as resp:
+                self.assertEqual(resp.headers.get("Content-Disposition"),
+                                 "attachment; filename*=UTF-8''file.bin")
+                body = resp.read()
+        self.assertEqual(body, payload)
+
+
 if __name__ == "__main__":
     unittest.main()

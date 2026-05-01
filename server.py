@@ -1097,6 +1097,101 @@ class SSHSession(object):
             return False, "rm exit %d" % proc.returncode
         return True, ""
 
+    def list_dir(self, remote_path):
+        """List a directory via the ControlMaster side-channel.
+        remote_path may be absolute, ~, ~/sub, or relative-to-$HOME.
+        Returns (entries, abs_path, error_string)."""
+        if not self._control_path or not os.path.exists(self._control_path):
+            return None, None, "control socket not ready"
+
+        b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            'case "$P" in '
+              '/*) D="$P";; '
+              '"~") D="$HOME";; '
+              '"~/"*) D="$HOME/${P#~/}";; '
+              '*) D="$HOME/$P";; '
+            'esac; '
+            'cd "$D" 2>/dev/null || exit 1; '
+            'printf "PWD:%s\\n" "$(pwd)"; '
+            'find . -maxdepth 1 ! -name . '
+            '-printf "%y\\t%s\\t%Ts\\t%f\\n" 2>/dev/null'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return None, None, "timeout"
+        except Exception as e:
+            return None, None, str(e)
+        if result.returncode != 0:
+            return None, None, "directory not found"
+
+        entries = []
+        abs_path = remote_path
+        for line in result.stdout.decode("utf-8", "replace").split("\n"):
+            if line.startswith("PWD:"):
+                abs_path = line[4:].strip()
+                continue
+            parts = line.split("\t", 3)
+            if len(parts) != 4 or not parts[3]:
+                continue
+            ftype, size_s, mtime_s, name = parts
+            entries.append({
+                "name": name,
+                "type": ftype,
+                "size": int(size_s) if size_s.isdigit() else 0,
+                "mtime": int(mtime_s) if mtime_s.isdigit() else 0,
+            })
+        entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
+        return entries, abs_path, None
+
+    def download_file(self, remote_path):
+        """Stream a file via ControlMaster. Returns (Popen, error).
+        Subprocess stdout starts with a header "OK\\t<size>\\n" or
+        "ERR\\t<msg>\\n" so the caller can detect failure before
+        sending HTTP response headers."""
+        if not self._control_path or not os.path.exists(self._control_path):
+            return None, "control socket not ready"
+
+        b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            'case "$P" in '
+              '/*) F="$P";; '
+              '"~") F="$HOME";; '
+              '"~/"*) F="$HOME/${P#~/}";; '
+              '*) F="$HOME/$P";; '
+            'esac; '
+            'if [ -f "$F" ]; then '
+              'SZ=$(stat -c%s "$F" 2>/dev/null || stat -f%z "$F" 2>/dev/null || printf -- -1); '
+              'printf "OK\\t%s\\n" "$SZ"; '
+              'cat -- "$F"; '
+            'else printf "ERR\\tFile not found\\n"; fi'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            return proc, None
+        except Exception as e:
+            return None, str(e)
+
     def close(self):
         self.alive = False
         try:
@@ -1258,6 +1353,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "version": __version__})
         elif action == "tmux_capture":
             self._tmux_capture()
+        elif action == "ls":
+            self._ls()
+        elif action == "download":
+            self._download()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1686,6 +1785,117 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
         self._json({"ok": True})
+
+    def _ls(self):
+        """GET /api/ls?session_id=<sid>&path=<path>
+        List a remote directory via ControlMaster. path defaults to ~."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        path = params.get("path", ["~"])[0] or "~"
+
+        if "\x00" in path:
+            self._json({"error": "invalid path"}, 400)
+            return
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        entries, abs_path, err = session.list_dir(path)
+        if err:
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"path": abs_path, "entries": entries})
+
+    def _download(self):
+        """GET /api/download?session_id=<sid>&path=<path>
+        Stream a file via ControlMaster (binary, no base64)."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        path = params.get("path", [""])[0]
+
+        if not path or "\x00" in path:
+            self._json({"error": "invalid path"}, 400)
+            return
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        proc, err = session.download_file(path)
+        if err:
+            self._json({"error": err}, 502)
+            return
+
+        # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
+        header_line = b""
+        try:
+            while True:
+                c = proc.stdout.read(1)
+                if not c or c == b"\n":
+                    break
+                header_line += c
+        except Exception:
+            proc.kill()
+            self._json({"error": "download failed"}, 502)
+            return
+
+        parts = header_line.decode("utf-8", "replace").split("\t", 1)
+        if not parts or parts[0] != "OK":
+            proc.kill()
+            msg = parts[1].strip() if len(parts) > 1 else "download failed"
+            self._json({"error": msg}, 404)
+            return
+
+        filename = path.rsplit("/", 1)[-1] or "download"
+        safe_name = urllib.parse.quote(filename, safe="")
+        content_length = None
+        if len(parts) > 1:
+            sz_str = parts[1].strip().lstrip("-")
+            if sz_str.isdigit():
+                sz = int(parts[1].strip())
+                if sz >= 0:
+                    content_length = sz
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header(
+            "Content-Disposition",
+            "attachment; filename*=UTF-8''" + safe_name,
+        )
+        if content_length is not None:
+            self.send_header("Content-Length", str(content_length))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        try:
+            BUF = 256 * 1024
+            while True:
+                chunk = proc.stdout.read(BUF)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        session.last_activity = time.time()
 
     def _disconnect(self):
         try:

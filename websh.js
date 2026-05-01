@@ -360,7 +360,7 @@ function _destroyPane(id, terminate) {
   if (!p) return;
   // Cancel active transfers
   if (p.upload) { p.upload.cancelled = true; closeUploadSession(p.upload); }
-  if (p.download) { p.download.cancelled = true; if(p.download.bgSid) api('disconnect',{body:{session_id:p.download.bgSid}}).catch(() => {}); }
+  if (p.download) { p.download.cancelled = true; if (p.download.abort) p.download.abort(); }
   // Disconnect main session
   if (p.sid) {
     p.polling = false;
@@ -1620,11 +1620,6 @@ function bgSend(u, data) {
   if (!u || !u.bgSid) return Promise.reject(new Error('no background session'));
   return api('input', { body: { session_id: u.bgSid, data: data } });
 }
-function bgDlSend(p, data) {
-  if (!p.download || !p.download.bgSid) return Promise.reject(new Error('no background session'));
-  return api('input', { body: { session_id: p.download.bgSid, data: data } });
-}
-
 function triggerUpload(id) {
   let p = panes[id];
   if (!p || !p.sid || p.upload || (!p.host && !p.connection)) return;
@@ -1889,148 +1884,72 @@ function cancelTransfer(id) {
   else if (p && p.download) cancelDownload(id);
 }
 
-// ── File download (background SSH session) ─────────────────────────
+// ── File download ────────────────────────────────────────────────────
 function triggerDownload(id) {
   let p = panes[id];
   if (!p || !p.sid || p.upload || p.download || (!p.host && !p.connection)) return;
-  // Use terminal selection as filename, or prompt
-  let sel = (p.term.getSelection() || '').trim().replace(/^['"]|['"]$/g, '');
-  if (sel && sel.indexOf('\n') === -1 && sel.length < 256) {
-    startDownload(p, sel);
-  } else {
-    let name = prompt('Filename to download:');
-    if (name && name.trim()) startDownload(p, name.trim());
-  }
+  showFileBrowser(id);
 }
 
-function startDownload(p, filename) {
-  let b64name = safeShellName(filename);
-  let sf = `"$(echo ${b64name} | base64 -d)"`; // injection-safe shell ref
-  p.download = { cancelled: false, bgSid: null, filename: filename, b64: '', expectedSize: 0 };
+function startFastDownload(id, path) {
+  let p = panes[id];
+  if (!p || !p.sid || p.upload || p.download) return;
+  let filename = path.split('/').pop() || 'download';
+  let ctrl = new AbortController();
+  p.download = {cancelled: false, filename: filename, abort: () => ctrl.abort()};
   showUploadProgress(p);
   updatePaneBadge(p);
 
-  // Create background session (no tmux wrap).
-  let body = buildConnectBody(paneRecord(p), 80, 24);
-  delete body.persistent; delete body.slot_id;
-  body.background = true;
-  api('connect', {body: body}).then(r => {
-    if (!p.download || p.download.cancelled) return;
-    if (r.error || r.alive === false) { finishDownload(p, false); return; }
-    p.download.bgSid = r.session_id;
-    // Wait for SSH + MOTD, then send base64 command with error marker
-    // No separate stat step — just try base64 and detect failure via marker
-    return delay(3000);
-  }).then(() => {
-    if (!p.download || p.download.cancelled) return;
-    // Drain all MOTD output before sending command
-    function drain() {
-      return api('output', {query: '&session_id=' + p.download.bgSid}).then(r => {
-        if (r && r.data && atob(r.data).length > 0) return delay(200).then(drain);
-      });
-    }
-    return drain();
-  }).then(() => {
-    if (!p.download || p.download.cancelled) return;
-    // Disable echo so our command doesn't appear in output
-    return bgDlSend(p, 'stty -echo\n');
-  }).then(() => {
-    return delay(200);
-  }).then(() => {
-    if (!p.download || p.download.cancelled) return;
-    return bgDlSend(p, `base64 ${sf} 2>/dev/null && echo WEBSH_DL_DONE || echo WEBSH_DL_ERR\n`);
-  }).then(() => {
-    if (!p.download || p.download.cancelled) return;
-    pollDownload(p);
-  }).catch(() => { finishDownload(p, false); });
-}
-
-const MAX_DOWNLOAD_B64 = 50 * 1024 * 1024; // ~37MB file limit
-
-function pollDownload(p) {
-  let dl = p.download;
-  if (!dl || dl.cancelled || !dl.bgSid) return;
-  api('output', {query: '&session_id=' + dl.bgSid}).then(r => {
-    if (!dl || dl.cancelled) return;
-    if (r.data) {
-      let chunk = atob(r.data);
-      dl.b64 += chunk;
-      if (dl.b64.length > MAX_DOWNLOAD_B64) { finishDownload(p, false, 'File too large'); return; }
-
-      // Check for error (file not found)
-      if (dl.b64.indexOf('WEBSH_DL_ERR') !== -1) { finishDownload(p, false, 'File not found'); return; }
-
-      // Check if done — extract only the base64 content (skip MOTD/prompts)
-      let doneIdx = dl.b64.indexOf('WEBSH_DL_DONE');
-      if (doneIdx !== -1) {
-        // base64 output is pure [A-Za-z0-9+/=\n] — extract it
-        let raw = dl.b64.substring(0, doneIdx);
-        // Find start of actual base64 (after MOTD/prompt) — look for first long base64 line
-        let lines = raw.split('\n');
-        let b64lines = [];
-        for (let i = 0; i < lines.length; i++) {
-          let line = lines[i].trim();
-          if (line && /^[A-Za-z0-9+/=]+$/.test(line)) b64lines.push(line);
-        }
-        dl.b64 = b64lines.join('');
-        saveDownload(p);
-        return;
+  let url = API + '?action=download&session_id=' + encodeURIComponent(p.sid) +
+            '&path=' + encodeURIComponent(path);
+  fetch(url, {signal: ctrl.signal})
+    .then(resp => {
+      if (!resp.ok) {
+        return resp.json().then(e => { throw new Error(e.error || 'failed'); });
       }
-      updateDownloadProgress(p);
-    }
-    if (r.alive === false) { finishDownload(p, false); return; }
-    pollDownload(p);
-  }).catch(() => {
-    finishDownload(p, false);
-  });
-}
-
-function updateDownloadProgress(p) {
-  let dl = p.download;
-  if (!dl) return;
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (!el) return;
-  let bar = el.querySelector('.upload-progress-bar');
-  // Indeterminate: pulse between 20-80% based on data received
-  let kb = Math.round(dl.b64.length / 1024);
-  let pulse = 20 + (Math.sin(Date.now() / 500) + 1) * 30;
-  bar.style.width = pulse + '%';
-  bar.style.opacity = '0.7';
-  el.querySelector('.upload-progress-text').textContent = dl.filename + ' (' + kb + ' KB)';
-}
-
-function saveDownload(p) {
-  let dl = p.download;
-  if (!dl) return;
-  try {
-    // Decode base64 — remove any whitespace/newlines
-    let clean = dl.b64.replace(/\s/g, '');
-    let binary = atob(clean);
-    let bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    let blob = new Blob([bytes], {type: 'application/octet-stream'});
-    let a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = dl.filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
-    finishDownload(p, true);
-  } catch(e) {
-    finishDownload(p, false, 'Decode error');
-  }
+      let total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+      let chunks = [], received = 0;
+      let reader = resp.body.getReader();
+      function pump() {
+        return reader.read().then(({done, value}) => {
+          if (done) return;
+          if (!p.download || p.download.cancelled) { reader.cancel(); return; }
+          chunks.push(value);
+          received += value.length;
+          let el = p.el && p.el.querySelector('[data-upload-progress]');
+          if (el) {
+            let pct = total > 0 ? Math.round(received / total * 100) : 30;
+            el.querySelector('.upload-progress-bar').style.width = pct + '%';
+            let sz = received < 1048576
+              ? Math.round(received / 1024) + ' KB'
+              : (received / 1048576).toFixed(1) + ' MB';
+            el.querySelector('.upload-progress-text').textContent = filename + ' (' + sz + ')';
+          }
+          return pump();
+        });
+      }
+      return pump().then(() => {
+        let blob = new Blob(chunks, {type: 'application/octet-stream'});
+        let a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+        finishDownload(p, true);
+      });
+    })
+    .catch(e => {
+      if (p.download && !p.download.cancelled)
+        finishDownload(p, false, e.message || 'download failed');
+    });
 }
 
 function finishDownload(p, success, msg) {
   let dl = p.download;
   if (!dl) return;
   dl.cancelled = true;
-  if (dl.bgSid) {
-    api('disconnect', {body: {session_id: dl.bgSid}}).catch(() => {});
-    dl.bgSid = null;
-  }
-  let el = p.el.querySelector('[data-upload-progress]');
+  let el = p.el && p.el.querySelector('[data-upload-progress]');
   if (el) {
     let bar = el.querySelector('.upload-progress-bar');
     let text = el.querySelector('.upload-progress-text');
@@ -2054,11 +1973,8 @@ function cancelDownload(id) {
   let p = panes[id];
   if (!p || !p.download) return;
   p.download.cancelled = true;
-  if (p.download.bgSid) {
-    api('disconnect', {body: {session_id: p.download.bgSid}}).catch(() => {});
-    p.download.bgSid = null;
-  }
-  let el = p.el.querySelector('[data-upload-progress]');
+  if (p.download.abort) p.download.abort();
+  let el = p.el && p.el.querySelector('[data-upload-progress]');
   if (el) {
     el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
     el.querySelector('.upload-progress-text').textContent = 'Cancelled';
@@ -2069,6 +1985,108 @@ function cancelDownload(id) {
     updatePaneBadge(p);
     if (el) el.querySelector('.upload-progress-bar').style.background = '';
   }, 2000);
+}
+
+// ── File browser ─────────────────────────────────────────────────────
+let _fbId = null;
+
+function showFileBrowser(id) {
+  let p = panes[id];
+  if (!p || !p.sid) return;
+  _fbId = id;
+  $('fbManual').value = '';
+  $('fbOv').classList.remove('h');
+  loadFbDir('~');
+}
+
+function closeFb() {
+  $('fbOv').classList.add('h');
+  _fbId = null;
+}
+
+function fbUp() {
+  let cur = $('fbPath').textContent;
+  if (!cur || cur === '/') return;
+  let parent = cur.lastIndexOf('/') > 0 ? cur.substring(0, cur.lastIndexOf('/')) : '/';
+  loadFbDir(parent);
+}
+
+function loadFbDir(path) {
+  let p = _fbId && panes[_fbId];
+  if (!p) return;
+  let list = $('fbList');
+  list.innerHTML = '<div class="fb-msg">Loading…</div>';
+  $('fbPath').textContent = path;
+  fetch(API + '?action=ls&session_id=' + encodeURIComponent(p.sid) +
+        '&path=' + encodeURIComponent(path))
+    .then(r => r.json())
+    .then(r => {
+      if (r.error) {
+        list.innerHTML = '<div class="fb-msg err">' + esc(r.error) + '</div>';
+        return;
+      }
+      $('fbPath').textContent = r.path;
+      renderFbEntries(r.entries, r.path);
+    })
+    .catch(() => {
+      list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+    });
+}
+
+function renderFbEntries(entries, absPath) {
+  let list = $('fbList');
+  list.innerHTML = '';
+  if (absPath !== '/') {
+    let parent = absPath.lastIndexOf('/') > 0
+      ? absPath.substring(0, absPath.lastIndexOf('/')) : '/';
+    let row = makeFbRow('d', '..', null);
+    row.addEventListener('click', () => loadFbDir(parent));
+    list.appendChild(row);
+  }
+  for (let e of entries) {
+    let fullPath = absPath.endsWith('/') ? absPath + e.name : absPath + '/' + e.name;
+    let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null);
+    if (e.type === 'd') {
+      row.addEventListener('click', () => loadFbDir(fullPath));
+    } else {
+      row.addEventListener('click', () => {
+        let id = _fbId;
+        closeFb();
+        if (id) startFastDownload(id, fullPath);
+      });
+    }
+    list.appendChild(row);
+  }
+  if (!entries.length) {
+    let m = document.createElement('div');
+    m.className = 'fb-msg'; m.textContent = 'Empty directory';
+    list.appendChild(m);
+  }
+}
+
+function makeFbRow(type, name, size) {
+  let row = document.createElement('div');
+  row.className = 'fb-row';
+  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  let sizeStr = '';
+  if (size !== null && size !== undefined) {
+    if (size < 1024) sizeStr = size + ' B';
+    else if (size < 1048576) sizeStr = (size / 1024).toFixed(1) + ' KB';
+    else if (size < 1073741824) sizeStr = (size / 1048576).toFixed(1) + ' MB';
+    else sizeStr = (size / 1073741824).toFixed(1) + ' GB';
+  }
+  row.innerHTML = '<span class="fb-ic">' + icon + '</span>' +
+    '<span class="fb-nm">' + esc(name) + '</span>' +
+    '<span class="fb-sz">' + esc(sizeStr) + '</span>';
+  return row;
+}
+
+function fbDownloadManual() {
+  let id = _fbId;
+  let path = $('fbManual').value.trim();
+  if (!path || !id) return;
+  closeFb();
+  startFastDownload(id, path);
 }
 
 // ── Search ──────────────────────────────────────────────────────────
