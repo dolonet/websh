@@ -1642,9 +1642,12 @@ function handleUpload(id, input) {
     files:files, fileIndex:0, cancelled:false,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
     currentFile:null, currentTmp:null, xhr:null,
-    // Files that landed in $HOME but couldn't be auto-mv'd into the
-    // shell's cwd (foreground was in an alt-screen app at the time).
-    // Surfaced in the final progress banner so the user can move them.
+    // Persistent sessions: server-side finalize landed each file at
+    // a known absolute path. Surfaced in the final banner so the
+    // user knows exactly where each upload went.
+    placed:[],
+    // Non-persistent + alt-screen: mv was skipped, file is at
+    // $HOME/.websh-tmp-* and the user must move it themselves.
     staged:[]
   };
   showUploadProgress(p);
@@ -1669,6 +1672,53 @@ function makeUploadMvCmd(finalName, tmpName) {
       'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; ' +
     'fi; ' +
     'mv "$t" "$f"\n';
+}
+
+// After bytes have landed at $HOME/<tmp>, move them into the user's
+// shell cwd. Persistent sessions take the server-side path: a single
+// /api/upload_finalize call uses tmux's #{pane_current_path} +
+// ControlMaster to do the mv with no foreground keystrokes, so vim,
+// less, htop etc. are never disturbed. Non-persistent sessions fall
+// back to typing the mv into the foreground PTY (the only thing
+// that knows their cwd), with an alt-screen guard so the keystrokes
+// are skipped while a TUI is in front — those files are surfaced as
+// staged at $HOME/.websh-tmp-* in the upload banner so the user can
+// move them by hand.
+function finalizeUploadedFile(p, file) {
+  let u = p.upload;
+  let tmp = u.currentTmp, fname = u.currentFile;
+  if (p.persistent) {
+    return api('upload_finalize', { body: { session_id: p.sid,
+                                             tmp: tmp, final: fname } })
+      .then(r => {
+        if (r && r.ok && r.path) {
+          u.placed.push({ name: fname, path: r.path });
+          return;
+        }
+        // Server says non-persistent (shouldn't happen for a persistent
+        // pane, but is the documented graceful-fallback shape) — fall
+        // through to the keystroke path. Any other error is a hard
+        // failure.
+        if (r && r.non_persistent) return foregroundMv(p, fname, tmp);
+        return Promise.reject(r && r.error ? r.error : 'finalize failed');
+      });
+  }
+  return foregroundMv(p, fname, tmp);
+}
+
+// Type the mv into the foreground PTY. Only path that knows the
+// non-persistent shell's cwd. Skipped under alt-screen so we don't
+// stuff text into a running editor.
+function foregroundMv(p, fname, tmp) {
+  let u = p.upload;
+  let altScreen = p.term && p.term.buffer.active &&
+    p.term.buffer.active.type === 'alternate';
+  if (altScreen) {
+    u.staged.push({ name: fname, tmp: tmp });
+    return Promise.resolve();
+  }
+  return api('input', { body: { session_id: p.sid,
+                                data: makeUploadMvCmd(fname, tmp) } });
 }
 
 function uploadNextFile(p) {
@@ -1703,24 +1753,7 @@ function uploadNextFile(p) {
     if (xhr.status !== 200 || !resp || !resp.ok) {
       finishUpload(p, false); return;
     }
-    // Move tmp from $HOME → cwd of the foreground shell. The mv is
-    // *typed* into the foreground PTY (only path that knows the user's
-    // cwd), so if an alt-screen app is currently in front (vim / less /
-    // htop / a TUI) those keystrokes would corrupt it. In that case
-    // skip the mv, remember the file, and let finishUpload tell the
-    // user where to find it. We re-check on every file because the
-    // user may exit the alt-screen app mid-batch.
-    let altScreen = p.term && p.term.buffer.active &&
-      p.term.buffer.active.type === 'alternate';
-    let mvPromise;
-    if (altScreen) {
-      u.staged.push({ name: u.currentFile, tmp: u.currentTmp });
-      mvPromise = Promise.resolve();
-    } else {
-      mvPromise = api('input', { body: { session_id: p.sid,
-        data: makeUploadMvCmd(u.currentFile, u.currentTmp) } });
-    }
-    mvPromise.then(() => {
+    finalizeUploadedFile(p, file).then(() => {
       if (!u || u.cancelled) return;
       u.sentBytes += file.size;
       u.fileOffset = 0;
@@ -1783,6 +1816,7 @@ function finishUpload(p, success) {
   u.cancelled = true;
   closeUploadSession(u);
   let staged = u.staged || [];
+  let placed = u.placed || [];
   let el = p.el.querySelector('[data-upload-progress]');
   if (el) {
     let bar = el.querySelector('.upload-progress-bar');
@@ -1795,6 +1829,9 @@ function finishUpload(p, success) {
         text.textContent = staged.length === 1
           ? 'Saved to $HOME/' + staged[0].tmp + ' (alt-screen — mv manually)'
           : 'Saved ' + staged.length + ' files to $HOME/.websh-tmp-* (alt-screen)';
+      } else if (placed.length === 1) {
+        // Persistent finalize gave us the absolute path — show it.
+        text.textContent = 'Saved to ' + placed[0].path;
       } else {
         text.textContent = 'Upload complete';
       }
@@ -1805,7 +1842,8 @@ function finishUpload(p, success) {
   }
   // Banner stays visible longer when there's a path the user needs to
   // act on, so they have time to read it before it disappears.
-  let dismissAfter = (success && staged.length) ? 8000 : 2000;
+  let dismissAfter = (success && (staged.length || placed.length === 1))
+    ? 6000 : 2000;
   setTimeout(() => {
     p.upload = null;
     hideUploadProgress(p);
@@ -1821,16 +1859,11 @@ function cancelUpload(id) {
   let tmpName = u.currentTmp;
   u.cancelled = true;
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
-  // Best-effort cleanup of the partial $HOME/<tmp> file via the
-  // foreground shell. Skipped while an alt-screen app is active so the
-  // keystrokes don't leak into vim/less/etc — the orphaned tmp keeps
-  // its `.websh-tmp-` prefix so it's trivially distinguishable.
-  let altScreen = p.term && p.term.buffer.active &&
-    p.term.buffer.active.type === 'alternate';
-  if (tmpName && !altScreen) {
-    let bt = safeShellName(tmpName);
-    api('input', { body: { session_id: p.sid,
-                           data: `rm -f "$HOME/$(echo ${bt} | base64 -d)"\n` } })
+  // Best-effort cleanup of the partial $HOME/<tmp> via the
+  // ControlMaster side-channel — keystroke-free, so a TUI in front
+  // of the foreground PTY (vim/less/htop) is left alone.
+  if (tmpName) {
+    api('upload_cancel', { body: { session_id: p.sid, tmp: tmpName } })
       .catch(() => {});
   }
 

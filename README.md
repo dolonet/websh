@@ -54,10 +54,13 @@ No `scp` dance. Move files without leaving the browser.
 
 - **Upload** — pick files, the browser streams the bytes verbatim through
   a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>` with no
-  PTY, no base64, single HTTP POST per file). The active shell then
-  `mv`s the temp into your current directory with auto-increment on
-  name conflicts. Native xhr.upload progress, multi-file queue, cancel
-  mid-flight.
+  PTY, no base64, single HTTP POST per file). For persistent (tmux)
+  panes the move-into-cwd step also rides ControlMaster — the server
+  asks tmux for `#{pane_current_path}` and `mv`s the file there itself,
+  so vim/less/htop in the foreground are never disturbed. Non-persistent
+  panes type the `mv` into the foreground shell (only thing that knows
+  their cwd), with an alt-screen guard. Auto-increment on name conflicts.
+  Native xhr.upload progress, multi-file queue, cancel mid-flight.
 - **Download** — select a filename in the terminal, click download
 - **Export scrollback** — save the current terminal buffer as a text
   file. In persistent panes the export pulls the real tmux scrollback

@@ -30,6 +30,8 @@ API endpoints:
     POST /api/resize      — resize terminal
     POST /api/disconnect  — close session
     POST /api/upload      — stream a file body to $HOME/<path> on remote
+    POST /api/upload_finalize — mv an uploaded tmp into pane cwd (persistent)
+    POST /api/upload_cancel — remove a partial/staged upload tmp
     POST /api/tmux_options — push tmux options live into a persistent session
     GET  /api/tmux_capture — capture full tmux pane buffer (persistent only)
     GET  /api/config      — return server-side config (without secrets)
@@ -881,11 +883,12 @@ class SSHSession(object):
         if not options:
             return True, ""
         # Each opt/val pair has been pre-validated, so direct
-        # interpolation is safe. Joined with `;` so a single ssh
-        # invocation applies them all to the global tmux server.
-        parts = [self.tmux_cmd + " set -g " + opt + " " + val
-                 for opt, val in options]
-        remote_cmd = "; ".join(parts)
+        # interpolation is safe. Chained via tmux's own `\;` separator
+        # so the whole batch hits a *single* tmux invocation on the
+        # target — same shape as `_build_remote_command` uses at
+        # connect time.
+        parts = ["set -g " + opt + " " + val for opt, val in options]
+        remote_cmd = self.tmux_cmd + " " + " \\; ".join(parts)
         ssh_cmd = [
             "ssh", "-T",
             "-o", "BatchMode=yes",
@@ -949,6 +952,10 @@ class SSHSession(object):
                     break
                 proc.stdin.write(chunk)
                 remaining -= len(chunk)
+                # Multi-GB uploads can outlast SESSION_TIMEOUT; without
+                # this stamp the cleanup loop would close the master
+                # mid-stream and the side-channel ssh would die with it.
+                self.last_activity = time.time()
             try:
                 proc.stdin.close()
             except Exception:
@@ -983,6 +990,103 @@ class SSHSession(object):
             return False, "ssh exit %d: %s" % (proc.returncode, msg)
         if remaining > 0:
             return False, "client sent fewer bytes than Content-Length"
+        return True, ""
+
+    def finalize_upload(self, tmp_name, final_name):
+        """Move $HOME/<tmp_name> into the foreground tmux pane's cwd
+        with auto-increment-on-conflict — without typing into the
+        foreground PTY. Persistent-only: tmux's own `#{pane_current_path}`
+        format variable is the cross-platform way to know the pane's
+        current working directory, so we don't need /proc introspection.
+
+        Returns (ok, final_path_or_error). For non-persistent sessions
+        returns (False, 'non-persistent') so the caller can fall back
+        to a client-side foreground mv (which has its own alt-screen
+        guard for vim/less/htop)."""
+        if not self.persistent or not self.slot_id:
+            return False, "non-persistent"
+        if not self._control_path or not os.path.exists(self._control_path):
+            return False, "control socket not ready"
+
+        # Both names are base64-encoded in case the user picked a file
+        # name with shell metacharacters / newlines / unicode. The
+        # decoded values land in shell vars and never touch the parser.
+        b_tmp = base64.b64encode(tmp_name.encode("utf-8")).decode("ascii")
+        b_final = base64.b64encode(final_name.encode("utf-8")).decode("ascii")
+        target = "websh-" + self.slot_id
+
+        # One ssh roundtrip via ControlMaster:
+        #   1. ask tmux for the pane's cwd (cross-platform)
+        #   2. fall back to $HOME if tmux didn't tell us
+        #   3. cd there
+        #   4. find a non-colliding final name with the same ext-aware
+        #      auto-increment logic the client used to ship inline
+        #   5. mv -- "$HOME/$t" "./$f" (—— and ./ keep the destination
+        #      from being parsed as an option even if $f starts with -)
+        #   6. echo the resolved absolute path so the API caller can
+        #      surface it to the user
+        remote_cmd = (
+            't=$(printf %s ' + b_tmp + ' | base64 -d); '
+            'f=$(printf %s ' + b_final + ' | base64 -d); '
+            'cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
+                ' "#{pane_current_path}" 2>/dev/null); '
+            '[ -n "$cwd" ] || cwd="$HOME"; '
+            'cd -- "$cwd" || exit 1; '
+            'b="${f%.*}"; e="${f##*.}"; '
+            'if [ "$b.$e" = "$f" ]; then '
+                'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; '
+            'else '
+                'n=1; while [ -e "$f" ]; do f="$f($n)"; n=$((n+1)); done; '
+            'fi; '
+            'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            return False, "finalize timeout"
+        except Exception as e:
+            return False, "ssh error: " + str(e)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()[:300]
+            return False, "finalize exit %d: %s" % (proc.returncode, err)
+        return True, proc.stdout.decode("utf-8", "replace").strip()
+
+    def remove_remote_tmp(self, rel_path):
+        """Best-effort delete $HOME/<rel_path> over the ControlMaster
+        side-channel. Used to clean up a partial / staged upload that
+        the user cancelled — keystroke-free, so no risk of poking a
+        running editor in the foreground PTY. Idempotent. rel_path
+        must come from the caller's path validator."""
+        if not self._control_path or not os.path.exists(self._control_path):
+            return False, "control socket not ready"
+        b = base64.b64encode(rel_path.encode("utf-8")).decode("ascii")
+        # The `--` after rm protects against an attacker-supplied path
+        # that starts with `-` even though the upstream validator
+        # already rejected absolute paths and `..`.
+        remote_cmd = (
+            'n=$(printf %s ' + b + ' | base64 -d) && '
+            'rm -f -- "$HOME/$n"'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return False, "rm timeout"
+        except Exception as e:
+            return False, "ssh error: " + str(e)
+        if proc.returncode != 0:
+            return False, "rm exit %d" % proc.returncode
         return True, ""
 
     def close(self):
@@ -1122,6 +1226,10 @@ class Handler(BaseHTTPRequestHandler):
             self._disconnect()
         elif action == "upload":
             self._upload()
+        elif action == "upload_finalize":
+            self._upload_finalize()
+        elif action == "upload_cancel":
+            self._upload_cancel()
         elif action == "tmux_options":
             self._tmux_options()
         else:
@@ -1453,7 +1561,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if (not rel_path or len(rel_path) > 4096
                 or rel_path.startswith("/")
+                or "\x00" in rel_path
                 or ".." in rel_path.split("/")):
+            # NUL would survive base64 encoding but bash strips it from
+            # variable values, so the file would silently land at a
+            # different name than the client asked for. Fail loud instead.
             self._json({"error": "invalid path"}, 400)
             return
 
@@ -1482,6 +1594,90 @@ class Handler(BaseHTTPRequestHandler):
             return
         session.last_activity = time.time()
         self._json({"ok": True, "bytes": length, "path": "$HOME/" + rel_path})
+
+    def _upload_finalize(self):
+        """POST /api/upload_finalize — for persistent sessions, move
+        an already-uploaded $HOME/<tmp> file into the foreground tmux
+        pane's cwd via the ControlMaster side-channel. Side-channel
+        only, no foreground keystrokes — safe regardless of what app
+        is in front (vim/less/htop/TUI). Returns the final absolute
+        path on success, or `non-persistent` so the client knows to
+        fall back to its own foreground-mv path.
+
+        Body: { session_id, tmp, final }."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+        sid = body.get("session_id", "")
+        tmp = body.get("tmp", "")
+        final = body.get("final", "")
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        # tmp uses the same rules as the upload path. final is a basename
+        # — no slashes, no traversal, no NUL — because finalize_upload
+        # cd's into the pane cwd and does `mv -- "$HOME/$t" "./$f"`.
+        if (not tmp or len(tmp) > 4096
+                or tmp.startswith("/") or "\x00" in tmp
+                or ".." in tmp.split("/")):
+            self._json({"error": "invalid tmp"}, 400)
+            return
+        if (not final or len(final) > 4096
+                or "/" in final or "\x00" in final or final in ("..", ".")):
+            self._json({"error": "invalid final"}, 400)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+        ok, msg = session.finalize_upload(tmp, final)
+        if not ok:
+            # `non-persistent` is an expected, non-error outcome —
+            # surface it with 200 so the client can branch cleanly
+            # without inspecting an error string.
+            if msg == "non-persistent":
+                self._json({"ok": False, "non_persistent": True})
+                return
+            self._json({"error": msg}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"ok": True, "path": msg})
+
+    def _upload_cancel(self):
+        """POST /api/upload_cancel — best-effort cleanup of a partial
+        / staged upload. Removes $HOME/<tmp> via the ControlMaster
+        side-channel (keystroke-free, so no risk of poking a running
+        editor). Idempotent.
+
+        Body: { session_id, tmp }."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+        sid = body.get("session_id", "")
+        tmp = body.get("tmp", "")
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        if (not tmp or len(tmp) > 4096
+                or tmp.startswith("/") or "\x00" in tmp
+                or ".." in tmp.split("/")):
+            self._json({"error": "invalid tmp"}, 400)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+        ok, err = session.remove_remote_tmp(tmp)
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        self._json({"ok": True})
 
     def _disconnect(self):
         try:
