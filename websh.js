@@ -71,6 +71,11 @@ function saveSettings() {
   try { localStorage.setItem(storageKey(SETTINGS_KEY), JSON.stringify(settings)); } catch(e) {}
 }
 const MAX_POLL_RETRIES = 5;
+// Hard cap on a single download (bytes). Server enforces this too via
+// MAX_DOWNLOAD_SIZE, but the client also bails early so a misconfigured
+// or trusted-but-misbehaving server can't OOM the tab. 2 GB matches the
+// upload limit and modern browsers' Blob ceilings.
+const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 let authMode = 'pw';
 
 const darkTheme = {
@@ -1908,6 +1913,9 @@ function startFastDownload(id, path) {
         return resp.json().then(e => { throw new Error(e.error || 'failed'); });
       }
       let total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+      if (total > MAX_DOWNLOAD_BYTES) {
+        throw new Error('file too large (' + (total / 1048576).toFixed(0) + ' MB)');
+      }
       let chunks = [], received = 0;
       let reader = resp.body.getReader();
       function pump() {
@@ -1916,6 +1924,13 @@ function startFastDownload(id, path) {
           if (!p.download || p.download.cancelled) { reader.cancel(); return; }
           chunks.push(value);
           received += value.length;
+          if (received > MAX_DOWNLOAD_BYTES) {
+            // Server didn't advertise Content-Length but the stream is
+            // overrunning the cap. Abort before the tab OOMs.
+            reader.cancel();
+            throw new Error('download exceeded ' +
+              (MAX_DOWNLOAD_BYTES / 1073741824).toFixed(0) + ' GB cap');
+          }
           let el = p.el && p.el.querySelector('[data-upload-progress]');
           if (el) {
             let pct = total > 0 ? Math.round(received / total * 100) : 30;

@@ -2691,12 +2691,14 @@ class TestListDir(unittest.TestCase):
 
     def test_parses_entries_and_path(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
+        # PWD line is \n-terminated; entry rows are \0-terminated so a
+        # filename containing \n can't split a row in half.
         stdout = (
-            "PWD:/home/alice\n"
-            "d\t4096\t1700000000\tdocs\n"
-            "f\t12345\t1700000001\tfile.txt\n"
-            "l\t0\t1700000002\tlink\n"
-        ).encode()
+            b"PWD:/home/alice\n"
+            b"d\t4096\t1700000000\tdocs\0"
+            b"f\t12345\t1700000001\tfile.txt\0"
+            b"l\t0\t1700000002\tlink\0"
+        )
         result = unittest.mock.MagicMock()
         result.returncode = 0
         result.stdout = stdout
@@ -2732,14 +2734,53 @@ class TestListDir(unittest.TestCase):
         self.assertIsNone(entries)
         self.assertEqual(err, "timeout")
 
+    def test_filename_with_embedded_newline_preserved(self):
+        """Regression: NUL-terminated rows mean a filename containing
+        \\n is not split across two rows. Old \\n-separated parser
+        produced a truncated entry name and silently dropped the rest."""
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        weird = "weird\nname.txt"
+        stdout = (
+            b"PWD:/home/alice\n"
+            b"f\t10\t1700000000\t" + weird.encode() + b"\0"
+            b"f\t20\t1700000001\tnext.txt\0"
+        )
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = stdout
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", return_value=result):
+            entries, _, err = s.list_dir("~")
+        self.assertIsNone(err)
+        names = [e["name"] for e in entries]
+        self.assertIn(weird, names)
+        self.assertIn("next.txt", names)
+
+    def test_remote_cmd_uses_nul_terminator(self):
+        """Regression: the find -printf format must end with \\0 so that
+        embedded newlines in filenames don't corrupt the listing."""
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        captured = {}
+        def fake_run(cmd, **kw):
+            captured["remote"] = cmd[-1]
+            r = unittest.mock.MagicMock()
+            r.returncode = 0
+            r.stdout = b"PWD:/home/alice\n"
+            return r
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            s.list_dir("~")
+        self.assertIn(r'%y\t%s\t%Ts\t%f\0', captured["remote"])
+        self.assertNotIn(r'%y\t%s\t%Ts\t%f\n', captured["remote"])
+
     def test_dirs_sorted_before_files(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
         stdout = (
-            "PWD:/home/alice\n"
-            "f\t100\t1700000000\taardvark.txt\n"
-            "d\t4096\t1700000000\tzebra_dir\n"
-            "f\t200\t1700000000\tbeta.py\n"
-        ).encode()
+            b"PWD:/home/alice\n"
+            b"f\t100\t1700000000\taardvark.txt\0"
+            b"d\t4096\t1700000000\tzebra_dir\0"
+            b"f\t200\t1700000000\tbeta.py\0"
+        )
         result = unittest.mock.MagicMock()
         result.returncode = 0
         result.stdout = stdout
@@ -2940,6 +2981,25 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
         # Regression: ERR-header early-return path must reap the side-channel
         # ssh after kill — otherwise it lingers as a zombie. Same defect
         # class as the upload_file TimeoutExpired branch fixed in PR #21.
+        self.assertTrue(fake_proc.kill.called)
+        self.assertTrue(fake_proc.wait.called)
+
+    def test_oversize_file_returns_413(self):
+        """Regression: download must refuse files larger than
+        MAX_DOWNLOAD_SIZE before sending HTTP 200, so the browser
+        doesn't try to accumulate a multi-GB Blob into memory."""
+        sid = str(uuid.uuid4())
+        # Header advertises a 4 GB file.
+        oversize = server.MAX_DOWNLOAD_SIZE + 1
+        header = "OK\t{}\n".format(oversize).encode()
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout.read.side_effect = [bytes([b]) for b in header]
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._get_json("session_id={}&path=/tmp/huge.bin".format(sid))
+        self.assertIn("error", r)
+        self.assertIn("too large", r["error"])
         self.assertTrue(fake_proc.kill.called)
         self.assertTrue(fake_proc.wait.called)
 

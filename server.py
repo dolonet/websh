@@ -77,6 +77,12 @@ MAX_SESSIONS = _int_env("MAX_SESSIONS", "10")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "10")
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
+# Hard cap on a single binary download via /api/download (bytes). The
+# browser accumulates the whole stream into a Blob before saving, so a
+# multi-GB file would OOM the tab. The old base64 download path had a
+# 37 MB cap; 2 GB matches the upload limit and modern browsers' Blob
+# ceilings without eating the tab on typical hardware.
+MAX_DOWNLOAD_SIZE = _int_env("MAX_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # How long a single upload may take before we kill the side-channel ssh.
 UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
 
@@ -1105,6 +1111,9 @@ class SSHSession(object):
             return None, None, "control socket not ready"
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
+        # Entry rows are NUL-terminated (not \n) so filenames containing
+        # an embedded newline don't split a row in half. The PWD: line
+        # before the find output still uses \n — easy to peel off first.
         remote_cmd = (
             'P=$(printf %s ' + b64 + ' | base64 -d); '
             'case "$P" in '
@@ -1116,7 +1125,7 @@ class SSHSession(object):
             'cd "$D" 2>/dev/null || exit 1; '
             'printf "PWD:%s\\n" "$(pwd)"; '
             'find . -maxdepth 1 ! -name . '
-            '-printf "%y\\t%s\\t%Ts\\t%f\\n" 2>/dev/null'
+            '-printf "%y\\t%s\\t%Ts\\t%f\\0" 2>/dev/null'
         )
         ssh_cmd = [
             "ssh", "-T",
@@ -1133,13 +1142,21 @@ class SSHSession(object):
         if result.returncode != 0:
             return None, None, "directory not found"
 
-        entries = []
+        # Peel the PWD:<path>\n preamble off the front, then split the
+        # rest on NUL — every find -printf row ends with \0 so embedded
+        # newlines in filenames stay intact.
+        raw = result.stdout
         abs_path = remote_path
-        for line in result.stdout.decode("utf-8", "replace").split("\n"):
-            if line.startswith("PWD:"):
-                abs_path = line[4:].strip()
+        nl = raw.find(b"\n")
+        if nl >= 0 and raw[:4] == b"PWD:":
+            abs_path = raw[4:nl].decode("utf-8", "replace").strip()
+            raw = raw[nl + 1:]
+
+        entries = []
+        for row in raw.split(b"\0"):
+            if not row:
                 continue
-            parts = line.split("\t", 3)
+            parts = row.decode("utf-8", "replace").split("\t", 3)
             if len(parts) != 4 or not parts[3]:
                 continue
             ftype, size_s, mtime_s, name = parts
@@ -1882,6 +1899,15 @@ class Handler(BaseHTTPRequestHandler):
                 sz = int(parts[1].strip())
                 if sz >= 0:
                     content_length = sz
+
+        # Hard cap: refuse files above MAX_DOWNLOAD_SIZE before sending
+        # any HTTP response headers, so the browser doesn't try to
+        # accumulate a multi-GB Blob into memory.
+        if content_length is not None and content_length > MAX_DOWNLOAD_SIZE:
+            proc.kill()
+            _reap()
+            self._json({"error": "file too large"}, 413)
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
