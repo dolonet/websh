@@ -1578,6 +1578,274 @@ class TestTerminateRemoteTmux(unittest.TestCase):
         self.assertEqual(called["n"], 0)
 
 
+class TestPushTmuxOptions(unittest.TestCase):
+    """Direct unit tests for SSHSession.push_tmux_options() — the
+    side-channel path that applies tmux options live without typing
+    into the foreground PTY."""
+
+    def _fake_session(self, persistent=True, slot_id="ok", control_path=None,
+                      tmux_cmd="tmux"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-tmuxopts"
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = True
+        s.master_fd = None
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = tmux_cmd
+        return s
+
+    def test_noop_when_not_persistent(self):
+        s = self._fake_session(persistent=False)
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+        self.assertIn("not a persistent", err)
+
+    def test_noop_when_no_slot_id(self):
+        s = self._fake_session(slot_id=None)
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+
+    def test_error_when_socket_missing(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_empty_options_no_ssh_invocation(self):
+        # An empty list should short-circuit before spawning ssh.
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            called = {"n": 0}
+            def fake_run(cmd, **kw):
+                called["n"] += 1
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([])
+            self.assertTrue(ok)
+            self.assertEqual(called["n"], 0)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_invokes_ssh_with_chained_set_g(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options(
+                    [("mouse", "on"), ("set-clipboard", "off"),
+                     ("history-limit", "200000")])
+            self.assertTrue(ok, err)
+            self.assertEqual(len(calls), 1)
+            cmd = calls[0]
+            self.assertEqual(cmd[0], "ssh")
+            self.assertIn("ControlPath=" + sock, cmd)
+            # The remote command is the last element. Verify all three
+            # set-g lines are joined with `;` for one ssh round-trip.
+            remote = cmd[-1]
+            self.assertIn("tmux set -g mouse on", remote)
+            self.assertIn("tmux set -g set-clipboard off", remote)
+            self.assertIn("tmux set -g history-limit 200000", remote)
+            self.assertEqual(remote.count(";"), 2)
+            # `--` separator must precede the host so an attacker-controlled
+            # _host can never be parsed as an ssh flag.
+            self.assertIn("--", cmd)
+            self.assertLess(cmd.index("--"), cmd.index(s._host))
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_nonzero_exit_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                class R:
+                    returncode = 2
+                    stderr = b"unknown option mouse"
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([("mouse", "on")])
+            self.assertFalse(ok)
+            self.assertIn("tmux exit", err)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_timeout_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                raise subprocess.TimeoutExpired(cmd, 10)
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([("mouse", "on")])
+            self.assertFalse(ok)
+            self.assertIn("timeout", err)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_custom_tmux_cmd_inlined(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock,
+                                   tmux_cmd="/usr/local/bin/tmux")
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.push_tmux_options([("mouse", "on")])
+            self.assertIn("/usr/local/bin/tmux set -g mouse on", calls[0][-1])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
+    """HTTP-level dispatch for POST /api/tmux_options — checks routing,
+    body validation, and unknown-session handling. Live ssh is mocked
+    via push_tmux_options."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18768
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}{}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_unknown_session_404(self):
+        body, code = self._post("/api/tmux_options",
+                                {"session_id": str(uuid.uuid4()),
+                                 "tmux_mouse": True})
+        self.assertEqual(code, 404)
+
+    def test_invalid_session_id_404(self):
+        body, code = self._post("/api/tmux_options",
+                                {"session_id": "not-a-uuid",
+                                 "tmux_mouse": True})
+        self.assertEqual(code, 404)
+
+    def test_invalid_json_400(self):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/tmux_options".format(self.port)
+        req = Request(url, data=b"{bad",
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            body = json.loads(resp.read().decode("utf-8"))
+            code = resp.getcode()
+        except Exception as e:
+            body = json.loads(e.read().decode("utf-8"))
+            code = e.code
+        self.assertEqual(code, 400)
+
+    def test_dispatches_to_session_with_validated_options(self):
+        # Plant a fake session in the registry, capture push_tmux_options call.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            def push_tmux_options(self, opts):
+                captured["opts"] = list(opts)
+                return True, ""
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/tmux_options", {
+                "session_id": sid,
+                "tmux_mouse": True,
+                "tmux_set_clipboard": False,
+                "tmux_history_limit": 50000,
+                # Garbage that must be dropped by validation, never passed
+                # through to the session:
+                "tmux_evil": "rm -rf /",
+                "tmux_status": "on",
+            })
+            self.assertEqual(code, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(set(body["applied"]),
+                             {"mouse", "set-clipboard", "history-limit"})
+            self.assertIn(("mouse", "on"), captured["opts"])
+            self.assertIn(("set-clipboard", "off"), captured["opts"])
+            self.assertIn(("history-limit", "50000"), captured["opts"])
+            self.assertEqual(len(captured["opts"]), 3)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_session_error_propagated_as_502(self):
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            def push_tmux_options(self, opts):
+                return False, "control socket not ready"
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/tmux_options",
+                                    {"session_id": sid, "tmux_mouse": True})
+            self.assertEqual(code, 502)
+            self.assertIn("control socket", body["error"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+
 class TestSlotIdSecurity(unittest.TestCase):
     """Document the security model around slot_id.
 

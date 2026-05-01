@@ -30,6 +30,8 @@ API endpoints:
     POST /api/resize      — resize terminal
     POST /api/disconnect  — close session
     POST /api/upload      — stream a file body to $HOME/<path> on remote
+    POST /api/tmux_options — push tmux options live into a persistent session
+    GET  /api/tmux_capture — capture full tmux pane buffer (persistent only)
     GET  /api/config      — return server-side config (without secrets)
     GET  /api/ping        — health check
 """
@@ -805,7 +807,7 @@ class SSHSession(object):
                      "-o", "ConnectTimeout=3",
                      "-p", str(self._port),
                      "-l", self._username,
-                     self._host,
+                     "--", self._host,
                      self.tmux_cmd, "kill-session", "-t", target_name],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -864,6 +866,43 @@ class SSHSession(object):
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return None, "tmux exit %d: %s" % (proc.returncode, err)
         return proc.stdout, None
+
+    def push_tmux_options(self, options):
+        """Apply per-session tmux options live, without typing into the
+        foreground PTY. Runs `tmux set -g …` over the ControlMaster
+        side-channel so the change can't bleed into a running editor /
+        pager occupying the user's shell. `options` is a list of
+        (opt, val) tuples already validated against the same allow-list
+        used at connect time. Returns (ok, error)."""
+        if not self.persistent or not self.slot_id:
+            return False, "not a persistent session"
+        if not self._control_path or not os.path.exists(self._control_path):
+            return False, "control socket not ready"
+        if not options:
+            return True, ""
+        # Each opt/val pair has been pre-validated, so direct
+        # interpolation is safe. Joined with `;` so a single ssh
+        # invocation applies them all to the global tmux server.
+        parts = [self.tmux_cmd + " set -g " + opt + " " + val
+                 for opt, val in options]
+        remote_cmd = "; ".join(parts)
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(
+                ssh_cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return False, "tmux set timeout"
+        except Exception as e:
+            return False, "ssh error: " + str(e)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()[:300]
+            return False, "tmux exit %d: %s" % (proc.returncode, err)
+        return True, ""
 
     def upload_file(self, rel_path, body_stream, length,
                     timeout=UPLOAD_TIMEOUT):
@@ -1083,6 +1122,8 @@ class Handler(BaseHTTPRequestHandler):
             self._disconnect()
         elif action == "upload":
             self._upload()
+        elif action == "tmux_options":
+            self._tmux_options()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1368,6 +1409,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _tmux_options(self):
+        """POST /api/tmux_options — push tmux options live into a
+        running persistent session via the ControlMaster side-channel.
+        Body shape mirrors /api/connect: tmux_mouse / tmux_set_clipboard
+        / tmux_history_limit. Anything else is silently ignored by the
+        same allow-list used at connect time."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+        sid = body.get("session_id", "")
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+        opts = _validate_tmux_options(body)
+        ok, err = session.push_tmux_options(opts)
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        self._json({"ok": True, "applied": [k for k, _ in opts]})
 
     def _upload(self):
         """POST /api/upload?session_id=...&path=<rel_name>

@@ -305,6 +305,10 @@ The server accepts these only via a fixed allow-list (`mouse`,
 is silently dropped, so an out-of-date or hostile client can't
 inject extra `set -g` lines.
 
+These `set -g` lines run after the target's own `~/.tmux.conf` and
+therefore override matching options there. Untick the toggles in the
+Options panel if you'd rather your host-side config win.
+
 ## Configuration
 
 Environment variables for `server.py`:

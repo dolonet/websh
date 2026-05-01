@@ -1641,7 +1641,11 @@ function handleUpload(id, input) {
   p.upload = {
     files:files, fileIndex:0, cancelled:false,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
-    currentFile:null, currentTmp:null, xhr:null
+    currentFile:null, currentTmp:null, xhr:null,
+    // Files that landed in $HOME but couldn't be auto-mv'd into the
+    // shell's cwd (foreground was in an alt-screen app at the time).
+    // Surfaced in the final progress banner so the user can move them.
+    staged:[]
   };
   showUploadProgress(p);
   updatePaneBadge(p);
@@ -1699,21 +1703,35 @@ function uploadNextFile(p) {
     if (xhr.status !== 200 || !resp || !resp.ok) {
       finishUpload(p, false); return;
     }
-    // Move tmp from $HOME → cwd of the foreground shell session.
-    api('input', { body: { session_id: p.sid,
-                           data: makeUploadMvCmd(u.currentFile, u.currentTmp) } })
-      .then(() => {
-        if (!u || u.cancelled) return;
-        u.sentBytes += file.size;
-        u.fileOffset = 0;
-        u.fileIndex++;
-        u.currentFile = null;
-        u.currentTmp = null;
-        u.xhr = null;
-        updateUploadProgress(p);
-        uploadNextFile(p);
-      })
-      .catch(() => { finishUpload(p, false); });
+    // Move tmp from $HOME → cwd of the foreground shell. The mv is
+    // *typed* into the foreground PTY (only path that knows the user's
+    // cwd), so if an alt-screen app is currently in front (vim / less /
+    // htop / a TUI) those keystrokes would corrupt it. In that case
+    // skip the mv, remember the file, and let finishUpload tell the
+    // user where to find it. We re-check on every file because the
+    // user may exit the alt-screen app mid-batch.
+    let altScreen = p.term && p.term.buffer.active &&
+      p.term.buffer.active.type === 'alternate';
+    let mvPromise;
+    if (altScreen) {
+      u.staged.push({ name: u.currentFile, tmp: u.currentTmp });
+      mvPromise = Promise.resolve();
+    } else {
+      mvPromise = api('input', { body: { session_id: p.sid,
+        data: makeUploadMvCmd(u.currentFile, u.currentTmp) } });
+    }
+    mvPromise.then(() => {
+      if (!u || u.cancelled) return;
+      u.sentBytes += file.size;
+      u.fileOffset = 0;
+      u.fileIndex++;
+      u.currentFile = null;
+      u.currentTmp = null;
+      u.xhr = null;
+      updateUploadProgress(p);
+      uploadNextFile(p);
+    })
+    .catch(() => { finishUpload(p, false); });
   };
   xhr.onerror = () => { if (u && !u.cancelled) finishUpload(p, false); };
   xhr.send(file);
@@ -1757,10 +1775,6 @@ function updateUploadProgress(p) {
 function closeUploadSession(u) {
   if (!u) return;
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
-  if (u.bgSid) {
-    api('disconnect', {body: {session_id: u.bgSid}}).catch(() => {});
-    u.bgSid = null;
-  }
 }
 
 function finishUpload(p, success) {
@@ -1768,24 +1782,36 @@ function finishUpload(p, success) {
   let u = p.upload;
   u.cancelled = true;
   closeUploadSession(u);
+  let staged = u.staged || [];
   let el = p.el.querySelector('[data-upload-progress]');
   if (el) {
     let bar = el.querySelector('.upload-progress-bar');
     let text = el.querySelector('.upload-progress-text');
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
-      text.textContent = 'Upload complete';
+      if (staged.length) {
+        // Files landed in $HOME but auto-mv was skipped (alt-screen).
+        // Tell the user where to look so the upload isn't a silent no-op.
+        text.textContent = staged.length === 1
+          ? 'Saved to $HOME/' + staged[0].tmp + ' (alt-screen — mv manually)'
+          : 'Saved ' + staged.length + ' files to $HOME/.websh-tmp-* (alt-screen)';
+      } else {
+        text.textContent = 'Upload complete';
+      }
     } else {
       bar.style.background = 'var(--dg)';
       text.textContent = 'Upload failed';
     }
   }
+  // Banner stays visible longer when there's a path the user needs to
+  // act on, so they have time to read it before it disappears.
+  let dismissAfter = (success && staged.length) ? 8000 : 2000;
   setTimeout(() => {
     p.upload = null;
     hideUploadProgress(p);
     updatePaneBadge(p);
     if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  }, dismissAfter);
 }
 
 function cancelUpload(id) {
@@ -1796,8 +1822,12 @@ function cancelUpload(id) {
   u.cancelled = true;
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
   // Best-effort cleanup of the partial $HOME/<tmp> file via the
-  // foreground shell.
-  if (tmpName) {
+  // foreground shell. Skipped while an alt-screen app is active so the
+  // keystrokes don't leak into vim/less/etc — the orphaned tmp keeps
+  // its `.websh-tmp-` prefix so it's trivially distinguishable.
+  let altScreen = p.term && p.term.buffer.active &&
+    p.term.buffer.active.type === 'alternate';
+  if (tmpName && !altScreen) {
     let bt = safeShellName(tmpName);
     api('input', { body: { session_id: p.sid,
                            data: `rm -f "$HOME/$(echo ${bt} | base64 -d)"\n` } })
@@ -2150,25 +2180,22 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Ship the current tmux toggles into every running persistent pane so
-// the change takes effect immediately (no reconnect). We pipe the
-// `tmux set -g …` lines through the active shell — fast, no RTT cost,
-// and it lands in the same tmux server the pane is attached to.
+// the change takes effect immediately (no reconnect). Routed through
+// /api/tmux_options, which runs `tmux set -g …` over the existing
+// ControlMaster channel server-side — so the change can't bleed into
+// a running editor / pager that happens to occupy the foreground PTY.
 function pushTmuxOptionsToActiveSessions() {
-  let lines = [];
-  lines.push('tmux set -g mouse ' + (settings.tmuxMouse ? 'on' : 'off'));
-  lines.push('tmux set -g set-clipboard ' + (settings.tmuxClipboard ? 'on' : 'off'));
+  let payload = {
+    tmux_mouse: !!settings.tmuxMouse,
+    tmux_set_clipboard: !!settings.tmuxClipboard,
+  };
   let hl = parseInt(settings.tmuxHistory, 10);
-  if (Number.isFinite(hl) && hl >= 100) {
-    lines.push('tmux set -g history-limit ' + hl);
-  }
-  // Wrap in a sub-shell so the commands don't appear in the user's
-  // visible prompt history (`{ … ; } >/dev/null 2>&1` keeps stdout/err
-  // off the screen but tmux still applies the options).
-  let payload = '{ ' + lines.join('; ') + '; } >/dev/null 2>&1\n';
+  if (Number.isFinite(hl) && hl >= 100) payload.tmux_history_limit = hl;
   Object.keys(panes).forEach(k => {
     let p = panes[k];
     if (!p || !p.sid || !p.persistent) return;
-    api('input', { body: { session_id: p.sid, data: payload } }).catch(() => {});
+    api('tmux_options', { body: Object.assign({ session_id: p.sid }, payload) })
+      .catch(() => {});
   });
 }
 
