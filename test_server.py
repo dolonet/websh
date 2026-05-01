@@ -2791,6 +2791,21 @@ class TestDownloadFile(unittest.TestCase):
         self.assertIsNone(proc)
         self.assertIn("no ssh", err)
 
+    def test_stderr_is_devnull_not_pipe(self):
+        """Regression: stderr=PIPE without a draining reader can block the
+        side-channel ssh once it writes >~64 KB of warnings (host-key
+        prompts, banners). The protocol header on stdout already conveys
+        OK/ERR so stderr is discarded."""
+        s = self._fake_session(control_path="/tmp/fake.sock")
+        captured = {}
+        def fake_popen(cmd, **kw):
+            captured.update(kw)
+            return unittest.mock.MagicMock()
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.Popen", side_effect=fake_popen):
+            s.download_file("/home/alice/file.txt")
+        self.assertEqual(captured.get("stderr"), subprocess.DEVNULL)
+
 
 class TestLsHTTPDispatch(unittest.TestCase):
     """HTTP-level tests for GET /api/ls."""
@@ -2922,6 +2937,26 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
             r = self._get_json("session_id={}&path=/tmp/missing.txt".format(sid))
         self.assertIn("error", r)
+        # Regression: ERR-header early-return path must reap the side-channel
+        # ssh after kill — otherwise it lingers as a zombie. Same defect
+        # class as the upload_file TimeoutExpired branch fixed in PR #21.
+        self.assertTrue(fake_proc.kill.called)
+        self.assertTrue(fake_proc.wait.called)
+
+    def test_header_read_exception_reaps_proc(self):
+        """Regression: when the protocol header read itself raises, the
+        early-return path must call proc.wait() after proc.kill() so the
+        side-channel ssh child is reaped, not leaked as a zombie."""
+        sid = str(uuid.uuid4())
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout.read.side_effect = OSError("pipe broken")
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._get_json("session_id={}&path=/tmp/x".format(sid))
+        self.assertIn("error", r)
+        self.assertTrue(fake_proc.kill.called)
+        self.assertTrue(fake_proc.wait.called)
 
     def test_successful_download_streams_binary(self):
         from urllib.request import urlopen
@@ -2958,6 +2993,11 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
                                  "attachment; filename*=UTF-8''file.bin")
                 body = resp.read()
         self.assertEqual(body, payload)
+        # Regression: the streaming loop must stamp last_activity per chunk
+        # so multi-GB downloads don't outlive SESSION_TIMEOUT and get reaped
+        # mid-stream. Symmetric with upload_file. The fake_session is a
+        # MagicMock, so any attribute assignment is recorded.
+        self.assertGreater(fake_session.last_activity, 0)
 
 
 if __name__ == "__main__":

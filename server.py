@@ -1182,11 +1182,16 @@ class SSHSession(object):
             "--", self._host, remote_cmd,
         ]
         try:
+            # stderr→DEVNULL: the protocol header (OK/ERR on stdout) already
+            # signals failure to the caller, and a PIPE that nobody drains
+            # would deadlock the child once ssh writes >~64 KB of warnings
+            # (host-key prompts, banners, debug). Same pattern as
+            # terminate_remote_tmux.
             proc = subprocess.Popen(
                 ssh_cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
             )
             return proc, None
         except Exception as e:
@@ -1838,6 +1843,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
 
+        def _reap():
+            # Reap the side-channel ssh after kill so it doesn't linger as
+            # a zombie. Mirrors the upload_file TimeoutExpired branch.
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
         # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
         header_line = b""
         try:
@@ -1848,12 +1861,14 @@ class Handler(BaseHTTPRequestHandler):
                 header_line += c
         except Exception:
             proc.kill()
+            _reap()
             self._json({"error": "download failed"}, 502)
             return
 
         parts = header_line.decode("utf-8", "replace").split("\t", 1)
         if not parts or parts[0] != "OK":
             proc.kill()
+            _reap()
             msg = parts[1].strip() if len(parts) > 1 else "download failed"
             self._json({"error": msg}, 404)
             return
@@ -1887,6 +1902,10 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                # Multi-GB downloads can outlast SESSION_TIMEOUT; without
+                # this stamp the cleanup loop would close the master
+                # mid-stream and the side-channel ssh would die with it.
+                session.last_activity = time.time()
         except Exception:
             pass
         finally:
@@ -1895,6 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                _reap()
         session.last_activity = time.time()
 
     def _disconnect(self):

@@ -1929,6 +1929,11 @@ function startFastDownload(id, path) {
         });
       }
       return pump().then(() => {
+        // Cancellation: pump returns undefined on cancel, which resolves
+        // the promise. Without this guard we'd still build a partial
+        // Blob and trigger a save dialog with success UI. The .catch
+        // branch below has the same guard.
+        if (!p.download || p.download.cancelled) return;
         let blob = new Blob(chunks, {type: 'application/octet-stream'});
         let a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
