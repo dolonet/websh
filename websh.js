@@ -58,6 +58,30 @@ function fontStack(id) {
   let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
   return (f[1] ? `'${f[1]}',` : '') + f[2];
 }
+
+// Copy `text` to the system clipboard. Yandex Browser silently rejects
+// navigator.clipboard.writeText() outside a tightly-scoped user gesture,
+// which is also where xterm's built-in OSC 52 handler falls over. We
+// run the synchronous document.execCommand('copy') path first so the
+// copy lands inside the post-mouseup "transient user activation" window
+// (~5 s in Chromium); writeText() runs after as a best-effort upgrade
+// for browsers where it's permitted.
+function copyText(text) {
+  if (!text) return;
+  let listener = e => {
+    if (e.clipboardData) {
+      e.clipboardData.setData('text/plain', text);
+      e.preventDefault();
+    }
+  };
+  document.addEventListener('copy', listener, true);
+  try { document.execCommand('copy'); } catch (e) {}
+  document.removeEventListener('copy', listener, true);
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+  }
+}
+
 let settings = loadSettings();
 // Legacy alias: the rest of the code reads `fontSize` directly.
 let fontSize = settings.fontSize;
@@ -183,9 +207,30 @@ function createPane(container) {
     }, 150);
   });
   term.onSelectionChange(() => {
-    let sel=term.getSelection();
-    if(sel && navigator.clipboard) navigator.clipboard.writeText(sel).catch(() => {});
+    let sel = term.getSelection();
+    if (sel) copyText(sel);
   });
+
+  // OSC 52 from tmux (with `set-clipboard on`, which is the default
+  // here). xterm v5's built-in OSC 52 handler calls writeText, which
+  // Yandex denies because OSC bytes arrive on the network polling
+  // path — outside a gesture frame. Our handler reuses copyText() so
+  // the sync execCommand runs inside the activation window left by
+  // the recent mouseup. Format: "<kind>;<base64>"; "?" means a read
+  // request, which we don't service.
+  if (term.parser && term.parser.registerOscHandler) {
+    term.parser.registerOscHandler(52, data => {
+      let semi = data.indexOf(';');
+      if (semi < 0) return false;
+      let payload = data.slice(semi + 1);
+      if (!payload || payload === '?') return false;
+      let text;
+      try { text = atob(payload); } catch (e) { return false; }
+      try { text = decodeURIComponent(escape(text)); } catch (e) {}
+      copyText(text);
+      return true;
+    });
+  }
   term.onBell(() => {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
   });
