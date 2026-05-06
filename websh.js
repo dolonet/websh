@@ -1400,7 +1400,7 @@ function showConnectStatus(kind, ctx) {
     btn.textContent = 'OK';
   } else if (kind === 'rate_limited') {
     title.textContent = 'Too many connection attempts';
-    sub.textContent = 'Please wait a minute, then try again.';
+    sub.textContent = 'Please wait and try again shortly.';
     if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
     btn.textContent = 'OK';
   } else {
