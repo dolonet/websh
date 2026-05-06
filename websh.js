@@ -1248,6 +1248,9 @@ function realConnect(opts, run) {
       if (/not allowed|not in the allowed list/i.test(r.error)) {
         throw { kind: 'policy_deny', msg: r.error };
       }
+      if (/too many (connection attempts|active sessions|background sessions)/i.test(r.error)) {
+        throw { kind: 'rate_limited', msg: r.error };
+      }
       throw { kind: 'error', msg: r.error };
     }
     if (r.alive === false) throw { kind: 'host_down' };
@@ -1342,6 +1345,9 @@ function mapConnectError(err, opts) {
   if (/timeout/i.test(msg)) {
     return {kind: 'timeout', host, user, msg};
   }
+  if (/too many (connection attempts|active sessions|background sessions)/i.test(msg)) {
+    return {kind: 'rate_limited', host, user, msg};
+  }
   return {kind: 'error', host, user, msg};
 }
 
@@ -1391,6 +1397,11 @@ function showConnectStatus(kind, ctx) {
   } else if (kind === 'timeout') {
     title.textContent = 'Connection timed out';
     sub.textContent = 'The connection to ' + host + ' timed out.';
+    btn.textContent = 'OK';
+  } else if (kind === 'rate_limited') {
+    title.textContent = 'Too many connection attempts';
+    sub.textContent = 'Please wait a minute, then try again.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
     btn.textContent = 'OK';
   } else {
     title.textContent = 'Connection error';
