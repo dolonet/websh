@@ -321,10 +321,12 @@ Environment variables for `server.py`:
 | `PORT` | `8765` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address |
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
-| `MAX_SESSIONS` | `10` | Max concurrent SSH sessions |
+| `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
-| `MAX_BG_SESSIONS` | `10` | Max background SSH sessions (file upload/download) |
+| `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
+| `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
+| `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
 | `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
 | `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
 
