@@ -10,10 +10,12 @@ Environment variables:
     PORT                  — listen port (default: 8765)
     HOST                  — bind address (default: 127.0.0.1)
     SESSION_TIMEOUT       — seconds of inactivity before cleanup (default: 300)
-    MAX_SESSIONS          — max concurrent SSH sessions (default: 10)
+    MAX_SESSIONS          — max concurrent SSH sessions (default: 50)
     WEBSH_CONFIG          — path to websh.json config file (optional)
     TRUSTED_PROXIES       — comma-separated IPs to trust X-Forwarded-For from (default: 127.0.0.1)
-    MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 10)
+    MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 50)
+    RATE_LIMIT_MAX        — max /api/connect attempts per IP per window (default: 50)
+    RATE_LIMIT_WINDOW     — rate-limit window in seconds (default: 60)
     WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
                             on the target before a watchdog kills it
                             (default: 259200 = 72h, 0 disables)
@@ -73,8 +75,8 @@ def _int_env(name, default):
 PORT = _int_env("PORT", "8765")
 HOST = os.environ.get("HOST", "127.0.0.1")
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
-MAX_SESSIONS = _int_env("MAX_SESSIONS", "10")
-MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "10")
+MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
+MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "50")
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # Hard cap on a single binary download via /api/download (bytes). The
@@ -124,8 +126,8 @@ AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
                       "access denied", "too many authentication failures")
 
 # Rate limiting for /api/connect
-RATE_LIMIT_WINDOW = 60    # seconds
-RATE_LIMIT_MAX = 10       # max connect attempts per IP per window
+RATE_LIMIT_WINDOW = _int_env("RATE_LIMIT_WINDOW", "60")    # seconds
+RATE_LIMIT_MAX = _int_env("RATE_LIMIT_MAX", "50")          # max connect attempts per IP per window
 
 # Session ID format
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
