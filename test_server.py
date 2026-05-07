@@ -1550,12 +1550,64 @@ class TestPerIpSessionCount(unittest.TestCase):
         self.assertEqual(server._per_ip_session_count(None), 0)
 
 
+def _make_stub_session_cls(spawn_delay=0.0):
+    """Build a fake SSHSession class for `server.SSHSession` patches.
+
+    Real SSHSession `pty.fork()`s ssh and is the source of the
+    `forkpty() may lead to deadlocks` DeprecationWarning when the
+    HTTP test harness drives /api/connect from a multi-threaded
+    server. Tests that exercise `_connect`'s success path don't care
+    about the ssh side at all — they care about session-registry
+    bookkeeping. This stub gives the success path the attributes it
+    serializes (`alive`, `auth_failed`, `tmux_cmd`) plus the ones the
+    cleanup/cap iteration reads (`client_ip`, `is_background`,
+    `persistent`, `slot_id`, `is_expired`, `close`) and nothing else.
+
+    `spawn_delay` lets the concurrency test widen the race window the
+    cap is meant to close (the real spawn is wall-clock-slow; that's
+    the reason the placeholder swap exists).
+    """
+
+    class _StubSession(object):
+
+        def __init__(self, session_id, host, port, username, password,
+                     cols, rows, key=None, ssh_options=None,
+                     is_background=False, persistent=False, slot_id=None,
+                     tmux_cmd="tmux", tmux_options=None, client_ip=None):
+            if spawn_delay:
+                time.sleep(spawn_delay)
+            self.id = session_id
+            self.client_ip = client_ip
+            self.is_background = is_background
+            # Mirror the real SSHSession: persistent only sticks if a
+            # slot_id was provided. _connect's response reads the local
+            # `persistent`/`slot_id` rather than ours, but be symmetric.
+            self.persistent = bool(persistent and slot_id)
+            self.slot_id = slot_id if self.persistent else None
+            self.tmux_cmd = tmux_cmd
+            self.alive = True
+            self.auth_failed = False
+            self.last_activity = time.time()
+
+        def is_expired(self):
+            return False
+
+        def close(self):
+            pass
+
+    return _StubSession
+
+
 class TestPerIpSessionCapHTTP(unittest.TestCase):
     """Integration: per-IP cap returns 429 before reaching the SSH spawn.
 
     Plants fake session objects in the live registry and posts to
     /api/connect — the handler runs the gate inside `with sessions_lock:`
-    so the count is observed atomically.
+    so the count is observed atomically. The real SSHSession is replaced
+    with a stub for the duration of the class so the success path
+    doesn't pty.fork() ssh against `ignored.example` (which leaks file
+    descriptors and emits a DeprecationWarning under multi-threaded
+    test servers).
     """
 
     @classmethod
@@ -1589,11 +1641,24 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
         self._sessions_snapshot = dict(server.sessions)
         server.sessions.clear()
         self._orig_cap = server.MAX_SESSIONS_PER_IP
+        # Stub SSHSession so the success path doesn't pty.fork() ssh
+        # against `ignored.example` (slow, leaks fds, fires the
+        # forkpty() DeprecationWarning under a multi-threaded server).
+        self._orig_session_cls = server.SSHSession
+        server.SSHSession = _make_stub_session_cls()
+        # CONNECT_SETTLE_TIME is a 0.5 s post-spawn sleep that
+        # serializes the response. It exists to give real ssh a moment
+        # before the client tries to read; with a stubbed Session it's
+        # pure dead weight.
+        self._orig_settle = server.CONNECT_SETTLE_TIME
+        server.CONNECT_SETTLE_TIME = 0
 
     def tearDown(self):
         server.sessions.clear()
         server.sessions.update(self._sessions_snapshot)
         server.MAX_SESSIONS_PER_IP = self._orig_cap
+        server.SSHSession = self._orig_session_cls
+        server.CONNECT_SETTLE_TIME = self._orig_settle
 
     def _fake(self, client_ip):
         s = type("_FakeS", (), {})()
@@ -1619,6 +1684,26 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
     _PAYLOAD = {"host": "ignored.example", "username": "u",
                 "password": "p", "cols": 80, "rows": 24}
 
+    def _assert_connect_ok(self, body, code):
+        """Success-path assertion: 200 + a real session_id we can lookup.
+
+        Replaces the old one-sided `if code == 429: assertNotIn(...)`
+        pattern, which silently passed when the gate dropped entirely
+        or always passed.
+        """
+        self.assertEqual(
+            code, 200,
+            "expected 200 from connect, got {} body={}".format(code, body))
+        sid = body.get("session_id", "")
+        self.assertTrue(server._UUID_RE.match(sid),
+                        "expected uuid session_id, got {!r}".format(sid))
+        # Real (stubbed) Session was swapped in for the placeholder —
+        # if the swap had been skipped, sessions[sid] would still be
+        # the _SessionPlaceholder.
+        self.assertIn(sid, server.sessions)
+        self.assertNotIsInstance(server.sessions[sid],
+                                 server._SessionPlaceholder)
+
     def test_cap_blocks_when_exceeded(self):
         server.MAX_SESSIONS_PER_IP = 2
         for i in range(2):
@@ -1628,30 +1713,50 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
         self.assertIn("from your IP", body["error"])
 
     def test_cap_allows_at_or_below_limit(self):
-        # 1 active session, cap is 2 → next connect must NOT hit per-IP 429.
+        # 1 active session, cap is 2 → next connect must succeed (200)
+        # and register a real session.
         server.MAX_SESSIONS_PER_IP = 2
         server.sessions["one"] = self._fake("127.0.0.1")
         body, code = self._post(self._PAYLOAD)
-        # ssh will fail or hang past the gate, but the gate did not
-        # produce a "from your IP" 429.
-        if code == 429:
-            self.assertNotIn("from your IP", body.get("error", ""))
+        self._assert_connect_ok(body, code)
 
     def test_cap_does_not_block_other_ips(self):
+        # Two sessions from a different IP at cap=2 must NOT block
+        # 127.0.0.1's connect.
         server.MAX_SESSIONS_PER_IP = 2
         for i in range(2):
             server.sessions["fake-{}".format(i)] = self._fake("9.9.9.9")
         body, code = self._post(self._PAYLOAD)
-        if code == 429:
-            self.assertNotIn("from your IP", body.get("error", ""))
+        self._assert_connect_ok(body, code)
 
     def test_cap_zero_disables_gate(self):
+        # Cap 0 = disabled: even with 5 active sessions from this IP
+        # the connect must succeed.
         server.MAX_SESSIONS_PER_IP = 0
         for i in range(5):
             server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
         body, code = self._post(self._PAYLOAD)
-        if code == 429:
-            self.assertNotIn("from your IP", body.get("error", ""))
+        self._assert_connect_ok(body, code)
+
+    def test_cap_at_exact_limit_blocks_one_more(self):
+        # Boundary: with cap-1 fakes preloaded, the first request must
+        # pass (count == cap-1 < cap, registers, count becomes cap) and
+        # the second must hit the per-IP 429 (count == cap >= cap).
+        # Verifies the gate's inequality direction is `>=` and not `>`.
+        cap = 3
+        server.MAX_SESSIONS_PER_IP = cap
+        for i in range(cap - 1):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+
+        body1, code1 = self._post(self._PAYLOAD)
+        self._assert_connect_ok(body1, code1)
+
+        body2, code2 = self._post(self._PAYLOAD)
+        self.assertEqual(
+            code2, 429,
+            "expected per-IP 429 on the second request, got {} body={}".format(
+                code2, body2))
+        self.assertIn("from your IP", body2.get("error", ""))
 
 
 class TestPerIpSessionCapConcurrency(unittest.TestCase):
