@@ -605,14 +605,22 @@ test("SSE 'open' event does not mark body as arrived", async () => {
   ok(p.sseGotAnyMessage === false,
      'sseGotAnyMessage=false before any event; got ' + p.sseGotAnyMessage);
 
-  // Fire 'open': must NOT flip sseGotAnyMessage. (The fix.)
-  ok(typeof captured.listeners.open === 'function',
-     "'open' listener registered");
-  captured.listeners.open();
-  ok(p.sseGotAnyMessage === false,
-     "'open' must not mark body arrived; got " + p.sseGotAnyMessage);
-  ok(p.sseFirstMsgTimer != null,
-     "'open' must not clear first-message timer; got " + p.sseFirstMsgTimer);
+  // 'open' fires when HTTP headers arrive. It must NOT flip
+  // sseGotAnyMessage and must NOT clear the retry clock — a buffering
+  // proxy passes headers through but holds the body. The handler may
+  // either register an 'open' listener that's a no-op, or skip the
+  // listener entirely; both are correct. Fire whatever the handler
+  // registered (if any) and verify nothing changes.
+  if (typeof captured.listeners.open === 'function') {
+    p.firstFailureAt = 12345; // sentinel: must NOT be cleared by 'open'
+    captured.listeners.open();
+    ok(p.sseGotAnyMessage === false,
+       "'open' must not mark body arrived; got " + p.sseGotAnyMessage);
+    ok(p.sseFirstMsgTimer != null,
+       "'open' must not clear first-message timer; got " + p.sseFirstMsgTimer);
+    ok(p.firstFailureAt === 12345,
+       "'open' must not clear retry clock; got " + p.firstFailureAt);
+  }
 
   // Fire 'data' with a benign payload: NOW the body has arrived.
   captured.listeners.data({data: JSON.stringify({data: '', alive: true})});
@@ -679,6 +687,54 @@ test('echo_off=true disables predictions; absent field leaves state alone', asyn
      'echoEnabled flipped true on echo_off=false; got ' + p.echoEnabled);
   ok(win.predictionsEnabled(p) === true,
      'predictionsEnabled() truthy again');
+  cleanup(env);
+});
+
+// Wide chars and non-ASCII bypass the prediction queue. rewindEcho's
+// '\b \b' assumes one column per queued char, but CJK / fullwidth /
+// emoji glyphs occupy 2 columns. Non-ASCII (Cyrillic, etc.) is
+// single-cell but doesn't round-trip safely against base64-decoded
+// server bytes (consumeEcho compares JS char codes byte-for-byte).
+// predictKey must drop those at entry.
+test('predictKey skips wide chars and non-ASCII', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const writes = [];
+  const p = {
+    id: 'p1', sid: 'abc', polling: true,
+    term: {
+      write(b) { writes.push(typeof b === 'string' ? b : '<bin>'); },
+      buffer: {active: {type: 'normal'}},
+    },
+    el: win.document.createElement('div'),
+    echoQueue: '', echoTimer: null, echoEnabled: true,
+  };
+
+  // ASCII printable: predicted (writes a dim glyph).
+  win.predictKey(p, 'a');
+  ok(p.echoQueue === 'a',
+     'ASCII queued; got echoQueue=' + JSON.stringify(p.echoQueue));
+  ok(writes.some(w => w.includes('\x1b[2m')),
+     'ASCII printable wrote a dim glyph; writes=' + JSON.stringify(writes));
+  // Reset: rewind, then drop predictions silently.
+  p.echoQueue = '';
+  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
+  writes.length = 0;
+
+  // CJK (wide): NOT predicted — column-only \b would corrupt.
+  win.predictKey(p, '中');
+  ok(p.echoQueue === '',
+     'CJK char must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
+  // Cyrillic single-cell but UTF-8 multibyte on the wire — still rejected.
+  win.predictKey(p, 'я');
+  ok(p.echoQueue === '',
+     'Cyrillic must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
+  // Emoji are length 2 in UTF-16 (surrogate pair) and already filtered
+  // by `ch.length !== 1` — confirm explicit assertion still holds.
+  win.predictKey(p, '😀');
+  ok(p.echoQueue === '',
+     'Emoji must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
+
   cleanup(env);
 });
 

@@ -141,7 +141,12 @@ function proxy_stream($url) {
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
     curl_setopt($ch, CURLOPT_HEADER, false);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+    // Bound stream lifetime so a hung backend doesn't tie up a PHP-FPM
+    // worker forever. 1 hour is generous for a real interactive session
+    // and short enough to bail on a deadlocked backend before the worker
+    // pool exhausts. The browser's EventSource auto-reconnects on EOF so
+    // a long-lived session reconnects through the timeout boundary.
+    curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
     curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: text/event-stream'));
     curl_setopt($ch, CURLOPT_HEADERFUNCTION,
         function ($ch, $header) use (&$sent_headers) {
@@ -149,7 +154,11 @@ function proxy_stream($url) {
             if (!$sent_headers
                     && preg_match('#^HTTP/\S+\s+(\d+)\b#', trim($header), $m)) {
                 $code = intval($m[1]);
-                header('HTTP/1.1 ' . $code);
+                // http_response_code() emits a proper status line on
+                // every SAPI (apache mod_php, fpm, cli-server). The bare
+                // header('HTTP/1.1 NNN') form silently drops on some
+                // FPM+nginx configs that expect a reason phrase.
+                http_response_code($code);
                 header('Cache-Control: no-cache, no-store');
                 if ($code === 200) {
                     header('Content-Type: text/event-stream');
@@ -175,7 +184,7 @@ function proxy_stream($url) {
     if (!$sent_headers) {
         // curl never received a response status line — treat as gateway
         // failure rather than letting PHP emit its default text/html.
-        header('HTTP/1.1 502 Bad Gateway');
+        http_response_code(502);
         header('Content-Type: application/json');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
     }
