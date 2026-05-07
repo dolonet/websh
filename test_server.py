@@ -1556,6 +1556,147 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
             self.assertNotIn("from your IP", body.get("error", ""))
 
 
+class TestPerIpSessionCapConcurrency(unittest.TestCase):
+    """Regression: per-IP cap must not be racy under concurrent connects.
+
+    The original implementation released sessions_lock between the gate
+    check and the registry insert, with the SSH spawn (wall-clock-slow)
+    in the middle. N concurrent POSTs from the same IP all observed
+    `count == cap-1`, all passed the gate, all spawned ssh, all
+    inserted — final count = cap + N - 1.
+
+    The fix reserves a counted slot (a `_SessionPlaceholder`) under the
+    gate lock before spawning. Concurrent connects from the same IP
+    observe the in-flight slots and trip the cap. We widen the spawn
+    window via a stubbed SSHSession that sleeps 50 ms in __init__, then
+    fire cap+5 concurrent POSTs and assert exactly `cap` succeed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18785
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+        self._sessions_snapshot = dict(server.sessions)
+        server.sessions.clear()
+        self._orig_cap = server.MAX_SESSIONS_PER_IP
+        self._orig_settle = server.CONNECT_SETTLE_TIME
+        # The settle sleep is post-spawn and serializes the response;
+        # zero it so we don't wait 0.5s per request needlessly.
+        server.CONNECT_SETTLE_TIME = 0
+        # Allow plenty of rate-limit budget — we fire cap+5 in one
+        # window. Default RATE_LIMIT_MAX is 50 which is fine, but be
+        # explicit.
+        self._orig_rate_max = server.RATE_LIMIT_MAX
+        server.RATE_LIMIT_MAX = 100
+        self._orig_session_cls = server.SSHSession
+
+        # Stubbed Session class: sleeps 50 ms in __init__ to widen the
+        # race window the gate is meant to close, then sets the minimum
+        # attrs the success-path response reads.
+        class _SlowFakeSession(object):
+            def __init__(self, session_id, host, port, username, password,
+                         cols, rows, key=None, ssh_options=None,
+                         is_background=False, persistent=False, slot_id=None,
+                         tmux_cmd="tmux", tmux_options=None, client_ip=None):
+                time.sleep(0.05)
+                self.id = session_id
+                self.client_ip = client_ip
+                self.is_background = is_background
+                self.persistent = bool(persistent and slot_id)
+                self.slot_id = slot_id if self.persistent else None
+                self.tmux_cmd = tmux_cmd
+                self.alive = True
+                self.auth_failed = False
+                self.last_activity = time.time()
+
+            def is_expired(self):
+                return False
+
+            def close(self):
+                pass
+
+        server.SSHSession = _SlowFakeSession
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._sessions_snapshot)
+        server.MAX_SESSIONS_PER_IP = self._orig_cap
+        server.CONNECT_SETTLE_TIME = self._orig_settle
+        server.RATE_LIMIT_MAX = self._orig_rate_max
+        server.SSHSession = self._orig_session_cls
+
+    def _post(self):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        body = json.dumps({"host": "ignored.example", "username": "u",
+                           "password": "p", "cols": 80, "rows": 24}).encode("utf-8")
+        req = Request(url, data=body,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=10)
+            return resp.getcode(), json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            if hasattr(e, "read") and hasattr(e, "code"):
+                try:
+                    return e.code, json.loads(e.read().decode("utf-8"))
+                except Exception:
+                    return e.code, {}
+            raise
+
+    def test_concurrent_connects_respect_cap(self):
+        from concurrent.futures import ThreadPoolExecutor
+        cap = 3
+        burst = cap + 5
+        server.MAX_SESSIONS_PER_IP = cap
+
+        with ThreadPoolExecutor(max_workers=burst) as pool:
+            futures = [pool.submit(self._post) for _ in range(burst)]
+            results = [f.result() for f in futures]
+
+        codes = [code for code, _ in results]
+        ok = [r for r in results if 200 <= r[0] < 300]
+        rate_limited = [r for r in results
+                        if r[0] == 429
+                        and "from your IP" in r[1].get("error", "")]
+
+        self.assertEqual(
+            len(ok), cap,
+            "expected exactly cap={} successful connects, got {} (codes: {})".format(
+                cap, len(ok), codes))
+        self.assertEqual(
+            len(rate_limited), burst - cap,
+            "expected exactly {} per-IP 429s, got {} (codes: {})".format(
+                burst - cap, len(rate_limited), codes))
+        # And no other failure modes — every response must have been
+        # accounted for above.
+        self.assertEqual(len(ok) + len(rate_limited), burst,
+                         "unexpected response codes: {}".format(codes))
+
+
 class TestUUIDValidation(unittest.TestCase):
 
     def test_valid(self):

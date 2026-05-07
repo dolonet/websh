@@ -411,12 +411,55 @@ def _per_ip_session_count(ip):
     Counts both foreground and background sessions together — for the
     purposes of the MAX_SESSIONS_PER_IP gate, an abuser holding N total
     sessions is the threat we're guarding against, regardless of how
-    they're tagged internally.
+    they're tagged internally. Placeholders (slots reserved for an
+    in-flight `_connect` whose ssh has not yet been spawned) are counted
+    too — the whole point of the placeholder is to make the gate
+    race-free against concurrent connects from the same IP.
     """
     if not ip:
         return 0
     return sum(1 for s in sessions.values()
                if getattr(s, "client_ip", None) == ip)
+
+
+class _SessionPlaceholder(object):
+    """Reserved slot in the `sessions` registry while `_connect` spawns ssh.
+
+    `_connect` runs the per-IP / global session-count gates inside
+    sessions_lock, then releases the lock to spawn ssh (pty.fork is
+    wall-clock-slow), then re-acquires the lock to insert the real
+    Session. Without a placeholder, N concurrent connects from the same
+    IP all see `count == cap-1`, all pass the gate, and all spawn ssh —
+    blowing past the cap by N-1. Inserting a placeholder under the gate
+    lock gives later connects a count that includes the in-flight ones.
+
+    Stubs `is_expired()` / `close()` so the cleanup loop and shutdown
+    handler can iterate `sessions.values()` without special-casing
+    placeholders. They live for at most a connect's worth of time —
+    longer-lived consumers will only ever see real Sessions.
+    """
+
+    __slots__ = ("client_ip", "is_background", "persistent")
+
+    def __init__(self, client_ip, is_background):
+        self.client_ip = client_ip
+        self.is_background = is_background
+        # cleanup() and other paths may inspect `.persistent`; placeholders
+        # are never persistent regardless of the caller's intent — the
+        # real Session takes over before the user sees the slot_id.
+        self.persistent = False
+
+    def is_expired(self):
+        # A placeholder never expires on its own — _connect's swap-or-pop
+        # is what removes it. SESSION_TIMEOUT is in the minute range
+        # while a connect lasts at most a few seconds, so this is moot in
+        # practice but lets cleanup() iterate without an isinstance check.
+        return False
+
+    def close(self):
+        # Shutdown handler iterates and calls close() on every session.
+        # A placeholder owns no fds or subprocesses — nothing to release.
+        pass
 
 
 # ─── Config file ────────────────────────────────────────────────────
@@ -1965,12 +2008,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "connections to this host are not allowed"}, 403)
             return
 
-        # Check session limits. Per-IP cap (if enabled) runs first so a
-        # single abuser cannot starve everyone else by holding all the
-        # global slots. fg/bg are counted separately for the global caps
-        # (a file-transfer side channel should not push a user out of an
-        # interactive session and vice versa) but they share the per-IP
-        # bucket — abuse is abuse regardless of classification.
+        # Check session limits and reserve a counted slot atomically.
+        # Per-IP cap (if enabled) runs first so a single abuser cannot
+        # starve everyone else by holding all the global slots. fg/bg
+        # are counted separately for the global caps (a file-transfer
+        # side channel should not push a user out of an interactive
+        # session and vice versa) but they share the per-IP bucket —
+        # abuse is abuse regardless of classification.
+        #
+        # We insert a _SessionPlaceholder under the gate lock and only
+        # then drop it to spawn ssh (which is wall-clock-slow). The next
+        # connect from the same IP / class observes a count that
+        # includes this in-flight slot, closing the TOCTOU window where
+        # N concurrent connects all observed `count == cap-1` and all
+        # passed the gate. Either we swap the placeholder for the real
+        # Session on success, or pop it on failure.
+        sid = str(uuid.uuid4())
         with sessions_lock:
             if MAX_SESSIONS_PER_IP > 0:
                 per_ip = _per_ip_session_count(ip)
@@ -1991,8 +2044,9 @@ class Handler(BaseHTTPRequestHandler):
                 if count >= MAX_SESSIONS:
                     self._json({"error": "too many active sessions"}, 429)
                     return
+            sessions[sid] = _SessionPlaceholder(client_ip=ip,
+                                                is_background=is_bg)
 
-        sid = str(uuid.uuid4())
         session = None
         try:
             session = SSHSession(
@@ -2013,6 +2067,9 @@ class Handler(BaseHTTPRequestHandler):
                 client_ip=ip,
             )
             with sessions_lock:
+                # Swap placeholder for the real Session. The slot was
+                # already counted under the gate lock, so this never
+                # bumps any cap.
                 sessions[sid] = session
 
             time.sleep(CONNECT_SETTLE_TIME)
@@ -2029,8 +2086,20 @@ class Handler(BaseHTTPRequestHandler):
                 "tmux_cmd": session.tmux_cmd,
             })
         except Exception as e:
-            if session:
+            # Spawn failed before the swap. Pop the placeholder so it
+            # does not occupy a counted slot forever, and (if the real
+            # Session was constructed but registry insert raised) close
+            # it. The pop is best-effort: if the swap above already ran
+            # and a later step raised, we'd be popping the real Session
+            # — that's fine, close() below releases its resources.
+            with sessions_lock:
+                stale = sessions.pop(sid, None)
+            if session is not None:
                 session.close()
+            elif stale is not None and hasattr(stale, "close"):
+                # Placeholder pop — no-op close() but keep the call
+                # symmetric with the real-session branch.
+                stale.close()
             self._json({"error": str(e)}, 500)
 
     def _input(self):
