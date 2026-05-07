@@ -1967,12 +1967,24 @@ def cleanup():
             sessions[sid].close()
             del sessions[sid]
     # Prune stale rate limit entries to prevent unbounded memory growth
-    cutoff = time.time() - RATE_LIMIT_WINDOW
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
     with _rate_lock:
         stale = [ip for ip, times in _rate_limits.items()
                  if not any(t > cutoff for t in times)]
         for ip in stale:
             del _rate_limits[ip]
+    # Prune stale scan-pattern entries the same way. Without this the
+    # dict grows proportionally to attacker activity and never shrinks
+    # — the worst possible scaling profile for a long-running deploy.
+    # Drop any IP whose newest event has aged out of the window (so an
+    # attacker that stops probing eventually disappears from RAM).
+    scan_cutoff = now - SCAN_PATTERN_WINDOW
+    with _scan_pattern_lock:
+        stale = [ip for ip, events in _scan_pattern.items()
+                 if not any(t > scan_cutoff for t, _ in events)]
+        for ip in stale:
+            del _scan_pattern[ip]
 
 
 def _cleanup_loop():

@@ -1810,6 +1810,45 @@ class TestScanPatternDetection(unittest.TestCase):
             unique = set(h for _, h in server._scan_pattern.get("1.2.3.4", []))
         self.assertEqual(unique, {"host.example"})
 
+    # ── memory bound: cleanup() prunes expired IPs ──
+
+    def test_cleanup_prunes_expired_scan_pattern_entries(self):
+        """`cleanup()` must drop any IP whose entire event list has
+        aged out of the window — otherwise the dict grows for every
+        unique attacker IP and never shrinks (slow leak proportional
+        to attacker activity, the worst scaling profile)."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 60
+        # Plant events from two IPs at virtual time t=1000.
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            server._record_deny_for_scan("scanner-a", "h1")
+            server._record_deny_for_scan("scanner-a", "h2")
+            server._record_deny_for_scan("scanner-b", "h3")
+        # Sanity: both IPs are present.
+        with server._scan_pattern_lock:
+            self.assertIn("scanner-a", server._scan_pattern)
+            self.assertIn("scanner-b", server._scan_pattern)
+        # Fast-forward past the window, then run cleanup. Both IPs'
+        # events are now stale and the entries should disappear.
+        with unittest.mock.patch("server.time.time", return_value=1100.0):
+            server.cleanup()
+        with server._scan_pattern_lock:
+            self.assertNotIn("scanner-a", server._scan_pattern)
+            self.assertNotIn("scanner-b", server._scan_pattern)
+
+    def test_cleanup_keeps_fresh_scan_pattern_entries(self):
+        """An IP with at least one in-window event must NOT be evicted
+        by cleanup() — otherwise we lose live state mid-attack."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 60
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            server._record_deny_for_scan("active", "h1")
+        # Run cleanup at t=1030 — still inside the 60s window.
+        with unittest.mock.patch("server.time.time", return_value=1030.0):
+            server.cleanup()
+        with server._scan_pattern_lock:
+            self.assertIn("active", server._scan_pattern)
+
 
 class TestPerIpSessionCount(unittest.TestCase):
     """Unit tests for the per-IP session-count helper."""
