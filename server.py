@@ -384,6 +384,123 @@ def _log(level, msg):
     sys.stderr.write("{} [{}] {}\n".format(ts, level, msg))
 
 
+# ─── Access log ─────────────────────────────────────────────────────
+#
+# When WEBSH_ACCESS_LOG points at a file, every abuse-relevant connect/
+# disconnect event is appended as a single JSON line. The format is
+# stable so fail2ban filters and ad-hoc jq pipelines can rely on it.
+# When unset (default), the helper is a no-op and the request flow is
+# unaffected.
+#
+# Each record is emitted with a single os.write(2) on an O_APPEND fd
+# opened-and-closed per call. logrotate(8) survives without any signal-
+# based reopen plumbing — `copytruncate` is fine. On Linux, O_APPEND
+# adjusts the file offset and writes the buffer atomically with respect
+# to other O_APPEND writers, so concurrent threads cannot interleave
+# bytes. To keep that guarantee real (rather than depending on PIPE_BUF
+# or per-syscall partial-write quirks), every attacker-controlled string
+# field is hard-capped before serialisation, which keeps the final JSON
+# line safely under any reasonable single-write limit.
+
+def _resolve_log_path(raw):
+    """Normalise the WEBSH_ACCESS_LOG value at module load.
+
+    Empty/whitespace → "" (logging disabled). Otherwise expand ~ and
+    resolve to an absolute path. Relative paths therefore land under
+    the server's cwd at startup time, not against whatever cwd a
+    request handler may briefly inherit.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+ACCESS_LOG_PATH = _resolve_log_path(os.environ.get("WEBSH_ACCESS_LOG"))
+
+# Per-field caps (in Unicode codepoints) for known fields. Anything not
+# listed here gets _DEFAULT_FIELD_CAP. Values are server- or attacker-
+# controlled strings; we cap aggressively so that ① a single record
+# always fits in one os.write(2), and ② operators who `cat` the log
+# don't get hosed by a megabyte of attacker payload.
+_LOG_FIELD_CAPS = {
+    "target_host": 253,    # DNS hostname max
+    "target_user": 64,     # POSIX login name typical
+    "sid": 36,             # UUID4
+    "error": 200,
+    "result": 32,
+    "event": 32,
+    "classification": 32,
+}
+_DEFAULT_FIELD_CAP = 256
+
+# Codepoints we replace with "?" before serialisation. ASCII C0 control,
+# DEL + C1 control (0x7F–0x9F), and Unicode bidi/format mischief
+# (LRE/RLE/PDF/LRO/RLO + LRI/RLI/FSI/PDI). JSON's ensure_ascii=False
+# does not escape any of these, so without this filter a hostile host=
+# value could land raw escape sequences into a log an operator may
+# later view in a terminal.
+_LOG_BAD_CODEPOINTS = (
+    set(range(0x00, 0x20)) |
+    set(range(0x7F, 0xA0)) |
+    {0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+     0x2066, 0x2067, 0x2068, 0x2069}
+)
+
+
+def _sanitize_for_log(value, max_len):
+    """Coerce to str, truncate to max_len codepoints, scrub control chars.
+
+    Used for any string field that may carry attacker-supplied bytes
+    (target_host, target_user, error, …). The output is safe to emit
+    inside a JSON line and to view in a terminal.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    if len(value) > max_len:
+        value = value[:max_len]
+    if not any(ord(ch) in _LOG_BAD_CODEPOINTS for ch in value):
+        return value
+    return "".join("?" if ord(ch) in _LOG_BAD_CODEPOINTS else ch
+                   for ch in value)
+
+
+def _access_log_emit(event, ip, **fields):
+    """Append one JSON record to the access log if WEBSH_ACCESS_LOG is set.
+
+    Failures are reported via _log and swallowed — access logging must
+    never break a live request.
+    """
+    if not ACCESS_LOG_PATH:
+        return
+    record = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"),
+        "event": _sanitize_for_log(event, _LOG_FIELD_CAPS["event"]),
+        "ip": _sanitize_for_log(ip or "", _DEFAULT_FIELD_CAP),
+    }
+    for k, v in fields.items():
+        if isinstance(v, str):
+            cap = _LOG_FIELD_CAPS.get(k, _DEFAULT_FIELD_CAP)
+            record[k] = _sanitize_for_log(v, cap)
+        else:
+            record[k] = v
+    try:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        # Single os.write on an O_APPEND fd: the kernel adjusts the
+        # offset and commits the buffer atomically against other
+        # O_APPEND writers on Linux, so concurrent emits cannot
+        # interleave bytes within one record.
+        fd = os.open(ACCESS_LOG_PATH,
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError as e:
+        _log("WARN", "access log write failed: {}".format(e))
+
+
 # ─── Rate limiting ──────────────────────────────────────────────────
 
 _rate_limits = {}  # IP -> list of timestamps
@@ -1982,8 +2099,10 @@ class Handler(BaseHTTPRequestHandler):
     def _connect(self):
         # Rate limit by IP
         ip = self._client_ip()
+        t0 = time.time()
         if not _check_rate_limit(ip):
             _log("WARN", "rate limited: {}".format(ip))
+            _access_log_emit("connect", ip, result="rate_limited")
             self._json({"error": "too many connection attempts"}, 429)
             return
 
@@ -2068,6 +2187,8 @@ class Handler(BaseHTTPRequestHandler):
         # Free-form manual connect is unrestricted unless restrict_hosts
         # pins the user to a ready server-side connection.
         if not conn_name and not is_host_allowed(host, port, username):
+            _access_log_emit("connect", ip, result="deny_blocked",
+                             target_host=host, target_user=username)
             self._json({"error": "connections to this host are not allowed"}, 403)
             return
 
@@ -2093,18 +2214,29 @@ class Handler(BaseHTTPRequestHandler):
                 if per_ip >= MAX_SESSIONS_PER_IP:
                     _log("WARN", "per-IP session cap hit: ip={} count={}".format(
                         ip, per_ip))
+                    _access_log_emit("connect", ip,
+                                     result="session_cap_per_ip",
+                                     target_host=host, target_user=username)
                     self._json({"error": "too many active sessions from your IP"},
                                429)
                     return
             if is_bg:
                 count = sum(1 for s in sessions.values() if s.is_background)
                 if count >= MAX_BG_SESSIONS:
+                    _access_log_emit("connect", ip,
+                                     result="session_cap_global",
+                                     target_host=host, target_user=username,
+                                     classification="background")
                     self._json({"error": "too many background sessions"}, 429)
                     return
             else:
                 count = sum(1 for s in sessions.values()
                             if not s.is_background)
                 if count >= MAX_SESSIONS:
+                    _access_log_emit("connect", ip,
+                                     result="session_cap_global",
+                                     target_host=host, target_user=username,
+                                     classification="foreground")
                     self._json({"error": "too many active sessions"}, 429)
                     return
             sessions[sid] = _SessionPlaceholder(client_ip=ip,
@@ -2139,6 +2271,10 @@ class Handler(BaseHTTPRequestHandler):
             _log("INFO", "new session {} for {}@{}:{}{}".format(
                 sid, username, host, port,
                 " [persistent slot=" + slot_id + "]" if persistent else ""))
+            _access_log_emit("connect", ip, result="ok", sid=sid,
+                             target_host=host, target_user=username,
+                             persistent=persistent,
+                             latency_ms=int((time.time() - t0) * 1000))
             self._json({
                 "session_id": sid,
                 "status": "connecting",
@@ -2163,6 +2299,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Placeholder pop — no-op close() but keep the call
                 # symmetric with the real-session branch.
                 stale.close()
+            _access_log_emit("connect", ip, result="error",
+                             target_host=host, target_user=username,
+                             error=str(e)[:200])
             self._json({"error": str(e)}, 500)
 
     def _input(self):
@@ -2800,9 +2939,25 @@ class Handler(BaseHTTPRequestHandler):
         with sessions_lock:
             session = sessions.pop(sid, None)
         if session:
-            if terminate:
-                session.terminate_remote_tmux()
-            session.close()
+            # Snapshot attacker-relevant state up front: if cleanup
+            # raises we still want the access-log entry, with `error`
+            # set so the failure is observable.
+            host_for_log = getattr(session, "host", "")
+            err = None
+            try:
+                if terminate:
+                    session.terminate_remote_tmux()
+                session.close()
+            except Exception as e:
+                err = str(e)
+            finally:
+                fields = {"sid": sid, "terminate": terminate,
+                          "target_host": host_for_log,
+                          "result": "terminated" if terminate else "closed"}
+                if err is not None:
+                    fields["error"] = err
+                    fields["result"] = "close_error"
+                _access_log_emit("disconnect", self._client_ip(), **fields)
         self._json({"ok": True})
 
 
@@ -2859,6 +3014,8 @@ def main():
 
     _log("INFO", "websh v{} listening on http://{}:{}".format(
         __version__, HOST, PORT))
+    if ACCESS_LOG_PATH:
+        _log("INFO", "access log: {}".format(ACCESS_LOG_PATH))
     server.serve_forever()
 
 

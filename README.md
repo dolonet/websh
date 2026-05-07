@@ -372,6 +372,7 @@ Environment variables for `server.py`:
 | `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
 | `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
 | `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
+| `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [Access log](#access-log) below. |
 
 The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
 
@@ -525,6 +526,61 @@ If your reverse proxy runs on a different host, add its IP:
 ```bash
 TRUSTED_PROXIES=127.0.0.1,10.0.0.5 python3 server.py
 ```
+
+### Access log
+
+Set `WEBSH_ACCESS_LOG=/path/to/access.log` to emit one JSON record per
+abuse-relevant event. Records are stable single-line JSON suitable for
+`fail2ban` filters and ad-hoc `jq` pipelines. The value is normalised
+at startup: `~` expands and a relative path resolves against the
+server's cwd. The resolved path is logged once at startup
+(`access log: <abs-path>`).
+
+```json
+{"ts":"2026-05-07T12:34:56.789012Z","event":"connect","ip":"203.0.113.7","result":"deny_blocked","target_host":"10.5.6.7","target_user":"root"}
+{"ts":"2026-05-07T12:35:01.123456Z","event":"connect","ip":"203.0.113.7","result":"rate_limited"}
+{"ts":"2026-05-07T12:35:42.999999Z","event":"connect","ip":"198.51.100.4","result":"ok","sid":"…","target_host":"prod.example","target_user":"deploy","persistent":false,"latency_ms":612}
+{"ts":"2026-05-07T12:40:11.000000Z","event":"disconnect","ip":"198.51.100.4","sid":"…","terminate":false,"target_host":"prod.example","result":"closed"}
+```
+
+Common `result` values on `connect` events:
+
+| `result` | Meaning |
+|---|---|
+| `ok` | Session created. Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
+| `rate_limited` | Caller exceeded `RATE_LIMIT_MAX` for the window. |
+| `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
+| `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
+| `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
+| `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
+
+Common `result` values on `disconnect` events:
+
+| `result` | Meaning |
+|---|---|
+| `closed` | Disconnect with `terminate=false`; the persistent session (if any) is left alive on the target. |
+| `terminated` | Disconnect with `terminate=true`; the persistent tmux session was killed on the target before close. |
+| `close_error` | `session.close()` (or `terminate_remote_tmux()`) raised. The record still appears, with `error` set to the exception text. |
+
+`fail2ban` filter sketch — drop into `/etc/fail2ban/filter.d/websh-abuse.conf`:
+
+```ini
+[Definition]
+failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|deny_blocked|session_cap_per_ip)".*$
+ignoreregex =
+```
+
+The file is opened-and-closed per write, so `logrotate(8)` works without
+any signal-based reopen plumbing — `copytruncate` is fine. Each record
+is committed with a single `write(2)` on an `O_APPEND` fd: on Linux the
+kernel adjusts the file offset and commits the buffer atomically against
+other `O_APPEND` writers, so concurrent threads do not interleave bytes
+within one record. To keep that guarantee real, every attacker-
+controlled string field is hard-capped before serialisation
+(`target_host` 253, `target_user` 64, `sid` 36, `error` 200, server-
+controlled status fields 32) and ASCII C0/C1 + Unicode bidi/format
+control codepoints are scrubbed to `?`, so a single record always fits
+in one `write(2)` call and stays safe to view in a terminal.
 
 ### Input validation
 
