@@ -569,9 +569,26 @@ Common `result` values on `disconnect` events:
 
 ```ini
 [Definition]
-failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|deny_blocked|session_cap_per_ip|scan_pattern)".*$
+failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|session_cap_per_ip|scan_pattern)".*$
 ignoreregex =
 ```
+
+Note that `deny_blocked` is deliberately **not** in the recommended
+filter. A one-off `deny_blocked` is just as likely a fat-fingered
+hostname or a stale UI link as it is an attacker — banning on a single
+event would burn legitimate users. The `scan_pattern` event is the
+curated signal for "this IP is probing the deny-list": it only fires
+once `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets are reached
+inside the window, and any successful connect from the same IP
+forgives the accumulation. So `deny_blocked` records stay in the log
+for operator visibility (you want to see misconfigured clients) but
+fail2ban acts only on the `scan_pattern` aggregate.
+
+If `SCAN_PATTERN_THRESHOLD=0` (the default — disabled), `deny_blocked`
+events are still recorded but no `scan_pattern` events are ever
+emitted — the operator hasn't opted in to automatic banning, so
+nothing in this filter triggers on a typo. Set a positive
+`SCAN_PATTERN_THRESHOLD` to enable the curated signal.
 
 The file is opened-and-closed per write, so `logrotate(8)` works without
 any signal-based reopen plumbing — `copytruncate` is fine. Each record

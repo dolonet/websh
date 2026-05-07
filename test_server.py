@@ -1729,17 +1729,20 @@ class TestScanPatternDetection(unittest.TestCase):
     def test_window_expires_old_events(self):
         """Old deny events fall out of the window — slow-and-low
         scanners stretching their probes across hours never accumulate
-        enough inside the 5-minute (default) window. Verify by setting
-        a tiny window and waiting it out."""
+        enough inside the 5-minute (default) window. Use a clock mock
+        so the test runs in milliseconds rather than burning real time
+        on a CI runner."""
         server.SCAN_PATTERN_THRESHOLD = 3
-        server.SCAN_PATTERN_WINDOW = 1  # 1 second for the test
-        for h in ("a", "b", "c"):
-            server._record_deny_for_scan("slow-scanner", h)
-        time.sleep(1.1)
-        # Old events have expired; the next probe is the first inside
-        # the (new) window — no fire.
-        self.assertFalse(server._record_deny_for_scan(
-            "slow-scanner", "d"))
+        server.SCAN_PATTERN_WINDOW = 60
+        # Plant three denies at virtual time t=1000.
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            for h in ("a", "b", "c"):
+                server._record_deny_for_scan("slow-scanner", h)
+        # Fast-forward past the window: the next probe is the first
+        # event inside the (new) window — count drops to 1 — no fire.
+        with unittest.mock.patch("server.time.time", return_value=1100.0):
+            self.assertFalse(server._record_deny_for_scan(
+                "slow-scanner", "d"))
 
     # ── safety: realistic devops user does NOT trigger ──
 
