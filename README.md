@@ -24,7 +24,9 @@ For the deeper picture — buffer-detection probe, lost-byte handling on disconn
 
 ## Requirements
 
-- **Backend:** Python 3.5+ with `ssh` command available
+- **Backend:** CPython 3.5+ with `ssh` command available (alternative
+  Python implementations may work but the GC-bound pipe-fd lifetime
+  in the SSE wait machinery assumes refcount-style finalization)
 - **Proxy:** PHP 5.3+ with curl extension (shared hosting) — or any reverse proxy (nginx, Apache)
 - **Browser:** Any modern browser (Chrome, Firefox, Safari, Edge)
 - **Frontend:** Loads [xterm.js](https://xtermjs.org/) from CDN (no npm, no build step)

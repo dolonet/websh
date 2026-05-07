@@ -30,6 +30,11 @@ class _FakeNotifyMixin(object):
     to not blow up and let the loop tick forward."""
     _notify_r = None
     _notify_w = None
+    # The /api/stream handler now enforces "at most one stream per
+    # session" by reading-then-setting this attribute under sessions_lock.
+    # Tests that plant fake sessions inherit this default and the guard
+    # works the same way it does for real Sessions.
+    _stream_active = False
 
     def _signal(self):
         pass
@@ -691,6 +696,161 @@ class TestHTTPApi(unittest.TestCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_stream_rejects_duplicate_with_409(self):
+        """A second /api/stream for an already-streaming session must
+        be rejected with 409 instead of silently racing two destructive
+        readers for the same buffer. The first stream is unaffected."""
+        import http.client
+        import socket as _socket
+        import threading as _threading
+        sid = str(uuid.uuid4())
+
+        # Long-running session: read() blocks on a flag we control so
+        # the first stream stays parked in its loop while we open the
+        # second one. The handler only releases _stream_active in the
+        # outer try/finally, so the slot remains held the whole time.
+        gate = _threading.Event()
+
+        class Sess(_FakeNotifyMixin):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+            def read(self):
+                if not gate.is_set():
+                    gate.wait(timeout=5)
+                self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return False
+
+        with server.sessions_lock:
+            server.sessions[sid] = Sess()
+        try:
+            # Open the first stream via a raw socket so we can keep it
+            # alive (no early close) without the http.client lifecycle
+            # closing the connection on us when we read.
+            s1 = _socket.create_connection(("127.0.0.1", self.port),
+                                           timeout=5)
+            req = ("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+            s1.sendall(req.encode("ascii"))
+            buf = b""
+            s1.settimeout(0.3)
+            deadline = time.time() + 3
+            while time.time() < deadline and b"\r\n\r\n" not in buf:
+                try:
+                    chunk = s1.recv(256)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except _socket.timeout:
+                    pass
+            self.assertIn(b"HTTP/1.0 200", buf,
+                "first stream must respond 200; got: " + repr(buf[:80]))
+            # First handler is now parked in read()/wait; _stream_active=True.
+
+            # Second stream: should be rejected immediately with 409.
+            c2 = http.client.HTTPConnection("127.0.0.1", self.port,
+                                            timeout=3)
+            c2.request("GET", "/api/stream?session_id=" + sid)
+            r2 = c2.getresponse()
+            self.assertEqual(r2.status, 409,
+                "second concurrent /api/stream must be 409, got "
+                + str(r2.status))
+            body = json.loads(r2.read().decode("utf-8"))
+            self.assertIn("stream already active", body.get("error", ""))
+            c2.close()
+
+            # Release the first handler so the slot is freed cleanly.
+            gate.set()
+            try:
+                # Drain a bit so server side can finish writing event:end
+                # before we tear down.
+                s1.settimeout(2.0)
+                while True:
+                    chunk = s1.recv(1024)
+                    if not chunk:
+                        break
+            except (_socket.timeout, OSError):
+                pass
+            try:
+                s1.close()
+            except OSError:
+                pass
+
+            # After slot release, a fresh stream is accepted again.
+            # Reseat the session so the same gate-based fake serves
+            # the next request without hanging this time.
+            gate.clear()
+            with server.sessions_lock:
+                server.sessions[sid] = Sess()
+            gate.set()
+            c3 = http.client.HTTPConnection("127.0.0.1", self.port,
+                                            timeout=5)
+            c3.request("GET", "/api/stream?session_id=" + sid)
+            r3 = c3.getresponse()
+            self.assertEqual(r3.status, 200,
+                "fresh stream after slot release must be 200")
+            r3.read()
+            c3.close()
+        finally:
+            gate.set()
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_event_end_carries_echo_off(self):
+        """The terminating event:end frame must include echo_off so the
+        client can reset its prediction gate consistently with data
+        frames. Missing field would leave the prediction in a stale
+        state if the disconnect arrives mid-prompt."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class Sess(_FakeNotifyMixin):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._calls = 0
+            def read(self):
+                self._calls += 1
+                if self._calls > 2:
+                    self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return True
+
+        with server.sessions_lock:
+            server.sessions[sid] = Sess()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            self.assertIn("event: end", text,
+                          "stream did not deliver event:end")
+            # Find the JSON immediately after `event: end`.
+            end_idx = text.find("event: end")
+            tail = text[end_idx:]
+            data_line = next(line for line in tail.splitlines()
+                             if line.startswith("data: "))
+            payload = json.loads(data_line[len("data: "):])
+            self.assertIn("echo_off", payload,
+                "event:end must include echo_off for client consistency")
+            self.assertTrue(payload["echo_off"])
+            self.assertFalse(payload["alive"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_stream_returns_undelivered_bytes_to_buffer(self):
         """Regression: when the client closes /api/stream mid-flight,
         bytes the SSE handler had already drained from the session must
@@ -828,6 +988,25 @@ class TestHTTPApi(unittest.TestCase):
         # Idempotent on empty input
         s.unread(b"")
         self.assertEqual(s.output_buf, b"")
+
+    def test_session_unread_with_overflow_drops_oldest(self):
+        """When the unread bytes plus existing buffer would exceed
+        OUTPUT_BUF_MAX, the truncation rule keeps the LAST OUTPUT_BUF_KEEP
+        bytes — that's the freshest terminal state. The unread bytes are
+        older so they're the ones dropped. Documented in
+        docs/sse-transport.md as a deliberate trade-off."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = __import__("threading").Lock()
+        s.last_activity = 0
+        # Recent buffer just under the cap.
+        s.output_buf = b"y" * (server.OUTPUT_BUF_MAX - 100)
+        # Unread bytes that, prepended, push us over the cap.
+        s.unread(b"x" * 1000)
+        # Result is exactly OUTPUT_BUF_KEEP and contains the freshest
+        # bytes (the y's), with the unread x's dropped.
+        self.assertEqual(len(s.output_buf), server.OUTPUT_BUF_KEEP)
+        self.assertNotIn(b"x", s.output_buf)
+        self.assertEqual(s.output_buf, b"y" * server.OUTPUT_BUF_KEEP)
 
     def test_resize_missing_session(self):
         body, code = self._post("/api/resize", {
@@ -1317,6 +1496,45 @@ class TestEchoOffHint(unittest.TestCase):
             b"i could tell you my password but i won't, $ ")
         self.assertFalse(s.echo_off_hint())
 
+    def test_prose_ending_with_password_colon_does_not_match(self):
+        """The keyword must be the label of the prompt, not a word
+        inside running prose. 'I forgot my password yesterday: ' has
+        the keyword and a trailing colon but is clearly not a prompt
+        — the conservative regex rejects it because the gap between
+        keyword and colon is filled with prose words rather than the
+        narrow PAM-style ' for X' shape."""
+        s = self._fake_session(b"I forgot my password yesterday: ")
+        self.assertFalse(s.echo_off_hint())
+        s = self._fake_session(b"echo password is supersecret: ")
+        self.assertFalse(s.echo_off_hint())
+        s = self._fake_session(b"My password: hunter2 was hacked")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_doas_prompt_matches(self):
+        """doas, OpenBSD's sudo equivalent, uses the same shape."""
+        s = self._fake_session(b"doas (alexey@host) password: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_passwd_change_prompts_match(self):
+        """passwd(1) emits three prompts in sequence."""
+        for tail in (b"(current) UNIX password: ",
+                     b"New password: ",
+                     b"Retype new password: "):
+            s = self._fake_session(tail)
+            self.assertTrue(s.echo_off_hint(),
+                            "expected match on " + repr(tail))
+
+    def test_osc_title_around_prompt_stripped(self):
+        """OSC sequences (terminal title updates from PAM modules) must
+        not break detection. xterm/gnome-terminal style: ESC ] 0; <title>
+        BEL or ST."""
+        # OSC with BEL terminator
+        s = self._fake_session(b"\x1b]0;sudo prompt\x07Password: ")
+        self.assertTrue(s.echo_off_hint())
+        # OSC with ST terminator
+        s = self._fake_session(b"\x1b]2;Sudo\x1b\\Password: ")
+        self.assertTrue(s.echo_off_hint())
+
     def test_empty_tail(self):
         s = self._fake_session(b"")
         self.assertFalse(s.echo_off_hint())
@@ -1409,7 +1627,11 @@ class TestSessionNotify(unittest.TestCase):
             self.assertGreaterEqual(elapsed, 0.05,
                 "wait must actually block, not spin; elapsed {:.1f} ms"
                 .format(elapsed * 1000))
-            self.assertLess(elapsed, 0.30,
+            # Upper bound is generous (was 0.30s) — on a heavily-loaded
+            # CI runner scheduler jitter alone can push the wakeup well
+            # past the timeout. The intent is "doesn't hang forever",
+            # not "hits the timeout exactly".
+            self.assertLess(elapsed, 1.0,
                 "wait shouldn't overshoot; elapsed {:.1f} ms"
                 .format(elapsed * 1000))
         finally:
@@ -1434,9 +1656,14 @@ class TestSessionNotify(unittest.TestCase):
             wakeup = time.time()
             self.assertEqual(len(feed_time), 1)
             latency_ms = (wakeup - feed_time[0]) * 1000
-            self.assertLess(latency_ms, 30,
+            # Target is <5ms (selectors should wake within tens of µs +
+            # scheduler jitter). 200ms is the slow-CI flake margin: on
+            # GitHub Actions free tier under contention we've seen 50-
+            # 150ms. The test still proves the wait actually blocked
+            # via the lower bound below.
+            self.assertLess(latency_ms, 200,
                 "signal->wakeup latency too high: {:.1f} ms (target <5 ms, "
-                "30 ms is the CI-flake margin)".format(latency_ms))
+                "200 ms is the CI-flake margin)".format(latency_ms))
             self.assertGreaterEqual(wakeup - t0, 0.04,
                 "consumer woke before producer signaled — false wakeup?")
         finally:
@@ -1507,6 +1734,70 @@ class TestSessionNotify(unittest.TestCase):
             t0 = time.time()
             s.wait_for_data(None, timeout=0)
             self.assertLess(time.time() - t0, 0.01)
+        finally:
+            self._close_pipe(s)
+
+    def test_close_does_not_close_pipe_fds(self):
+        """Regression guard: Session.close() must NOT call os.close on
+        the notification pipes. Fd lifetime is bound to GC so concurrent
+        _signal()/wait_for_data callers can't race with fd reuse. If a
+        future patch adds an explicit close in close(), this test fails
+        loudly. See the design comment in Session.__init__."""
+        # Build a Session shell that has just the bits close() touches.
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.alive = True
+        s._notify_r, s._notify_w = os.pipe()
+        os.set_blocking(s._notify_r, False)
+        os.set_blocking(s._notify_w, False)
+        # close() needs a real child pid (not 0 — kill(0, sig) signals
+        # the entire process group, including this test runner). Fork
+        # a stub that exits immediately; close() will reap it.
+        s.master_fd, slave_fd = os.pipe()
+        os.close(slave_fd)  # close() will close master_fd; that's fine.
+        child_pid = os.fork()
+        if child_pid == 0:
+            os._exit(0)
+        s.pid = child_pid
+        s._key_file = None
+        s._control_path = None
+        try:
+            s.close()
+            # Both pipe fds must still be open. fstat raises OSError if not.
+            os.fstat(s._notify_r)
+            os.fstat(s._notify_w)
+            # And _signal() must still work without raising.
+            s._signal()
+        finally:
+            for fd in (s._notify_r, s._notify_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_unread_signals_consumer(self):
+        """Regression: after unread(), a consumer parked in
+        wait_for_data must wake up so the bytes are delivered without
+        waiting for the next PTY signal or the keepalive deadline."""
+        s = self._fake()
+        s.output_buf = b""
+        wakeup = []
+
+        def consumer():
+            t0 = time.time()
+            s.wait_for_data(None, timeout=2.0)
+            wakeup.append(time.time() - t0)
+
+        try:
+            t = threading.Thread(target=consumer, daemon=True)
+            t.start()
+            time.sleep(0.05)  # ensure consumer is parked
+            s.unread(b"deferred bytes")
+            t.join(timeout=1.0)
+            self.assertEqual(len(wakeup), 1,
+                             "consumer did not wake on unread()")
+            self.assertLess(wakeup[0], 0.3,
+                            "wakeup latency too high: {:.1f} ms"
+                            .format(wakeup[0] * 1000))
         finally:
             self._close_pipe(s)
 
@@ -1582,7 +1873,9 @@ class TestSessionNotify(unittest.TestCase):
                 s.wait_for_data(None, timeout=2.0, selector=sel)
                 self.assertEqual(len(feed_time), 1)
                 latency_ms = (time.time() - feed_time[0]) * 1000
-                self.assertLess(latency_ms, 30,
+                # Same generous CI margin as the one-shot path — see
+                # test_cross_thread_signal_wakes_within_milliseconds.
+                self.assertLess(latency_ms, 200,
                     "cached-selector signal->wakeup: {:.1f} ms"
                     .format(latency_ms))
         finally:
