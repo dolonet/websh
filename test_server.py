@@ -1405,6 +1405,157 @@ class TestRateLimit(unittest.TestCase):
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
 
 
+class TestPerIpSessionCount(unittest.TestCase):
+    """Unit tests for the per-IP session-count helper."""
+
+    def setUp(self):
+        self._snapshot = dict(server.sessions)
+        server.sessions.clear()
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._snapshot)
+
+    def _fake(self, client_ip, is_background=False):
+        s = type("_FakeS", (), {})()
+        s.client_ip = client_ip
+        s.is_background = is_background
+        return s
+
+    def test_empty_registry(self):
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 0)
+
+    def test_counts_matching_ips(self):
+        server.sessions["a"] = self._fake("1.2.3.4")
+        server.sessions["b"] = self._fake("1.2.3.4")
+        server.sessions["c"] = self._fake("9.9.9.9")
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 2)
+        self.assertEqual(server._per_ip_session_count("9.9.9.9"), 1)
+        self.assertEqual(server._per_ip_session_count("0.0.0.0"), 0)
+
+    def test_counts_bg_and_fg_together(self):
+        # The cap is anti-abuse, not anti-resource-class — count everything.
+        server.sessions["a"] = self._fake("1.2.3.4", is_background=False)
+        server.sessions["b"] = self._fake("1.2.3.4", is_background=True)
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 2)
+
+    def test_session_without_client_ip_not_counted(self):
+        s = type("_FakeS", (), {})()
+        s.is_background = False
+        # intentionally missing client_ip — getattr default None never matches
+        server.sessions["a"] = s
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 0)
+
+    def test_empty_or_none_ip_returns_zero(self):
+        server.sessions["a"] = self._fake("1.2.3.4")
+        self.assertEqual(server._per_ip_session_count(""), 0)
+        self.assertEqual(server._per_ip_session_count(None), 0)
+
+
+class TestPerIpSessionCapHTTP(unittest.TestCase):
+    """Integration: per-IP cap returns 429 before reaching the SSH spawn.
+
+    Plants fake session objects in the live registry and posts to
+    /api/connect — the handler runs the gate inside `with sessions_lock:`
+    so the count is observed atomically.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18768
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+        self._sessions_snapshot = dict(server.sessions)
+        server.sessions.clear()
+        self._orig_cap = server.MAX_SESSIONS_PER_IP
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._sessions_snapshot)
+        server.MAX_SESSIONS_PER_IP = self._orig_cap
+
+    def _fake(self, client_ip):
+        s = type("_FakeS", (), {})()
+        s.client_ip = client_ip
+        s.is_background = False
+        s.persistent = False
+        return s
+
+    def _post(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    _PAYLOAD = {"host": "ignored.example", "username": "u",
+                "password": "p", "cols": 80, "rows": 24}
+
+    def test_cap_blocks_when_exceeded(self):
+        server.MAX_SESSIONS_PER_IP = 2
+        for i in range(2):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        self.assertEqual(code, 429)
+        self.assertIn("from your IP", body["error"])
+
+    def test_cap_allows_at_or_below_limit(self):
+        # 1 active session, cap is 2 → next connect must NOT hit per-IP 429.
+        server.MAX_SESSIONS_PER_IP = 2
+        server.sessions["one"] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        # ssh will fail or hang past the gate, but the gate did not
+        # produce a "from your IP" 429.
+        if code == 429:
+            self.assertNotIn("from your IP", body.get("error", ""))
+
+    def test_cap_does_not_block_other_ips(self):
+        server.MAX_SESSIONS_PER_IP = 2
+        for i in range(2):
+            server.sessions["fake-{}".format(i)] = self._fake("9.9.9.9")
+        body, code = self._post(self._PAYLOAD)
+        if code == 429:
+            self.assertNotIn("from your IP", body.get("error", ""))
+
+    def test_cap_zero_disables_gate(self):
+        server.MAX_SESSIONS_PER_IP = 0
+        for i in range(5):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        if code == 429:
+            self.assertNotIn("from your IP", body.get("error", ""))
+
+
 class TestUUIDValidation(unittest.TestCase):
 
     def test_valid(self):

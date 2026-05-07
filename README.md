@@ -364,6 +364,7 @@ Environment variables for `server.py`:
 | `HOST` | `127.0.0.1` | Bind address |
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
+| `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
 | `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
@@ -505,6 +506,7 @@ TRUSTED_PROXIES=127.0.0.1,10.0.0.5 python3 server.py
 - Session IDs are validated as UUID format
 - Terminal dimensions are clamped to safe ranges
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
+- `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots
 
 ## Project structure
 

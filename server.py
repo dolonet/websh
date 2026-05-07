@@ -108,6 +108,10 @@ PORT = _int_env("PORT", "8765")
 HOST = os.environ.get("HOST", "127.0.0.1")
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
+# Per-source-IP active session cap. 0 disables the check (preserve legacy
+# behaviour). Counts foreground and background sessions together, since
+# an abuser holding N sessions does not care about the classification.
+MAX_SESSIONS_PER_IP = _int_env("MAX_SESSIONS_PER_IP", "0")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "50")
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
@@ -401,6 +405,20 @@ def _check_rate_limit(ip):
         return True
 
 
+def _per_ip_session_count(ip):
+    """Count active sessions opened from `ip`. Caller MUST hold sessions_lock.
+
+    Counts both foreground and background sessions together — for the
+    purposes of the MAX_SESSIONS_PER_IP gate, an abuser holding N total
+    sessions is the threat we're guarding against, regardless of how
+    they're tagged internally.
+    """
+    if not ip:
+        return 0
+    return sum(1 for s in sessions.values()
+               if getattr(s, "client_ip", None) == ip)
+
+
 # ─── Config file ────────────────────────────────────────────────────
 
 _config_cache = None
@@ -662,8 +680,12 @@ class SSHSession(object):
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
                  persistent=False, slot_id=None, tmux_cmd="tmux",
-                 tmux_options=None):
+                 tmux_options=None, client_ip=None):
         self.id = session_id
+        # Source IP that opened this session — kept here only so the
+        # MAX_SESSIONS_PER_IP gate can iterate the registry and count.
+        # Not used for any auth or routing decision.
+        self.client_ip = client_ip
         self.master_fd = None
         self.pid = None
         self.output_buf = b""
@@ -1943,8 +1965,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "connections to this host are not allowed"}, 403)
             return
 
-        # Check session limit (foreground and background counted separately)
+        # Check session limits. Per-IP cap (if enabled) runs first so a
+        # single abuser cannot starve everyone else by holding all the
+        # global slots. fg/bg are counted separately for the global caps
+        # (a file-transfer side channel should not push a user out of an
+        # interactive session and vice versa) but they share the per-IP
+        # bucket — abuse is abuse regardless of classification.
         with sessions_lock:
+            if MAX_SESSIONS_PER_IP > 0:
+                per_ip = _per_ip_session_count(ip)
+                if per_ip >= MAX_SESSIONS_PER_IP:
+                    _log("WARN", "per-IP session cap hit: ip={} count={}".format(
+                        ip, per_ip))
+                    self._json({"error": "too many active sessions from your IP"},
+                               429)
+                    return
             if is_bg:
                 count = sum(1 for s in sessions.values() if s.is_background)
                 if count >= MAX_BG_SESSIONS:
@@ -1975,6 +2010,7 @@ class Handler(BaseHTTPRequestHandler):
                 slot_id=slot_id,
                 tmux_cmd=tmux_cmd,
                 tmux_options=tmux_options,
+                client_ip=ip,
             )
             with sessions_lock:
                 sessions[sid] = session
