@@ -2268,7 +2268,17 @@ class Handler(BaseHTTPRequestHandler):
         if not conn_name and not is_host_allowed(host, port, username):
             _access_log_emit("connect", ip, result="deny_blocked",
                              target_host=host, target_user=username)
-            if _record_deny_for_scan(ip, host):
+            # Only feed the scan-pattern detector when the rejection
+            # actually came from the deny-list. Under restrict_hosts:
+            # true, is_host_allowed() returns False unconditionally —
+            # that's a different policy ("manual connects disabled,
+            # use named connections") and a buggy or stale UI POSTing
+            # `host` instead of `connection` could rapidly accumulate
+            # against an honest user. The deny_blocked record is still
+            # emitted so operators see the misconfigured client; the
+            # scanner heuristic just doesn't count it.
+            cfg = load_config()
+            if not cfg["restrict_hosts"] and _record_deny_for_scan(ip, host):
                 # Emit a separate scan_pattern record so fail2ban can
                 # ban specifically on this signal without also banning
                 # one-off deny_blocked typos.

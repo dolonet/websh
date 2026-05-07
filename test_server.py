@@ -5515,6 +5515,120 @@ class TestAccessLogConnectEvents(unittest.TestCase):
             server.SSHSession = orig
 
 
+class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
+    """Integration: under restrict_hosts: true, a manual /api/connect
+    is rejected because the policy disallows free-form connects (use a
+    named connection), NOT because the target was on the deny-list. So
+    the scan-pattern detector must NOT count those rejections — a
+    buggy or stale UI POSTing `host` instead of `connection` from one
+    legitimate IP could otherwise rapidly accumulate to a ban."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18786
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({
+                "restrict_hosts": True,
+                "denied_hosts": [],
+                "connections": [],
+            }, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        # Generous rate-limit budget so 100 POSTs all reach the
+        # is_host_allowed gate (the bit we actually want to test).
+        server._rate_limits.clear()
+        with server._scan_pattern_lock:
+            self._snap = dict(server._scan_pattern)
+            server._scan_pattern.clear()
+        self._orig_threshold = server.SCAN_PATTERN_THRESHOLD
+        self._orig_window = server.SCAN_PATTERN_WINDOW
+        self._orig_rate_max = server.RATE_LIMIT_MAX
+        # Threshold low enough that the test would fire if the bug
+        # were present (probing 100 distinct hosts > 5).
+        server.SCAN_PATTERN_THRESHOLD = 5
+        server.SCAN_PATTERN_WINDOW = 300
+        server.RATE_LIMIT_MAX = 1000
+        self.logfile = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False)
+        self.logfile.close()
+        self._orig_path = server.ACCESS_LOG_PATH
+        server.ACCESS_LOG_PATH = self.logfile.name
+
+    def tearDown(self):
+        server.ACCESS_LOG_PATH = self._orig_path
+        os.unlink(self.logfile.name)
+        with server._scan_pattern_lock:
+            server._scan_pattern.clear()
+            server._scan_pattern.update(self._snap)
+        server.SCAN_PATTERN_THRESHOLD = self._orig_threshold
+        server.SCAN_PATTERN_WINDOW = self._orig_window
+        server.RATE_LIMIT_MAX = self._orig_rate_max
+        server._rate_limits.clear()
+
+    def _read_records(self):
+        with open(self.logfile.name, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _post_connect(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_restrict_hosts_does_not_feed_scan_pattern(self):
+        """100 raw manual /api/connect POSTs from one IP, each to a
+        different host, must all reject as deny_blocked but must NOT
+        produce any scan_pattern records — restrict_hosts: true is a
+        policy mismatch, not a deny-list hit."""
+        for i in range(100):
+            _, code = self._post_connect({
+                "host": "host{}.example".format(i),
+                "username": "u", "password": "p",
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 403)
+        recs = self._read_records()
+        # All 100 deny_blocked records present (operator visibility):
+        deny = [r for r in recs
+                if r["event"] == "connect" and r["result"] == "deny_blocked"]
+        self.assertEqual(len(deny), 100)
+        # But zero scan_pattern records — that's the whole point.
+        scan = [r for r in recs
+                if r["event"] == "connect" and r["result"] == "scan_pattern"]
+        self.assertEqual(scan, [],
+                         "restrict_hosts must not feed scan-pattern: {}"
+                         .format(scan))
+
+
 class TestAccessLogDisconnectEvents(unittest.TestCase):
     """Integration: /api/disconnect emits an access-log record with the
     right `result` value (and surfaces close failures via close_error)."""
