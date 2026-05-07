@@ -256,6 +256,39 @@ those lists — they're a UX-guided allowlist for your team, not a hardening
 boundary against a determined caller. Combine with `restrict_hosts: true`
 if you need the rules to be enforced against direct API access too.
 
+### Deny-list for free-form connect
+
+When `restrict_hosts` is off (the default), visitors can target any host
+they like. To stop the proxy from reaching internal infrastructure or
+your own boxes, add a `denied_hosts` array:
+
+```json
+{
+  "restrict_hosts": false,
+  "denied_hosts": [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fe80::/10",
+    "evil.example",
+    "your-internal-jumpbox.example.com"
+  ]
+}
+```
+
+Each entry is parsed as an IP address or CIDR network when possible
+(IPv4 and IPv6 both supported); otherwise it's matched as an exact
+hostname (case-insensitive). At connect time websh resolves the target
+hostname via the system resolver and rejects the request if any of the
+returned addresses fall inside a denied range — so a public-looking
+domain whose A record points into RFC1918 is also blocked.
+
+DNS resolution failures fail open (the request goes through; ssh's own
+resolver will then fail with a clear error). Hosts you've put in
+`connections` bypass the deny-list — explicit configuration wins.
+
 ### URL anchors
 
 Link directly to a server-side connection:

@@ -46,6 +46,7 @@ API endpoints:
 import base64
 import datetime
 import fcntl
+import ipaddress
 import json
 import os
 import pty
@@ -405,7 +406,9 @@ def _check_rate_limit(ip):
 _config_cache = None
 _config_mtime = 0
 _CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
-                 "isolate_storage": False}
+                 "isolate_storage": False,
+                 "denied_host_set": frozenset(),
+                 "denied_net_list": ()}
 
 
 def _normalize_user_list(value):
@@ -414,6 +417,86 @@ def _normalize_user_list(value):
         return None
     clean = [str(u).strip() for u in value if str(u).strip()]
     return clean or None
+
+
+def _parse_denied_hosts(entries):
+    """Parse denied_hosts list into (hostname set, ip_network list).
+
+    Each entry is treated as IP/CIDR when it parses cleanly via
+    ipaddress.ip_network (so "127.0.0.1" becomes /32, "10.0.0.0/8"
+    stays /8); otherwise it is stored as a lowercase hostname for
+    exact-match comparison. Empty/invalid entries are skipped silently.
+    """
+    host_set = set()
+    net_list = []
+    if not isinstance(entries, list):
+        return frozenset(host_set), tuple(net_list)
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        s = entry.strip()
+        if not s:
+            continue
+        try:
+            net_list.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            host_set.add(s.lower())
+    return frozenset(host_set), tuple(net_list)
+
+
+def _resolve_host_ips(host):
+    """Resolve hostname to a list of ipaddress.ip_address objects.
+
+    Returns [] when resolution fails — caller treats that as "no IPs to
+    check" and falls open. ssh will then run its own resolution and fail
+    naturally if the host doesn't exist.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, socket.herror, UnicodeError):
+        return []
+    ips = []
+    seen = set()
+    for info in infos:
+        addr = info[4][0]
+        if "%" in addr:           # strip scope id from link-local IPv6
+            addr = addr.split("%", 1)[0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        try:
+            ips.append(ipaddress.ip_address(addr))
+        except ValueError:
+            pass
+    return ips
+
+
+def _is_denied_host(host):
+    """Check `host` against the deny-list. Returns (denied, reason).
+
+    `host` may be a hostname or an IP literal. We do an exact hostname
+    match first, then resolve to IPs and test each against configured
+    CIDR ranges (covers both "1.2.3.4" /32 entries and "10.0.0.0/8"
+    block ranges). Defends against attempts to reach RFC1918 / our own
+    infra by passing a hostname whose A record resolves into a denied
+    range.
+    """
+    cfg = load_config()
+    host_set = cfg.get("denied_host_set") or frozenset()
+    net_list = cfg.get("denied_net_list") or ()
+    if not host_set and not net_list:
+        return False, None
+    hl = host.strip().lower()
+    if hl in host_set:
+        return True, "hostname on deny-list"
+    if not net_list:
+        return False, None
+    for ip in _resolve_host_ips(host):
+        for net in net_list:
+            if ip in net:
+                return True, "{} resolves to {} which is in denied range {}".format(
+                    host, ip, net)
+    return False, None
 
 
 def load_config():
@@ -449,10 +532,14 @@ def load_config():
             c["allowed_users"] = _normalize_user_list(c.get("allowed_users"))
             c["denied_users"] = _normalize_user_list(c.get("denied_users"))
 
+        denied_host_set, denied_net_list = _parse_denied_hosts(
+            cfg.get("denied_hosts"))
         result = {
             "connections": conns,
             "restrict_hosts": bool(cfg.get("restrict_hosts", False)),
             "isolate_storage": bool(cfg.get("isolate_storage", False)),
+            "denied_host_set": denied_host_set,
+            "denied_net_list": denied_net_list,
         }
         _config_cache = result
         _config_mtime = mtime
@@ -499,15 +586,31 @@ def find_config_connection(name):
 
 
 def is_host_allowed(host, port, username):
-    """Manual-connect gate when restrict_hosts is on.
+    """Manual-connect gate.
 
-    Kept deliberately strict: when restrict_hosts is true, raw manual
-    (host, port, username) POSTs are always rejected — callers must go
-    through a named connection. The arguments are kept so the enforcement
-    site can pass them in unchanged.
+    Two layers:
+
+      1. When restrict_hosts is on, raw manual (host, port, username)
+         POSTs are always rejected — callers must go through a named
+         connection.
+      2. When restrict_hosts is off, the host is checked against the
+         denied_hosts deny-list (hostname exact match + DNS-resolved
+         IP / CIDR match). Entries in the operator's `connections`
+         array bypass this gate by going through the named-connection
+         path, so a deny-list does not affect explicitly configured
+         destinations.
+
+    The (port, username) arguments are kept for forward compatibility —
+    the enforcement site passes them in unchanged.
     """
     cfg = load_config()
-    return not cfg["restrict_hosts"]
+    if cfg["restrict_hosts"]:
+        return False
+    denied, reason = _is_denied_host(host)
+    if denied:
+        _log("INFO", "deny-list block: host={} reason={}".format(host, reason))
+        return False
+    return True
 
 
 def check_prompt_user(entry, username):

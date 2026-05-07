@@ -252,6 +252,200 @@ class TestIsHostAllowed(unittest.TestCase):
         self.assertFalse(server.is_host_allowed("evil.com", 22, "x"))
 
 
+class TestParseDeniedHosts(unittest.TestCase):
+    """Unit tests for _parse_denied_hosts splitting hostnames vs IP/CIDR."""
+
+    def test_empty_or_missing(self):
+        h, n = server._parse_denied_hosts(None)
+        self.assertEqual(h, frozenset())
+        self.assertEqual(n, ())
+        h, n = server._parse_denied_hosts([])
+        self.assertEqual(h, frozenset())
+        self.assertEqual(n, ())
+
+    def test_hostnames_lowercased(self):
+        h, n = server._parse_denied_hosts(["EVIL.com", "Bad.Example"])
+        self.assertEqual(h, frozenset({"evil.com", "bad.example"}))
+        self.assertEqual(n, ())
+
+    def test_ip_literal_becomes_host_network(self):
+        h, n = server._parse_denied_hosts(["127.0.0.1", "::1"])
+        self.assertEqual(h, frozenset())
+        self.assertEqual(len(n), 2)
+        # /32 for v4 host literal, /128 for v6 host literal
+        self.assertEqual(str(n[0]), "127.0.0.1/32")
+        self.assertEqual(str(n[1]), "::1/128")
+
+    def test_cidr_ranges(self):
+        h, n = server._parse_denied_hosts(
+            ["10.0.0.0/8", "192.168.0.0/16", "fe80::/10"])
+        self.assertEqual(h, frozenset())
+        nets = [str(x) for x in n]
+        self.assertIn("10.0.0.0/8", nets)
+        self.assertIn("192.168.0.0/16", nets)
+        self.assertIn("fe80::/10", nets)
+
+    def test_mixed(self):
+        h, n = server._parse_denied_hosts(
+            ["evil.com", "10.0.0.0/8", "127.0.0.1", "  ", "", None, 42])
+        self.assertEqual(h, frozenset({"evil.com"}))
+        self.assertEqual(len(n), 2)
+
+    def test_invalid_string_treated_as_hostname(self):
+        # "not-an-ip!!" is not parseable as ip_network → goes to host_set
+        h, n = server._parse_denied_hosts(["not-an-ip!!"])
+        self.assertEqual(h, frozenset({"not-an-ip!!"}))
+        self.assertEqual(n, ())
+
+
+class TestResolveHostIPs(unittest.TestCase):
+    """Unit tests for _resolve_host_ips."""
+
+    def test_returns_empty_on_gaierror(self):
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=server.socket.gaierror):
+            self.assertEqual(server._resolve_host_ips("nope.example"), [])
+
+    def test_returns_empty_on_unicode_error(self):
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=UnicodeError):
+            self.assertEqual(server._resolve_host_ips("​"), [])
+
+    def test_returns_unique_addresses(self):
+        # getaddrinfo may return the same address from v4/v6 plus duplicates
+        infos = [
+            (None, None, None, None, ("10.0.0.5", 0)),
+            (None, None, None, None, ("10.0.0.5", 0)),
+            (None, None, None, None, ("fe80::1%eth0", 0)),
+        ]
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        return_value=infos):
+            ips = server._resolve_host_ips("foo.example")
+        self.assertEqual(len(ips), 2)
+        self.assertEqual(str(ips[0]), "10.0.0.5")
+        self.assertEqual(str(ips[1]), "fe80::1")  # scope stripped
+
+
+class TestDeniedHosts(unittest.TestCase):
+    """End-to-end deny-list behaviour at is_host_allowed boundary."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+        os.environ.pop("WEBSH_CONFIG", None)
+
+    def _write_config(self, data):
+        path = os.path.join(self.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+    def _patched_resolve(self, ip):
+        """Patch _resolve_host_ips to deterministically return one IP."""
+        return unittest.mock.patch.object(
+            server, "_resolve_host_ips",
+            return_value=[server.ipaddress.ip_address(ip)])
+
+    def test_empty_deny_list_allows_all(self):
+        self._write_config({"restrict_hosts": False, "connections": []})
+        with self._patched_resolve("8.8.8.8"):
+            self.assertTrue(server.is_host_allowed("public.example", 22, "u"))
+
+    def test_hostname_exact_match_blocked(self):
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["evil.example"],
+        })
+        with self._patched_resolve("8.8.8.8"):
+            self.assertFalse(server.is_host_allowed("evil.example", 22, "u"))
+            self.assertFalse(server.is_host_allowed("EVIL.example", 22, "u"))
+            self.assertTrue(server.is_host_allowed("ok.example", 22, "u"))
+
+    def test_ip_literal_in_target_blocked_by_cidr(self):
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["10.0.0.0/8"],
+        })
+        with self._patched_resolve("10.5.6.7"):
+            self.assertFalse(server.is_host_allowed("10.5.6.7", 22, "u"))
+
+    def test_loopback_blocked_by_cidr(self):
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["127.0.0.0/8"],
+        })
+        with self._patched_resolve("127.0.0.1"):
+            self.assertFalse(server.is_host_allowed("localhost", 22, "u"))
+        with self._patched_resolve("127.5.5.5"):
+            self.assertFalse(server.is_host_allowed("loopback.example", 22, "u"))
+
+    def test_dns_resolves_to_denied_range_blocked(self):
+        """The whole point: hostname looks innocent, but A record points
+        into a denied range → blocked."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["192.168.0.0/16"],
+        })
+        with self._patched_resolve("192.168.1.42"):
+            self.assertFalse(
+                server.is_host_allowed("looks-public.example", 22, "u"))
+
+    def test_dns_resolution_failure_fails_open(self):
+        """When DNS doesn't resolve at all, we let the request through —
+        ssh will produce its own resolution error. Failing closed here
+        would block any typo'd hostname unnecessarily."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["192.168.0.0/16"],
+        })
+        with unittest.mock.patch.object(server, "_resolve_host_ips",
+                                        return_value=[]):
+            self.assertTrue(
+                server.is_host_allowed("nonexistent.example", 22, "u"))
+
+    def test_ipv6_cidr_blocked(self):
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["fe80::/10"],
+        })
+        with self._patched_resolve("fe80::1"):
+            self.assertFalse(server.is_host_allowed("link-local.example", 22, "u"))
+
+    def test_mixed_hostname_and_cidr(self):
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": [
+                "blocked-name.example",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "127.0.0.0/8",
+                "169.254.0.0/16",
+            ],
+        })
+        with self._patched_resolve("10.0.0.5"):
+            self.assertFalse(server.is_host_allowed("any-rfc1918.example", 22, "u"))
+        with self._patched_resolve("8.8.8.8"):
+            self.assertTrue(server.is_host_allowed("ok.example", 22, "u"))
+            self.assertFalse(server.is_host_allowed("blocked-name.example", 22, "u"))
+
+    def test_restrict_hosts_takes_precedence(self):
+        """When restrict_hosts is on, the deny-list never even runs —
+        all manual connects are rejected by the prior gate."""
+        self._write_config({
+            "restrict_hosts": True,
+            "denied_hosts": ["evil.example"],
+        })
+        # Even a non-blocked host is rejected because of restrict_hosts.
+        with self._patched_resolve("8.8.8.8"):
+            self.assertFalse(server.is_host_allowed("ok.example", 22, "u"))
+
+
 class TestConnectionKinds(unittest.TestCase):
     """Classification of connections[] entries as Ready vs Prompt."""
 
