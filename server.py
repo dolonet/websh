@@ -566,12 +566,23 @@ def _record_deny_for_scan(ip, target_host):
     """
     if SCAN_PATTERN_THRESHOLD <= 0 or not ip:
         return False
+    # Normalise the host so the same target written different ways
+    # (case differences, trailing dot from a FQDN) collapses to one
+    # bucket — otherwise an attacker could probe one host with 10
+    # case variants and stay under the distinct-host threshold.
+    # Cap the stored string before it lands in the per-IP buffer so a
+    # 100KB payload from the request body cannot inflate memory: the
+    # access-log layer already caps target_host to _DEFAULT_FIELD_CAP
+    # (256) on emit, mirror that bound here on the in-memory state.
+    normalised = (target_host or "").strip().rstrip(".").lower()
+    if len(normalised) > _DEFAULT_FIELD_CAP:
+        normalised = normalised[:_DEFAULT_FIELD_CAP]
     now = time.time()
     cutoff = now - SCAN_PATTERN_WINDOW
     with _scan_pattern_lock:
         events = _scan_pattern.get(ip, [])
         events = [(t, h) for t, h in events if t > cutoff]
-        events.append((now, target_host))
+        events.append((now, normalised))
         _scan_pattern[ip] = events
         unique_hosts = set(h for _, h in events)
         return len(unique_hosts) > SCAN_PATTERN_THRESHOLD

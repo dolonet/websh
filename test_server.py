@@ -1768,6 +1768,48 @@ class TestScanPatternDetection(unittest.TestCase):
         server._forgive_scan_for_ip("")
         server._forgive_scan_for_ip(None)
 
+    # ── safety: stored host string is capped and normalised ──
+
+    def test_long_target_host_is_capped(self):
+        """Per-IP buffer must not let a 100KB host inflate memory.
+        Stored entries must be truncated to _DEFAULT_FIELD_CAP chars."""
+        server.SCAN_PATTERN_THRESHOLD = 1
+        server._record_deny_for_scan("1.2.3.4", "x" * 100000)
+        with server._scan_pattern_lock:
+            events = list(server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(len(events), 1)
+        _, stored = events[0]
+        self.assertLessEqual(len(stored), server._DEFAULT_FIELD_CAP)
+
+    def test_case_variants_collapse_to_one_distinct_host(self):
+        """An attacker probing one host with 10 case variants must not
+        clear the distinct-host threshold — same host = one bucket."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # 10 case variants of the same host — all should normalise
+        # to a single distinct entry, no fire.
+        variants = [
+            "Host.Example", "HOST.EXAMPLE", "host.example",
+            "hOsT.ExAmPlE", "HOST.example", "host.EXAMPLE",
+            "Host.example", "host.Example", "HoSt.eXaMpLe",
+            "HOST.Example",
+        ]
+        for h in variants:
+            self.assertFalse(server._record_deny_for_scan("1.2.3.4", h))
+        with server._scan_pattern_lock:
+            unique = set(h for _, h in server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(unique, {"host.example"})
+
+    def test_trailing_dot_collapses_to_one_distinct_host(self):
+        """FQDN with trailing dot ('host.example.') and same host
+        without ('HOST.example') must both count as the same bucket."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server._record_deny_for_scan("1.2.3.4", "host.example")
+        server._record_deny_for_scan("1.2.3.4", "HOST.example.")
+        server._record_deny_for_scan("1.2.3.4", "  Host.Example.  ")
+        with server._scan_pattern_lock:
+            unique = set(h for _, h in server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(unique, {"host.example"})
+
 
 class TestPerIpSessionCount(unittest.TestCase):
     """Unit tests for the per-IP session-count helper."""
