@@ -444,6 +444,26 @@ def _parse_denied_hosts(entries):
     return frozenset(host_set), tuple(net_list)
 
 
+def _normalize_host(host):
+    """Return host without RFC 3986 [...] wrapping.
+
+    The bracket-strip must happen on every path that compares a target
+    host against the deny-list, not just the IP-resolution one —
+    otherwise a deny-list that lists hostnames only (no CIDR) can be
+    bypassed with `[name]` (the hostname-exact-match step misses,
+    `net_list` is empty, and the function falls open without ever
+    resolving).
+
+    Predicate is `len(h) > 2`, not `>= 2`, so the literal input `"[]"`
+    is left unmodified. Otherwise it would strip to the empty string
+    and `getaddrinfo("")` (gaierror) makes the deny-list fall open.
+    """
+    h = host
+    if h.startswith("[") and h.endswith("]") and len(h) > 2:
+        h = h[1:-1]
+    return h
+
+
 def _resolve_host_ips(host):
     """Resolve hostname to a list of ipaddress.ip_address objects.
 
@@ -462,9 +482,7 @@ def _resolve_host_ips(host):
     IPv4 address — without this, an operator's `denied_hosts: ["10.0.0.0/8"]`
     would not block `::ffff:10.5.6.7`.
     """
-    h = host
-    if h.startswith("[") and h.endswith("]") and len(h) >= 2:
-        h = h[1:-1]
+    h = _normalize_host(host)
     try:
         infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
     except (socket.gaierror, socket.herror, UnicodeError):
@@ -505,12 +523,15 @@ def _is_denied_host(host):
     net_list = cfg.get("denied_net_list") or ()
     if not host_set and not net_list:
         return False, None
-    hl = host.strip().lower()
+    h = _normalize_host(host)
+    hl = h.strip().lower()
     if hl in host_set:
         return True, "hostname on deny-list"
     if not net_list:
         return False, None
-    for ip in _resolve_host_ips(host):
+    # h already stripped of [...]; _resolve_host_ips re-normalises but is
+    # idempotent so this is fine.
+    for ip in _resolve_host_ips(h):
         for net in net_list:
             if ip in net:
                 return True, "{} resolves to {} which is in denied range {}".format(

@@ -358,20 +358,45 @@ class TestResolveHostIPs(unittest.TestCase):
             server._resolve_host_ips("evil]")
         self.assertEqual(captured, ["[evil", "evil]"])
 
+    def test_empty_brackets_does_not_strip_to_empty(self):
+        """Literal `"[]"` must not strip to `""`. Otherwise the resolver
+        would call `getaddrinfo("")` (gaierror) and the deny-list would
+        fall open. The bracket-strip predicate is `len(h) > 2`, so `"[]"`
+        is left unmodified and behaves like any other malformed input."""
+        self.assertEqual(server._normalize_host("[]"), "[]")
+        captured = []
+
+        def fake_gai(host, *args, **kwargs):
+            captured.append(host)
+            raise server.socket.gaierror
+
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=fake_gai):
+            server._resolve_host_ips("[]")
+        self.assertEqual(captured, ["[]"])
+
     def test_ipv4_mapped_ipv6_yields_both_forms(self):
         """`::ffff:127.0.0.1` is the IPv6 representation of the IPv4
         address 127.0.0.1; an operator's `denied_hosts: ["127.0.0.0/8"]`
         must block it. Verify the resolver returns BOTH the v6 form and
-        the unwrapped v4 form so the deny-list iteration sees both."""
+        the unwrapped v4 form (in that order — v6 from getaddrinfo, then
+        the IPv4 buddy appended) so the deny-list iteration sees both.
+
+        Compare via `ipaddress.ip_address`, not strings: the canonical
+        compressed IPv6 form for `::ffff:10.5.6.7` is implementation-
+        defined (CPython has shifted between `"::ffff:a05:607"` and the
+        dotted-quad form across versions), so a string-equality assert
+        is brittle. Comparing parsed addresses is stable."""
         infos = [
             (None, None, None, None, ("::ffff:10.5.6.7", 0, 0, 0)),
         ]
         with unittest.mock.patch.object(server.socket, "getaddrinfo",
                                         return_value=infos):
             ips = server._resolve_host_ips("foo.example")
-        strs = [str(ip) for ip in ips]
-        self.assertIn("::ffff:a05:607", strs)  # canonical IPv6 form
-        self.assertIn("10.5.6.7", strs)        # the IPv4 buddy
+        # Order matters: getaddrinfo's v6 first, synthesised v4 second.
+        self.assertEqual(len(ips), 2)
+        self.assertEqual(ips[0], server.ipaddress.ip_address("::ffff:10.5.6.7"))
+        self.assertEqual(ips[1], server.ipaddress.ip_address("10.5.6.7"))
 
     def test_pure_ipv6_does_not_synth_ipv4(self):
         """An ordinary IPv6 address has no ipv4_mapped buddy and the
@@ -503,6 +528,25 @@ class TestDeniedHosts(unittest.TestCase):
         # Even a non-blocked host is rejected because of restrict_hosts.
         with self._patched_resolve("8.8.8.8"):
             self.assertFalse(server.is_host_allowed("ok.example", 22, "u"))
+
+    def test_hostname_exact_match_bypass_via_brackets(self):
+        """End-to-end regression: target `[localhost]` must be denied
+        when `denied_hosts: ["localhost"]` is configured (hostname-only,
+        no CIDR). Pre-fix, the bracket-strip lived only inside
+        `_resolve_host_ips`, so the hostname-exact-match step at the
+        top of `_is_denied_host` saw `"[localhost]"` (miss), `net_list`
+        was empty, and the function returned False without ever
+        resolving — full bypass.
+
+        We patch `_resolve_host_ips` to a benign IP so that if the
+        hostname-exact-match step misses (the regression we guard
+        against), the resolution path doesn't accidentally rescue us."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["localhost"],
+        })
+        with self._patched_resolve("8.8.8.8"):
+            self.assertFalse(server.is_host_allowed("[localhost]", 22, "u"))
 
     def test_ipv6_brackets_target_blocked_by_loopback_cidr(self):
         """End-to-end regression: target `[::1]` must be denied when
