@@ -1385,6 +1385,104 @@ class TestPromptConnectHTTP(unittest.TestCase):
         self.assertEqual(code, 403)
 
 
+class TestClientIp(unittest.TestCase):
+    """Unit tests for Handler._client_ip — XFF parsing and validation.
+
+    Covers Issue 2 (must reject non-IP-literal first XFF token, NOT
+    silently use it as the rate-limit / per-IP-cap key) and Issue 6
+    (attacker-controlled bytes must not end up as the registry
+    comparison key for `client_ip`).
+    """
+
+    class _FakeHeaders(object):
+        """Minimal stand-in for http.client.HTTPMessage. _client_ip only
+        calls `.get(name, default)`; we do not need the rest."""
+
+        def __init__(self, mapping):
+            self._m = dict(mapping or {})
+
+        def get(self, name, default=""):
+            return self._m.get(name, default)
+
+    def _make_handler(self, peer, headers=None):
+        h = server.Handler.__new__(server.Handler)
+        h.client_address = (peer, 12345)
+        h.headers = self._FakeHeaders(headers or {})
+        return h
+
+    def setUp(self):
+        # Pin TRUSTED_PROXIES to a known value so other tests that
+        # mutate it cannot bleed in.
+        self._orig_trusted = server._TRUSTED_PROXIES
+        server._TRUSTED_PROXIES = {"127.0.0.1", "10.0.0.5"}
+
+    def tearDown(self):
+        server._TRUSTED_PROXIES = self._orig_trusted
+
+    def test_no_xff_returns_peer(self):
+        h = self._make_handler("127.0.0.1")
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_untrusted_peer_ignores_xff(self):
+        h = self._make_handler("8.8.8.8",
+                               {"X-Forwarded-For": "1.2.3.4"})
+        self.assertEqual(h._client_ip(), "8.8.8.8")
+
+    def test_trusted_peer_uses_first_xff_token(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"})
+        self.assertEqual(h._client_ip(), "1.2.3.4")
+
+    def test_trusted_peer_ipv6_token_is_accepted(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "2001:db8::1"})
+        self.assertEqual(h._client_ip(), "2001:db8::1")
+
+    def test_garbage_first_xff_token_falls_back_to_peer(self):
+        # The crucial regression: pre-fix, "garbage" would be the
+        # returned IP and end up in the rate-limit dict and as
+        # SSHSession.client_ip.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "garbage,1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+        # Sanity: the *peer* never silently picks up the garbage as a
+        # substring or prefix.
+        self.assertNotIn("garbage", h._client_ip())
+
+    def test_oversized_non_ip_token_falls_back_to_peer(self):
+        # Issue 6: attacker-controlled bytes must not propagate as the
+        # registry key. 1 KiB of binary garbage is well past anything
+        # ipaddress.ip_address would accept.
+        blob = "A" * 1024
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": blob + ",1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_empty_first_token_falls_back_to_peer(self):
+        # ", 1.2.3.4" — first token is the empty string. Validation is
+        # gated on truthiness so we still hit the peer fallback.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": ", 1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_whitespace_only_token_falls_back_to_peer(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "   ,1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_token_is_stripped_before_validation(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "  1.2.3.4  ,5.6.7.8"})
+        self.assertEqual(h._client_ip(), "1.2.3.4")
+
+    def test_invalid_ip_with_extra_chars_falls_back(self):
+        # "1.2.3.4abc" is not a valid IP literal even though it starts
+        # with a valid IP — strict ip_address() parsing.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "1.2.3.4abc"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+
 class TestRateLimit(unittest.TestCase):
 
     def setUp(self):

@@ -436,6 +436,13 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8765;
         proxy_read_timeout 60s;
+
+        # OVERWRITE the client-IP header with the real peer. Do not
+        # append — a client can pre-populate X-Forwarded-For and bypass
+        # per-IP rate limiting and the per-IP session cap if you
+        # `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`
+        # (which appends). websh trusts only the first token.
+        proxy_set_header X-Forwarded-For $remote_addr;
     }
 }
 ```
@@ -492,7 +499,26 @@ Connection attempts are rate-limited to **50 per IP per minute** by default
 (configurable via `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW`). The client IP is
 determined from `X-Forwarded-For` **only** when the request comes from an IP
 listed in `TRUSTED_PROXIES` (default: `127.0.0.1`). Direct connections always
-use the TCP peer address — `X-Forwarded-For` cannot be spoofed.
+use the TCP peer address.
+
+**Requirement when running behind a reverse proxy:** the proxy MUST overwrite
+(not append) the client-IP header before forwarding. websh reads the *first*
+`X-Forwarded-For` token, so a proxy that appends (the default
+`$proxy_add_x_forwarded_for` recipe in many tutorials) lets a client supply
+their own first token and bypass both per-IP rate limiting and the
+`MAX_SESSIONS_PER_IP` cap. Use one of:
+
+```nginx
+# nginx — overwrite (good)
+proxy_set_header X-Forwarded-For $remote_addr;
+# OR use X-Real-IP, also overwrite by default:
+proxy_set_header X-Real-IP $remote_addr;
+```
+
+websh validates the token via `ipaddress.ip_address()` and silently falls
+back to the TCP peer if it doesn't parse, so non-IP garbage cannot end up as
+the rate-limit / session-cap key — but a *valid* IP forged by an appending
+proxy will still be honored. The only defense there is correct proxy config.
 
 If your reverse proxy runs on a different host, add its IP:
 

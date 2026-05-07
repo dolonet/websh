@@ -1906,11 +1906,34 @@ class Handler(BaseHTTPRequestHandler):
     # ── Handlers ──
 
     def _client_ip(self):
+        """Return the IP we treat as the request's source for rate-limit
+        and per-IP-cap purposes.
+
+        Uses the TCP peer by default. When the peer is in TRUSTED_PROXIES
+        we read the FIRST X-Forwarded-For token — but only if it parses
+        as a valid IP literal. Anything else (typo, intentional garbage,
+        an injected oversized blob) falls back to the peer.
+
+        Important: when running behind a reverse proxy, the proxy MUST
+        OVERWRITE this header (`proxy_set_header X-Forwarded-For $remote_addr;`
+        on nginx, or use X-Real-IP), not append to it. A proxy that
+        appends lets a client put any IP they like in the first token,
+        bypassing per-IP rate-limiting and the per-IP session cap. The
+        ip_address() validation here only stops obvious garbage and
+        attacker-controlled non-IP bytes from ending up as the registry
+        comparison key — it does NOT compensate for an appending proxy.
+        """
         peer = self.client_address[0]
         if peer in _TRUSTED_PROXIES:
             xff = self.headers.get("X-Forwarded-For", "")
             if xff:
-                return xff.split(",")[0].strip()
+                token = xff.split(",", 1)[0].strip()
+                if token:
+                    try:
+                        ipaddress.ip_address(token)
+                    except ValueError:
+                        return peer
+                    return token
         return peer
 
     def _valid_sid(self, sid):
