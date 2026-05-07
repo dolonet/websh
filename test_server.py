@@ -1816,33 +1816,9 @@ class TestPerIpSessionCapConcurrency(unittest.TestCase):
         self._orig_rate_max = server.RATE_LIMIT_MAX
         server.RATE_LIMIT_MAX = 100
         self._orig_session_cls = server.SSHSession
-
-        # Stubbed Session class: sleeps 50 ms in __init__ to widen the
-        # race window the gate is meant to close, then sets the minimum
-        # attrs the success-path response reads.
-        class _SlowFakeSession(object):
-            def __init__(self, session_id, host, port, username, password,
-                         cols, rows, key=None, ssh_options=None,
-                         is_background=False, persistent=False, slot_id=None,
-                         tmux_cmd="tmux", tmux_options=None, client_ip=None):
-                time.sleep(0.05)
-                self.id = session_id
-                self.client_ip = client_ip
-                self.is_background = is_background
-                self.persistent = bool(persistent and slot_id)
-                self.slot_id = slot_id if self.persistent else None
-                self.tmux_cmd = tmux_cmd
-                self.alive = True
-                self.auth_failed = False
-                self.last_activity = time.time()
-
-            def is_expired(self):
-                return False
-
-            def close(self):
-                pass
-
-        server.SSHSession = _SlowFakeSession
+        # Reuse the HTTP-tests stub but with a 50 ms spawn_delay to
+        # widen the race window the gate is meant to close.
+        server.SSHSession = _make_stub_session_cls(spawn_delay=0.05)
 
     def tearDown(self):
         server.sessions.clear()
