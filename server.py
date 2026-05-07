@@ -205,6 +205,17 @@ AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
 RATE_LIMIT_WINDOW = _int_env("RATE_LIMIT_WINDOW", "60")    # seconds
 RATE_LIMIT_MAX = _int_env("RATE_LIMIT_MAX", "50")          # max connect attempts per IP per window
 
+# Scan-pattern detection: an IP that has hit the deny-list on more than
+# SCAN_PATTERN_THRESHOLD distinct target hosts inside SCAN_PATTERN_WINDOW
+# seconds is plainly probing — log result=scan_pattern so fail2ban can
+# ban. Default 0 disables the check (preserve legacy behaviour); operators
+# opt in by setting a positive threshold. ANY successful connect from the
+# same IP clears the IP's accumulated state — a power user with 50
+# legitimate servers never accumulates anything because their connects
+# succeed; only a credential-less prober keeps tripping deny_blocked.
+SCAN_PATTERN_THRESHOLD = _int_env("SCAN_PATTERN_THRESHOLD", "0")
+SCAN_PATTERN_WINDOW = _int_env("SCAN_PATTERN_WINDOW", "300")
+
 # Session ID format
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
@@ -520,6 +531,63 @@ def _check_rate_limit(ip):
         times.append(now)
         _rate_limits[ip] = times
         return True
+
+
+# ─── Scan-pattern detection ─────────────────────────────────────────
+#
+# Per-IP record of recent connects so we can spot one IP probing many
+# distinct deny-listed target hosts. Two design choices keep this from
+# burning a legitimate user:
+#
+#   1. The signal is *deny-list hits*, not all failed connects. A
+#      legitimate user typing the wrong password just has auth fail
+#      against ONE target — no scan pattern. A power user pinging 50
+#      real servers gets through the deny-list (those hosts are
+#      public) so nothing accumulates. Only an attacker probing
+#      RFC1918 / loopback / our own infra keeps tripping deny_blocked.
+#   2. *Any* successful connect from the same IP clears the IP's
+#      accumulated state. So even if a power user's session crashes
+#      and they retry against a typoed-into-RFC1918 hostname once or
+#      twice, their next successful login forgives them. A scanner
+#      never has any successful connects to forgive itself with.
+
+_scan_pattern = {}  # ip -> list of (ts, target_host)
+_scan_pattern_lock = Lock()
+
+
+def _record_deny_for_scan(ip, target_host):
+    """Record a deny_blocked event for scan-pattern detection.
+
+    Returns True iff this attempt brings the IP over
+    SCAN_PATTERN_THRESHOLD distinct target hosts inside
+    SCAN_PATTERN_WINDOW seconds. The caller emits an extra
+    `result=scan_pattern` access-log record so fail2ban can pick the
+    pattern up; the original deny_blocked record is still emitted.
+    """
+    if SCAN_PATTERN_THRESHOLD <= 0 or not ip:
+        return False
+    now = time.time()
+    cutoff = now - SCAN_PATTERN_WINDOW
+    with _scan_pattern_lock:
+        events = _scan_pattern.get(ip, [])
+        events = [(t, h) for t, h in events if t > cutoff]
+        events.append((now, target_host))
+        _scan_pattern[ip] = events
+        unique_hosts = set(h for _, h in events)
+        return len(unique_hosts) > SCAN_PATTERN_THRESHOLD
+
+
+def _forgive_scan_for_ip(ip):
+    """Successful connect from `ip` clears its scan-pattern state.
+
+    Called from the success path. The asymmetry — only deny_blocked
+    accumulates, only ok forgives — is what makes the heuristic safe:
+    real users always have ok events; pure scanners never do.
+    """
+    if not ip:
+        return
+    with _scan_pattern_lock:
+        _scan_pattern.pop(ip, None)
 
 
 def _per_ip_session_count(ip):
@@ -2189,6 +2257,12 @@ class Handler(BaseHTTPRequestHandler):
         if not conn_name and not is_host_allowed(host, port, username):
             _access_log_emit("connect", ip, result="deny_blocked",
                              target_host=host, target_user=username)
+            if _record_deny_for_scan(ip, host):
+                # Emit a separate scan_pattern record so fail2ban can
+                # ban specifically on this signal without also banning
+                # one-off deny_blocked typos.
+                _access_log_emit("connect", ip, result="scan_pattern",
+                                 target_host=host, target_user=username)
             self._json({"error": "connections to this host are not allowed"}, 403)
             return
 
@@ -2271,6 +2345,8 @@ class Handler(BaseHTTPRequestHandler):
             _log("INFO", "new session {} for {}@{}:{}{}".format(
                 sid, username, host, port,
                 " [persistent slot=" + slot_id + "]" if persistent else ""))
+            # Successful connect forgives the IP — see _forgive_scan_for_ip.
+            _forgive_scan_for_ip(ip)
             _access_log_emit("connect", ip, result="ok", sid=sid,
                              target_host=host, target_user=username,
                              persistent=persistent,

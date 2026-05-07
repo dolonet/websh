@@ -1640,6 +1640,135 @@ class TestRateLimit(unittest.TestCase):
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
 
 
+class TestScanPatternDetection(unittest.TestCase):
+    """Unit tests for the scan-pattern detector.
+
+    Two safety properties matter as much as the positive detection:
+      1. A legitimate user with one or two typos does NOT trip.
+      2. ANY successful connect from an IP clears its accumulated
+         deny-list state, so a power user with many real targets is
+         immune.
+    """
+
+    def setUp(self):
+        # Detector is module-state; snapshot+clear so tests can't leak.
+        with server._scan_pattern_lock:
+            self._snapshot = dict(server._scan_pattern)
+            server._scan_pattern.clear()
+        self._orig_threshold = server.SCAN_PATTERN_THRESHOLD
+        self._orig_window = server.SCAN_PATTERN_WINDOW
+
+    def tearDown(self):
+        with server._scan_pattern_lock:
+            server._scan_pattern.clear()
+            server._scan_pattern.update(self._snapshot)
+        server.SCAN_PATTERN_THRESHOLD = self._orig_threshold
+        server.SCAN_PATTERN_WINDOW = self._orig_window
+
+    # ── safety: detector disabled by default ──
+
+    def test_disabled_by_default(self):
+        """SCAN_PATTERN_THRESHOLD=0 means the detector is a no-op no
+        matter what an IP does. Default config must NOT ban anyone."""
+        server.SCAN_PATTERN_THRESHOLD = 0
+        for i in range(100):
+            self.assertFalse(server._record_deny_for_scan(
+                "1.2.3.4", "host{}.example".format(i)))
+
+    # ── positive detection ──
+
+    def test_triggers_past_threshold(self):
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # First three distinct hosts: under or AT threshold → no fire
+        # (we fire on STRICTLY greater than the threshold, so the
+        # operator-set value is the legitimate maximum)
+        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h1"))
+        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h2"))
+        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h3"))
+        # Fourth distinct host → fires
+        self.assertTrue(server._record_deny_for_scan("1.2.3.4", "h4"))
+
+    def test_repeats_to_same_host_do_not_count(self):
+        """An IP retrying the SAME blocked host (e.g. a script with a
+        config error pinning to one bad target) is annoying but it is
+        not a scan — no broad probing. Threshold counts DISTINCT hosts."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        for _ in range(20):
+            self.assertFalse(server._record_deny_for_scan(
+                "1.2.3.4", "stuck.example"))
+
+    def test_other_ips_independent(self):
+        server.SCAN_PATTERN_THRESHOLD = 2
+        for h in ("a", "b", "c"):
+            server._record_deny_for_scan("attacker", h)
+        # Innocent IP not affected
+        self.assertFalse(server._record_deny_for_scan(
+            "innocent.10.0.0.5", "real.example"))
+
+    # ── safety: success forgives ──
+
+    def test_successful_connect_clears_state(self):
+        """The asymmetry: only deny_blocked accumulates, only ok forgives.
+        A power user who legitimately connects to many servers always
+        forgives themselves, so they never accumulate to a ban."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # IP gets close to the threshold via a string of typoed denies
+        for h in ("rfc1918-typo-a", "rfc1918-typo-b", "rfc1918-typo-c"):
+            server._record_deny_for_scan("power-user", h)
+        # Then they successfully connect to a real server
+        server._forgive_scan_for_ip("power-user")
+        # Their state is gone; one more deny doesn't trigger
+        self.assertFalse(server._record_deny_for_scan(
+            "power-user", "another-typo"))
+        # Even another three before the next deny doesn't trigger
+        for h in ("d", "e"):
+            self.assertFalse(server._record_deny_for_scan("power-user", h))
+        # Only the FOURTH new distinct host since the forgive does
+        self.assertTrue(server._record_deny_for_scan("power-user", "f"))
+
+    def test_window_expires_old_events(self):
+        """Old deny events fall out of the window — slow-and-low
+        scanners stretching their probes across hours never accumulate
+        enough inside the 5-minute (default) window. Verify by setting
+        a tiny window and waiting it out."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 1  # 1 second for the test
+        for h in ("a", "b", "c"):
+            server._record_deny_for_scan("slow-scanner", h)
+        time.sleep(1.1)
+        # Old events have expired; the next probe is the first inside
+        # the (new) window — no fire.
+        self.assertFalse(server._record_deny_for_scan(
+            "slow-scanner", "d"))
+
+    # ── safety: realistic devops user does NOT trigger ──
+
+    def test_devops_with_50_servers_never_triggers(self):
+        """Simulate a power user touching 50 real servers, with one
+        typo'd RFC1918 attempt. Must never trigger."""
+        server.SCAN_PATTERN_THRESHOLD = 5
+        for i in range(50):
+            # Each successful connect clears any accumulated state
+            server._forgive_scan_for_ip("devops")
+            # And imagine they had a typo somewhere
+            if i % 7 == 3:
+                triggered = server._record_deny_for_scan(
+                    "devops", "10.0.0.{}".format(i))
+                self.assertFalse(
+                    triggered,
+                    "devops user must not trigger after iter {}".format(i))
+
+    def test_empty_ip_returns_false(self):
+        server.SCAN_PATTERN_THRESHOLD = 1
+        self.assertFalse(server._record_deny_for_scan("", "h"))
+        self.assertFalse(server._record_deny_for_scan(None, "h"))
+
+    def test_forgive_no_op_on_empty_ip(self):
+        # Should not raise
+        server._forgive_scan_for_ip("")
+        server._forgive_scan_for_ip(None)
+
+
 class TestPerIpSessionCount(unittest.TestCase):
     """Unit tests for the per-IP session-count helper."""
 

@@ -370,6 +370,8 @@ Environment variables for `server.py`:
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
 | `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
 | `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
+| `SCAN_PATTERN_THRESHOLD` | `0` | One IP probing more than N distinct deny-listed targets in `SCAN_PATTERN_WINDOW` seconds gets `result=scan_pattern` events emitted; `0` disables. ANY successful connect from the same IP clears state, so legitimate users never accumulate. |
+| `SCAN_PATTERN_WINDOW` | `300` | Sliding window for scan-pattern detection, in seconds |
 | `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
 | `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
 | `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [Access log](#access-log) below. |
@@ -552,6 +554,7 @@ Common `result` values on `connect` events:
 | `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
 | `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
 | `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
+| `scan_pattern` | The IP has tripped `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, on every probe past the threshold. ANY successful connect from the same IP clears state, so a power user touching many real servers never accumulates here. |
 | `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
 
 Common `result` values on `disconnect` events:
@@ -566,7 +569,7 @@ Common `result` values on `disconnect` events:
 
 ```ini
 [Definition]
-failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|deny_blocked|session_cap_per_ip)".*$
+failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|deny_blocked|session_cap_per_ip|scan_pattern)".*$
 ignoreregex =
 ```
 
