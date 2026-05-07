@@ -66,6 +66,13 @@ it, and never re-tries SSE for that pane (no flapping).
    one body event, transient errors are left to EventSource's own
    auto-retry plus our wall-clock budget (below).
 
+The `'open'` event (HTTP headers received) is deliberately **not**
+listened to. Headers traverse a buffering proxy fine while the body
+sits in the buffer — disarming the timer or resetting the retry
+budget on `'open'` would mask exactly the failure mode the rest of
+this machinery is designed to detect. Only body events
+(`event: data` / `event: end`) prove the channel actually flushes.
+
 ### Wall-clock reconnect budget
 
 Both transports share `nextRetryDelay(p)`. The first time a request
@@ -81,8 +88,8 @@ banner the user has to dismiss.
 ### Local echo prediction (Mosh-style lite)
 
 `websh.js:predictKey` is wired into `term.onData`. For a single
-printable ASCII character typed in the **normal** xterm buffer (not
-alt-screen), we:
+printable **ASCII** character (codes 32-126) typed in the **normal**
+xterm buffer (not alt-screen), we:
 
 1. Append the char to `p.echoQueue`.
 2. Render it immediately at the cursor with dim SGR
@@ -112,6 +119,16 @@ Predictions are wiped on:
 - Pane close.
 - The 1-second TTL.
 
+Non-ASCII printable input (Cyrillic, CJK, fullwidth, emoji) is **not**
+predicted at all. Two reasons: (a) wide-cell glyphs (CJK, fullwidth,
+many emoji) occupy 2 terminal columns, but `rewindEcho`'s `\b ` `\b`
+sequence is column-only — it would leave half a glyph and a stray space
+behind on rewind; (b) Cyrillic/Greek/Latin-extended is single-cell but
+encoded as multi-byte UTF-8 on the wire, and `consumeEcho` matches the
+prediction queue against base64-decoded server bytes byte-for-byte, so
+a 2-byte Cyrillic char never lines up with a 1-character JS string.
+Drop them at entry instead of producing visual artefacts.
+
 ## Lost-byte handling on disconnect
 
 `SSHSession.read()` is destructive: it returns the contents of
@@ -136,7 +153,12 @@ Two protections, either of which is sufficient on its own:
    raises `BrokenPipeError`, we push the bytes back to the front of
    `output_buf`. Order is preserved (the unread bytes are older than
    anything `_reader_loop` has appended in the meantime). The next
-   reader picks them up.
+   reader picks them up. `unread()` also fires `_signal()` so a
+   consumer that's already parked in `wait_for_data` wakes up
+   immediately rather than at the next keepalive deadline; in
+   practice the next reader is a fresh request that read()s on
+   entry, but the signal makes the contract symmetric with
+   `_read_loop` and removes the latency dependency.
 
 Trade-off: when the unread bytes plus fresh PTY output exceed
 `OUTPUT_BUF_MAX`, the truncation rule (keep the last
@@ -188,6 +210,24 @@ fire `\b`/space/`\b` on top of the freshly-rendered banner. Resize
 also wipes them silently — `\b`/space/`\b` after `xterm.js` reflow
 isn't actually silent (column-only backspace doesn't cross line
 wraps) and would clobber legitimate content on narrowing.
+
+## At most one `/api/stream` per session
+
+`SSHSession.read()` is destructive. Two concurrent SSE consumers for
+the same session would race for bytes — each wakeup drains a fragment
+into one consumer's local variable, the other gets the next fragment,
+neither sees the full byte stream. The handler refuses a second
+`/api/stream` for an already-streaming session with `409 Conflict`
+("stream already active for this session"). The first consumer holds
+a per-session flag (`_stream_active`) under `sessions_lock` from the
+moment the request validates until the handler returns through any
+exit path — clean end, BrokenPipe, or unexpected exception.
+
+`/api/output` (long-poll) does not enforce a similar guard. Two
+long-poll clients overlapping is unlikely in practice (the browser
+opens at most one per pane, and the poll window is short) and the
+protocol stays backwards-compatible with anyone hand-crafting
+requests against it.
 
 ## Known limitations
 
@@ -253,6 +293,16 @@ short-circuits when it's `false`. Heuristic only — it matches the
 common English `password|passcode|passphrase` prompt shape; exotic
 prompts that ask for a secret without that word still leak the
 keystroke, which is a known limitation.
+
+The regex is intentionally narrow: it matches the keyword followed
+by either an immediate `:` or the canonical PAM-style ` for X:`
+shape (sudo, ssh-add, doas, polkit). Free-running prose like
+`I forgot my password yesterday: ` is rejected because it doesn't
+fit the label shape. ANSI control sequences — CSI (colors), OSC
+(title-bar updates) and DCS — are stripped before applying the
+regex so a prompt wrapped by terminal-control bytes still hits the
+match. The `event: end` SSE frame also carries `echo_off` so the
+client's prediction gate stays consistent through disconnect.
 
 ### Why a 60-second budget instead of N retries
 

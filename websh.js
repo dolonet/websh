@@ -806,6 +806,19 @@ function predictKey(p, ch) {
     if (undo) p.term.write(undo);
     return;
   }
+  // Predict only single-cell ASCII printable. Wide chars (CJK, fullwidth,
+  // many emoji) occupy 2 terminal columns; rewindEcho's '\b \b' assumes
+  // 1 column per queued char and would leave half a glyph and a stray
+  // space behind. Non-ASCII (Cyrillic, Greek, Latin extended) is single-
+  // cell but doesn't round-trip safely against a base64-decoded server
+  // chunk that may include UTF-8 continuation bytes — consumeEcho
+  // compares JS char codes byte-for-byte. ASCII-only keeps the matcher
+  // honest.
+  if (code > 126) {
+    let undo = rewindEcho(p);
+    if (undo) p.term.write(undo);
+    return;
+  }
   p.echoQueue = (p.echoQueue || '') + ch;
   p.term.write('\x1b[2m' + ch + '\x1b[22m');
   if (p.echoTimer) clearTimeout(p.echoTimer);
@@ -1058,13 +1071,17 @@ function streamOutput(p) {
   // fastcgi_buffering on) flushes headers immediately and holds the body,
   // which is exactly the case the first-message timer is designed to detect.
   // So we DO NOT mark sseGotAnyMessage on 'open' — only body events
-  // ('data' / 'end') prove the channel actually flushes. We do clear the
-  // retry clock since the TCP connection itself succeeded.
+  // ('data' / 'end') prove the channel actually flushes. We also DO NOT
+  // clear the retry clock on 'open': through a buffering proxy the
+  // headers arrive but no body ever does, and resetting the budget on
+  // every 'open' would let an unbroken series of half-working
+  // connections starve the wall-clock retry budget. The first-message
+  // timer is the safety net that fires the long-poll fallback; the
+  // retry clock should only reset once a real frame proves the channel.
   let onBodyEvent = () => {
     p.sseGotAnyMessage = true;
     clearRetryClock(p);
   };
-  es.addEventListener('open', () => clearRetryClock(p));
   // EventSource fires onmessage for unnamed events; the ': ok' comment
   // doesn't trigger it but still arrives on the wire. We rely on the
   // 'data' / 'end' named events here.

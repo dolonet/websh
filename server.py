@@ -158,14 +158,34 @@ PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 # prompts. Heuristic only: the *local* PTY (between server.py and the ssh
 # client) is in raw mode regardless of remote ECHO state, so we can't read
 # the remote pty's termios bit directly.
+# Recognize the "PAM-style label + colon" shape rather than any
+# co-occurrence of the keyword with a colon. Real prompts have a tight
+# structure:
+#     "Password:"                       — keyword then colon
+#     "[sudo] password for user:"       — keyword + " for " + username
+#     "Enter passphrase for key '...':" — keyword + " for " + path
+#     "(current) UNIX password:"        — keyword then colon
+#     "MySQL password:"                 — keyword then colon
+# Prose, by contrast, puts other words between the keyword and the
+# closing colon: "I forgot my password yesterday: ",
+# "echo password is supersecret: ". This regex accepts only:
+#   keyword + (immediate ":" with optional whitespace), OR
+#   keyword + " for ..." + ":" (the "for" is the only verb that appears
+#   in the canonical prompt shapes — covers sudo, ssh, doas, polkit).
 ECHO_OFF_PROMPT_RE = re.compile(
-    rb"(?i)\b(password|passcode|passphrase)\b[^\n]*:\s*$")
-# ANSI CSI sequences end in an ASCII letter, which `\b` interprets as a
-# word char — `\b` between a CSI's terminator and the next keyword would
-# fail to match. echo_off_hint() strips CSI sequences from the tail
-# before applying ECHO_OFF_PROMPT_RE so colored prompts (`\x1b[1mPassword:
-# \x1b[0m `, common in distros that wrap PAM output) still hit.
-ANSI_CSI_RE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+    rb"(?i)\b(?:password|passcode|passphrase)\b"
+    rb"(?:\s*:|\s+for\s+[^:\n]{1,80}:)\s*$")
+# ANSI control sequences. CSI ends in an ASCII letter, OSC ends in BEL or
+# ST (ESC \), DCS/APC/PM/SOS end in ST. `\b` between a sequence terminator
+# and the next keyword would fail to match if the terminator is a word
+# char (CSI's ending letter is word-class), so we strip them before
+# applying ECHO_OFF_PROMPT_RE. Covers colored prompts (CSI), title-bar
+# updates around prompts (OSC), and DCS-wrapped prompts on exotic shells.
+ANSI_CSI_RE = re.compile(
+    rb"\x1b\[[0-9;]*[A-Za-z]"                           # CSI
+    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"              # OSC ... BEL or ST
+    rb"|\x1b[PX\^_][^\x1b]*\x1b\\"                      # DCS/SOS/PM/APC ... ST
+)
 # Bytes of recent PTY output kept on each Session for ECHO_OFF_PROMPT_RE.
 # 256 covers any single-line prompt; the regex only inspects the last line.
 RECENT_TAIL_MAX = 256
@@ -529,6 +549,13 @@ sessions_lock = Lock()
 class SSHSession(object):
     """Manages a single SSH connection via PTY subprocess."""
 
+    # Class-level defaults so `SSHSession.__new__(SSHSession)` (used by
+    # tests that bypass __init__) still has these attributes — _signal()
+    # reads them and would AttributeError on a stripped instance.
+    _notify_r = None
+    _notify_w = None
+    _stream_active = False
+
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
                  persistent=False, slot_id=None, tmux_cmd="tmux",
@@ -575,6 +602,14 @@ class SSHSession(object):
                 self._notify_w = None
         self.alive = True
         self.last_activity = time.time()
+        # At most one /api/stream consumer per session. SSHSession.read()
+        # is destructive: a second concurrent stream would race for bytes
+        # and each would only see fragments. The flag is owned by the
+        # _stream handler under sessions_lock; long-poll (/api/output)
+        # has the same destructive read but its short-window nature
+        # makes overlap a non-issue in practice and we keep it
+        # unrestricted for backwards compatibility.
+        self._stream_active = False
         self.is_background = is_background
         self._password = password
         self._password_sent = False
@@ -694,8 +729,14 @@ class SSHSession(object):
 
         pid, fd = pty.fork()
         if pid == 0:
+            # In the forked child: only call os._exit on execvpe failure.
+            # sys.exit raises SystemExit which runs atexit handlers and
+            # flushes Python buffers — both inherited from the parent.
+            # In the child those handlers may delete files, release locks,
+            # or write garbage to the user's terminal (stdio is the PTY
+            # slave). os._exit skips all that and exits immediately.
             os.execvpe("ssh", ssh_cmd, env)
-            sys.exit(1)
+            os._exit(127)
 
         self.pid = pid
         self.master_fd = fd
@@ -994,6 +1035,14 @@ class SSHSession(object):
             self.output_buf = data + self.output_buf
             if len(self.output_buf) > OUTPUT_BUF_MAX:
                 self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+        # Wake any consumer parked in wait_for_data so unread bytes get
+        # delivered immediately instead of waiting for the next PTY
+        # signal or the keepalive deadline. In the current code paths
+        # the next consumer always reads on entry so this is defensive
+        # consistency with _read_loop, but it makes the contract simpler
+        # to reason about: any output_buf mutation that produces bytes
+        # to deliver also signals.
+        self._signal()
 
     def write(self, data):
         """Send input to SSH process."""
@@ -1488,10 +1537,18 @@ class SSHSession(object):
             except OSError:
                 pass
             self._control_path = None
-        # NOTE: do NOT close the notification pipe here — see __init__
-        # for the full rationale. Pipe-fd lifetime is bound to Session
-        # GC via weakref.finalize, which closes the race between
-        # reader-thread _signal() and pipe-fd reuse during teardown.
+        # NOTE: do NOT add `os.close(self._notify_r)` or
+        # `os.close(self._notify_w)` here — pipe-fd lifetime is bound
+        # to Session GC via weakref.finalize. The race is: another
+        # thread reads `fd = self._notify_w` (one bytecode), GIL
+        # yields, close() in this thread frees the fd, kernel reuses
+        # the fd number for an unrelated socket, the other thread's
+        # `os.write(fd, b"\x00")` lands a stray byte in someone
+        # else's stream. Tying fd lifetime to GC means the pipe stays
+        # valid for as long as ANY thread holds a Session reference;
+        # only after the last consumer and the reader thread have
+        # released their refs does the finalizer run. test_close_does_
+        # not_close_pipe_fds locks this in.
 
     def is_expired(self):
         return time.time() - self.last_activity > SESSION_TIMEOUT
@@ -1941,12 +1998,40 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
+        # Acquire the per-session stream slot under sessions_lock. Reject
+        # a second /api/stream for the same session with 409 instead of
+        # silently racing two consumers for destructive reads. EventSource
+        # auto-reconnect can briefly overlap with a manual reconnect on
+        # flaky networks; the duplicate is rejected fast and the client's
+        # onerror handler picks the next attempt.
         with sessions_lock:
             session = sessions.get(sid)
+            if session and session._stream_active:
+                session = None
+                duplicate = True
+            else:
+                duplicate = False
+                if session:
+                    session._stream_active = True
+        if duplicate:
+            self._json({"error": "stream already active for this session"}, 409)
+            return
         if not session:
             self._json({"error": "session not found"}, 404)
             return
 
+        try:
+            self._stream_session(session)
+        finally:
+            # Release the per-session stream slot regardless of how the
+            # body exited (clean end, BrokenPipe, exception). Done under
+            # sessions_lock to keep the acquire/release symmetric and
+            # ordered with concurrent _stream entrants.
+            with sessions_lock:
+                session._stream_active = False
+
+    def _stream_session(self, session):
+        """Body of /api/stream once the per-session slot is held."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -2062,9 +2147,16 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     session.unread(tail)
                     return
+            # Carry echo_off here too for consistency with event:data
+            # frames. The browser's handleOutputPayload only updates
+            # p.echoEnabled when the field is present; missing field
+            # would leave a stale echo-off-on state if the session
+            # disconnected at exactly the moment the user finished a
+            # password prompt. Cheap to include, no-op on the happy path.
             end_payload = json.dumps({
                 "alive": False,
                 "auth_failed": session.auth_failed,
+                "echo_off": session.echo_off_hint(),
             })
             self.wfile.write(
                 ("event: end\ndata: " + end_payload + "\n\n")
