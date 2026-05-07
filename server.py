@@ -2771,7 +2771,36 @@ class Server(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def _warn_per_ip_misconfig():
+    """Emit a WARN when MAX_SESSIONS_PER_IP cannot ever trip.
+
+    The per-IP cap only matters when it is strictly tighter than the
+    global caps. If it is set to (or above) max(MAX_SESSIONS,
+    MAX_BG_SESSIONS), a single IP exhausting the global pool already
+    hits the global 429 first — the per-IP gate becomes dead code and
+    the operator is paying the inventory cost (the iteration in
+    _per_ip_session_count, the per-session client_ip attribute) for
+    no benefit. Most likely they intended a smaller value and should
+    lower it.
+
+    Module-level WARN lets a one-time misconfiguration surface at
+    startup; we deliberately avoid raising or refusing to start since
+    the existing default (0 = disabled) and any positive value short of
+    the threshold are valid configurations.
+    """
+    if MAX_SESSIONS_PER_IP <= 0:
+        return
+    threshold = max(MAX_SESSIONS, MAX_BG_SESSIONS)
+    if MAX_SESSIONS_PER_IP >= threshold:
+        _log("WARN", ("MAX_SESSIONS_PER_IP={} is >= max(MAX_SESSIONS={}, "
+                      "MAX_BG_SESSIONS={}); the per-IP cap will never "
+                      "trip — a single client hits the global cap first. "
+                      "Lower MAX_SESSIONS_PER_IP to take effect.").format(
+            MAX_SESSIONS_PER_IP, MAX_SESSIONS, MAX_BG_SESSIONS))
+
+
 def main():
+    _warn_per_ip_misconfig()
     # Start background cleanup thread
     t = Thread(target=_cleanup_loop, daemon=True)
     t.start()

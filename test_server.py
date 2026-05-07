@@ -1822,6 +1822,79 @@ class TestIntEnv(unittest.TestCase):
         self.assertEqual(server._int_env("_TEST_MISSING_XYZ", "99"), 99)
 
 
+class TestPerIpMisconfigWarn(unittest.TestCase):
+    """Issue 7: warn when MAX_SESSIONS_PER_IP is set so high it can
+    never trip — the operator is paying the per-session inventory cost
+    for a gate that's effectively dead code."""
+
+    def setUp(self):
+        self._orig_per_ip = server.MAX_SESSIONS_PER_IP
+        self._orig_max = server.MAX_SESSIONS
+        self._orig_bg = server.MAX_BG_SESSIONS
+
+    def tearDown(self):
+        server.MAX_SESSIONS_PER_IP = self._orig_per_ip
+        server.MAX_SESSIONS = self._orig_max
+        server.MAX_BG_SESSIONS = self._orig_bg
+
+    def test_warns_when_at_or_above_global_max(self):
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 50  # exactly at the threshold
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
+        level, msg = mock_log.call_args[0][0], mock_log.call_args[0][1]
+        self.assertEqual(level, "WARN")
+        self.assertIn("MAX_SESSIONS_PER_IP=50", msg)
+        self.assertIn("never", msg.lower())
+
+    def test_warns_when_above_global_max(self):
+        server.MAX_SESSIONS = 30
+        server.MAX_BG_SESSIONS = 20
+        server.MAX_SESSIONS_PER_IP = 100
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
+        self.assertEqual(mock_log.call_args[0][0], "WARN")
+
+    def test_silent_when_strictly_below_global_max(self):
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 5
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(
+            mock_log.called,
+            "no WARN expected for a normally-configured per-IP cap")
+
+    def test_silent_when_disabled(self):
+        # 0 is the documented "off" sentinel — must not warn.
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 0
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(mock_log.called)
+
+    def test_threshold_uses_max_of_global_caps(self):
+        # If MAX_SESSIONS is small but MAX_BG_SESSIONS is large, the
+        # threshold is the larger of the two — only above that does
+        # the per-IP cap become dead.
+        server.MAX_SESSIONS = 10
+        server.MAX_BG_SESSIONS = 100
+        # Below the larger cap → no warn.
+        server.MAX_SESSIONS_PER_IP = 50
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(mock_log.called)
+        # At the larger cap → warn.
+        server.MAX_SESSIONS_PER_IP = 100
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
+
+
 # ── Input validation regexes (slot_id, tmux_cmd) ───────────────────────
 # These guard the remote ssh command string, so any hole here is a
 # potential RCE on the target. Tests the regex in isolation and then the
