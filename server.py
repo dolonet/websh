@@ -205,7 +205,7 @@ AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
 RATE_LIMIT_WINDOW = _int_env("RATE_LIMIT_WINDOW", "60")    # seconds
 RATE_LIMIT_MAX = _int_env("RATE_LIMIT_MAX", "50")          # max connect attempts per IP per window
 
-# Scan-pattern detection: an IP that has hit the deny-list on more than
+# Scan-pattern detection: an IP that has hit the deny-list on at least
 # SCAN_PATTERN_THRESHOLD distinct target hosts inside SCAN_PATTERN_WINDOW
 # seconds is plainly probing — log result=scan_pattern so fail2ban can
 # ban. Default 0 disables the check (preserve legacy behaviour); operators
@@ -558,11 +558,16 @@ _scan_pattern_lock = Lock()
 def _record_deny_for_scan(ip, target_host):
     """Record a deny_blocked event for scan-pattern detection.
 
-    Returns True iff this attempt brings the IP over
+    Returns True iff this attempt brings the IP to at least
     SCAN_PATTERN_THRESHOLD distinct target hosts inside
     SCAN_PATTERN_WINDOW seconds. The caller emits an extra
     `result=scan_pattern` access-log record so fail2ban can pick the
     pattern up; the original deny_blocked record is still emitted.
+
+    Convention matches `_check_rate_limit`: `>=` means
+    `SCAN_PATTERN_THRESHOLD=10` fires on the 10th distinct host (not
+    the 11th) — the operator-set value IS the ban threshold, not one
+    below it.
     """
     if SCAN_PATTERN_THRESHOLD <= 0 or not ip:
         return False
@@ -585,7 +590,7 @@ def _record_deny_for_scan(ip, target_host):
         events.append((now, normalised))
         _scan_pattern[ip] = events
         unique_hosts = set(h for _, h in events)
-        return len(unique_hosts) > SCAN_PATTERN_THRESHOLD
+        return len(unique_hosts) >= SCAN_PATTERN_THRESHOLD
 
 
 def _forgive_scan_for_ip(ip):

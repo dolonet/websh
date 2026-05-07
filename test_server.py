@@ -1679,13 +1679,14 @@ class TestScanPatternDetection(unittest.TestCase):
 
     def test_triggers_past_threshold(self):
         server.SCAN_PATTERN_THRESHOLD = 3
-        # First three distinct hosts: under or AT threshold → no fire
-        # (we fire on STRICTLY greater than the threshold, so the
-        # operator-set value is the legitimate maximum)
+        # Convention matches _check_rate_limit: fire on the threshold
+        # itself (>=), not threshold+1. SCAN_PATTERN_THRESHOLD=3 means
+        # "the 3rd distinct host trips the ban".
         self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h1"))
         self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h2"))
-        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h3"))
-        # Fourth distinct host → fires
+        self.assertTrue(server._record_deny_for_scan("1.2.3.4", "h3"))
+        # And every probe AFTER fires too (so fail2ban keeps seeing
+        # the signal — single line is easy to miss in log rotation).
         self.assertTrue(server._record_deny_for_scan("1.2.3.4", "h4"))
 
     def test_repeats_to_same_host_do_not_count(self):
@@ -1720,11 +1721,10 @@ class TestScanPatternDetection(unittest.TestCase):
         # Their state is gone; one more deny doesn't trigger
         self.assertFalse(server._record_deny_for_scan(
             "power-user", "another-typo"))
-        # Even another three before the next deny doesn't trigger
-        for h in ("d", "e"):
-            self.assertFalse(server._record_deny_for_scan("power-user", h))
-        # Only the FOURTH new distinct host since the forgive does
-        self.assertTrue(server._record_deny_for_scan("power-user", "f"))
+        # Another distinct host: still under threshold (count=2)
+        self.assertFalse(server._record_deny_for_scan("power-user", "d"))
+        # Third distinct host since the forgive: hits threshold (>=3)
+        self.assertTrue(server._record_deny_for_scan("power-user", "e"))
 
     def test_window_expires_old_events(self):
         """Old deny events fall out of the window — slow-and-low
