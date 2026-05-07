@@ -325,6 +325,65 @@ class TestResolveHostIPs(unittest.TestCase):
         self.assertEqual(str(ips[0]), "10.0.0.5")
         self.assertEqual(str(ips[1]), "fe80::1")  # scope stripped
 
+    def test_strips_ipv6_brackets_before_resolution(self):
+        """`getaddrinfo("[::1]")` raises gaierror on glibc — without bracket
+        stripping, an attacker writes `[::1]` and resolution fails open,
+        slipping past the deny-list. Verify _resolve_host_ips passes the
+        bracket-less form to getaddrinfo."""
+        captured = []
+
+        def fake_gai(host, *args, **kwargs):
+            captured.append(host)
+            return [(None, None, None, None, ("::1", 0, 0, 0))]
+
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=fake_gai):
+            ips = server._resolve_host_ips("[::1]")
+        self.assertEqual(captured, ["::1"])
+        self.assertEqual([str(ip) for ip in ips], ["::1"])
+
+    def test_brackets_only_stripped_when_well_formed(self):
+        """Stray opening bracket without closing must NOT be stripped —
+        `[evil` should still be passed to getaddrinfo as-is so DNS is
+        the only thing that decides."""
+        captured = []
+
+        def fake_gai(host, *args, **kwargs):
+            captured.append(host)
+            raise server.socket.gaierror
+
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=fake_gai):
+            server._resolve_host_ips("[evil")
+            server._resolve_host_ips("evil]")
+        self.assertEqual(captured, ["[evil", "evil]"])
+
+    def test_ipv4_mapped_ipv6_yields_both_forms(self):
+        """`::ffff:127.0.0.1` is the IPv6 representation of the IPv4
+        address 127.0.0.1; an operator's `denied_hosts: ["127.0.0.0/8"]`
+        must block it. Verify the resolver returns BOTH the v6 form and
+        the unwrapped v4 form so the deny-list iteration sees both."""
+        infos = [
+            (None, None, None, None, ("::ffff:10.5.6.7", 0, 0, 0)),
+        ]
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        return_value=infos):
+            ips = server._resolve_host_ips("foo.example")
+        strs = [str(ip) for ip in ips]
+        self.assertIn("::ffff:a05:607", strs)  # canonical IPv6 form
+        self.assertIn("10.5.6.7", strs)        # the IPv4 buddy
+
+    def test_pure_ipv6_does_not_synth_ipv4(self):
+        """An ordinary IPv6 address has no ipv4_mapped buddy and the
+        resolver shouldn't invent one."""
+        infos = [
+            (None, None, None, None, ("2001:db8::1", 0, 0, 0)),
+        ]
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        return_value=infos):
+            ips = server._resolve_host_ips("foo.example")
+        self.assertEqual([str(ip) for ip in ips], ["2001:db8::1"])
+
 
 class TestDeniedHosts(unittest.TestCase):
     """End-to-end deny-list behaviour at is_host_allowed boundary."""
@@ -444,6 +503,40 @@ class TestDeniedHosts(unittest.TestCase):
         # Even a non-blocked host is rejected because of restrict_hosts.
         with self._patched_resolve("8.8.8.8"):
             self.assertFalse(server.is_host_allowed("ok.example", 22, "u"))
+
+    def test_ipv6_brackets_target_blocked_by_loopback_cidr(self):
+        """End-to-end regression: target `[::1]` must be denied when
+        `::1/128` (or `127.0.0.0/8` for the IPv4-mapped form) is in
+        denied_hosts. Pre-fix, `getaddrinfo("[::1]")` raised gaierror
+        and the request fell open."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["::1/128"],
+        })
+
+        def fake_gai(host, *args, **kwargs):
+            # Mirror real getaddrinfo: "[::1]" raises, "::1" resolves.
+            if host == "[::1]":
+                raise server.socket.gaierror
+            return [(None, None, None, None, ("::1", 0, 0, 0))]
+
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        side_effect=fake_gai):
+            self.assertFalse(server.is_host_allowed("[::1]", 22, "u"))
+
+    def test_ipv4_mapped_ipv6_blocked_by_ipv4_cidr(self):
+        """End-to-end regression: target `::ffff:10.5.6.7` must be
+        denied when `10.0.0.0/8` is in denied_hosts (RFC 4291 §2.5.5.2:
+        the lower 32 bits ARE the IPv4 address)."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["10.0.0.0/8"],
+        })
+        infos = [(None, None, None, None, ("::ffff:10.5.6.7", 0, 0, 0))]
+        with unittest.mock.patch.object(server.socket, "getaddrinfo",
+                                        return_value=infos):
+            self.assertFalse(
+                server.is_host_allowed("looks-public.example", 22, "u"))
 
 
 class TestConnectionKinds(unittest.TestCase):

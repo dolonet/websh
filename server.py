@@ -450,9 +450,23 @@ def _resolve_host_ips(host):
     Returns [] when resolution fails — caller treats that as "no IPs to
     check" and falls open. ssh will then run its own resolution and fail
     naturally if the host doesn't exist.
+
+    Strips the RFC 3986 IPv6 `[address]` wrapping before resolution
+    because `getaddrinfo("[::1]")` raises gaierror on glibc — without
+    the strip, an attacker could write `[::1]` and slip past the
+    deny-list (resolution fails → no IPs to check → fall-open).
+
+    For each IPv6 address that is an IPv4-mapped form (`::ffff:a.b.c.d`),
+    also returns the equivalent IPv4 address. RFC 4291 section 2.5.5.2
+    says the lower 32 bits of these addresses ARE the corresponding
+    IPv4 address — without this, an operator's `denied_hosts: ["10.0.0.0/8"]`
+    would not block `::ffff:10.5.6.7`.
     """
+    h = host
+    if h.startswith("[") and h.endswith("]") and len(h) >= 2:
+        h = h[1:-1]
     try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
     except (socket.gaierror, socket.herror, UnicodeError):
         return []
     ips = []
@@ -465,9 +479,14 @@ def _resolve_host_ips(host):
             continue
         seen.add(addr)
         try:
-            ips.append(ipaddress.ip_address(addr))
+            ip = ipaddress.ip_address(addr)
         except ValueError:
-            pass
+            continue
+        ips.append(ip)
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and str(mapped) not in seen:
+            seen.add(str(mapped))
+            ips.append(mapped)
     return ips
 
 
