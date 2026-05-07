@@ -20,6 +20,8 @@ On shared hosting where you can't run a long-lived process, an optional PHP prox
 
 **Why not WebSocket?** Two reasons. First, many shared-hosting PHP environments don't support WebSocket — and we want websh to drop in there without a separate server. Second, we don't need it: SSE delivers the same low latency as a WebSocket but is plain HTTP, so it tunnels through any HTTPS proxy or PHP host without a protocol upgrade. If even SSE gets buffered by an aggressive upstream (some shared hosts compress every response and won't flush), the frontend silently falls back to HTTP long-polling on `/api/output` for that session. Slower, but works literally anywhere.
 
+For the deeper picture — buffer-detection probe, lost-byte handling on disconnect, local-echo prediction, the selectors-based wait machinery — see [`docs/sse-transport.md`](docs/sse-transport.md).
+
 ## Requirements
 
 - **Backend:** Python 3.5+ with `ssh` command available
@@ -450,7 +452,8 @@ If this is unacceptable for your use case:
 
 ### Rate limiting & proxies
 
-Connection attempts are rate-limited to 10 per IP per minute. The client IP is
+Connection attempts are rate-limited to **50 per IP per minute** by default
+(configurable via `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW`). The client IP is
 determined from `X-Forwarded-For` **only** when the request comes from an IP
 listed in `TRUSTED_PROXIES` (default: `127.0.0.1`). Direct connections always
 use the TCP peer address — `X-Forwarded-For` cannot be spoofed.
