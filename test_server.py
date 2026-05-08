@@ -5075,6 +5075,14 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
         # so multi-GB downloads don't outlive SESSION_TIMEOUT and get reaped
         # mid-stream. Symmetric with upload_file. The fake_session is a
         # MagicMock, so any attribute assignment is recorded.
+        # urlopen returns once Content-Length bytes are read, but the server
+        # worker thread may still be in the loop / finally block — poll for
+        # the assignment to land before asserting.
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not isinstance(
+                fake_session.last_activity, (int, float)):
+            time.sleep(0.01)
+        self.assertIsInstance(fake_session.last_activity, (int, float))
         self.assertGreater(fake_session.last_activity, 0)
 
 
