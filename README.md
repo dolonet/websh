@@ -2,111 +2,99 @@
 
 **English** | [Русский](README.ru.md)
 
-Lite but powerful web-based SSH terminal.
+Browser-based SSH terminal. Plain HTTP, no build, no extra services.
 
-- 📦 **No build step, no server dependencies**
-- 🌐 **Plain HTTP, no WebSocket**
-- ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h)**
+- 📦 No npm, no pip — drop the files in and run
+- 🌐 Corporate networks with only HTTPS open: works without WebSocket
+- ⭐ Sessions survive tab close, reboot, and backend restart for up to 72 h (via tmux on the target host)
 
 ![websh split panes](screenshot.png)
 
 ```
-Browser (xterm.js) ──── server.py ──── ssh
+┌─ Your browser ─┐    HTTPS     ┌── websh host ──┐     SSH      ┌──── Remote ────┐
+│                │              │                │              │                │
+│    xterm.js    │─── POST ────►│   server.py    │◄────────────►│      bash      │
+│                │◄─── SSE ─────│    (Python)    │              │     + tmux     │
+│                │              │                │              │                │
+└────────────────┘              └────────────────┘              └────────────────┘
 ```
 
 ## How it works
 
-The browser runs a full terminal emulator (xterm.js) and talks to the Python backend over plain HTTP. Output streams back via Server-Sent Events (`/api/stream`); keystrokes go up as short POSTs (`/api/input`). The backend manages SSH sessions as PTY subprocesses and serves the frontend directly.
+Three pieces:
 
-On shared hosting where you can't run a long-lived process, an optional PHP proxy (`api.php`) auto-starts the backend and forwards requests to it.
+- **Browser.** xterm.js renders the terminal. Each keystroke goes up as a POST to `/api/input`.
+- **websh host.** `server.py` runs each SSH connection as a PTY subprocess and streams output back over Server-Sent Events on `/api/stream`. The same process serves the frontend, so you don't need a separate web server.
+- **Remote.** The host you SSH into. Optionally wrapped in tmux so the session survives reconnects.
 
-**Why not WebSocket?** Two reasons. First, many shared-hosting PHP environments don't support WebSocket — and we want websh to drop in there without a separate server. Second, we don't need it: SSE delivers the same low latency as a WebSocket but is plain HTTP, so it tunnels through any HTTPS proxy or PHP host without a protocol upgrade. If even SSE gets buffered by an aggressive upstream (some shared hosts compress every response and won't flush), the frontend silently falls back to HTTP long-polling on `/api/output` for that session. Slower, but works literally anywhere.
+If a proxy buffers SSE (some shared hosts do), the client falls back to long-polling on `/api/output` for that session. Slower, but works.
 
-For the deeper picture — buffer-detection probe, lost-byte handling on disconnect, local-echo prediction, the selectors-based wait machinery — see [`docs/sse-transport.md`](docs/sse-transport.md).
+Shared hosting that doesn't allow long-lived processes? Ship `api.php` next to `server.py`. The PHP shim starts the backend on the first request and proxies the API to it.
+
+**Why not WebSocket?** Many shared-hosting PHP setups don't proxy it — websh has to drop in there too. SSE gives the same low latency on plain HTTP and tunnels through any HTTPS proxy without a protocol upgrade.
+
+For deeper internals — buffer-detection probe, lost-byte handling on disconnect, local-echo prediction, selectors-based wait — see [`docs/sse-transport.md`](docs/sse-transport.md).
 
 ## Requirements
 
-- **Backend:** CPython 3.5+ with `ssh` command available (alternative
-  Python implementations may work but the GC-bound pipe-fd lifetime
-  in the SSE wait machinery assumes refcount-style finalization)
-- **Proxy:** PHP 5.3+ with curl extension (shared hosting) — or any reverse proxy (nginx, Apache)
-- **Browser:** Any modern browser (Chrome, Firefox, Safari, Edge)
-- **Frontend:** Loads [xterm.js](https://xtermjs.org/) from CDN (no npm, no build step)
+- **Backend.** Python 3.5+ with `ssh` in PATH. CPython only — the SSE wait code relies on refcount-based GC for pipe-fd lifetime.
+- **Browser.** Any modern browser. xterm.js is loaded from a CDN.
+- **Optional shared-hosting proxy.** PHP 5.3+ with the `curl` extension.
+- **Optional reverse proxy.** nginx, Caddy, or Apache.
 
 ## Highlights
 
-### 🖥️ Full terminal in the browser
-A real xterm.js terminal — not a toy. Feels like iTerm2 or Terminal.app.
+### 🖥️ Terminal
 
-- Split panes, horizontal or vertical, with draggable resize handles
-- Keyboard pane switching (`Ctrl+Tab` / `Ctrl+Shift+Tab`)
-- Search scrollback (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`)
-- Copy-on-select, right-click paste
-- Dark and light themes, persisted
-- Customizable font family, size, line height, and weight (⚙ icon) with
-  live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono,
-  Source Code Pro, Inconsolata, or system default
+Real xterm.js — copy-on-select, right-click paste, scrollback search (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`).
 
-### 🔁 Sessions that survive
-Close the tab, reboot, keep your shell. Persistent panes are wrapped
-in a tmux session on the target host — reopen the browser and you're
-back where you left off with scrollback and running processes intact.
-See [Persistent sessions (tmux)](#persistent-sessions-tmux) below.
+- Split panes, horizontal or vertical, with draggable dividers
+- Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab`
+- Dark and light themes (persisted)
+- Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight
 
-- Optional per-pane: tick **Persistent session** on connect
-- One-click reconnect when a session drops; red banner on auth fail
-- Keep-alive while any tab is open; expires naturally after close
+### 🔁 Persistent sessions
+
+Tick **Persistent session** at connect — websh wraps the shell in a tmux session on the target host. Close the tab, reboot, restart `server.py`: the pane re-attaches to the same tmux session with scrollback and running processes intact. See [Persistent sessions (tmux)](#persistent-sessions-tmux).
+
+- Reconnect button on disconnect; red banner on auth failure
 - URL anchors (`#connect=Production`) for direct links and bookmarks
 - Saved connections in browser `localStorage`
 
-### 📁 File transfer in the terminal
-No `scp` dance. Move files without leaving the browser.
+### 📁 File transfer
 
-- **Upload** — pick files, the browser streams the bytes verbatim through
-  a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>` with no
-  PTY, no base64, single HTTP POST per file). For persistent (tmux)
-  panes the move-into-cwd step also rides ControlMaster — the server
-  asks tmux for `#{pane_current_path}` and `mv`s the file there itself,
-  so vim/less/htop in the foreground are never disturbed. Non-persistent
-  panes type the `mv` into the foreground shell (only thing that knows
-  their cwd), with an alt-screen guard. Auto-increment on name conflicts.
-  Native xhr.upload progress, multi-file queue, cancel mid-flight.
-- **Download** — select a filename in the terminal, click download
-- **Export scrollback** — save the current terminal buffer as a text
-  file. In persistent panes the export pulls the real tmux scrollback
-  via `tmux capture-pane`, not just what xterm.js currently shows.
+Upload and download without `scp`.
 
-### 🔐 Flexible connection management
-From free-form "type a host and go" to strictly allowlisted
-click-to-connect — pick the model that fits your team.
+- **Upload.** Pick files; the browser streams the bytes through a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>`, no PTY, no base64, one HTTP POST per file). On persistent (tmux) panes the file is moved into `pane_current_path` automatically — vim/less/htop in the foreground stay untouched. Non-persistent panes type the `mv` into the foreground shell with an alt-screen guard. Auto-increment on name conflicts. Native xhr.upload progress, multi-file queue, cancel mid-flight.
+- **Download.** Select a filename in the terminal, click Download.
+- **Export scrollback.** Save the current buffer as a text file. Persistent panes pull the real tmux scrollback via `tmux capture-pane`.
 
-- Password and SSH key authentication
-- Server-side profiles in `websh.json` — credentials stay on the server,
-  browser never sees them
-- **Ready** (saved creds) or **Prompt** (allowlisted target, user types
-  own password) connection kinds
-- `allowed_users` / `denied_users` per connection
-- Per-connection SSH options (`ProxyJump`, `StrictHostKeyChecking`, …)
-- `restrict_hosts` mode hides the free-form form entirely
+### 🔐 Connection profiles
 
-### 🚀 Deploy anywhere
-Made to fit where other web terminals can't.
+From free-form "type a host and go" to strictly allowlisted click-to-connect.
 
-- **Shared hosting** — upload 4 files + the `assets/` folder via FTP,
-  `api.php` auto-starts the backend. No SSH access to the host needed
-- **Python-only mode** — backend serves the frontend directly, zero extras
-- Docker, systemd, reverse proxy examples included
-- Plain HTTP transport (SSE for output, POSTs for input) — works through corporate HTTPS, no WebSocket required, with automatic long-poll fallback for hosts that buffer SSE
-- Python 3.5+ stdlib only — no pip install, no npm, no build step
+- Password and SSH key auth
+- Server-side profiles in `websh.json` — credentials stay on the server; the browser never sees them
+- **Ready** (saved creds) and **Prompt** (allowlisted target, user types own password) profile kinds
+- `allowed_users` / `denied_users` per profile
+- Per-profile SSH options (`ProxyJump`, `StrictHostKeyChecking`, …)
+- `restrict_hosts: true` hides the free-form form entirely
+
+### 🚀 Deployment
+
+- **Shared hosting.** Upload 4 files + `assets/` via FTP; `api.php` starts the backend on demand. No SSH access to the host needed.
+- **Python only.** The backend serves the frontend itself — zero extras.
+- **Docker, systemd, reverse proxy.** Recipes included.
+- Plain HTTP transport with automatic long-poll fallback for hosts that buffer SSE.
 
 ## Use cases
 
-- **Corporate networks** — SSH port blocked, but HTTPS is open? websh tunnels SSH through standard HTTPS.
-- **Chromebooks & tablets** — any device with a browser becomes a terminal.
-- **Customer support / managed servers** — give clients browser-based access to their servers without teaching them PuTTY or terminal. Use URL anchors (`#connect=ServerName`) for direct links.
-- **Jump host UI** — put websh on a bastion host, access internal servers through it from any browser.
-- **Emergency access** — any browser, any computer, just open a URL.
-- **Teaching & workshops** — provide students with browser-based terminal access, no local setup required.
+- **Corporate firewalls** — SSH port blocked, only HTTPS open. websh tunnels through standard HTTPS.
+- **No native terminal** — Chromebooks, iPads, kiosks. Any browser becomes a terminal.
+- **Customer access** — give a customer a browser link to their own server. URL anchors (`#connect=ServerName`) for direct links.
+- **Bastion UI** — install websh on a jump host, reach internal servers from any browser.
+- **Recovery from a foreign machine** — open a URL, you're in.
+- **Workshops** — students don't install anything locally.
 
 ## Quick start (your machine)
 
