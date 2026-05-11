@@ -2755,7 +2755,8 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertEqual(
             cmd,
             'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
-            ' \\; set -g mouse on')
+            ' \\; set -g mouse on'
+            ' \\; set -g status off')
 
     def test_ttl_negative_treated_as_disabled(self):
         # The _build function is called with TMUX_IDLE_TTL which is
@@ -2774,7 +2775,24 @@ class TestBuildRemoteCommand(unittest.TestCase):
         # Ends with the exec so the login shell doesn't linger.
         self.assertTrue(cmd.rstrip().endswith(
             'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
-            ' \\; set -g mouse on'))
+            ' \\; set -g mouse on'
+            ' \\; set -g status off'))
+
+    def test_status_off_baked_into_command(self):
+        """tmux's status bar is hidden by default — every command must
+        include `set -g status off` regardless of options passed in,
+        and must never include a later `set -g status on` that could
+        win on tmux's last-write-wins option semantics."""
+        for tmux_options in (None, [], [("set-clipboard", "off")]):
+            for ttl in (0, 3600):
+                cmd = server._build_remote_command(
+                    "ok", "tmux", ttl, tmux_options=tmux_options)
+                self.assertIn(' \\; set -g status off', cmd,
+                    "missing baked-in `status off` for "
+                    "tmux_options=%r, ttl=%d" % (tmux_options, ttl))
+                self.assertNotIn(' \\; set -g status on', cmd,
+                    "stray `status on` would override the baseline "
+                    "for tmux_options=%r, ttl=%d" % (tmux_options, ttl))
 
     def test_ttl_uses_session_last_attached(self):
         """Watchdog must read session_last_attached so reconnects reset
@@ -2868,6 +2886,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertIn(
             'new-session -A -D -s websh-ok -- "$SHELL" -l'
             ' \\; set -g mouse on'
+            ' \\; set -g status off'
             ' \\; set -g set-clipboard on'
             ' \\; set -g history-limit 100000',
             cmd)

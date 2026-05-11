@@ -233,13 +233,20 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     no user-controlled data is ever evaluated as shell.
     """
     tname = "websh-" + slot_id
-    # `set -g mouse on` is appended unconditionally — mouse mode is
-    # always enabled (no longer a user-facing toggle) so wheel-scroll-
-    # history and click-in-vim/htop work out of the box. `\;` chains
-    # the option in the same tmux invocation, applying it regardless
-    # of whether the session was newly created or re-attached via -A.
+    # Two baseline tmux options are baked in (no user-facing toggle):
+    #   - `set -g mouse on`  — wheel-scroll-history + click-in-vim/htop
+    #     work out of the box.
+    #   - `set -g status off` — hides tmux's bottom status bar. websh
+    #     handles multi-pane on the frontend (split panes are independent
+    #     SSH connections, not tmux windows), so the default bar —
+    #     slot-id session name + empty window list + clock — is visual
+    #     noise that just steals a row of terminal real estate.
+    # `\;` chains the options in the same tmux invocation, applying
+    # them regardless of whether the session was newly created or
+    # re-attached via -A.
     attach = (tmux_cmd + " new-session -A -D -s " + tname
-              + ' -- "$SHELL" -l \\; set -g mouse on')
+              + ' -- "$SHELL" -l \\; set -g mouse on'
+              + ' \\; set -g status off')
     # Per-connect tmux options. Tuples are pre-validated against an
     # allow-list (see _validate_tmux_options) so direct interpolation
     # below is shell- and tmux-injection-safe. `\;` chains commands in
