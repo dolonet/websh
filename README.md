@@ -54,7 +54,7 @@ Real xterm.js — copy-on-select, right-click paste, scrollback search (`Ctrl+Sh
 
 ### 🔁 Persistent sessions
 
-Tick **Persistent session** at connect — websh wraps the shell in a tmux session on the target host. Close the tab, reboot, restart `server.py`: the pane re-attaches to the same tmux session with scrollback and running processes intact. See [Persistent sessions (tmux)](#persistent-sessions-tmux).
+Tick **Persistent session** at connect — websh wraps the shell in a tmux session on the target host. Close the tab, reboot, restart `server.py`: the pane re-attaches to the same tmux session with scrollback and running processes intact. See [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
 
 - Reconnect button on disconnect; red banner on auth failure
 - URL anchors (`#connect=Production`) for direct links and bookmarks
@@ -70,7 +70,7 @@ Upload and download without `scp`.
 
 ### 🔐 Connection profiles
 
-From free-form "type a host and go" to strictly allowlisted click-to-connect.
+From free-form "type a host and go" to strictly allowlisted click-to-connect. See [`docs/server-side-connections.md`](docs/server-side-connections.md).
 
 - Password and SSH key auth
 - Server-side profiles in `websh.json` — credentials stay on the server; the browser never sees them
@@ -83,7 +83,7 @@ From free-form "type a host and go" to strictly allowlisted click-to-connect.
 
 - **Shared hosting.** Upload 4 files + `assets/` via FTP; `api.php` starts the backend on demand. No SSH access to the host needed.
 - **Python only.** The backend serves the frontend itself — zero extras.
-- **Docker, systemd, reverse proxy.** Recipes included.
+- **Docker, systemd, reverse proxy.** Recipes in [`docs/deployment.md`](docs/deployment.md).
 - Plain HTTP transport with automatic long-poll fallback for hosts that buffer SSE.
 
 ## Use cases
@@ -110,514 +110,58 @@ Requires Python 3.5+ and `ssh` in your PATH. The server binds to
 
 ## Quick start (shared hosting)
 
-**No SSH access required.** Upload files via FTP, open in browser.
+**No SSH access required.** Upload `index.html`, `websh.js`, `api.php`,
+`server.py`, and the `assets/` folder into a folder in your web root.
+Open it in a browser. `api.php` starts `server.py` automatically on the
+first request.
 
-A typical shared hosting directory structure:
+`websh.json` (optional, for server-side connections) lives **outside**
+the web root — `api.php` looks two directories up from itself by
+default. Override with `WEBSH_CONFIG=/path/to/websh.json`.
 
-```
-/home/user/
-  example.com/              <- site root
-    websh.json              <- config (OUTSIDE www — not accessible via HTTP)
-    www/                    <- web root (public)
-      console/
-        index.html          <- frontend
-        websh.js            <- frontend logic
-        api.php             <- PHP proxy
-        server.py           <- backend (auto-started by api.php)
-        assets/             <- brand SVGs (logo)
-```
-
-**Steps:**
-
-1. Create a folder in your web root (e.g. `www/console/`)
-2. Upload `index.html`, `websh.js`, `api.php`, `server.py`, and the `assets/` folder there
-3. Open `https://your-host/console/` in a browser
-
-That's it. `api.php` starts `server.py` automatically on the first request.
-
-> **Path details:** `api.php` looks for `websh.json` two directories up from itself
-> (i.e. the site root, above `www/`). This works for most hosting providers.
-> If your layout is different, set the `WEBSH_CONFIG` environment variable
-> or edit the path in `api.php` line 34.
-
-### Troubleshooting
-
-**"Backend unavailable" or blank page:**
-- Check that Python 3 is installed: `python3 --version`
-- Check that `ssh` is available: `which ssh`
-- Some shared hosts disable `exec()` in PHP — ask your hosting provider or check `phpinfo()`
-
-**Config not loading:**
-- Verify `websh.json` path — `api.php` looks two directories up by default
-- Set `WEBSH_CONFIG=/full/path/to/websh.json` environment variable if your layout differs
-- Check JSON syntax: `python3 -c "import json; json.load(open('websh.json'))"`
-
-**Port already in use:**
-- Another instance of `server.py` may be running: `ps aux | grep server.py`
-- Change the port: `PORT=8766 python3 server.py`
-
-## Server-side connections (optional)
-
-Pre-configure connections so users just click to connect — no passwords
-on the client. Create `websh.json` in your **site root** (not in `www/`):
-
-```json
-{
-  "restrict_hosts": false,
-  "connections": [
-    {
-      "name": "Production",
-      "host": "server.example.com",
-      "port": 22,
-      "username": "deploy",
-      "password": "secret"
-    }
-  ]
-}
-```
-
-See `websh.json.example` for a full example including SSH key auth and custom SSH options.
-
-> **This file contains passwords — keep it outside the web root.**
-> It must not be accessible via HTTP. If your hosting layout doesn't match
-> the diagram above, set the `WEBSH_CONFIG` environment variable.
-
-### Per-connection SSH options
-
-Override default SSH behavior for specific connections:
-
-```json
-{
-  "name": "Strict server",
-  "host": "secure.example.com",
-  "username": "admin",
-  "password": "secret",
-  "ssh_options": {
-    "StrictHostKeyChecking": "yes",
-    "ProxyJump": "bastion.example.com"
-  }
-}
-```
-
-Only the connection-shape options (host-key policy, jump host, timeouts,
-algorithm preferences) are accepted. Directives that turn `ssh -o` into
-local command execution — `ProxyCommand`, `LocalCommand`,
-`PermitLocalCommand`, `KnownHostsCommand`, `Include`, `Match`,
-`IdentityAgent` — are dropped at session creation with a WARN in the
-server log. If you need those, put them in the system `ssh_config` on
-the websh host instead of in `websh.json` (which has a broader trust
-profile — FTP'able on shared hosting, sometimes restored from backups).
-
-### Connection kinds: Ready vs Prompt
-
-Each `connections[]` entry is one of two kinds, auto-detected by whether
-a `password` or `key` is present:
-
-- **Ready** — credentials (`password` or `key`) are stored server-side.
-  The user clicks the card and connects. The browser never sees the
-  credentials.
-- **Prompt** — no `password` and no `key`. The entry acts as an
-  allowlisted target: the user clicks the card, the manual form appears
-  pre-filled (host/port locked, username locked if fixed) and the user
-  types their own password or key.
-
-Prompt entries may carry optional `allowed_users` (whitelist) or
-`denied_users` (blacklist) to restrict which usernames may connect.
-`allowed_users` wins if both are set. These rules are ignored when the
-entry has a fixed `username` (there's no choice to police). Saving the
-typed credentials locally via the "Save this connection" checkbox works
-the same as with the free manual form.
-
-```json
-{
-  "name": "Shared DB",
-  "host": "db.example.com",
-  "port": 2222,
-  "allowed_users": ["alice", "bob"]
-}
-```
-
-### Restrict mode
-
-Set `"restrict_hosts": true` to hide the free-form manual connection form
-entirely. Users can only go through a configured connection card. Raw
-manual-path POSTs to `/api/connect` (bypassing the UI) are also rejected.
-With a single connection, the UI auto-selects it on load — Ready connects
-immediately, Prompt surfaces the locked form ready for a password.
-
-### Security note on user lists
-
-`allowed_users` / `denied_users` apply only inside the **named** connection
-flow (`{connection: "<name>"}` on `/api/connect`). When `restrict_hosts`
-is off, the free manual form and raw manual-path POSTs are not bound by
-those lists — they're a UX-guided allowlist for your team, not a hardening
-boundary against a determined caller. Combine with `restrict_hosts: true`
-if you need the rules to be enforced against direct API access too.
-
-### Deny-list for free-form connect
-
-When `restrict_hosts` is off (the default), visitors can target any host
-they like. To stop the proxy from reaching internal infrastructure or
-your own boxes, add a `denied_hosts` array:
-
-```json
-{
-  "restrict_hosts": false,
-  "denied_hosts": [
-    "127.0.0.0/8",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-    "fe80::/10",
-    "evil.example",
-    "your-internal-jumpbox.example.com"
-  ]
-}
-```
-
-Each entry is parsed as an IP address or CIDR network when possible
-(IPv4 and IPv6 both supported); otherwise it's matched as an exact
-hostname (case-insensitive). At connect time websh resolves the target
-hostname via the system resolver and rejects the request if any of the
-returned addresses fall inside a denied range — so a public-looking
-domain whose A record points into RFC1918 is also blocked.
-
-DNS resolution failures fail open (the request goes through; ssh's own
-resolver will then fail with a clear error). Hosts you've put in
-`connections` bypass the deny-list — explicit configuration wins.
-
-### URL anchors
-
-Link directly to a server-side connection:
-
-```
-https://your-host/console/#connect=Production
-```
-
-This auto-connects on page load — useful for bookmarks and support links.
-
-## Persistent sessions (tmux)
-
-Tick **Persistent session** on the connect form and the remote shell is
-wrapped in a tmux session on the target host
-(`tmux new-session -A -D -s websh-<slot>`). Close the tab, refresh the
-page, or restart `server.py` — the pane re-attaches to the same session
-with scrollback and running processes intact.
-
-**Requirements.** `tmux` must be installed on the target (any recent
-version). If it isn't, the connect flow surfaces a popup offering to
-fall back to a short-lived (non-persistent) session instead.
-
-**How reattach works.** Each persistent pane stores its slot id in
-browser `localStorage` alongside the connection record. On refresh, the
-frontend re-opens the pane with the same slot id and tmux re-attaches
-you to the existing session. Slot ids are per pane instance — closing
-a pane with `[x]` does not free the slot for reuse.
-
-**Terminating a session.** Clicking `[x]` on a persistent pane pops a
-confirm modal (Cancel / Terminate session / Terminate and never ask
-again). "Terminate" sends `tmux kill-session` on the target before the
-pane closes. If you just close the browser tab without terminating,
-the session stays alive on the target and you can re-attach later.
-
-**Idle-TTL watchdog.** At session creation, a detached POSIX-sh
-watchdog is spawned alongside the shell. It polls tmux and kills the
-session once it has been unattached for `WEBSH_TMUX_IDLE_TTL` seconds
-(default 72 h; `0` disables). The watchdog reparents to init via
-`nohup` and survives `server.py` restarts. Active (attached) sessions
-refresh the clock each poll, so long-running work doesn't get reaped
-just because you had a brief disconnect.
-
-**Per-connect tmux options.** Every persistent connect runs
-`tmux new-session … \; set -g …` so a small set of tmux options is
-applied uniformly regardless of what's on the target host. Mouse mode
-is baked in unconditionally; two toggles in the Options panel are
-user-configurable and also pushed into running panes the moment you
-change them, so the new behaviour takes effect without a reconnect:
-
-- **Mouse** (always on, no toggle) — `set -g mouse on`. Wheel scrolls
-  tmux scrollback in shell; alt-screen apps (vim, less, htop) get raw
-  mouse events. Hold Shift to bypass tmux selection and use the
-  browser's native text selection instead.
-- **Auto-copy** (toggle) — `set-clipboard on`. tmux copy-mode
-  selections are pushed to the system clipboard via OSC52 (xterm.js
-  ships them on).
-- **Scrollback** (number) — `history-limit` (default 100 000). How
-  many lines per pane tmux retains.
-
-The server accepts user-configurable options only via a fixed
-allow-list (`set-clipboard`, `history-limit` clamped to 100..10 M);
-anything else — including a legacy `tmux_mouse` field from older
-clients — is silently dropped, so an out-of-date or hostile client
-can't inject extra `set -g` lines. Mouse stays on regardless.
-
-The `set -g` lines run after the target's own `~/.tmux.conf` and
-therefore override matching options there.
-
-**tmux status bar is hidden by default.** websh runs `set -g status
-off` on every persistent attach. Multi-pane is handled by websh's
-own splits (each pane is a separate SSH connection), not by tmux
-windows, so the default status bar — slot-id session name, empty
-window list, and a clock — is visual noise that just steals a row of
-terminal real estate. To re-enable for a single session: `Ctrl+B
-:set -g status on` (resets on next reconnect).
+Full directory layout, troubleshooting, and config-path notes:
+[`docs/deployment.md`](docs/deployment.md).
 
 ## Configuration
 
-Environment variables for `server.py`:
+The only things most deployments need to change:
 
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `8765` | Listen port |
-| `HOST` | `127.0.0.1` | Bind address |
-| `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
-| `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
-| `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
-| `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
-| `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
-| `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
-| `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
-| `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
-| `SCAN_PATTERN_THRESHOLD` | `0` | One IP that probes at least N distinct deny-listed targets in `SCAN_PATTERN_WINDOW` seconds gets `result=scan_pattern` events emitted starting on the Nth probe; `0` disables. ANY successful connect from the same IP clears state, so legitimate users never accumulate. |
-| `SCAN_PATTERN_WINDOW` | `300` | Sliding window for scan-pattern detection, in seconds |
-| `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
-| `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
-| `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [Access log](#access-log) below. |
+```bash
+PORT=8765           # listen port
+HOST=127.0.0.1      # bind address (use 0.0.0.0 for LAN)
+WEBSH_CONFIG=...    # path to websh.json (auto-detected by api.php)
+```
 
-The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
+Full table of environment variables (rate limits, session caps, tmux
+idle-TTL, access log path, …): [`docs/configuration.md`](docs/configuration.md).
 
 ## Deployment
 
-### Shared hosting (PHP + Python)
+- **Shared hosting (PHP + Python)** — FTP-drop the 4 files + `assets/`. See [`docs/deployment.md`](docs/deployment.md#shared-hosting-php--python).
+- **Python only** — `HOST=0.0.0.0 python3 server.py`. See [`docs/deployment.md`](docs/deployment.md#python-only-no-php).
+- **Docker** — `docker build -t websh . && docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh`. See [`docs/deployment.md`](docs/deployment.md#docker).
+- **systemd** — `websh.service` unit included. See [`docs/deployment.md`](docs/deployment.md#systemd).
+- **HTTPS via reverse proxy** — nginx / Caddy in front for TLS. See [`docs/deployment.md`](docs/deployment.md#https-via-reverse-proxy).
 
-Upload the four files (`index.html`, `websh.js`, `api.php`, `server.py`)
-and the `assets/` folder (brand SVGs) to your web directory. The backend
-starts automatically.
+## Security
 
-For manual control (e.g. custom config path):
+**websh has no built-in authentication** — add it at the web-server layer
+(`auth_basic`, Cloudflare Access, Tailscale Funnel, IP allowlists, etc.).
+For threat-model details, rate limiting, the JSON access log, fail2ban
+integration, host-key handling, and saved-passwords caveats see
+[`docs/security.md`](docs/security.md).
 
-```bash
-WEBSH_CONFIG=/path/to/websh.json nohup python3 server.py &
-```
+## Documentation
 
-### Python only (no PHP)
-
-The backend can serve the frontend directly — no PHP or separate web server needed:
-
-```bash
-HOST=0.0.0.0 python3 server.py
-```
-
-Open `http://your-host:8765/` in a browser. The backend serves the static
-files (`index.html`, `websh.js`, `assets/*.svg`) from the same directory as
-`server.py`, and handles API requests on the same port. See
-[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
-
-### Docker
-
-```bash
-docker build -t websh .
-docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh
-```
-
-Open `http://localhost:8765/` — the backend serves the frontend directly. See
-[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
-
-### systemd
-
-```bash
-# Create a dedicated user
-useradd -r -s /bin/false websh
-
-mkdir -p /opt/websh
-cp server.py index.html websh.js /opt/websh/
-cp websh.service /etc/systemd/system/
-systemctl enable --now websh
-```
-
-### HTTPS via reverse proxy
-
-Put nginx or Caddy in front for TLS termination:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name ssh.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8765;
-        proxy_read_timeout 60s;
-
-        # OVERWRITE the client-IP header with the real peer. Do not
-        # append — a client can pre-populate X-Forwarded-For and bypass
-        # per-IP rate limiting and the per-IP session cap if you
-        # `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`
-        # (which appends). websh trusts only the first token.
-        proxy_set_header X-Forwarded-For $remote_addr;
-    }
-}
-```
-
-`proxy_read_timeout` must comfortably exceed both the long-poll window
-(10 s) and the SSE keep-alive interval (15 s) — 60 s leaves plenty of
-headroom. The backend sets `X-Accel-Buffering: no` on the SSE response,
-so nginx flushes each event immediately without further configuration.
-If the proxy runs on a different host, add its IP to `TRUSTED_PROXIES`
-so rate limiting uses the real client IP — see
-[Rate limiting & proxies](#rate-limiting--proxies).
-
-## Authentication & security
-
-**websh does not include its own authentication layer by design.**
-It is meant to be lightweight — add access control at the web server level:
-
-- **Apache:** `.htaccess` with `AuthType Basic` + `AuthUserFile`
-- **nginx:** `auth_basic` directive
-- **Cloudflare Access**, **Tailscale Funnel**, or similar zero-trust tools
-- IP allowlisting via firewall rules
-
-### SSH host keys
-
-The backend connects with `StrictHostKeyChecking=no` by default to avoid
-interactive prompts. **This makes the first connection to any host vulnerable
-to man-in-the-middle attacks** — the server identity is not verified.
-
-This is acceptable when:
-- You are connecting to your own servers on a trusted network
-- The connection goes over an encrypted tunnel (VPN, Tailscale, etc.)
-
-To enable host key verification for specific connections, use `ssh_options`
-in `websh.json`:
-
-```json
-"ssh_options": {"StrictHostKeyChecking": "yes"}
-```
-
-### Saved connections & passwords
-
-Saved connections in the browser are stored in `localStorage` **in plaintext**,
-including passwords. Any JavaScript running on the same origin (including XSS
-vulnerabilities) could read them.
-
-If this is unacceptable for your use case:
-- Use server-side connections (`websh.json`) — passwords stay on the server, never reach the browser
-- Don't save connections in the browser — use SSH keys instead
-- Restrict access to the websh URL to trusted networks
-
-### Rate limiting & proxies
-
-Connection attempts are rate-limited to **50 per IP per minute** by default
-(configurable via `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW`). The client IP is
-determined from `X-Forwarded-For` **only** when the request comes from an IP
-listed in `TRUSTED_PROXIES` (default: `127.0.0.1`). Direct connections always
-use the TCP peer address.
-
-**Requirement when running behind a reverse proxy:** the proxy MUST overwrite
-(not append) the client-IP header before forwarding. websh reads the *first*
-`X-Forwarded-For` token, so a proxy that appends (the default
-`$proxy_add_x_forwarded_for` recipe in many tutorials) lets a client supply
-their own first token and bypass both per-IP rate limiting and the
-`MAX_SESSIONS_PER_IP` cap. Use one of:
-
-```nginx
-# nginx — overwrite (good)
-proxy_set_header X-Forwarded-For $remote_addr;
-# OR use X-Real-IP, also overwrite by default:
-proxy_set_header X-Real-IP $remote_addr;
-```
-
-websh validates the token via `ipaddress.ip_address()` and silently falls
-back to the TCP peer if it doesn't parse, so non-IP garbage cannot end up as
-the rate-limit / session-cap key — but a *valid* IP forged by an appending
-proxy will still be honored. The only defense there is correct proxy config.
-
-If your reverse proxy runs on a different host, add its IP:
-
-```bash
-TRUSTED_PROXIES=127.0.0.1,10.0.0.5 python3 server.py
-```
-
-### Access log
-
-Set `WEBSH_ACCESS_LOG=/path/to/access.log` to emit one JSON record per
-abuse-relevant event. Records are stable single-line JSON suitable for
-`fail2ban` filters and ad-hoc `jq` pipelines. The value is normalised
-at startup: `~` expands and a relative path resolves against the
-server's cwd. The resolved path is logged once at startup
-(`access log: <abs-path>`).
-
-```json
-{"ts":"2026-05-07T12:34:56.789012Z","event":"connect","ip":"203.0.113.7","result":"deny_blocked","target_host":"10.5.6.7","target_user":"root"}
-{"ts":"2026-05-07T12:35:01.123456Z","event":"connect","ip":"203.0.113.7","result":"rate_limited"}
-{"ts":"2026-05-07T12:35:42.999999Z","event":"connect","ip":"198.51.100.4","result":"ok","sid":"…","target_host":"prod.example","target_user":"deploy","persistent":false,"latency_ms":612}
-{"ts":"2026-05-07T12:40:11.000000Z","event":"disconnect","ip":"198.51.100.4","sid":"…","terminate":false,"target_host":"prod.example","result":"closed"}
-```
-
-Common `result` values on `connect` events:
-
-| `result` | Meaning |
+| Topic | File |
 |---|---|
-| `ok` | Session created. Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
-| `rate_limited` | Caller exceeded `RATE_LIMIT_MAX` for the window. |
-| `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
-| `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
-| `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
-| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. ANY successful connect from the same IP clears state, so a power user touching many real servers never accumulates here. |
-| `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
-
-Common `result` values on `disconnect` events:
-
-| `result` | Meaning |
-|---|---|
-| `closed` | Disconnect with `terminate=false`; the persistent session (if any) is left alive on the target. |
-| `terminated` | Disconnect with `terminate=true`; the persistent tmux session was killed on the target before close. |
-| `close_error` | `session.close()` (or `terminate_remote_tmux()`) raised. The record still appears, with `error` set to the exception text. |
-
-`fail2ban` filter sketch — drop into `/etc/fail2ban/filter.d/websh-abuse.conf`:
-
-```ini
-[Definition]
-failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|session_cap_per_ip|scan_pattern)".*$
-ignoreregex =
-```
-
-Note that `deny_blocked` is deliberately **not** in the recommended
-filter. A one-off `deny_blocked` is just as likely a fat-fingered
-hostname or a stale UI link as it is an attacker — banning on a single
-event would burn legitimate users. The `scan_pattern` event is the
-curated signal for "this IP is probing the deny-list": it only fires
-once `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets are reached
-inside the window, and any successful connect from the same IP
-forgives the accumulation. So `deny_blocked` records stay in the log
-for operator visibility (you want to see misconfigured clients) but
-fail2ban acts only on the `scan_pattern` aggregate.
-
-If `SCAN_PATTERN_THRESHOLD=0` (the default — disabled), `deny_blocked`
-events are still recorded but no `scan_pattern` events are ever
-emitted — the operator hasn't opted in to automatic banning, so
-nothing in this filter triggers on a typo. Set a positive
-`SCAN_PATTERN_THRESHOLD` to enable the curated signal.
-
-The file is opened-and-closed per write, so `logrotate(8)` works without
-any signal-based reopen plumbing — `copytruncate` is fine. Each record
-is committed with a single `write(2)` on an `O_APPEND` fd: on Linux the
-kernel adjusts the file offset and commits the buffer atomically against
-other `O_APPEND` writers, so concurrent threads do not interleave bytes
-within one record. To keep that guarantee real, every attacker-
-controlled string field is hard-capped before serialisation
-(`target_host` 253, `target_user` 64, `sid` 36, `error` 200, server-
-controlled status fields 32) and ASCII C0/C1 + Unicode bidi/format
-control codepoints are scrubbed to `?`, so a single record always fits
-in one `write(2)` call and stays safe to view in a terminal.
-
-### Input validation
-
-- Host and username values starting with `-` are rejected (prevents SSH flag injection)
-- Session IDs are validated as UUID format
-- Terminal dimensions are clamped to safe ranges
-- `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
-- `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots
+| Server-side connection profiles | [`docs/server-side-connections.md`](docs/server-side-connections.md) |
+| Persistent sessions (tmux) | [`docs/persistent-sessions.md`](docs/persistent-sessions.md) |
+| Authentication & security | [`docs/security.md`](docs/security.md) |
+| Configuration reference | [`docs/configuration.md`](docs/configuration.md) |
+| Deployment recipes | [`docs/deployment.md`](docs/deployment.md) |
+| SSE transport design | [`docs/sse-transport.md`](docs/sse-transport.md) |
+| Auth-failure detection | [`docs/auth-fail-detection.md`](docs/auth-fail-detection.md) |
 
 ## Project structure
 
@@ -630,7 +174,7 @@ assets/                   Brand SVG (logo) loaded by index.html
 websh.json.example        Example server-side config
 test_server.py            Backend tests (unit + integration)
 tests/frontend/           jsdom-based frontend tests
-docs/                     Design notes (e.g. auth-fail-detection.md, sse-transport.md)
+docs/                     Design notes & reference docs
 Dockerfile                Container deployment
 websh.service             systemd unit file
 LICENSE                   MIT license
