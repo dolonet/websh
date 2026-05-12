@@ -5567,7 +5567,7 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
 
     def test_disconnect_terminate_true_logs_terminated(self):
         sid = "12345678-1234-1234-1234-bbbbbbbbbbbb"
-        self._seed(sid)
+        self._seed(sid, host="srv.example")
         _, code = self._post("/api/disconnect",
                              {"session_id": sid, "terminate": True})
         self.assertEqual(code, 200)
@@ -5576,6 +5576,7 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
         self.assertEqual(len(d), 1, recs)
         self.assertEqual(d[0]["result"], "terminated")
         self.assertEqual(d[0]["terminate"], True)
+        self.assertEqual(d[0]["target_host"], "srv.example")
 
     def test_disconnect_close_failure_logs_close_error(self):
         """If session.close raises, the access-log record must still

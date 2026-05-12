@@ -2668,6 +2668,11 @@ document.addEventListener('mouseup', () => {
     if (!p || !p._dragBlurred) return;
     if (!p._dragMoved) {
       // Bare click — no drag, no trim window, no defer.
+      // Clear any stale trim timestamp from a recent drag, otherwise a
+      // programmatic OSC 52 firing within DRAG_TRIM_WINDOW_MS of the
+      // earlier drag would still be trimmed even though the user has
+      // since just clicked.
+      p._recentDragSelectAt = 0;
       _restorePaneFromDrag(p);
       return;
     }
@@ -2806,6 +2811,12 @@ function tryRestoreSessions() {
 }
 
 // ── Init ────────────────────────────────────────────────────────────
+// One-time cleanup: theme toggle was dropped (single dark theme now),
+// so the legacy `websh_theme` key from users who flipped the toggle
+// before the change is an orphan. Remove it once so a fresh devtools
+// pass on a returning user's browser doesn't show stray entries.
+try { localStorage.removeItem('websh_theme'); } catch(e){}
+
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
