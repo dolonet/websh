@@ -653,7 +653,8 @@ class TestConfigPublicKind(unittest.TestCase):
         path = os.path.join(self.tmpdir, "websh.json")
         with open(path, "w") as f:
             json.dump({"connections": [
-                {"name": "r", "host": "h", "username": "u", "password": "p"},
+                {"name": "r", "host": "h", "username": "u",
+                 "password": "p", "key": "-----BEGIN KEY-----"},
                 {"name": "p", "host": "h2", "allowed_users": ["a"]},
             ]}, f)
         os.environ["WEBSH_CONFIG"] = path
@@ -664,6 +665,7 @@ class TestConfigPublicKind(unittest.TestCase):
         r, p = pub["connections"]
         self.assertEqual(r["kind"], "ready")
         self.assertNotIn("password", r)
+        self.assertNotIn("key", r)
         self.assertNotIn("allowed_users", r)
         self.assertEqual(p["kind"], "prompt")
         self.assertEqual(p["allowed_users"], ["a"])
