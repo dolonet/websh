@@ -1009,6 +1009,52 @@ def _load_creds():
     return _creds_cache
 
 
+def _save_creds_atomic(data):
+    """Persist `data` to websh.creds.json via tmp + fsync + rename.
+
+    Acquires _creds_lock around the whole RMW so concurrent writes
+    serialize. Mode 0600. Updates the in-process cache so the next
+    _load_creds() returns the just-written value without re-reading.
+
+    Refuses to write when _vault_disabled is set (an unsupported schema
+    version file is on disk and we must not overwrite it). Callers
+    should also check the flag and respond 501 before computing the
+    payload — the RuntimeError raised here is a backstop.
+    """
+    if _vault_disabled:
+        raise RuntimeError("vault disabled — refusing to write")
+    global _creds_cache, _creds_cache_key
+    path = _creds_path()
+    parent = os.path.dirname(path) or "."
+    with _creds_lock:
+        fd, tmp = tempfile.mkstemp(prefix=".websh.creds.", suffix=".tmp",
+                                   dir=parent)
+        try:
+            os.write(fd, json.dumps(data, separators=(",", ":")).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        # fsync the parent dir so the rename is durable across crash.
+        try:
+            dir_fd = os.open(parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some filesystems (tmpfs in CI) don't support O_DIRECTORY
+            # or fsync on dirs. Best-effort.
+            pass
+        _creds_cache = data
+        try:
+            st = os.stat(path)
+            _creds_cache_key = (st.st_mtime, st.st_size)
+        except OSError:
+            _creds_cache_key = (0, 0)
+
+
 def config_public():
     """Return config safe for the client (no passwords or keys)."""
     cfg = load_config()
@@ -1108,6 +1154,7 @@ def clamp(value, lo, hi, default):
 
 sessions = OrderedDict()
 sessions_lock = Lock()
+_creds_lock = Lock()
 
 
 class SSHSession(object):

@@ -292,6 +292,72 @@ class TestVaultLoad(unittest.TestCase):
         self.assertEqual(server._load_creds(), bigger)
 
 
+class TestVaultWrite(unittest.TestCase):
+    """Atomic-rename writes for websh.creds.json + lock semantics."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, "websh.creds.json")
+        self._old_env = os.environ.get("WEBSH_CREDS_PATH")
+        os.environ["WEBSH_CREDS_PATH"] = self.path
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("WEBSH_CREDS_PATH", None)
+        else:
+            os.environ["WEBSH_CREDS_PATH"] = self._old_env
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def test_writer_creates_file_with_mode_600(self):
+        server._save_creds_atomic({"version": 1, "vaults": {"X": {}}})
+        self.assertTrue(os.path.isfile(self.path))
+        st = os.stat(self.path)
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+
+    def test_writer_round_trip_via_loader(self):
+        payload = {"version": 1, "vaults": {"V": {"C": {"iv": "i", "ct": "c"}}}}
+        server._save_creds_atomic(payload)
+        # Drop cache so the loader actually reads the disk
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+        self.assertEqual(server._load_creds(), payload)
+
+    def test_writer_no_partial_state_after_repeated_writes(self):
+        # Write A then B; assert no leftover .tmp files in the dir.
+        server._save_creds_atomic({"version": 1, "vaults": {"A": {}}})
+        server._save_creds_atomic({"version": 1, "vaults": {"B": {}}})
+        leftovers = [n for n in os.listdir(self.tmpdir)
+                     if n.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_concurrent_writes_serialize_via_lock(self):
+        # Two threads racing _save_creds_atomic should both succeed and
+        # the final file should be one of the two payloads, fully formed.
+        payloads = [{"version": 1, "vaults": {str(i): {}}} for i in range(2)]
+        threads = [threading.Thread(target=server._save_creds_atomic,
+                                     args=(p,)) for p in payloads]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        with open(self.path) as f:
+            final = json.load(f)
+        self.assertEqual(final["version"], 1)
+        self.assertIn(list(final["vaults"].keys())[0], ("0", "1"))
+
+    def test_writer_refuses_when_vault_disabled(self):
+        # Protects against overwriting a v99 file with v1 payload
+        # after _load_creds tripped the runtime flag.
+        original = server._vault_disabled
+        try:
+            server._vault_disabled = True
+            with self.assertRaises(RuntimeError):
+                server._save_creds_atomic({"version": 1, "vaults": {}})
+        finally:
+            server._vault_disabled = original
+
+
 class TestFindConfigConnection(unittest.TestCase):
 
     def setUp(self):
