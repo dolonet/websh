@@ -156,6 +156,69 @@ class TestConfigLoading(unittest.TestCase):
         self.assertEqual(cfg2["connections"][0]["name"], "v2")
 
 
+    def test_plaintext_password_emits_deprecation_warn(self):
+        self._write_config({
+            "connections": [
+                {"name": "Production", "host": "p", "username": "u",
+                 "password": "secret"},
+                {"name": "Staging",    "host": "s", "username": "u"},
+                {"name": "Dev",        "host": "d", "username": "u",
+                 "key": "-----BEGIN----"},
+            ]
+        })
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            os.environ["WEBSH_CONFIG"] = os.path.join(self.tmpdir,
+                                                       "websh.json")
+            server._config_cache = None
+            server._config_mtime = 0
+            server.load_config()
+            warnings = [c for c in mock_log.call_args_list
+                        if c.args[0] == "WARN"
+                        and "plaintext credentials" in c.args[1]]
+            self.assertEqual(len(warnings), 1)
+            msg = warnings[0].args[1]
+            self.assertIn("Production", msg)
+            self.assertIn("Dev", msg)
+            self.assertNotIn("Staging", msg)
+
+    def test_clean_config_no_deprecation_warn(self):
+        self._write_config({
+            "connections": [
+                {"name": "Staging", "host": "s", "username": "u"},
+            ]
+        })
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            os.environ["WEBSH_CONFIG"] = os.path.join(self.tmpdir,
+                                                       "websh.json")
+            server._config_cache = None
+            server._config_mtime = 0
+            server.load_config()
+            warns = [c for c in mock_log.call_args_list
+                     if c.args[0] == "WARN"
+                     and "plaintext credentials" in c.args[1]]
+            self.assertEqual(warns, [])
+
+    def test_require_vault_makes_plaintext_a_startup_error(self):
+        self._write_config({
+            "connections": [
+                {"name": "Production", "host": "p", "username": "u",
+                 "password": "secret"},
+            ]
+        })
+        original = server.WEBSH_REQUIRE_VAULT
+        try:
+            server.WEBSH_REQUIRE_VAULT = True
+            os.environ["WEBSH_CONFIG"] = os.path.join(self.tmpdir,
+                                                       "websh.json")
+            server._config_cache = None
+            server._config_mtime = 0
+            with self.assertRaises(SystemExit) as ctx:
+                server.load_config()
+            self.assertEqual(ctx.exception.code, 1)
+        finally:
+            server.WEBSH_REQUIRE_VAULT = original
+
+
 class TestVaultGate(unittest.TestCase):
     """HAS_CRYPTOGRAPHY flag, _vault_disabled flag, and the combined
     vault_enabled mirror in config_public()."""

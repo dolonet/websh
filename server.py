@@ -85,6 +85,11 @@ except ImportError:  # pragma: no cover - exercised by the no-deps CI job
 # does not know how to call. Will become the default once PR-C ships.
 WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
 
+# Operator opt-in to the future v1.0.0 default. With this set, any
+# plaintext credential in websh.json blocks startup with an actionable
+# message. Without it, plaintext still works and emits a WARN once.
+WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
+
 # Runtime trap: flipped True when the on-disk creds file is unreadable
 # (unsupported schema version, etc) to refuse-to-write rather than
 # silently overwrite. Cleared only by process restart.
@@ -932,6 +937,22 @@ def load_config():
             c["kind"] = "ready" if has_creds else "prompt"
             c["allowed_users"] = _normalize_user_list(c.get("allowed_users"))
             c["denied_users"] = _normalize_user_list(c.get("denied_users"))
+
+        flagged = []
+        for c in conns:
+            if c.get("password") or c.get("key") or c.get("key_pass"):
+                flagged.append(c.get("name") or c.get("host") or "?")
+        if flagged:
+            msg = ("websh.json contains plaintext credentials on "
+                   "{} entr{}: {} — see docs/encryption.md to "
+                   "migrate").format(
+                       len(flagged),
+                       "ies" if len(flagged) > 1 else "y",
+                       ", ".join(flagged))
+            if WEBSH_REQUIRE_VAULT:
+                _log("ERROR", msg)
+                raise SystemExit(1)
+            _log("WARN", msg)
 
         denied_host_set, denied_net_list = _parse_denied_hosts(
             cfg.get("denied_hosts"))
