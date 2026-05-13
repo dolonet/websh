@@ -148,8 +148,9 @@ idle-TTL, access log path, …): [`docs/configuration.md`](docs/configuration.md
 **websh has no built-in authentication** — add it at the web-server layer
 (`auth_basic`, Cloudflare Access, Tailscale Funnel, IP allowlists, etc.).
 For threat-model details, rate limiting, the JSON access log, fail2ban
-integration, host-key handling, and saved-passwords caveats see
-[`docs/security.md`](docs/security.md).
+integration, and host-key handling see [`docs/security.md`](docs/security.md).
+For the encrypted credential vault that closes the saved-password
+plaintext caveat see [`docs/encryption.md`](docs/encryption.md).
 
 ## Documentation
 
@@ -158,6 +159,7 @@ integration, host-key handling, and saved-passwords caveats see
 | Server-side connection profiles | [`docs/server-side-connections.md`](docs/server-side-connections.md) |
 | Persistent sessions (tmux) | [`docs/persistent-sessions.md`](docs/persistent-sessions.md) |
 | Authentication & security | [`docs/security.md`](docs/security.md) |
+| Encrypted credential vault | [`docs/encryption.md`](docs/encryption.md) |
 | Configuration reference | [`docs/configuration.md`](docs/configuration.md) |
 | Deployment recipes | [`docs/deployment.md`](docs/deployment.md) |
 | SSE transport design | [`docs/sse-transport.md`](docs/sse-transport.md) |
