@@ -84,10 +84,9 @@ except ImportError:  # pragma: no cover - exercised by the no-deps CI job
 # does not know how to call. Will become the default once PR-C ships.
 WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
 
-# Set to True at runtime if the on-disk websh.creds.json carries an
-# unsupported schema version (next task). Loud-failure semantics — the
-# loader refuses to parse the file, the writer refuses to overwrite,
-# and config_public flips vault_enabled to False until process restart.
+# Runtime trap: flipped True when the on-disk creds file is unreadable
+# (unsupported schema version, etc) to refuse-to-write rather than
+# silently overwrite. Cleared only by process restart.
 _vault_disabled = False
 
 __version__ = "0.2.0"
