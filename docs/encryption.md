@@ -18,22 +18,39 @@ the ~50 ms it takes to type it into the SSH PTY.
 
 ## Quick start (operators)
 
-1. Install the optional dependency:
+1. Install the optional dependency (minimum supported version is
+   `3.4.8`, the floor most current distros ship; modern wheels
+   `>=42` are recommended):
    ```bash
-   pip install cryptography
+   pip install 'cryptography>=3.4.8'
    ```
    Without it, websh keeps working — the saved-credential UI is just
    hidden. With it, the browser's "Save" checkbox enables encrypted
    storage end-to-end.
-2. Confirm at startup. The log line:
+2. Until the client side ships (PR-C), opt the vault on explicitly:
+   ```bash
+   WEBSH_VAULT_ENABLE=1 python3 server.py
    ```
-   credential vault: enabled (cryptography 42.0.5)
+   Without `WEBSH_VAULT_ENABLE`, the server reports
+   `vault_enabled: false` in `/api/config` and the new endpoints
+   return `501`, even when `cryptography` is present. This stops a
+   server upgrade from advertising endpoints the bundled client
+   does not yet know how to call. The flag becomes the default
+   once the client lands; operators who left it set will see no
+   change.
+3. Confirm at startup. The log line:
+   ```
+   credential vault: enabled (cryptography 42.0.5, WEBSH_VAULT_ENABLE=1)
    ```
    means the gate is open. Without `cryptography`:
    ```
    credential vault: disabled (install cryptography to enable)
    ```
-3. Optional: set `WEBSH_CREDS_PATH=/path/to/websh.creds.json`. Default
+   Without `WEBSH_VAULT_ENABLE`:
+   ```
+   credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)
+   ```
+4. Optional: set `WEBSH_CREDS_PATH=/path/to/websh.creds.json`. Default
    is the same directory as `websh.json` (or the cwd if `WEBSH_CONFIG`
    is unset).
 
@@ -48,12 +65,26 @@ the blobs are useless without each user's browser-side key.
    connection"**, click Connect.
 2. The browser silently generates a 256-bit AES-GCM key in IndexedDB
    the first time and asks the browser to keep storage permanently
-   (one prompt in Firefox; silent in Chromium).
+   (one prompt in Firefox; silent in Chromium; **silent no-op on
+   Safari outside of an installed PWA — see "Safari / iOS caveat"
+   below**).
 3. From then on, the saved card connects in one click. No master
    passphrase, no prompt.
 
 A different browser, profile, or device sees an empty saved-list — the
 key is local. Re-enter on each browser you use.
+
+### Safari / iOS caveat
+
+Safari's Intelligent Tracking Prevention evicts unpartitioned IndexedDB
+after **7 days of no first-party interaction with the site**, and
+`navigator.storage.persist()` is silently ignored on Safari outside of
+an installed PWA. So on Safari (desktop and iOS in browser), saved
+cards transparently disappear after a quiet week. The UI surfaces this
+at save-time on Safari with a one-line note ("on Safari this entry
+will be cleared after 7 days of inactivity unless you add the site to
+your home screen"). For long-lived saves on iOS, install websh as a
+PWA (Share → Add to Home Screen) — the IDB then survives indefinitely.
 
 ## How it works
 
@@ -78,9 +109,12 @@ sessionStorage[websh_panes_session]:
 ```
 
 **Save flow** — browser encrypts `{password, key, key_pass}` as a single
-JSON object with AES-GCM-256, sends `{vault_id, conn_id, host, port,
-username, ssh_options?, iv, ct}` to `POST /api/save`. The server stores
-it, never seeing the SSH credential plaintext.
+JSON object with AES-GCM-256, **freshly drawing a 12-byte IV via
+`crypto.getRandomValues()` on every save** (GCM IV reuse under the
+same key is catastrophic — leaks plaintext XORs and forges auth-tags
+permanently), and sends `{vault_id, conn_id, host, port, username,
+ssh_options?, iv, ct}` to `POST /api/save`. The server stores it,
+never seeing the SSH credential plaintext.
 
 > **Field-name note.** The new endpoints use a separate field name
 > `vault_key` for the AES key on the wire, **not** `key`. The existing
@@ -148,9 +182,15 @@ free-form save.
 - `vault_id` is a 128-bit random base32 string per browser profile per
   origin (or per `isolate_storage` path scope when that operator option
   is set; see "Interaction with `isolate_storage`" below). Two browsers
-  on the same websh write to disjoint server-side vaults; their
-  saved-card lists and stored blobs never see each other. `vault_id`
-  is not a secret — it just namespaces the server-side store.
+  on the same websh write to disjoint server-side vaults — their
+  saved-card lists and stored blobs do not collide. `vault_id` is **not
+  a secret** and **not an authentication principal**: anyone who
+  learns one (extension, browser-history sync of `localStorage`, log
+  scrape, devtools shoulder-surf) can call `DELETE /api/save` against
+  any `conn_id` in that vault. Without `vault_key` they still cannot
+  read the blobs — this is denial-of-service, not data exfil. websh
+  has no caller-auth model on the wire; isolation is namespace-level,
+  not enforceable.
 - `conn_id` is a 128-bit random base32 string generated **once on
   first save** of an entry; the value is stable for the entry's
   lifetime. Renaming or editing metadata reuses the same `conn_id` so
@@ -159,7 +199,14 @@ free-form save.
   copied to a different `conn_id` (or different vault) fails
   decryption with an auth-tag mismatch — the server returns
   `400 Bad Request` with `{"error":"vault_decrypt_failed"}`, the UI
-  prompts the user to re-enter and re-save.
+  prompts the user to re-enter and re-save. Input-shape failures
+  (malformed base64, IV not 12 bytes, ct shorter than the GCM tag,
+  vault_id/conn_id format mismatch) also return `400` but with
+  `{"error":"vault_input_invalid"}` so implementers and operators
+  can tell the two failure classes apart from the body without
+  splitting on the HTTP status code (both stay `400` so upstream
+  `auth_basic` / Cloudflare Access never sees a `401` and never
+  triggers a re-prompt loop).
 
 ### Interaction with `isolate_storage`
 
@@ -183,11 +230,16 @@ entries even though the origin is shared.
   are unrecoverable AES-256-GCM).
 - Browser profile or IndexedDB exfil (extension, file-stealer malware,
   profile sync to a compromised cloud, forensics on a stolen unlocked
-  device): attacker has the key but no blobs (they're on the server).
-  The most they can do is call `/api/connect` to tunnel SSH — logged in
+  device): attacker has `vault_key` but no blobs (they're on the
+  server). See the "On the `extractable` flag" section above for why
+  `extractable: true` is correct here — the IDB layer is not the
+  confidentiality boundary; the absence of ciphertext blobs from the
+  client is what closes the threat. The most an attacker with
+  `vault_key` can do is call `/api/connect` to tunnel SSH — logged in
   `WEBSH_ACCESS_LOG`, rate-limited, killable by deleting the saved
-  entry. **Plaintext SSH passwords are not extractable**, so
-  password-reuse on banking, email, GitLab, etc. is closed.
+  entry. **The plaintext SSH password cannot be exfiltrated to other
+  services** (banking, email, GitLab, etc.) — `/api/connect` returns a
+  PTY stream, never the password value.
 - Server-side collision between two browsers' saved entries
   (`vault_id` namespace prevents — each browser writes to a disjoint
   slot, even with identical card names).
@@ -222,6 +274,13 @@ entries even though the origin is shared.
   rate limits on `/api/save`. Acceptable for v1 because operator-side
   `WEBSH_ACCESS_LOG` records every save/delete and the gateway-level
   `auth_basic` / `MAX_SESSIONS_PER_IP` already cap the abuse window.
+- Orphan vaults (browsers that never come back). `websh.creds.json`
+  grows unboundedly across staff turnover. v1 does not ship an
+  operator GC surface; sizes are small (~200 B per blob, kilobytes
+  even for a heavy team), so this is a months-or-years-out concern.
+  A future minor lands `GET /api/vault/stats` (operator-auth) and a
+  `python3 server.py --vault-gc --older-than 90d` CLI when that
+  becomes load-bearing.
 
 ## Recovery and the panic button
 
@@ -235,11 +294,14 @@ delete" affordance. Clicking it sends `DELETE /api/save` for each
 entry (the `vault_id` is still in `localStorage`), the server reaps the
 empty vault, and the next save generates a fresh key.
 
-The settings panel exposes a **"Clear all saved (server + browser)"**
-panic button: deletes every blob in the current vault from the server,
-wipes IndexedDB and the saved-card list locally, and clears
-`sessionStorage`. After this, the next save creates a new vault from
-scratch.
+The settings panel exposes a **"Sign out of this browser"** action
+(typed-`DELETE` confirmation required, since the action is permanent
+and crosses every saved host at once): deletes every blob in the
+current vault from the server, wipes IndexedDB and the saved-card
+list locally, and clears `sessionStorage`. After this, the next
+save creates a new vault from scratch. The copy is intentionally
+"sign out" rather than "clear settings" so the irreversible nature
+of the action matches the user's password-manager mental model.
 
 ## Migrating from legacy plaintext
 
@@ -258,7 +320,12 @@ once, tick "Save", and they become one-click again — encrypted under
 the user's browser-side key.
 
 A future minor will turn this warning into a refuse-to-start error.
-The exact version is announced in `CHANGELOG.md` when it ships.
+**Operators can opt in early** by setting `WEBSH_REQUIRE_VAULT=1`
+(refuses to start if any plaintext is found, prints the same
+multi-line migration message as the eventual default). Targeting
+**v1.0.0** for the default flip, announced in `CHANGELOG.md` when
+it ships. Until then, leaving `WEBSH_REQUIRE_VAULT` unset preserves
+today's behavior (warn-and-continue).
 
 If your browser already has plaintext entries in
 `localStorage[websh_connections]` (saved before encryption shipped), a
@@ -287,9 +354,11 @@ works**.
 
 The existing manual `POST /api/connect` (with `host`, `password`, etc.)
 is unchanged. The existing `GET /api/config` adds one boolean field —
-`vault_enabled` — mirroring `HAS_CRYPTOGRAPHY` **and** a successful
-load of `websh.creds.json` so the client can hide the Save UI when the
-gate is closed for any reason.
+`vault_enabled` — true iff **all three** of: `HAS_CRYPTOGRAPHY`
+imported successfully, `WEBSH_VAULT_ENABLE=1` is in the environment
+(until the client lands; default-on after that), and the
+`websh.creds.json` schema version on disk is supported. The client
+hides the Save UI when this is `false`.
 
 Access-log hygiene: `iv`, `ct`, `vault_key` are never logged in full —
 lengths only. `vault_id` and `conn_id` are loggable as-is for
@@ -315,11 +384,27 @@ correlation (they are not secrets).
 }
 ```
 
+Connection metadata (`host`, `port`, `username`, `ssh_options?`) is
+**always stored alongside the blob**, not pulled from `websh.json` by
+some link key. Self-contained records are simpler and survive the
+operator deleting or renaming a `websh.json` connection without
+orphaning their users' saved entries (a deleted reference would
+otherwise leave a blob pointing at no host). Cost: ~50 extra bytes
+per record.
+
 Standard base64 (RFC 4648, `+/=` alphabet) for both `iv` and `ct`.
-Server-managed: do not hand-edit. Mode `0600`, atomic-rename writes,
-mtime-cached reads. A whole-file JSON parse failure logs a warn and
-treats the store as empty — server stays up, pre-configured
-`websh.json` connections are unaffected.
+Server-managed: do not hand-edit. Mode `0600`, **atomic-rename writes
+under an in-process `threading.Lock` around the read-modify-write
+cycle** (atomic-rename alone prevents torn writes, not lost updates;
+two browsers POSTing simultaneously would otherwise both read-modify
+the same vaults dict and the second would silently clobber the first).
+The writer flow is: write to tmp, `fsync(tmp_fd)`, `os.replace(tmp,
+final)`, `fsync(parent_dir_fd)`. The cache key for re-parse is
+`(mtime, size)`, not bare mtime — bare mtime is 1 s granularity on
+some filesystems and a fast write-read-write within 1 s would return
+stale. A whole-file JSON parse failure logs a warn and treats the
+store as empty — server stays up, pre-configured `websh.json`
+connections are unaffected.
 
 A `version` other than `1` is a **loud failure**: the server logs a
 single `WARN websh.creds.json schema version=N unsupported (this
