@@ -2404,6 +2404,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def do_DELETE(self):
+        action = self._resolve_action()
+        if action == "save":
+            self._delete_credential()
+        else:
+            self._json({"error": "not found"}, 404)
+
     # ── Source-IP / session-ID validation ───────────────────────────
 
     def _client_ip(self):
@@ -2440,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
 
-    # ── Vault save ──────────────────────────────────────────────────
+    # ── Vault save / delete ─────────────────────────────────────────
 
     def _save_credential(self):
         if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
@@ -2509,6 +2516,44 @@ class Handler(BaseHTTPRequestHandler):
                          result="ok", vault_id=vault_id, conn_id=conn_id,
                          iv_len=len(iv), ct_len=len(ct))
         self._json({})
+
+    def _delete_credential(self):
+        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                and not _vault_disabled):
+            self._json({"error": "credential vault unavailable "
+                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                        "set / websh.creds.json schema unsupported — "
+                        "see server log)"}, 501)
+            return
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        vault_id = (params.get("vault_id", [""])[0] or "").strip()
+        conn_id  = (params.get("conn_id",  [""])[0] or "").strip()
+        if not _VAULT_ID_RE.match(vault_id) or not _CONN_ID_RE.match(conn_id):
+            self._json({"error": "vault_input_invalid",
+                        "detail": "invalid vault_id or conn_id"}, 400)
+            return
+        with _creds_lock:
+            data = _load_creds()
+            slot = dict(data.get("vaults", {}).get(vault_id, {}))
+            if conn_id not in slot:
+                self._json({"error": "not found"}, 404)
+                return
+            slot.pop(conn_id)
+            new_vaults = dict(data.get("vaults", {}))
+            if slot:
+                new_vaults[vault_id] = slot
+            else:
+                # Reap empty vault entry so iteration stays cheap.
+                new_vaults.pop(vault_id, None)
+            new_data = {"version": _CREDS_SCHEMA_VERSION,
+                        "vaults": new_vaults}
+            _save_creds_atomic(new_data)
+        _access_log_emit("save_delete", self._client_ip(),
+                         result="ok", vault_id=vault_id, conn_id=conn_id)
+        # 204 No Content
+        self.send_response(204)
+        self.end_headers()
 
     # ── Connect ─────────────────────────────────────────────────────
 

@@ -6329,5 +6329,127 @@ class TestApiSave(unittest.TestCase):
         self.assertIn(v2, data["vaults"])
 
 
+class TestApiSaveDelete(unittest.TestCase):
+    """DELETE /api/save validation, reap-empty-vault, gate."""
+
+    VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
+    CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18773
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
+        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
+        cls._old_enable = server.WEBSH_VAULT_ENABLE
+        server.WEBSH_VAULT_ENABLE = True
+        cfg_path = os.path.join(cls.tmpdir, "websh.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = cfg_path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        server.WEBSH_VAULT_ENABLE = cls._old_enable
+        os.environ.pop("WEBSH_CREDS_PATH", None)
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+        # Seed with one entry
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {self.CONN: {
+                "host": "h", "port": 22, "username": "u",
+                "iv": "ii", "ct": "cc",
+            }}},
+        })
+
+    def _delete(self, path):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
+        req = Request(url, method="DELETE")
+        try:
+            resp = urlopen(req, timeout=5)
+            return resp.getcode(), resp.read()
+        except Exception as e:
+            if hasattr(e, 'code'):
+                payload = b""
+                if hasattr(e, 'read'):
+                    payload = e.read()
+                return e.code, payload
+            raise
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_existing_entry_returns_204_and_reaps_empty_vault(self):
+        code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
+            self.VAULT, self.CONN))
+        self.assertEqual(code, 204)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        # Empty vault is reaped — the last conn_id deletion removes the vault key.
+        self.assertNotIn(self.VAULT, data["vaults"])
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_missing_entry_returns_404(self):
+        code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
+            self.VAULT, "C" * 26))
+        self.assertEqual(code, 404)
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_invalid_vault_id_returns_400(self):
+        code, _ = self._delete("/api/save?vault_id=not-base32&conn_id={}".format(
+            self.CONN))
+        self.assertEqual(code, 400)
+
+    def test_gate_returns_501_when_crypto_missing(self):
+        original = server.HAS_CRYPTOGRAPHY
+        try:
+            server.HAS_CRYPTOGRAPHY = False
+            code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
+                self.VAULT, self.CONN))
+            self.assertEqual(code, 501)
+        finally:
+            server.HAS_CRYPTOGRAPHY = original
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_partial_delete_keeps_other_conn_in_vault(self):
+        # Add a second conn_id in the same vault, then delete only one.
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {
+                self.CONN: {"host": "h", "port": 22, "username": "u",
+                            "iv": "ii", "ct": "cc"},
+                "X" * 26: {"host": "h2", "port": 22, "username": "u",
+                           "iv": "ii", "ct": "cc"},
+            }},
+        })
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+        code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
+            self.VAULT, self.CONN))
+        self.assertEqual(code, 204)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        # Vault stays, second slot preserved
+        self.assertIn(self.VAULT, data["vaults"])
+        self.assertIn("X" * 26, data["vaults"][self.VAULT])
+        self.assertNotIn(self.CONN, data["vaults"][self.VAULT])
+
+
 if __name__ == "__main__":
     unittest.main()
