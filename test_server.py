@@ -6298,6 +6298,36 @@ class TestApiSave(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking", rec.get("ssh_options", {}))
         self.assertNotIn("ProxyCommand", rec.get("ssh_options", {}))
 
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_concurrent_saves_preserve_both_slots(self):
+        # RMW atomicity: two parallel saves to different (vault, conn)
+        # slots must both end up in the final file. Without the outer
+        # _creds_lock around load-modify-save, one would clobber the
+        # other. Barrier ensures both POSTs hit the server at once.
+        barrier = threading.Barrier(3)
+        results = {}
+
+        def _save_with_barrier(vault, conn):
+            barrier.wait()
+            _body, code = self._post("/api/save",
+                self._valid_body(vault_id=vault, conn_id=conn))
+            results[vault] = code
+
+        v1, c1 = "C" * 26, "D" * 26
+        v2, c2 = "E" * 26, "F" * 26
+        t1 = threading.Thread(target=_save_with_barrier, args=(v1, c1))
+        t2 = threading.Thread(target=_save_with_barrier, args=(v2, c2))
+        t1.start(); t2.start()
+        barrier.wait()
+        t1.join(); t2.join()
+
+        self.assertEqual(results[v1], 200)
+        self.assertEqual(results[v2], 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        self.assertIn(v1, data["vaults"])
+        self.assertIn(v2, data["vaults"])
+
 
 if __name__ == "__main__":
     unittest.main()

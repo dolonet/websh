@@ -69,7 +69,7 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread, Lock, Event, BoundedSemaphore
+from threading import Thread, Lock, RLock, Event, BoundedSemaphore
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -1187,7 +1187,10 @@ def clamp(value, lo, hi, default):
 
 sessions = OrderedDict()
 sessions_lock = Lock()
-_creds_lock = Lock()
+# Reentrant so handlers can do `with _creds_lock: ... _save_creds_atomic(...)`.
+# _save_creds_atomic reacquires the same lock internally; without RLock that
+# self-acquisition would deadlock.
+_creds_lock = RLock()
 
 
 class SSHSession(object):
@@ -2490,13 +2493,17 @@ class Handler(BaseHTTPRequestHandler):
         if ssh_options:
             rec["ssh_options"] = ssh_options
 
-        data = _load_creds()
-        new_vaults = dict(data.get("vaults", {}))
-        slot = dict(new_vaults.get(vault_id, {}))
-        slot[conn_id] = rec
-        new_vaults[vault_id] = slot
-        new_data = {"version": _CREDS_SCHEMA_VERSION, "vaults": new_vaults}
-        _save_creds_atomic(new_data)
+        with _creds_lock:
+            # RMW must be atomic — without the outer lock, a concurrent save
+            # to a different (vault_id, conn_id) slot could read the same
+            # pre-state and clobber our update on its own save.
+            data = _load_creds()
+            new_vaults = dict(data.get("vaults", {}))
+            slot = dict(new_vaults.get(vault_id, {}))
+            slot[conn_id] = rec
+            new_vaults[vault_id] = slot
+            new_data = {"version": _CREDS_SCHEMA_VERSION, "vaults": new_vaults}
+            _save_creds_atomic(new_data)
 
         _access_log_emit("save", self._client_ip(),
                          result="ok", vault_id=vault_id, conn_id=conn_id,
