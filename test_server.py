@@ -6390,6 +6390,8 @@ class TestApiSave(unittest.TestCase):
             data = json.load(f)
         self.assertIn(v1, data["vaults"])
         self.assertIn(v2, data["vaults"])
+        self.assertIn(c1, data["vaults"][v1])
+        self.assertIn(c2, data["vaults"][v2])
 
 
 class TestApiSaveDelete(unittest.TestCase):

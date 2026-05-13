@@ -2471,6 +2471,11 @@ class Handler(BaseHTTPRequestHandler):
     # ── Vault save / delete ─────────────────────────────────────────
 
     def _save_credential(self):
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            _access_log_emit("save", ip, result="rate_limited")
+            self._json({"error": "too many requests"}, 429)
+            return
         if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
                 and not _vault_disabled):
             self._json({"error": "credential vault unavailable "
@@ -2539,6 +2544,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json({})
 
     def _delete_credential(self):
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            _access_log_emit("save_delete", ip, result="rate_limited")
+            self._json({"error": "too many requests"}, 429)
+            return
         if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
                 and not _vault_disabled):
             self._json({"error": "credential vault unavailable "
