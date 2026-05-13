@@ -358,6 +358,80 @@ class TestVaultWrite(unittest.TestCase):
             server._vault_disabled = original
 
 
+@unittest.skipUnless(server.HAS_CRYPTOGRAPHY,
+                     "cryptography not installed; gate path covered separately")
+class TestVaultDecrypt(unittest.TestCase):
+    """AES-GCM decrypt + AAD binding."""
+
+    VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
+    CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+    def _encrypt(self, plaintext, vault=None, conn=None):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = AESGCM.generate_key(bit_length=256)
+        iv = os.urandom(12)
+        aad = "{}:{}".format(vault or self.VAULT, conn or self.CONN).encode()
+        ct = AESGCM(key).encrypt(iv, plaintext, aad)
+        return key, iv, ct
+
+    def test_round_trip_returns_plaintext(self):
+        plaintext = b'{"password":"hunter2"}'
+        key, iv, ct = self._encrypt(plaintext)
+        out = server._decrypt_credential(key,
+                                          base64.b64encode(iv).decode(),
+                                          base64.b64encode(ct).decode(),
+                                          self.VAULT, self.CONN)
+        self.assertEqual(out, plaintext)
+
+    def test_wrong_key_raises_invalid(self):
+        _, iv, ct = self._encrypt(b"x")
+        bad_key = bytes(32)
+        with self.assertRaises(server.InvalidTag):
+            server._decrypt_credential(bad_key,
+                                        base64.b64encode(iv).decode(),
+                                        base64.b64encode(ct).decode(),
+                                        self.VAULT, self.CONN)
+
+    def test_wrong_vault_id_raises_invalid(self):
+        key, iv, ct = self._encrypt(b"x")
+        with self.assertRaises(server.InvalidTag):
+            server._decrypt_credential(key,
+                                        base64.b64encode(iv).decode(),
+                                        base64.b64encode(ct).decode(),
+                                        "Z" * 26, self.CONN)
+
+    def test_wrong_conn_id_raises_invalid(self):
+        key, iv, ct = self._encrypt(b"x")
+        with self.assertRaises(server.InvalidTag):
+            server._decrypt_credential(key,
+                                        base64.b64encode(iv).decode(),
+                                        base64.b64encode(ct).decode(),
+                                        self.VAULT, "Z" * 26)
+
+    def test_iv_must_be_12_bytes(self):
+        key = bytes(32)
+        with self.assertRaises(ValueError):
+            server._decrypt_credential(key,
+                                        base64.b64encode(bytes(11)).decode(),
+                                        base64.b64encode(b"x" * 17).decode(),
+                                        self.VAULT, self.CONN)
+
+    def test_key_must_be_32_bytes(self):
+        with self.assertRaises(ValueError):
+            server._decrypt_credential(bytes(31),
+                                        base64.b64encode(bytes(12)).decode(),
+                                        base64.b64encode(b"x" * 17).decode(),
+                                        self.VAULT, self.CONN)
+
+    def test_malformed_base64_raises_value_error(self):
+        # Garbage in iv or ct that's not valid base64 → ValueError
+        with self.assertRaises(ValueError):
+            server._decrypt_credential(bytes(32),
+                                        "!!not-base64!!",
+                                        base64.b64encode(b"x" * 17).decode(),
+                                        self.VAULT, self.CONN)
+
+
 class TestFindConfigConnection(unittest.TestCase):
 
     def setUp(self):

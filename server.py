@@ -47,6 +47,7 @@ API endpoints:
 """
 
 import base64
+import binascii
 import datetime
 import fcntl
 import ipaddress
@@ -229,6 +230,11 @@ _SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # "~/.local/bin/tmux". Rejects shell metacharacters so it's safe to
 # interpolate into the remote-command string without escaping.
 _TMUX_CMD_RE = re.compile(r'^[A-Za-z0-9_./~-]{1,128}$')
+
+# Vault and connection IDs are 26-character base32 strings (e.g. ulid-style).
+# Named separately so the format can diverge independently in the future.
+_VAULT_ID_RE = re.compile(r"^[A-Z2-7]{26}$")
+_CONN_ID_RE  = re.compile(r"^[A-Z2-7]{26}$")
 
 # ─── Persistent-session TTL watchdog ─────────────────────────────────
 #
@@ -1053,6 +1059,33 @@ def _save_creds_atomic(data):
             _creds_cache_key = (st.st_mtime, st.st_size)
         except OSError:
             _creds_cache_key = (0, 0)
+
+
+def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
+    """Decrypt one stored blob.
+
+    Raises ValueError on malformed inputs (wrong key length, bad
+    base64, wrong IV length, ct too short). Raises InvalidTag when
+    authentication fails — callers map that to 400 vault_decrypt_failed.
+
+    AAD = utf8(vault_id + ":" + conn_id) so blobs cannot be moved
+    between slots even by an operator with shell access to the file.
+    """
+    if not HAS_CRYPTOGRAPHY:
+        raise RuntimeError("cryptography not installed")
+    if not isinstance(key_bytes, (bytes, bytearray)) or len(key_bytes) != 32:
+        raise ValueError("key must be 32 bytes")
+    try:
+        iv = base64.b64decode(iv_b64, validate=True)
+        ct = base64.b64decode(ct_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError("invalid base64: {}".format(e))
+    if len(iv) != 12:
+        raise ValueError("iv must be 12 bytes")
+    if len(ct) < 17:
+        raise ValueError("ct too short for GCM tag")
+    aad = ("{}:{}".format(vault_id, conn_id)).encode("utf-8")
+    return AESGCM(bytes(key_bytes)).decrypt(iv, ct, aad)
 
 
 def config_public():
