@@ -10,13 +10,19 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.12"]
+        # `with` exercises the encrypted-flow tests; `without` asserts
+        # the 501 gate path so a deploy without cryptography stays sane.
+        crypto: ["with", "without"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - if: matrix.crypto == 'with'
+        run: pip install 'cryptography>=42'
       - run: python test_server.py -v
 
   frontend:
