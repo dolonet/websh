@@ -70,6 +70,26 @@ from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread, Lock, Event, BoundedSemaphore
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+    HAS_CRYPTOGRAPHY = True
+except ImportError:  # pragma: no cover - exercised by the no-deps CI job
+    AESGCM = None
+    InvalidTag = Exception
+    HAS_CRYPTOGRAPHY = False
+
+# Operator opt-in until the client-side PR (PR-C) lands. Default off
+# so a server upgrade does not advertise endpoints the bundled client
+# does not know how to call. Will become the default once PR-C ships.
+WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
+
+# Set to True at runtime if the on-disk websh.creds.json carries an
+# unsupported schema version (next task). Loud-failure semantics — the
+# loader refuses to parse the file, the writer refuses to overwrite,
+# and config_public flips vault_enabled to False until process restart.
+_vault_disabled = False
+
 __version__ = "0.2.0"
 
 # socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
@@ -949,6 +969,7 @@ def config_public():
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
+        "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
     }
 
 
@@ -3358,6 +3379,12 @@ def main():
         __version__, HOST, PORT))
     if ACCESS_LOG_PATH:
         _log("INFO", "access log: {}".format(ACCESS_LOG_PATH))
+    if not HAS_CRYPTOGRAPHY:
+        _log("INFO", "credential vault: disabled (install cryptography to enable)")
+    elif not WEBSH_VAULT_ENABLE:
+        _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
+    else:
+        _log("INFO", "credential vault: enabled")
     server.serve_forever()
 
 

@@ -156,6 +156,50 @@ class TestConfigLoading(unittest.TestCase):
         self.assertEqual(cfg2["connections"][0]["name"], "v2")
 
 
+class TestVaultGate(unittest.TestCase):
+    """HAS_CRYPTOGRAPHY flag, _vault_disabled flag, and the combined
+    vault_enabled mirror in config_public()."""
+
+    def test_has_cryptography_is_bool(self):
+        self.assertIsInstance(server.HAS_CRYPTOGRAPHY, bool)
+
+    def test_vault_disabled_defaults_false(self):
+        self.assertIsInstance(server._vault_disabled, bool)
+        self.assertFalse(server._vault_disabled)
+
+    def test_config_public_exposes_vault_enabled(self):
+        cfg = server.config_public()
+        self.assertIn("vault_enabled", cfg)
+        self.assertEqual(cfg["vault_enabled"],
+                         server.HAS_CRYPTOGRAPHY
+                         and server.WEBSH_VAULT_ENABLE
+                         and not server._vault_disabled)
+
+    def test_vault_enabled_false_when_crypto_missing(self):
+        original = server.HAS_CRYPTOGRAPHY
+        try:
+            server.HAS_CRYPTOGRAPHY = False
+            self.assertFalse(server.config_public()["vault_enabled"])
+        finally:
+            server.HAS_CRYPTOGRAPHY = original
+
+    def test_vault_enabled_false_when_disabled_flag_set(self):
+        original = server._vault_disabled
+        try:
+            server._vault_disabled = True
+            self.assertFalse(server.config_public()["vault_enabled"])
+        finally:
+            server._vault_disabled = original
+
+    def test_vault_enabled_false_when_env_flag_unset(self):
+        original = server.WEBSH_VAULT_ENABLE
+        try:
+            server.WEBSH_VAULT_ENABLE = False
+            self.assertFalse(server.config_public()["vault_enabled"])
+        finally:
+            server.WEBSH_VAULT_ENABLE = original
+
+
 class TestFindConfigConnection(unittest.TestCase):
 
     def setUp(self):
