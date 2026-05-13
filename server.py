@@ -944,6 +944,71 @@ def load_config():
         return _CONFIG_EMPTY
 
 
+# ── Credential vault (websh.creds.json) ─────────────────────────────
+
+_creds_cache = None
+_creds_cache_key = (0, 0)   # (mtime, size); bare mtime is 1s on some FS
+_CREDS_EMPTY = {"version": 1, "vaults": {}}
+_CREDS_SCHEMA_VERSION = 1
+
+
+def _creds_path():
+    """Path to websh.creds.json.
+
+    Honors WEBSH_CREDS_PATH explicitly; otherwise sits next to
+    WEBSH_CONFIG when set, else cwd.
+    """
+    env = os.environ.get("WEBSH_CREDS_PATH", "").strip()
+    if env:
+        return env
+    cfg = os.environ.get("WEBSH_CONFIG", "").strip()
+    if cfg:
+        return os.path.join(os.path.dirname(os.path.abspath(cfg)),
+                            "websh.creds.json")
+    return os.path.abspath("websh.creds.json")
+
+
+def _load_creds():
+    """Load websh.creds.json with (mtime, size) caching.
+
+    Returns a fresh empty store dict when the file is missing,
+    unparseable, malformed, or carries an unsupported schema version.
+    Unsupported version also sets `_vault_disabled` so the writer can
+    refuse-to-write and config_public flips vault_enabled off until
+    process restart.
+    """
+    global _creds_cache, _creds_cache_key, _vault_disabled
+    path = _creds_path()
+    if not os.path.isfile(path):
+        return dict(_CREDS_EMPTY, vaults={})
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+        if _creds_cache is not None and key == _creds_cache_key:
+            return _creds_cache
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        _log("WARN", "failed to load creds: {}".format(e))
+        return dict(_CREDS_EMPTY, vaults={})
+    if data.get("version") != _CREDS_SCHEMA_VERSION:
+        if not _vault_disabled:
+            _log("WARN",
+                 "websh.creds.json schema version={} unsupported "
+                 "(this build expects {}) — vault disabled until "
+                 "operator action".format(
+                     data.get("version"), _CREDS_SCHEMA_VERSION))
+        _vault_disabled = True
+        return dict(_CREDS_EMPTY, vaults={})
+    if not isinstance(data.get("vaults"), dict):
+        _log("WARN", "creds file {}: missing or non-object 'vaults'; "
+             "treating as empty".format(path))
+        return dict(_CREDS_EMPTY, vaults={})
+    _creds_cache = data
+    _creds_cache_key = key
+    return _creds_cache
+
+
 def config_public():
     """Return config safe for the client (no passwords or keys)."""
     cfg = load_config()

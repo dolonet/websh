@@ -200,6 +200,98 @@ class TestVaultGate(unittest.TestCase):
             server.WEBSH_VAULT_ENABLE = original
 
 
+class TestVaultLoad(unittest.TestCase):
+    """websh.creds.json reads, mtime caching, version handling."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, "websh.creds.json")
+        self._old_env = os.environ.get("WEBSH_CREDS_PATH")
+        os.environ["WEBSH_CREDS_PATH"] = self.path
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("WEBSH_CREDS_PATH", None)
+        else:
+            os.environ["WEBSH_CREDS_PATH"] = self._old_env
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def _write(self, data):
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+
+    def test_missing_file_returns_empty_store(self):
+        self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
+
+    def test_valid_v1_file_parsed(self):
+        self._write({
+            "version": 1,
+            "vaults": {
+                "AAAAAAAAAAAAAAAAAAAAAAAAAA": {
+                    "BBBBBBBBBBBBBBBBBBBBBBBBBB": {
+                        "host": "h", "port": 22, "username": "u",
+                        "iv": "abc", "ct": "def",
+                    }
+                }
+            }
+        })
+        result = server._load_creds()
+        self.assertEqual(result["version"], 1)
+        self.assertIn("AAAAAAAAAAAAAAAAAAAAAAAAAA", result["vaults"])
+
+    def test_unknown_version_disables_vault(self):
+        self._write({"version": 99, "vaults": {}})
+        original = server._vault_disabled
+        try:
+            self.assertEqual(server._load_creds(),
+                             {"version": 1, "vaults": {}})
+            self.assertTrue(server._vault_disabled)
+        finally:
+            server._vault_disabled = original
+
+    def test_corrupt_json_returns_empty_store(self):
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
+
+    def test_missing_vaults_object_returns_empty_store(self):
+        self._write({"version": 1})  # no 'vaults' key
+        self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
+
+    def test_cache_reuses_parse_when_key_unchanged(self):
+        # Mutate the file to a same-size payload + restore the original
+        # mtime via os.utime. Cache key (mtime,size) matches → loader
+        # returns the cached parse, NOT a re-read.
+        self._write({"version": 1, "vaults": {"X": {}}})
+        first = server._load_creds()
+        same_len_payload = '{"version": 1, "vaults": {"Y": {}}}'
+        first_len = os.path.getsize(self.path)
+        self.assertEqual(len(same_len_payload), first_len)
+        with open(self.path, "r+") as f:
+            f.seek(0)
+            f.write(same_len_payload)
+            f.truncate()
+        cached_mtime, _ = server._creds_cache_key
+        os.utime(self.path, (cached_mtime, cached_mtime))
+        cached = server._load_creds()
+        self.assertEqual(cached, first)
+
+    def test_size_change_invalidates_cache(self):
+        # (mtime, size) tuple guards against bare-mtime stale read on
+        # FS with 1s granularity. Same mtime, different size → re-read.
+        self._write({"version": 1, "vaults": {"X": {}}})
+        first = server._load_creds()
+        cached_mtime, _ = server._creds_cache_key
+        bigger = {"version": 1, "vaults": {"X" * 50: {}}}
+        with open(self.path, "w") as f:
+            json.dump(bigger, f)
+        os.utime(self.path, (cached_mtime, cached_mtime))
+        self.assertEqual(server._load_creds(), bigger)
+
+
 class TestFindConfigConnection(unittest.TestCase):
 
     def setUp(self):
