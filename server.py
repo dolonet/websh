@@ -2372,6 +2372,8 @@ class Handler(BaseHTTPRequestHandler):
             self._upload_cancel()
         elif action == "tmux_options":
             self._tmux_options()
+        elif action == "save":
+            self._save_credential()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -2434,6 +2436,72 @@ class Handler(BaseHTTPRequestHandler):
 
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
+
+    # ── Vault save ──────────────────────────────────────────────────
+
+    def _save_credential(self):
+        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                and not _vault_disabled):
+            self._json({"error": "credential vault unavailable "
+                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                        "set / websh.creds.json schema unsupported — "
+                        "see server log)"}, 501)
+            return
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+        vault_id = (body.get("vault_id") or "").strip()
+        conn_id  = (body.get("conn_id") or "").strip()
+        host     = (body.get("host") or "").strip()
+        port     = clamp(body.get("port"), MIN_PORT, MAX_PORT, 22)
+        username = (body.get("username") or "").strip()
+        iv_b64   = body.get("iv") or ""
+        ct_b64   = body.get("ct") or ""
+
+        def _bad(detail):
+            self._json({"error": "vault_input_invalid",
+                        "detail": detail}, 400)
+
+        if not _VAULT_ID_RE.match(vault_id):
+            return _bad("invalid vault_id")
+        if not _CONN_ID_RE.match(conn_id):
+            return _bad("invalid conn_id")
+        if not host or not username:
+            return _bad("host and username are required")
+        if host.startswith("-") or username.startswith("-"):
+            return _bad("host and username must not start with '-'")
+        try:
+            iv = base64.b64decode(iv_b64, validate=True)
+            ct = base64.b64decode(ct_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return _bad("iv/ct must be base64")
+        if len(iv) != 12:
+            return _bad("iv must be 12 bytes")
+        if len(ct) < 17:
+            return _bad("ct too short for GCM tag")
+        ssh_options, dropped = _filter_ssh_options(body.get("ssh_options", {}))
+        if dropped:
+            _log("WARN", "save dropped ssh_options keys: {}".format(dropped))
+
+        rec = {"host": host, "port": port, "username": username,
+               "iv": iv_b64, "ct": ct_b64}
+        if ssh_options:
+            rec["ssh_options"] = ssh_options
+
+        data = _load_creds()
+        new_vaults = dict(data.get("vaults", {}))
+        slot = dict(new_vaults.get(vault_id, {}))
+        slot[conn_id] = rec
+        new_vaults[vault_id] = slot
+        new_data = {"version": _CREDS_SCHEMA_VERSION, "vaults": new_vaults}
+        _save_creds_atomic(new_data)
+
+        _access_log_emit("save", self._client_ip(),
+                         result="ok", vault_id=vault_id, conn_id=conn_id,
+                         iv_len=len(iv), ct_len=len(ct))
+        self._json({})
 
     # ── Connect ─────────────────────────────────────────────────────
 

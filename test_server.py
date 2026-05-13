@@ -6139,5 +6139,165 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
         self.assertEqual(self._read_records(), [])
 
 
+class TestApiSave(unittest.TestCase):
+    """POST /api/save validation, upsert, gate."""
+
+    VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
+    CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18772
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
+        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
+        cls._old_enable = server.WEBSH_VAULT_ENABLE
+        server.WEBSH_VAULT_ENABLE = True
+        # Empty config so /api/save doesn't conflict with anything
+        cfg_path = os.path.join(cls.tmpdir, "websh.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = cfg_path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        server.WEBSH_VAULT_ENABLE = cls._old_enable
+        os.environ.pop("WEBSH_CREDS_PATH", None)
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        # Reset the creds cache so each test sees a fresh file
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+        if os.path.exists(self.creds_path):
+            os.unlink(self.creds_path)
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, 'read'):
+                payload = e.read().decode("utf-8")
+                try:
+                    return json.loads(payload), e.code
+                except ValueError:
+                    return {"_raw": payload}, e.code
+            raise
+
+    def _valid_body(self, **overrides):
+        body = {
+            "vault_id": self.VAULT,
+            "conn_id": self.CONN,
+            "host": "h.example.com",
+            "port": 22,
+            "username": "deploy",
+            "iv": base64.b64encode(bytes(12)).decode(),
+            "ct": base64.b64encode(b"x" * 32).decode(),
+        }
+        body.update(overrides)
+        return body
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_valid_save_persists_record(self):
+        body, code = self._post("/api/save", self._valid_body())
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        self.assertIn(self.VAULT, data["vaults"])
+        self.assertIn(self.CONN, data["vaults"][self.VAULT])
+        rec = data["vaults"][self.VAULT][self.CONN]
+        self.assertEqual(rec["host"], "h.example.com")
+        self.assertEqual(rec["port"], 22)
+        self.assertEqual(rec["username"], "deploy")
+        self.assertIn("iv", rec)
+        self.assertIn("ct", rec)
+
+    def test_gate_returns_501_when_crypto_missing(self):
+        original = server.HAS_CRYPTOGRAPHY
+        try:
+            server.HAS_CRYPTOGRAPHY = False
+            body, code = self._post("/api/save", self._valid_body())
+            self.assertEqual(code, 501)
+            self.assertIn("cryptography", body.get("error", "").lower())
+        finally:
+            server.HAS_CRYPTOGRAPHY = original
+
+    def test_gate_returns_501_when_vault_enable_unset(self):
+        original = server.WEBSH_VAULT_ENABLE
+        try:
+            server.WEBSH_VAULT_ENABLE = False
+            body, code = self._post("/api/save", self._valid_body())
+            self.assertEqual(code, 501)
+        finally:
+            server.WEBSH_VAULT_ENABLE = original
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_bad_vault_id_format(self):
+        body, code = self._post("/api/save",
+                                self._valid_body(vault_id="not-base32"))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_bad_iv_length(self):
+        body, code = self._post("/api/save",
+            self._valid_body(iv=base64.b64encode(bytes(11)).decode()))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_empty_ct_rejected(self):
+        body, code = self._post("/api/save",
+            self._valid_body(ct=""))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_missing_host_rejected(self):
+        body, code = self._post("/api/save",
+            self._valid_body(host=""))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_host_starting_with_dash_rejected(self):
+        body, code = self._post("/api/save",
+            self._valid_body(host="-evil.com"))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_ssh_options_filtered(self):
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options={"ProxyCommand": "evil",
+                                          "StrictHostKeyChecking": "yes"}))
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        rec = data["vaults"][self.VAULT][self.CONN]
+        # StrictHostKeyChecking is on the allow-list; ProxyCommand is not.
+        self.assertIn("StrictHostKeyChecking", rec.get("ssh_options", {}))
+        self.assertNotIn("ProxyCommand", rec.get("ssh_options", {}))
+
+
 if __name__ == "__main__":
     unittest.main()
