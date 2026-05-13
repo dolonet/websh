@@ -11,44 +11,29 @@
   ],
   "connections": [
     {
-      "name": "Production (one-click)",
+      "name": "Production",
       "host": "server.example.com",
       "port": 22,
-      "username": "deploy",
-      "password": "your-password-here"
+      "username": "deploy"
     },
     {
-      "name": "Dev (one-click, SSH key)",
-      "host": "dev.example.com",
-      "port": 22,
-      "username": "admin",
-      "key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
-    },
-    {
-      "name": "Bastion (one-click, custom SSH options)",
+      "name": "Bastion (custom SSH options)",
       "host": "bastion.example.com",
       "port": 22,
       "username": "ops",
-      "password": "your-password-here",
       "ssh_options": {
         "StrictHostKeyChecking": "yes",
         "ProxyJump": "jump.example.com"
       }
     },
     {
-      "name": "Staging (BYO password, fixed user)",
-      "host": "staging.example.com",
-      "port": 22,
-      "username": "deploy"
-    },
-    {
-      "name": "Shared DB (BYO creds, whitelist)",
+      "name": "Shared DB (user whitelist)",
       "host": "db.example.com",
       "port": 2222,
       "allowed_users": ["alice", "bob"]
     },
     {
-      "name": "Jumpbox (BYO creds, blacklist)",
+      "name": "Jumpbox (user blacklist)",
       "host": "jumpbox.example.com",
       "port": 22,
       "denied_users": ["root"]
