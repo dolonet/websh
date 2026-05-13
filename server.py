@@ -2597,10 +2597,88 @@ class Handler(BaseHTTPRequestHandler):
             return
         tmux_options = _validate_tmux_options(body) if persistent else []
 
-        # Resolve credentials: by config connection name, or from request body
+        # Resolve credentials: saved vault card, named connection, or manual body.
         conn_name = body.get("connection", "").strip()
+        sv_vault = (body.get("vault_id") or "").strip()
+        sv_conn  = (body.get("conn_id")  or "").strip()
+        sv_vkey  = body.get("vault_key") or ""
+        is_saved = bool(sv_vault or sv_conn or sv_vkey)
         ssh_options = {}
-        if conn_name:
+        if is_saved:
+            # ── Saved-variant: resolve host/username/password from vault ──
+            if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                    and not _vault_disabled):
+                self._json({"error": "credential vault unavailable "
+                            "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                            "set / websh.creds.json schema unsupported — "
+                            "see server log)"}, 501)
+                return
+            if not _VAULT_ID_RE.match(sv_vault) or not _CONN_ID_RE.match(sv_conn):
+                self._json({"error": "vault_input_invalid",
+                            "detail": "invalid vault_id or conn_id"}, 400)
+                return
+            try:
+                vault_key_bytes = base64.b64decode(sv_vkey, validate=True)
+            except (binascii.Error, ValueError):
+                self._json({"error": "vault_input_invalid",
+                            "detail": "vault_key must be base64"}, 400)
+                return
+            if len(vault_key_bytes) != 32:
+                self._json({"error": "vault_input_invalid",
+                            "detail": "vault_key must be 32 bytes"}, 400)
+                return
+            data = _load_creds()
+            rec = data.get("vaults", {}).get(sv_vault, {}).get(sv_conn)
+            if rec is None:
+                _access_log_emit("connect", ip, result="cred_not_found",
+                                 vault_id=sv_vault, conn_id=sv_conn)
+                self._json({"error": "saved entry not found"}, 404)
+                return
+            try:
+                plaintext = _decrypt_credential(
+                    vault_key_bytes, rec.get("iv", ""), rec.get("ct", ""),
+                    sv_vault, sv_conn)
+            except InvalidTag:
+                _access_log_emit("connect", ip,
+                                 result="cred_decrypt_failed",
+                                 vault_id=sv_vault, conn_id=sv_conn)
+                # 400 not 401 — avoid upstream auth re-prompt loops.
+                self._json({"error": "vault_decrypt_failed"}, 400)
+                return
+            except (ValueError, RuntimeError) as e:
+                self._json({"error": "vault_input_invalid",
+                            "detail": str(e)}, 400)
+                return
+            try:
+                creds = json.loads(plaintext.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "blob plaintext is not JSON"}, 400)
+                return
+            host = (rec.get("host") or "").strip()
+            port = clamp(rec.get("port"), MIN_PORT, MAX_PORT, 22)
+            username = (rec.get("username") or "").strip()
+            ssh_options = rec.get("ssh_options") or {}
+            password = creds.get("password") or ""
+            key = creds.get("key") or ""
+            # key_pass is in the plaintext for forward-compat but the
+            # current SSHSession ctor doesn't accept it — drop silently.
+            # Best-effort scrub of bytearrays. Python str copies in
+            # `password`/`key` linger until GC; hardened deploy recipe
+            # is what actually closes the read window.
+            try:
+                pa = bytearray(plaintext)
+                for i in range(len(pa)):
+                    pa[i] = 0
+            except TypeError:
+                pass
+            try:
+                ka = bytearray(vault_key_bytes)
+                for i in range(len(ka)):
+                    ka[i] = 0
+            except TypeError:
+                pass
+        elif conn_name:
             entry = find_config_connection(conn_name)
             if not entry:
                 self._json({"error": "connection not found"}, 404)

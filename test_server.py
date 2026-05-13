@@ -6451,5 +6451,174 @@ class TestApiSaveDelete(unittest.TestCase):
         self.assertNotIn(self.CONN, data["vaults"][self.VAULT])
 
 
+class TestApiConnectSaved(unittest.TestCase):
+    """Saved-variant POST /api/connect: decrypt → spawn ssh."""
+
+    VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
+    CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18774
+        cls.tmpdir = tempfile.mkdtemp()
+        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
+        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
+        cls._old_enable = server.WEBSH_VAULT_ENABLE
+        server.WEBSH_VAULT_ENABLE = True
+        cfg_path = os.path.join(cls.tmpdir, "websh.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = cfg_path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        server.WEBSH_VAULT_ENABLE = cls._old_enable
+        os.environ.pop("WEBSH_CREDS_PATH", None)
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+        # Seed a stored entry encrypted with self.key/self.iv
+        if server.HAS_CRYPTOGRAPHY:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            self.key = AESGCM.generate_key(bit_length=256)
+            self.iv = os.urandom(12)
+            aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+            self.ct = AESGCM(self.key).encrypt(
+                self.iv,
+                b'{"password":"hunter2","key":null,"key_pass":null}',
+                aad)
+            server._save_creds_atomic({
+                "version": 1,
+                "vaults": {self.VAULT: {self.CONN: {
+                    "host": "h.example.com", "port": 22, "username": "u",
+                    "iv": base64.b64encode(self.iv).decode(),
+                    "ct": base64.b64encode(self.ct).decode(),
+                }}},
+            })
+
+    def _post(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{0}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, 'read'):
+                payload = e.read().decode("utf-8")
+                try:
+                    return json.loads(payload), e.code
+                except ValueError:
+                    return {"_raw": payload}, e.code
+            raise
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_saved_variant_decrypts_and_spawns(self):
+        # Patch SSHSession so we don't actually fork
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            instance = unittest.mock.MagicMock(alive=True, auth_failed=False,
+                                                tmux_cmd="tmux")
+            MockSSH.return_value = instance
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(self.key).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 200)
+            # Wire body did NOT include host/username; values come from store.
+            kwargs = MockSSH.call_args.kwargs
+            self.assertEqual(kwargs.get("host"), "h.example.com")
+            self.assertEqual(kwargs.get("username"), "u")
+            self.assertEqual(kwargs.get("password"), "hunter2")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_wrong_vault_key_returns_400_decrypt_failed(self):
+        bad = bytes(32)
+        body, code = self._post({
+            "vault_id": self.VAULT, "conn_id": self.CONN,
+            "vault_key": base64.b64encode(bad).decode(),
+            "cols": 80, "rows": 24,
+        })
+        # 400 (not 401) so upstream auth_basic / Cloudflare Access never
+        # sees a 401 and never triggers a re-prompt loop.
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_decrypt_failed")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_malformed_vault_key_returns_400_input_invalid(self):
+        body, code = self._post({
+            "vault_id": self.VAULT, "conn_id": self.CONN,
+            "vault_key": base64.b64encode(bytes(31)).decode(),
+            "cols": 80, "rows": 24,
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_missing_entry_returns_404(self):
+        body, code = self._post({
+            "vault_id": self.VAULT, "conn_id": "Z" * 26,
+            "vault_key": base64.b64encode(bytes(32)).decode(),
+            "cols": 80, "rows": 24,
+        })
+        self.assertEqual(code, 404)
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_bad_vault_id_format_returns_400(self):
+        body, code = self._post({
+            "vault_id": "not-base32", "conn_id": self.CONN,
+            "vault_key": base64.b64encode(bytes(32)).decode(),
+            "cols": 80, "rows": 24,
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    def test_gate_returns_501_when_crypto_missing(self):
+        original = server.HAS_CRYPTOGRAPHY
+        try:
+            server.HAS_CRYPTOGRAPHY = False
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(bytes(32)).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 501)
+        finally:
+            server.HAS_CRYPTOGRAPHY = original
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_existing_manual_path_still_works(self):
+        # Regression: a body with host/username (no vault fields) routes
+        # to the manual flow exactly as before.
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            instance = unittest.mock.MagicMock(alive=True, auth_failed=False,
+                                                tmux_cmd="tmux")
+            MockSSH.return_value = instance
+            body, code = self._post({
+                "host": "manual.example.com", "username": "alice",
+                "password": "p", "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 200)
+            kwargs = MockSSH.call_args.kwargs
+            self.assertEqual(kwargs.get("host"), "manual.example.com")
+
+
 if __name__ == "__main__":
     unittest.main()
