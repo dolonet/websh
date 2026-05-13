@@ -52,6 +52,16 @@ switch ($action) {
     case 'input':      proxy_post($BACKEND . '/api/input');      break;
     case 'resize':     proxy_post($BACKEND . '/api/resize');     break;
     case 'disconnect': proxy_post($BACKEND . '/api/disconnect'); break;
+    case 'save':       proxy_post($BACKEND . '/api/save');       break;
+    case 'save_delete':
+        // Browsers can't issue DELETE through form posts, so the
+        // client POSTs here and we translate to a real backend DELETE.
+        $vault = isset($_GET['vault_id']) ? $_GET['vault_id'] : '';
+        $conn  = isset($_GET['conn_id'])  ? $_GET['conn_id']  : '';
+        proxy_delete($BACKEND . '/api/save'
+            . '?vault_id=' . urlencode($vault)
+            . '&conn_id='  . urlencode($conn));
+        break;
     case 'output':
         $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
         proxy_get($BACKEND . '/api/output?session_id=' . urlencode($sid));
@@ -114,6 +124,29 @@ function proxy_get($url) {
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
         return;
     }
+    echo $resp;
+}
+
+// Forwards the backend's status code so the browser can distinguish
+// 204 No Content (success) from 404/400/501 (error). The existing
+// proxy_post / proxy_get do not forward status — kept that way to
+// avoid changing behavior of unrelated routes mid-feature.
+function proxy_delete($url) {
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    if ($resp === false) {
+        header('HTTP/1.1 502 Bad Gateway');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+        return;
+    }
+    if ($code) http_response_code($code);
     echo $resp;
 }
 
