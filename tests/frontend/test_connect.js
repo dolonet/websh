@@ -1781,6 +1781,285 @@ test('no-key state: hasKey cache is true after a fresh save → not grayed', asy
 });
 
 // =====================================================================
+// Vault: vault-key lifecycle — IfPresent guards (PR-67 review findings)
+// =====================================================================
+
+test('no-key F5: stale vault pane manifest does NOT mint a fresh K', async () => {
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: () => { connectCalls++; return {alive: false}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed: vault-backed pane manifest in localStorage, IDB is empty
+  // (Safari ITP eviction / cleared-site-data / sign-out-in-other-tab).
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'leaf', pane: 'v1', flex: ''},
+    panes: {
+      v1: {label: 'Stale', via: 'vault', conn_id: 'V'.repeat(26),
+           host: 'h', port: 22, user: 'u', persistent: false,
+           slot_id: null, tmux_cmd: 'tmux', cols: 80, rows: 24},
+    },
+  }));
+  // Confirm baseline: IDB empty, cache false.
+  ok((await win.eval('_idbGet("K")')) == null, 'baseline: IDB K is empty');
+  ok(win.eval('_idbHasKeyCache') === false, 'baseline: _idbHasKeyCache false');
+  // Drive the F5 restore explicitly (mkEnv boot's tryRestoreSessions
+  // already ran against an empty manifest, so seeding-and-re-running is
+  // the cleanest way to isolate this code path).
+  const restored = win.eval('tryRestoreSessions()');
+  ok(restored === true, 'tryRestoreSessions returned true; got ' + restored);
+  // Let the async connectPane vault-branch run.
+  await sleep(80);
+  // The fix: vault-branch must NOT silently mint. Cache stays false,
+  // IDB stays empty, no /api/connect was fired.
+  ok(win.eval('_idbHasKeyCache') === false,
+     '_idbHasKeyCache NOT flipped to true by stale-vault F5; got ' +
+     win.eval('_idbHasKeyCache'));
+  ok((await win.eval('_idbGet("K")')) == null,
+     'IDB K NOT silently minted by stale-vault F5');
+  ok((await win.eval('_idbGet("vault_id")')) == null,
+     'IDB vault_id NOT silently minted by stale-vault F5');
+  ok(connectCalls === 0,
+     '/api/connect NOT called when vault key is missing; got ' + connectCalls);
+  // The pane is rendered but disconnected, with the reconnect bar up.
+  const ps = paneList(win);
+  ok(ps.length === 1, 'pane rendered; got ' + ps.length);
+  if (ps.length) {
+    ok(!ps[0].sid, 'pane has no sid (connect bailed)');
+    ok(!ps[0].connecting, 'pane.connecting cleared');
+    const bar = ps[0].el.querySelector('[data-reconnect]');
+    ok(bar && !bar.classList.contains('h'), 'reconnect bar visible');
+    const msg = bar && bar.querySelector('span');
+    ok(msg && msg.textContent.indexOf('Vault key missing') !== -1,
+       'reconnect bar says "Vault key missing"; got=' +
+       (msg && msg.textContent));
+  }
+  cleanup(env);
+});
+
+test('no-key F5: connectSaved on empty IDB skips /api/connect, no minting', async () => {
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: () => { connectCalls++; return {alive: false}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Saved card row exists in localStorage but IDB is empty.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Orphan', conn_id: 'O'.repeat(26), host: 'o', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  // Call connectSaved directly (bypassing renderSaved's pre-gate).
+  await win.connectSaved({name: 'Orphan', conn_id: 'O'.repeat(26),
+                          host: 'o', port: 22, user: 'u',
+                          auth: 'pw', persistent: false});
+  await sleep(60);
+  ok(connectCalls === 0,
+     '/api/connect NOT called for no-key connectSaved; got ' + connectCalls);
+  ok((await win.eval('_idbGet("K")')) == null,
+     'IDB K NOT silently minted by connectSaved');
+  ok((await win.eval('_idbGet("vault_id")')) == null,
+     'IDB vault_id NOT silently minted by connectSaved');
+  // User-visible toast acknowledges the missing key.
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length >= 1, 'toast raised for no-key connectSaved; count=' +
+     toasts.length);
+  cleanup(env);
+});
+
+test('no-key F5: _bulkDeleteVaultEntry on empty IDB skips server call', async () => {
+  let deleteCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'save_delete', response: () => { deleteCalls++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // No IDB seed; jump straight into the bulk-delete path.
+  await win._bulkDeleteVaultEntry({name: 'Orphan', conn_id: 'O'.repeat(26),
+                                    host: 'o', port: 22, user: 'u',
+                                    auth: 'pw', persistent: false});
+  await sleep(40);
+  ok(deleteCalls === 0,
+     'save_delete NOT called when vault_id missing; got ' + deleteCalls);
+  ok((await win.eval('_idbGet("vault_id")')) == null,
+     'IDB vault_id NOT silently minted by _bulkDeleteVaultEntry');
+  cleanup(env);
+});
+
+test('decryptCredentials on empty IDB throws no_vault_key', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  let threw = null;
+  try {
+    await win.decryptCredentials('AAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAA',
+                                  'C'.repeat(26));
+  } catch (e) { threw = e; }
+  ok(threw && /no_vault_key/.test(threw.message),
+     'decryptCredentials threw no_vault_key; got ' + (threw && threw.message));
+  ok((await win.eval('_idbGet("K")')) == null,
+     'IDB K NOT silently minted by decryptCredentials');
+  cleanup(env);
+});
+
+test('sign out: live vault pane torn down + manifest filtered', async () => {
+  // We need a live vault-backed pane plus a manual pane in the same
+  // session so we can prove the manifest is FILTERED (vault row dropped,
+  // manual row kept) rather than nuked wholesale.
+  let disconnects = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      // Distinguish manual vs. vault by body shape; return a unique sid.
+      if (body && body.vault_id) return {session_id: 'sid-vault', alive: true};
+      return {session_id: 'sid-manual', alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save_delete', response: {}},
+    {action: 'disconnect', response: () => { disconnects++; return {}; }},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // First: seed + click a vault card so we get a live vault pane.
+  const {vault_id, conn_id} = await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(120);
+  // Confirm the vault pane is live.
+  let panesArr = paneList(win);
+  ok(panesArr.length === 1, 'vault pane materialized; got ' + panesArr.length);
+  const vaultPaneId = panesArr[0].id;
+  ok(panesArr[0].sid === 'sid-vault', 'vault pane has sid-vault sid');
+  ok(panesArr[0].conn_id === conn_id, 'vault pane carries conn_id');
+  // Persist manifest with the vault pane.
+  win.eval('saveSessions()');
+  // Now seed a manual pane manifest row alongside the vault row by
+  // editing the manifest directly — driving the manual connect through
+  // the UI would create a real second pane but also fire a real
+  // /api/connect for it, which complicates assertions. The manifest-
+  // filter test only needs the manifest to contain BOTH shapes.
+  let raw = win.localStorage.getItem('websh_panes');
+  ok(raw, 'manifest exists pre-signout');
+  const pre = JSON.parse(raw);
+  pre.panes['mManual'] = {
+    label: 'Manual', via: 'manual', host: 'm.example.com', port: 22,
+    user: 'u', auth: 'pw', persistent: false, slot_id: null,
+    tmux_cmd: 'tmux', cols: 80, rows: 24,
+  };
+  // Wrap the layout into a split so both manifest keys are referenced.
+  pre.layout = {type: 'split', dir: 'h', a: pre.layout,
+                b: {type: 'leaf', pane: 'mManual', flex: ''}};
+  win.localStorage.setItem('websh_panes', JSON.stringify(pre));
+  // Sign out.
+  win.openSignOutModal();
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  await win.confirmSignOut();
+  await sleep(40);
+  // Manifest: vault entry filtered, manual kept.
+  const post = JSON.parse(win.localStorage.getItem('websh_panes'));
+  ok(post && post.panes, 'manifest still present after sign-out');
+  ok(!(vaultPaneId in post.panes),
+     'vault pane key dropped from manifest; got keys=' +
+     Object.keys(post.panes).join(','));
+  ok('mManual' in post.panes,
+     'manual pane key kept in manifest; got keys=' +
+     Object.keys(post.panes).join(','));
+  // Live vault pane: stopped polling, sid cleared, reconnect bar up.
+  const livePane = win.panes[vaultPaneId];
+  ok(livePane, 'live vault pane DOM kept around for user to see');
+  if (livePane) {
+    ok(!livePane.sid, 'live vault pane sid cleared; got ' + livePane.sid);
+    ok(!livePane.polling, 'live vault pane polling stopped');
+    const bar = livePane.el.querySelector('[data-reconnect]');
+    ok(bar && !bar.classList.contains('h'),
+       'reconnect bar visible on torn-down vault pane');
+    const msg = bar && bar.querySelector('span');
+    ok(msg && msg.textContent.indexOf('Vault key missing') !== -1,
+       'torn-down vault pane shows "Vault key missing"; got=' +
+       (msg && msg.textContent));
+  }
+  // /api/disconnect was fired for the vault pane.
+  ok(disconnects === 1,
+     'one /api/disconnect for the torn-down vault pane; got ' + disconnects);
+  cleanup(env);
+});
+
+test('cross-tab signed_out tears down live vault panes in sibling tab', async () => {
+  // Boot with a BroadcastChannel shim so this tab listens for sibling
+  // signed_out broadcasts. The cross-tab fix: invalidating the cache
+  // alone leaves any live vault pane streaming on with a key that's
+  // been nuked from disk — Finding 3 in the PR-67 review.
+  let disconnects = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-xt', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'disconnect', response: () => { disconnects++; return {}; }},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const ChannelMock = class {
+    constructor(name) {
+      this.name = name; ChannelMock.instances.push(this); this.onmessage = null;
+    }
+    postMessage(d) {
+      ChannelMock.instances.forEach(c => {
+        if (c !== this && c.onmessage) c.onmessage({data: d});
+      });
+    }
+    close() {}
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  const log = [];
+  makeFakes(win);
+  win.fetch = makeFetch(plan, log);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  // Live vault pane: seed + click.
+  const {conn_id} = await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(120);
+  const panesArr = Object.values(win.panes);
+  ok(panesArr.length === 1, 'live vault pane created');
+  const livePane = panesArr[0];
+  ok(livePane.sid === 'sid-xt', 'live vault pane has sid');
+  ok(livePane.conn_id === conn_id, 'live vault pane carries conn_id');
+  // Sibling tab fires signed_out.
+  const sibling = new ChannelMock('websh_vault');
+  sibling.postMessage({type: 'signed_out'});
+  await sleep(40);
+  // Live vault pane torn down: sid cleared, reconnect bar up, server
+  // got a /api/disconnect.
+  ok(!livePane.sid,
+     'live vault pane sid cleared by cross-tab signed_out; got ' + livePane.sid);
+  ok(!livePane.polling, 'live vault pane polling stopped');
+  const bar = livePane.el.querySelector('[data-reconnect]');
+  ok(bar && !bar.classList.contains('h'),
+     'reconnect bar visible after cross-tab signed_out');
+  const msg = bar && bar.querySelector('span');
+  ok(msg && msg.textContent.indexOf('Vault key missing') !== -1,
+     'reconnect bar says "Vault key missing"; got=' +
+     (msg && msg.textContent));
+  ok(disconnects === 1,
+     'one /api/disconnect fired by cross-tab teardown; got ' + disconnects);
+  // Cache invalidated — _idbHasKeyCache false (no minting in handler).
+  ok(win.eval('_idbHasKeyCache') === false,
+     '_idbHasKeyCache invalidated after cross-tab signed_out');
+  dom.window.close();
+});
+
+// =====================================================================
 // Vault: legacy-plaintext banner
 // =====================================================================
 

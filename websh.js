@@ -659,6 +659,14 @@ function showReconnectBar(p, reason) {
     if (reason === 'auth_failed') {
       msg.textContent = 'Authentication failed';
       msg.style.color = 'var(--dg)';
+    } else if (reason === 'no_vault_key') {
+      // Distinct from auth-fail (creds rejected): the encryption key
+      // that wraps this pane's saved creds is missing in this browser.
+      // Clicking "Reconnect" loops back into connectPane which will
+      // hit the same guard and re-show this bar — that's intentional;
+      // the user needs to sign in again on this browser to recover.
+      msg.textContent = 'Vault key missing — sign in again to recover';
+      msg.style.color = 'var(--wn)';
     } else {
       msg.textContent = 'Disconnected';
       msg.style.color = 'var(--dim)';
@@ -1356,15 +1364,31 @@ async function connectPane(p, opts) {
 
   let rec = paneRecord(p);
   if (rec && rec.via === 'vault') {
+    // Use the non-minting variants. If IDB has been wiped between save
+    // and now (Safari ITP eviction, user cleared site data, sign-out
+    // in another tab), we must NOT silently mint a fresh K — that
+    // mints garbage that can't decrypt the server-side blob AND
+    // defeats the .nokey cleanup UX in renderSaved. Surface the
+    // condition and bail with the reconnect bar showing "no_vault_key".
+    let vault_id_b32 = null;
+    let key = null;
     try {
-      rec.vault_id = await ensureVaultId();
-      rec.vault_key = await exportRawVaultKey();
-    } catch (e) {
+      vault_id_b32 = await ensureVaultIdIfPresent();
+      key = await ensureVaultKeyIfPresent();
+    } catch (e) { /* IDB broken — treat as missing */ }
+    if (!vault_id_b32 || !key) {
       p.connecting = false;
-      showErr('Vault key not available in this browser — re-enter to re-save.');
+      showReconnectBar(p, 'no_vault_key');
+      showToast('Saved pane "' + (p.label || (p.user + '@' + p.host)) +
+                '" cannot reconnect — vault key missing in this browser. ' +
+                'Use the saved-card list to clean up.', 'warn');
       updatePaneBadge(p);
       return;
     }
+    rec.vault_id = vault_id_b32;
+    // key already in cache; exportRawVaultKey re-derives raw bytes from
+    // the cached CryptoKey without re-reading IDB or minting.
+    rec.vault_key = await exportRawVaultKey();
   } else if (rec) {
     // Manual / named: paneRecord intentionally strips plaintext from the
     // disk shape (kept in sessionStorage, see _setPaneSecret). Pass the
@@ -2024,6 +2048,44 @@ async function ensureVaultKey() {
   return key;
 }
 
+// Non-minting variants of ensureVaultId / ensureVaultKey. Return the
+// IDB-resident value if it exists, null otherwise — NEVER mint.
+//
+// Why we need both: the mint-allowed variants are correct for the save
+// flow (commitVaultSave / _onFirstVaultSave), where "no vault yet" is
+// the precondition for creating one. They're wrong for every other
+// caller (connectPane on F5 restore, connectSaved click, bulk-delete,
+// decryptCredentials). After IDB is wiped — Safari ITP eviction, the
+// user cleared site data, sign-out in another tab — those code paths
+// must see "no key" and degrade, not silently mint a fresh K that has
+// nothing to do with the stored ciphertext. Silent minting after a
+// wipe defeats the no-key cleanup UX (the .nokey grayed state goes
+// away on the next render) and re-populates IDB right after a sibling
+// tab signed out (Finding 3 in the PR-67 review). See connectPane and
+// confirmSignOut for the consumers.
+async function ensureVaultIdIfPresent() {
+  if (_vaultIdCache) return _vaultIdCache;
+  let id = await _idbGet(IDB_VAULT_ID_KEY);
+  if (!id) return null;
+  _vaultIdCache = id;
+  return id;
+}
+
+async function ensureVaultKeyIfPresent() {
+  if (_vaultKeyCache) return _vaultKeyCache;
+  let key = await _idbGet(IDB_K_KEY);
+  if (!key) {
+    // Keep the sync-readable mirror honest. Without this, a caller
+    // that observes _idbHasKeyCache=true (stale from boot) would
+    // mistake "no key" for "key present" and render a non-grayed row.
+    _idbHasKeyCache = false;
+    return null;
+  }
+  _vaultKeyCache = key;
+  _idbHasKeyCache = true;
+  return key;
+}
+
 async function exportRawVaultKey() {
   let key = await ensureVaultKey();
   let raw = await crypto.subtle.exportKey('raw', key);
@@ -2058,8 +2120,13 @@ async function encryptCredentials(plaintext, conn_id) {
 }
 
 async function decryptCredentials(iv_b64, ct_b64, conn_id) {
-  let vault_id = await ensureVaultId();
-  let key = await ensureVaultKey();
+  // Non-minting: silently minting a fresh vault_id / K here would just
+  // guarantee a decrypt failure with extra garbage left in IDB. Raise
+  // a clear error so the caller can surface a useful diagnostic
+  // (Finding 8 in the PR-67 review).
+  let vault_id = await ensureVaultIdIfPresent();
+  let key = await ensureVaultKeyIfPresent();
+  if (!vault_id || !key) throw new Error('no_vault_key');
   let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
   let pt = await crypto.subtle.decrypt(
     {name: 'AES-GCM', iv: _b64ToBytes(iv_b64), additionalData: aad},
@@ -2112,6 +2179,10 @@ function _initVaultBroadcast() {
     _vaultBroadcast.onmessage = (e) => {
       if (!e || !e.data) return;
       if (e.data.type === 'signed_out') {
+        // Tear down live vault-backed panes BEFORE invalidating caches
+        // so the in-flight connectPane / pollOutput on this tab can't
+        // race ahead and mint a fresh K from empty IDB (Finding 3).
+        _disconnectAllVaultPanesForNoKey();
         invalidateVaultCache();
         renderSaved();
       }
@@ -2153,6 +2224,39 @@ function invalidateVaultCache() {
   _vaultIdCache = null;
   _vaultKeyCache = null;
   _idbHasKeyCache = false;
+}
+
+// Tear down a live vault-backed pane after the vault key has just been
+// wiped (local sign-out, or a sibling tab broadcasting signed_out).
+// Lighter than _destroyPane: we keep the pane in the DOM so the user
+// sees the no-key state and can act, but stop polling, close the
+// stream, and best-effort disconnect the server-side session.
+// Reconnect bar shows 'no_vault_key' — clicking Reconnect funnels back
+// through connectPane's vault guard, which re-shows the same bar
+// (intentional: the user has to sign in again to recover).
+function _disconnectVaultPaneForNoKey(p) {
+  if (!p) return;
+  p.connecting = false;
+  if (p.sid) {
+    let sid = p.sid;
+    p.polling = false;
+    stopKeepalive(p);
+    closeStream(p);
+    api('disconnect', {body: {session_id: sid}}).catch(() => {});
+    p.sid = null;
+  }
+  updatePaneBadge(p);
+  showReconnectBar(p, 'no_vault_key');
+}
+
+// Iterate live panes and tear down every vault-backed one. Shared by
+// confirmSignOut (this tab) and the BroadcastChannel signed_out
+// handler (sibling tab) so the same pane state is reached either way.
+function _disconnectAllVaultPanesForNoKey() {
+  Object.keys(panes).forEach(id => {
+    let p = panes[id];
+    if (p && p.conn_id) _disconnectVaultPaneForNoKey(p);
+  });
 }
 
 // Toggle vault-on / vault-off on <html> based on the server's
@@ -2270,13 +2374,14 @@ function renderSaved() {
 // proxy translates `?action=save_delete` POST into a backend DELETE.
 async function _bulkDeleteVaultEntry(c) {
   if (!c || !c.conn_id) return;
-  let vault_id;
-  try { vault_id = await ensureVaultId(); }
-  catch (e) {
-    // If IDB itself is broken we can't recover vault_id; bail silently
-    // — local list removal still proceeds in the caller.
-    return;
-  }
+  // Non-minting: if the user wiped IDB and then clicked Delete on a
+  // .nokey row, the old ensureVaultId would mint a fresh vault_id
+  // that doesn't match the saved entry's namespace — the DELETE
+  // would fire against a meaningless URL and the original blob
+  // would linger server-side. Skip the network call instead.
+  let vault_id = null;
+  try { vault_id = await ensureVaultIdIfPresent(); } catch (e) {}
+  if (!vault_id) return;  // local removal still proceeds in the caller
   let q = '&vault_id=' + encodeURIComponent(vault_id) +
           '&conn_id='  + encodeURIComponent(c.conn_id);
   // body:{} forces POST through api(); empty body is fine, PHP proxy
@@ -2294,14 +2399,23 @@ async function connectSaved(c) {
   // shipped) keep the old manual-mode flow so they continue to work
   // until the user acks the legacy banner or re-saves.
   if (c.conn_id) {
-    let vault_key, vault_id;
+    // Non-minting: IDB may be empty (Safari ITP, site-data clear,
+    // sign-out in another tab). renderSaved's onclick handler pre-gates
+    // on _idbHasKeyCache, but that mirror can be momentarily stale —
+    // and direct callers (programmatic or future code paths) bypass it.
+    // Guard at the bottom of the funnel so a fresh K is never minted
+    // from a no-key state.
+    let vault_id = null;
+    let key = null;
     try {
-      vault_id = await ensureVaultId();
-      vault_key = await exportRawVaultKey();
-    } catch (e) {
+      vault_id = await ensureVaultIdIfPresent();
+      key = await ensureVaultKeyIfPresent();
+    } catch (e) { /* IDB broken — treat as missing */ }
+    if (!vault_id || !key) {
       showToast('No vault key in this browser — re-enter to re-save this connection.', 'err');
       return;
     }
+    let vault_key = await exportRawVaultKey();
     runConnect({
       label: label,
       vault_id: vault_id,
@@ -3336,6 +3450,35 @@ async function confirmSignOut() {
   try { await _idbDelete(IDB_VAULT_ID_KEY); } catch (e) {}
   saveSaved([]);
   try { sessionStorage.removeItem(storageKey(SS_PANE_SECRETS_KEY)); } catch (e) {}
+  // Filter vault entries out of the pane manifest in localStorage.
+  // Without this, an open vault-backed pane's record survives the wipe
+  // and the next F5 would hit connectPane's vault branch with no key
+  // → silently mint a fresh K (the original Finding 1 scenario). We
+  // filter rather than nuking the whole manifest so any non-vault
+  // panes (manual / named) the user had open still restore on F5.
+  try {
+    let raw = localStorage.getItem(storageKey(PANES_KEY));
+    if (raw) {
+      let m = JSON.parse(raw);
+      if (m && m.panes) {
+        let kept = {};
+        let dropped = false;
+        Object.keys(m.panes).forEach(k => {
+          let rec = m.panes[k];
+          if (rec && (rec.via === 'vault' || rec.conn_id)) { dropped = true; return; }
+          kept[k] = rec;
+        });
+        if (dropped) {
+          m.panes = kept;
+          localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(m));
+        }
+      }
+    }
+  } catch (e) {}
+  // Tear down any live vault-backed panes in this tab — they're now
+  // running with a key that was just wiped from disk, so the next
+  // disconnect/reconnect would silently re-mint a fresh K.
+  _disconnectAllVaultPanesForNoKey();
   invalidateVaultCache();
   _broadcastSignedOut();
   closeSignOutModal();
