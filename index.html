@@ -78,6 +78,12 @@
     .fg input:focus{border-color:var(--ac)}
     .fg input:disabled{opacity:.7;cursor:not-allowed}
     .sv-kind{font-size:10px;padding:1px 6px;border-radius:8px;background:var(--bd);color:var(--dim);margin-left:6px}
+    /* No-key state: vault-backed row whose IDB key is missing (Safari
+       ITP eviction, site data cleared, sign-out in another tab). The
+       row stays clickable but the click goes to delete, not connect. */
+    .sv.nokey{opacity:.55}
+    .sv.nokey:hover{background:rgba(248,81,73,.05)}
+    .sv-nokey{background:rgba(248,81,73,.12);color:var(--dg)}
     .prompt-target{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;margin-bottom:12px;border:1px solid var(--ac);border-radius:var(--radius);background:rgba(88,166,255,.06)}
     .prompt-target-info{font-size:12px;color:var(--tx)}
     .prompt-target-change{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;line-height:1;padding:0 4px}

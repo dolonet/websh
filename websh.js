@@ -2020,6 +2020,7 @@ async function ensureVaultKey() {
     await _idbPut(IDB_K_KEY, key);
   }
   _vaultKeyCache = key;
+  _idbHasKeyCache = true;  // K is present, sync-readable for renderSaved
   return key;
 }
 
@@ -2070,12 +2071,26 @@ async function decryptCredentials(iv_b64, ct_b64, conn_id) {
 // vault_id; the server validates with the same regex.
 function generateConnId() { return _generateBase32Id(); }
 
+// Sync-readable mirror of "is K present in IDB?". renderSaved checks
+// this to gray out vault-backed rows that can no longer connect
+// (Safari ITP cleared IDB after 7 days, user wiped site data, etc).
+// Refreshed from loadServerConfig at boot, after save / sign-out
+// (which know they just touched IDB), and on the storage / vault
+// BroadcastChannel events (Task 11).
+let _idbHasKeyCache = false;
+async function _refreshIdbHasKey() {
+  try { _idbHasKeyCache = !!(await _idbGet(IDB_K_KEY)); }
+  catch (e) { _idbHasKeyCache = false; }
+  return _idbHasKeyCache;
+}
+
 // Invalidate in-memory caches without touching IDB. Used when another
 // tab signs out, when sign-out completes locally, and when /api/config
 // reports the vault has been disabled out from under us.
 function invalidateVaultCache() {
   _vaultIdCache = null;
   _vaultKeyCache = null;
+  _idbHasKeyCache = false;
 }
 
 // Toggle vault-on / vault-off on <html> based on the server's
@@ -2147,21 +2162,64 @@ function renderSaved() {
   el.innerHTML='';
   $('divider').querySelector('span').textContent=list.length?'Or connect manually':'Connect';
   list.forEach((c,i) => {
-    let div=document.createElement('div'); div.className='sv'; div.setAttribute('data-idx',i);
+    // A vault-backed row is unusable when the browser's IDB key is gone
+    // (Safari ITP eviction, user wiped site data, sign-out in another
+    // tab). We mark it .nokey so CSS grays it out, and the click
+    // handler routes to the bulk-delete path instead of connect.
+    let nokey = !!(c.conn_id && !_idbHasKeyCache);
+    let div=document.createElement('div');
+    div.className = 'sv' + (nokey ? ' nokey' : '');
+    div.setAttribute('data-idx', i);
+    let suffix = _entryUsesKey(c) ? ' (key)' : '';
+    let nokeyTag = nokey ? ' <span class="sv-kind sv-nokey" title="No vault key in this browser — cannot connect; delete to clean up">no key</span>' : '';
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
-      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${_entryUsesKey(c)?' (key)':''}</div></div>`+
+      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${suffix}${nokeyTag}</div></div>`+
       `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {
     if(e.target.classList.contains('del')){
-      list.splice(parseInt(e.target.getAttribute('data-idx')),1);saveSaved(list);renderSaved();return;
+      let idx = parseInt(e.target.getAttribute('data-idx'));
+      let c = list[idx];
+      if (c && c.conn_id) {
+        // Vault-backed: best-effort tell the server to drop its blob.
+        // We don't await — local removal proceeds even if the server
+        // is unreachable.
+        _bulkDeleteVaultEntry(c).catch(() => {});
+      }
+      list.splice(idx, 1); saveSaved(list); renderSaved();
+      return;
     }
     let row=e.target.closest('.sv'); if(!row) return;
     let idx=parseInt(row.getAttribute('data-idx')); if(isNaN(idx)) return;
-    connectSaved(list[idx]);
+    let c = list[idx];
+    if (c && c.conn_id && !_idbHasKeyCache) {
+      // No-key state: the row's click target is delete, not connect.
+      _bulkDeleteVaultEntry(c).catch(() => {});
+      list.splice(idx, 1); saveSaved(list); renderSaved();
+      return;
+    }
+    connectSaved(c);
   };
+}
+
+// Fire-and-forget DELETE /api/save for a vault-backed entry. The PHP
+// proxy translates `?action=save_delete` POST into a backend DELETE.
+async function _bulkDeleteVaultEntry(c) {
+  if (!c || !c.conn_id) return;
+  let vault_id;
+  try { vault_id = await ensureVaultId(); }
+  catch (e) {
+    // If IDB itself is broken we can't recover vault_id; bail silently
+    // — local list removal still proceeds in the caller.
+    return;
+  }
+  let q = '&vault_id=' + encodeURIComponent(vault_id) +
+          '&conn_id='  + encodeURIComponent(c.conn_id);
+  // body:{} forces POST through api(); empty body is fine, PHP proxy
+  // routes by ?action= regardless of body content.
+  await api('save_delete', {query: q, body: {}});
 }
 
 async function connectSaved(c) {
@@ -2289,11 +2347,14 @@ function doConnect() {
 
 // ── Server config ───────────────────────────────────────────────────
 function loadServerConfig() {
-  api('config').then(cfg => {
+  api('config').then(async cfg => {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
     _applyVaultEnabledClass();
     _maybeShowLegacyBanner();
+    // Pre-cache the IDB key presence so the first renderSaved doesn't
+    // flash all vault-backed rows as no-key while we wait on IDB.
+    await _refreshIdbHasKey();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to

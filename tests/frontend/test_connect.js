@@ -93,6 +93,11 @@ const EXPOSE = `
     set: v => { currentConnectRun = v; },
     configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
+  Object.defineProperty(window, '_idbHasKeyCache', {
+    get: () => _idbHasKeyCache,
+    set: v => { _idbHasKeyCache = v; },
+    configurable: true,
+  });
 })();`;
 
 // jsdom v24 ships `crypto.getRandomValues` but not `crypto.subtle`, and it
@@ -1375,6 +1380,105 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
   ok(/^[A-Z2-7]{26}$/.test(idB), 'B vault_id well-formed');
   ok(idA !== idB, 'path-scoped vault_ids differ (got both ' + idA + ')');
   domA.window.close(); domB.window.close();
+});
+
+// =====================================================================
+// Vault: no-key grayed state for orphan saved cards
+// =====================================================================
+
+test('no-key state: rendered when IDB lacks K but localStorage row survives', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Simulate the post-Safari-ITP / cleared-site-data scenario: vault
+  // row in localStorage, no K in IDB. The cache defaults to false on
+  // boot until _refreshIdbHasKey races in; loadServerConfig in mkEnv
+  // already called it and it observed "no K" → false. So we can render
+  // directly.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Orphan', conn_id: 'O'.repeat(26), host: 'o', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  win.eval('renderSaved()');
+  const row = win.document.querySelector('.sv');
+  ok(row && row.classList.contains('nokey'),
+     'row has .nokey class');
+  ok(row.textContent.indexOf('no key') !== -1,
+     'no-key tag shown in row text');
+  cleanup(env);
+});
+
+test('no-key state: click on no-key row deletes (no /api/connect)', async () => {
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'save_delete', response: {}, once: true},
+    {action: 'connect', response: () => { connectCalls++; return {alive: false}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Force ensureVaultId to materialise a vault_id so the bulk-delete
+  // path can ship a meaningful query string.
+  const realVaultId = await win.eval('ensureVaultId()');
+  // Wipe K and re-sync the cache — simulates a Safari ITP eviction
+  // where vault_id survives but K does not.
+  await win.eval('_idbDelete("K")');
+  win.eval('_vaultKeyCache = null;');
+  await win.eval('_refreshIdbHasKey()');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Orphan', conn_id: 'O'.repeat(26), host: 'o', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  win.eval('renderSaved()');
+  // Intercept fetch to capture URL too — the plan matcher only sees
+  // action, but we need the query string.
+  const originalFetch = win.fetch;
+  let capturedUrl = null;
+  win.fetch = async (url, init) => {
+    if (url.indexOf('save_delete') !== -1) capturedUrl = url;
+    return originalFetch(url, init);
+  };
+  // Click the row (NOT the delete button) — no-key routes to delete.
+  win.document.querySelector('.sv').click();
+  await sleep(60);
+  ok(connectCalls === 0, '/api/connect was NOT called; got ' + connectCalls);
+  ok(capturedUrl && capturedUrl.indexOf('vault_id=' + realVaultId) !== -1,
+     'save_delete URL carried the IDB-resident vault_id; got ' + capturedUrl);
+  ok(capturedUrl && capturedUrl.indexOf('conn_id=' + 'O'.repeat(26)) !== -1,
+     'save_delete URL carried the conn_id; got ' + capturedUrl);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(list.length === 0, 'row removed from localStorage');
+  cleanup(env);
+});
+
+test('no-key state: hasKey cache is true after a fresh save → not grayed', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-nk1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: {}, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Force the save path so ensureVaultKey runs and sets the cache.
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true;
+  $(win, 'iName').value = 'Live';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  // _idbHasKeyCache should be true now.
+  const cache = win.eval('_idbHasKeyCache');
+  ok(cache === true, '_idbHasKeyCache true after save; got ' + cache);
+  // Re-render and check the row is NOT grayed.
+  win.eval('renderSaved()');
+  const row = win.document.querySelector('.sv');
+  ok(row && !row.classList.contains('nokey'),
+     'live vault row not marked .nokey');
+  cleanup(env);
 });
 
 // =====================================================================
