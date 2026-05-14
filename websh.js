@@ -673,6 +673,28 @@ function paneRecord(p) {
 
 function buildConnectBody(rec, termCols, termRows) {
   // Translate a pane record into the shape server.py /api/connect wants.
+  // Saved-variant: ship the vault tuple; server pulls host/username
+  // from the stored record, decrypts the blob with vault_key, and
+  // proceeds with ssh. Cols/rows/persistent/slot_id/tmux options still
+  // flow through (server-side they apply identically to manual mode).
+  if (rec.vault_id && rec.conn_id && rec.vault_key) {
+    let b = {
+      vault_id: rec.vault_id,
+      conn_id:  rec.conn_id,
+      vault_key: rec.vault_key,
+      cols: termCols || rec.cols || 80,
+      rows: termRows || rec.rows || 24,
+    };
+    if (rec.persistent) {
+      b.persistent = true;
+      b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
+      b.tmux_set_clipboard = !!settings.tmuxClipboard;
+      let hl = parseInt(settings.tmuxHistory, 10);
+      if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
+    }
+    if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
+    return b;
+  }
   let b = {
     username: rec.user,
     cols: termCols || rec.cols || 80,
@@ -1494,7 +1516,10 @@ function runConnect(opts) {
 
 function realConnect(opts, run) {
   // Build connect body from opts (no pane yet, so cols/rows default to
-  // 80x24 and we /api/resize once the pane is materialised).
+  // 80x24 and we /api/resize once the pane is materialised). When the
+  // saved-variant fields are present, the body builder ships them
+  // instead of host/password/etc — the server resolves the real
+  // credentials from the vault.
   let rec = {
     label: opts.label || '',
     host: opts.host || '',
@@ -1505,6 +1530,9 @@ function realConnect(opts, run) {
     password: opts.password || '',
     key: opts.key || '',
     key_pass: opts.keyPass || '',
+    vault_id: opts.vault_id || null,
+    conn_id:  opts.conn_id  || null,
+    vault_key: opts.vault_key || null,
     persistent: !!opts.persistent,
     slot_id: opts.slotId || (opts.persistent
       ? slotIdFor(opts.user, opts.host, opts.port) : null),
@@ -1526,6 +1554,21 @@ function realConnect(opts, run) {
       }
       if (/too many (connection attempts|active sessions|background sessions)/i.test(r.error)) {
         throw { kind: 'rate_limited', msg: r.error };
+      }
+      // Saved-variant /api/connect surfaces vault-specific errors:
+      //   404 + "saved entry not found"
+      //   400 + {error: "vault_decrypt_failed"}
+      //   501 + "credential vault unavailable…"
+      // Status code is opaque to api() (always parses JSON), so we
+      // pattern-match the strings.
+      if (/saved entry not found/i.test(r.error)) {
+        throw { kind: 'vault_not_found', msg: r.error };
+      }
+      if (r.error === 'vault_decrypt_failed') {
+        throw { kind: 'vault_decrypt', msg: r.error };
+      }
+      if (/credential vault unavailable/i.test(r.error)) {
+        throw { kind: 'vault_off', msg: r.error };
       }
       throw { kind: 'error', msg: r.error };
     }
@@ -1550,9 +1593,13 @@ function finalizeSuccess(opts, result, run) {
   p.user = opts.user || '';
   p.connection = opts.connection || null;
   p.auth = opts.auth || (opts.key ? 'key' : 'pw');
+  // Plaintext SSH credentials live on the pane only for manual mode.
+  // Saved-variant panes carry conn_id; F5 restore (Task 6) re-derives
+  // vault_key from IDB rather than re-using a stale in-memory copy.
   p.password = opts.password || '';
   p.key = opts.key || '';
   p.keyPass = opts.keyPass || '';
+  p.conn_id = opts.conn_id || null;
   p.persistent = !!opts.persistent;
   p.slotId = result.slot_id || opts.slotId || null;
   p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
@@ -1660,6 +1707,23 @@ function showConnectStatus(kind, ctx) {
   } else if (kind === 'rate_limited') {
     title.textContent = 'Too many connection attempts';
     sub.textContent = 'Please wait and try again shortly.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+    btn.textContent = 'OK';
+  } else if (kind === 'vault_not_found') {
+    title.textContent = 'Saved entry missing on server';
+    sub.textContent = 'This card was deleted or the server vault was cleared.';
+    status.textContent = 'Delete this card from the saved list, then re-enter to re-save.';
+    status.className = 'tm-status err';
+    btn.textContent = 'OK';
+  } else if (kind === 'vault_decrypt') {
+    title.textContent = 'Cannot decrypt this card';
+    sub.textContent = 'The vault key in this browser does not match the stored blob.';
+    status.textContent = 'Re-enter the credentials to re-save this connection.';
+    status.className = 'tm-status err';
+    btn.textContent = 'OK';
+  } else if (kind === 'vault_off') {
+    title.textContent = 'Vault is disabled on the server';
+    sub.textContent = 'The server is not accepting saved credentials right now.';
     if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
     btn.textContent = 'OK';
   } else {
@@ -1965,15 +2029,44 @@ function renderSaved() {
   };
 }
 
-function connectSaved(c) {
+async function connectSaved(c) {
   hideErr();
-  let label = c.name||(c.user+'@'+c.host);
+  let label = c.name || (c.user + '@' + c.host);
+  // New-shape rows carry a conn_id and use the saved-variant
+  // /api/connect — the server fetches host/port/username from the
+  // vault record, browser supplies vault_key. Legacy rows (still
+  // carrying c.pass / c.key in localStorage from before the vault
+  // shipped) keep the old manual-mode flow so they continue to work
+  // until the user acks the legacy banner or re-saves.
+  if (c.conn_id) {
+    let vault_key, vault_id;
+    try {
+      vault_id = await ensureVaultId();
+      vault_key = await exportRawVaultKey();
+    } catch (e) {
+      showToast('No vault key in this browser — re-enter to re-save this connection.', 'err');
+      return;
+    }
+    runConnect({
+      label: label,
+      vault_id: vault_id,
+      conn_id: c.conn_id,
+      vault_key: vault_key,
+      // host/port/user are display hints for the connect popup; the
+      // server derives the real values from the stored vault record.
+      host: c.host, port: c.port || 22, user: c.user,
+      persistent: c.persistent !== false,
+      slotId: null,
+      tmuxCmd: c.tmux_cmd || 'tmux',
+    });
+    return;
+  }
   // Auto-match legacy entries (saved before we tagged with connection name)
   // to a config entry by host:port so they still work under restrict_hosts.
   let connName = c.connection;
-  if(!connName && serverConfig && serverConfig.connections) {
-    let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
-    if(m) connName = m.name;
+  if (!connName && serverConfig && serverConfig.connections) {
+    let m = serverConfig.connections.find(e => e.host === c.host && e.port === c.port);
+    if (m) connName = m.name;
   }
   runConnect({
     label: label,

@@ -1378,6 +1378,131 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: saved-card click → saved-variant /api/connect
+// =====================================================================
+
+async function _seedVaultCard(win) {
+  // Helper: force ensureVaultId / ensureVaultKey to materialise so the
+  // saved-card click can export a real vault_key. Returns {vault_id,
+  // vault_key, conn_id} to compare wire bodies against.
+  const vault_id = await win.eval('ensureVaultId()');
+  const vault_key = await win.eval('exportRawVaultKey()');
+  const conn_id = 'S'.repeat(26);
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Prod', conn_id, host: 'p.example.com', port: 22,
+     user: 'deploy', auth: 'pw', persistent: false}]));
+  win.eval('renderSaved()');
+  return {vault_id, vault_key, conn_id};
+}
+
+test('saved-card connect: click → saved-variant body to /api/connect', async () => {
+  let connectBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connectBody = body;
+      return {session_id: 'sid-sv1', alive: true};
+    }, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const {vault_id, vault_key, conn_id} = await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  // Give the async ensureVaultId/exportRawVaultKey chain time to settle
+  // (it was already warmed by _seedVaultCard, so this is mostly the
+  // fetch interceptor's 1 ms turnaround).
+  await sleep(80);
+  ok(connectBody, '/api/connect was called');
+  ok(connectBody.vault_id === vault_id, 'vault_id matches IDB-resident id');
+  ok(connectBody.conn_id === conn_id, 'conn_id matches saved card');
+  ok(connectBody.vault_key === vault_key, 'vault_key is raw export of K');
+  ok(Buffer.from(connectBody.vault_key, 'base64').length === 32,
+     'vault_key is 32 bytes base64');
+  ok(!connectBody.host && !connectBody.username && !connectBody.password &&
+     !connectBody.key && !connectBody.connection,
+     'no host/username/password/key/connection — server pulls from vault');
+  cleanup(env);
+});
+
+test('saved-card connect: legacy entry (no conn_id) still uses manual body', async () => {
+  let connectBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connectBody = body;
+      return {session_id: 'sid-sv2', alive: true};
+    }, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Pre-vault localStorage row — keep working until user re-saves.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: 'old.example.com', port: 22,
+     user: 'u', pass: 'hunter2'}]));
+  win.eval('renderSaved()');
+  win.document.querySelector('.sv').click();
+  await sleep(80);
+  ok(connectBody, '/api/connect was called');
+  ok(connectBody.host === 'old.example.com', 'manual host on body');
+  ok(connectBody.username === 'u', 'manual username on body');
+  ok(connectBody.password === 'hunter2', 'manual password on body');
+  ok(!connectBody.vault_id && !connectBody.conn_id && !connectBody.vault_key,
+     'no vault fields for legacy entry');
+  cleanup(env);
+});
+
+test('saved-card connect: 404 saved-entry-not-found surfaces vault_not_found popup', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {error: 'saved entry not found'}, once: true},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(80);
+  ok(!hidden($(win, 'tmuxOv')), 'connect-status popup visible');
+  ok($(win, 'tmTitle').textContent === 'Saved entry missing on server',
+     'vault_not_found title; got=' + $(win, 'tmTitle').textContent);
+  cleanup(env);
+});
+
+test('saved-card connect: 400 vault_decrypt_failed surfaces vault_decrypt popup', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {error: 'vault_decrypt_failed'}, once: true},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(80);
+  ok($(win, 'tmTitle').textContent === 'Cannot decrypt this card',
+     'vault_decrypt title; got=' + $(win, 'tmTitle').textContent);
+  cleanup(env);
+});
+
+test('saved-card connect: 501 credential-vault-unavailable surfaces vault_off popup', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {error: 'credential vault unavailable — see server log'},
+     once: true},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(80);
+  ok($(win, 'tmTitle').textContent === 'Vault is disabled on the server',
+     'vault_off title; got=' + $(win, 'tmTitle').textContent);
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: save flow — encrypt + POST /api/save after stable connect
 // =====================================================================
 
