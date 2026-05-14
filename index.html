@@ -336,9 +336,32 @@
       </div>
     </div>
     <div class="opt-hint">How many lines of output to keep above the screen. More lines = longer history to scroll through.</div>
+    <div class="opt-section-hd vault-only">Credential vault</div>
+    <div class="opt-row vault-only">
+      <label>Saved credentials</label>
+      <div class="opt-ctl">
+        <button id="signOutBtn" class="opt-btn" type="button" onclick="openSignOutModal()">Sign out of this browser</button>
+      </div>
+    </div>
+    <div class="opt-hint vault-only">Permanently deletes every saved credential in this vault from the server and clears the key in this browser. Other browsers you've used keep their own copies. There is no recovery.</div>
     <div class="opt-actions">
       <button class="opt-btn" onclick="resetOptions()">Reset to defaults</button>
       <button class="opt-btn primary" onclick="closeOptions()">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sign-out confirmation modal — typed-DELETE gate -->
+<div id="signOutModal" class="ov h" onclick="if(event.target===this)closeSignOutModal()">
+  <div class="tm-panel">
+    <h2>Sign out of this browser?</h2>
+    <div class="tm-sub">This permanently deletes every saved credential in this vault from the server and clears the key in this browser. Other browsers you've used keep their own copies. There is no recovery.</div>
+    <div class="tm-sub" style="margin-top:12px">Type <strong>DELETE</strong> below to confirm:</div>
+    <input id="signOutInput" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" style="margin-top:8px;width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:13px;outline:none">
+    <div id="signOutStatus" class="tm-status"></div>
+    <div class="tm-row">
+      <button class="btn" onclick="closeSignOutModal()">Cancel</button>
+      <button id="signOutConfirm" class="btn btn-d" disabled onclick="confirmSignOut()">Sign out</button>
     </div>
   </div>
 </div>

@@ -3224,6 +3224,61 @@ function openOptions(){
   $('ovOpt').classList.remove('h');
 }
 function closeOptions(){ $('ovOpt').classList.add('h'); }
+
+// ── Sign out of this browser ────────────────────────────────────────
+// Permanently deletes every saved credential in this vault from the
+// server and clears the key in this browser. Typed-DELETE confirm
+// gate because the action is irreversible.
+function openSignOutModal() {
+  let input = $('signOutInput');
+  let confirm = $('signOutConfirm');
+  let status = $('signOutStatus');
+  if (input) input.value = '';
+  if (confirm) confirm.disabled = true;
+  if (status) { status.textContent = ''; status.className = 'tm-status'; }
+  if (input && !input._wired) {
+    input._wired = true;
+    input.addEventListener('input', () => {
+      let ok = input.value === 'DELETE';
+      if (confirm) confirm.disabled = !ok;
+    });
+  }
+  $('signOutModal').classList.remove('h');
+  setTimeout(() => { try { input && input.focus(); } catch(e){} }, 0);
+}
+
+function closeSignOutModal() {
+  $('signOutModal').classList.add('h');
+}
+
+async function confirmSignOut() {
+  let confirm = $('signOutConfirm');
+  let status = $('signOutStatus');
+  if (confirm) confirm.disabled = true;
+  if (status) { status.textContent = 'Deleting saved credentials…'; status.className = 'tm-status'; }
+  // Best-effort: tell the server to drop each blob in this vault. We
+  // continue on per-row failure (404/network) — the local wipe still
+  // happens, and the orphaned server-side blob (if any) is just a
+  // namespace squat with no plaintext leak.
+  let vault_id = null;
+  try { vault_id = await ensureVaultId(); } catch (e) {}
+  let list = loadSaved();
+  for (let c of list) {
+    if (!vault_id || !c.conn_id) continue;
+    let q = '&vault_id=' + encodeURIComponent(vault_id) +
+            '&conn_id='  + encodeURIComponent(c.conn_id);
+    try { await api('save_delete', {query: q, body: {}}); } catch (e) {}
+  }
+  // Local wipe: IDB (K + vault_id), saved-card list, pane-secrets.
+  try { await _idbDelete(IDB_K_KEY); } catch (e) {}
+  try { await _idbDelete(IDB_VAULT_ID_KEY); } catch (e) {}
+  saveSaved([]);
+  try { sessionStorage.removeItem(storageKey(SS_PANE_SECRETS_KEY)); } catch (e) {}
+  invalidateVaultCache();
+  closeSignOutModal();
+  renderSaved();
+  showToast('Signed out. All saved credentials in this browser have been removed.', '');
+}
 function resetOptions(){
   settings = { ...DEFAULT_SETTINGS };
   fontSize = settings.fontSize;

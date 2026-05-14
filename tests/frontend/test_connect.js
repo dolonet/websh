@@ -1383,6 +1383,107 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: Sign out of this browser
+// =====================================================================
+
+test('sign out: typed-DELETE gate enables confirm button', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.openSignOutModal();
+  ok(!hidden($(win, 'signOutModal')), 'modal visible');
+  ok($(win, 'signOutConfirm').disabled === true, 'confirm disabled initially');
+  // Type a wrong word — still disabled.
+  $(win, 'signOutInput').value = 'delete';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  ok($(win, 'signOutConfirm').disabled === true, 'lowercase delete keeps disabled');
+  // Type the right word — enabled.
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  ok($(win, 'signOutConfirm').disabled === false, 'DELETE enables confirm');
+  win.closeSignOutModal();
+  cleanup(env);
+});
+
+test('sign out: confirm wipes everything (server + IDB + localStorage + sessionStorage)', async () => {
+  const deletes = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'save_delete', response: (body) => { return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed: vault_id + K in IDB (via a save round-trip), two saved cards,
+  // some sessionStorage pane secrets, then sign out.
+  const realVaultId = await win.eval('ensureVaultId()');
+  await win.eval('ensureVaultKey()');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'A', conn_id: 'A'.repeat(26), host: 'a', port: 22, user: 'u',
+     auth: 'pw', persistent: false},
+    {name: 'B', conn_id: 'B'.repeat(26), host: 'b', port: 22, user: 'u',
+     auth: 'pw', persistent: false}]));
+  win.sessionStorage.setItem('websh_panes_session',
+    JSON.stringify({pX: {password: 'manual-pw'}}));
+  // Capture every save_delete URL.
+  const originalFetch = win.fetch;
+  win.fetch = async (url, init) => {
+    if (url.indexOf('save_delete') !== -1) deletes.push(url);
+    return originalFetch(url, init);
+  };
+  win.openSignOutModal();
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  await win.confirmSignOut();
+  // Two DELETEs to the server (one per card), each with the right vault.
+  ok(deletes.length === 2, 'two server DELETEs; got ' + deletes.length);
+  ok(deletes.every(u => u.indexOf('vault_id=' + realVaultId) !== -1),
+     'every DELETE used the correct vault_id');
+  // localStorage saved list emptied.
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(Array.isArray(list) && list.length === 0,
+     'saved-card list emptied; got ' + JSON.stringify(list));
+  // sessionStorage pane-secrets removed.
+  ok(win.sessionStorage.getItem('websh_panes_session') === null,
+     'pane-secrets removed from sessionStorage');
+  // IDB K + vault_id gone.
+  const idbK = await win.eval('_idbGet("K")');
+  ok(!idbK, 'IDB K wiped; got ' + idbK);
+  const idbV = await win.eval('_idbGet("vault_id")');
+  ok(!idbV, 'IDB vault_id wiped; got ' + idbV);
+  // In-memory caches invalidated; renderSaved would now show empty,
+  // and any subsequent ensureVaultId/Key would mint fresh values.
+  const cache = win.eval('_idbHasKeyCache');
+  ok(cache === false, '_idbHasKeyCache invalidated; got ' + cache);
+  // Modal hidden.
+  ok(hidden($(win, 'signOutModal')), 'sign-out modal closed');
+  cleanup(env);
+});
+
+test('sign out: tolerates server-side failures (local wipe still happens)', async () => {
+  let attempts = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'save_delete', response: () => { attempts++; throw new Error('boom'); }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await win.eval('ensureVaultId()');
+  await win.eval('ensureVaultKey()');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'A', conn_id: 'A'.repeat(26), host: 'a', port: 22, user: 'u',
+     auth: 'pw', persistent: false}]));
+  win.openSignOutModal();
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  await win.confirmSignOut();
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(list.length === 0, 'local list wiped despite server failure');
+  const idbK = await win.eval('_idbGet("K")');
+  ok(!idbK, 'IDB K wiped despite server failure');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: no-key grayed state for orphan saved cards
 // =====================================================================
 
