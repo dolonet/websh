@@ -992,10 +992,24 @@ async function commitVaultSave(entry) {
   entry.conn_id = conn_id;
   // De-dup by conn_id (and by name, for the pre-vault upgrade path
   // where an old plaintext row with the same label is still around).
-  let list = loadSaved().filter(c => c.conn_id !== conn_id && c.name !== entry.name);
+  // Same-name re-save ("I'm updating the password") drops the previous
+  // row from localStorage; its server-side blob would linger under the
+  // old conn_id. Capture those old conn_ids first and fire-and-forget
+  // a server-side reap so they don't accumulate in websh.creds.json.
+  let allRows = loadSaved();
+  let droppedConns = allRows
+    .filter(c => c.name === entry.name && c.conn_id && c.conn_id !== conn_id)
+    .map(c => c.conn_id);
+  let list = allRows.filter(c => c.conn_id !== conn_id && c.name !== entry.name);
   list.unshift(entry);
   saveSaved(list);
   renderSaved();
+  // Fire-and-forget: the new entry is already locally committed; a
+  // transient server hiccup on cleanup shouldn't block the save flow.
+  // _bulkDeleteVaultEntry resolves vault_id from IDB and IfPresent-guards
+  // the network call (no fresh vault_id minted in a sign-out state).
+  droppedConns.forEach(cid =>
+    _bulkDeleteVaultEntry({conn_id: cid}).catch(() => {}));
 }
 
 // ── Output transport ────────────────────────────────────────────────

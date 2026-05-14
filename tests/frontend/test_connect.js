@@ -2712,6 +2712,92 @@ test('vault save: vault_enabled=false leaves no pendingSave (even if iSave force
   cleanup(env);
 });
 
+test('vault save: same-name re-save reaps prior conn_id from server', async () => {
+  // Saving twice under the same name (legit "updating the password"
+  // workflow) drops the old localStorage row. Without this fix the old
+  // server-side blob lingers under the previous conn_id — quiet
+  // accumulation per legitimate re-save. We assert that the OLD conn_id
+  // is reaped via /api/save_delete after the second /api/save lands.
+  const saveBodies = [];
+  const deleteUrls = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-resave', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: (body) => { saveBodies.push(body); return {}; }},
+    {action: 'save_delete', response: {}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Capture every save_delete URL — the conn_id of the reaped blob
+  // travels in the query string (same shape as the sign-out tests).
+  const originalFetch = win.fetch;
+  win.fetch = async (url, init) => {
+    if (url.indexOf('save_delete') !== -1) deleteUrls.push(url);
+    return originalFetch(url, init);
+  };
+  // First save: name "Prod", first conn_id is minted at commit time.
+  $(win, 'iH').value = 'prod.ex'; $(win, 'iU').value = 'deploy';
+  $(win, 'iPw').value = 'old-pw'; $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Prod';
+  win.doConnect();
+  await sleep(120);
+  let p1 = paneList(win)[0];
+  p1.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p1, {data: '', alive: true});
+  await sleep(80);
+  ok(saveBodies.length === 1, 'first /api/save POSTed; got ' + saveBodies.length);
+  const firstConnId = saveBodies[0].conn_id;
+  const realVaultId = saveBodies[0].vault_id;
+  ok(/^[A-Z2-7]{26}$/.test(firstConnId), 'first conn_id well-formed; got ' + firstConnId);
+  // No save_delete yet — this was the first save.
+  ok(deleteUrls.length === 0, 'no save_delete after first save; got ' + deleteUrls.length);
+  // Close the pane so we can run a clean second doConnect under the same
+  // name with different credentials.
+  win.closePane(p1.id);
+  await sleep(60);
+  // Second save: same name "Prod", different password. The new entry
+  // mints a fresh conn_id; the old one must be reaped from the server.
+  $(win, 'iH').value = 'prod.ex'; $(win, 'iU').value = 'deploy';
+  $(win, 'iPw').value = 'new-pw'; $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Prod';
+  win.doConnect();
+  await sleep(120);
+  let p2 = paneList(win)[0];
+  p2.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p2, {data: '', alive: true});
+  // commitVaultSave runs the new local write synchronously after the
+  // POST resolves; the fire-and-forget _bulkDeleteVaultEntry kicks off
+  // in the same tick. Give the IDB resolve + fetch a moment to land.
+  await sleep(120);
+  ok(saveBodies.length === 2, 'second /api/save POSTed; got ' + saveBodies.length);
+  const secondConnId = saveBodies[1].conn_id;
+  ok(/^[A-Z2-7]{26}$/.test(secondConnId), 'second conn_id well-formed; got ' + secondConnId);
+  ok(secondConnId !== firstConnId, 'second conn_id differs from first');
+  // Exactly one save_delete, against the FIRST conn_id (not the new one),
+  // carrying the right vault_id.
+  ok(deleteUrls.length === 1,
+     'exactly one save_delete fired after re-save; got ' + deleteUrls.length +
+     ' (' + JSON.stringify(deleteUrls) + ')');
+  const reapUrl = deleteUrls[0];
+  ok(reapUrl.indexOf('conn_id=' + firstConnId) !== -1,
+     'save_delete carried the OLD conn_id; url=' + reapUrl);
+  ok(reapUrl.indexOf('conn_id=' + secondConnId) === -1,
+     'save_delete did NOT carry the new conn_id; url=' + reapUrl);
+  ok(reapUrl.indexOf('vault_id=' + realVaultId) !== -1,
+     'save_delete carried the vault_id; url=' + reapUrl);
+  // localStorage: exactly one "Prod" row, carrying the new conn_id.
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  const prodRows = list.filter(c => c.name === 'Prod');
+  ok(prodRows.length === 1,
+     'exactly one Prod row in localStorage; got ' + prodRows.length +
+     ' (' + JSON.stringify(list) + ')');
+  ok(prodRows[0].conn_id === secondConnId,
+     'surviving Prod row carries the NEW conn_id; got ' + prodRows[0].conn_id);
+  cleanup(env);
+});
+
 // =====================================================================
 // Vault: saved-card list new shape (no secrets in localStorage)
 // =====================================================================
