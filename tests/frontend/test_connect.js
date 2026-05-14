@@ -1383,6 +1383,124 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: Safari ITP note + navigator.storage.persist()
+// =====================================================================
+
+test('first save: calls navigator.storage.persist() when available', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-fs1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: {}, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Inject a fake navigator.storage.persist that records the call.
+  let persistCalls = 0;
+  Object.defineProperty(win.navigator, 'storage', {
+    value: { persist: async () => { persistCalls++; return true; } },
+    configurable: true,
+  });
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'First';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(120);
+  ok(persistCalls === 1, 'persist() called exactly once; got ' + persistCalls);
+  cleanup(env);
+});
+
+test('first save on Safari: shows ITP note toast', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-fs2', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: {}, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Override userAgent to a Safari string. navigator.userAgent is a
+  // getter; defineProperty lets us swap it out.
+  Object.defineProperty(win.navigator, 'userAgent', {
+    value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    configurable: true,
+  });
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'SafariSave';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(120);
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  const itpToast = Array.from(toasts).find(t =>
+    t.textContent.indexOf('Safari') !== -1 && t.textContent.indexOf('7 days') !== -1);
+  ok(itpToast, 'Safari ITP toast shown on first save');
+  cleanup(env);
+});
+
+test('subsequent saves: no Safari toast, persist not re-requested', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'x', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: {}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  let persistCalls = 0;
+  Object.defineProperty(win.navigator, 'storage', {
+    value: { persist: async () => { persistCalls++; return true; } },
+    configurable: true,
+  });
+  Object.defineProperty(win.navigator, 'userAgent', {
+    value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    configurable: true,
+  });
+  // First save mints the vault → expect toast + persist call.
+  $(win, 'iH').value = 'h1'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'S1';
+  win.doConnect();
+  await sleep(120);
+  let p1 = paneList(win)[0];
+  p1.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p1, {data: '', alive: true});
+  await sleep(120);
+  ok(persistCalls === 1, 'first save → persist called once; got ' + persistCalls);
+  // Clear the toast host so we can detect a NEW toast.
+  $(win, 'toastHost').innerHTML = '';
+  // Close pane, then trigger another save. _vaultFirstSave should NOT
+  // re-arm because vault_id already exists.
+  win.closePane(p1.id);
+  await sleep(60);
+  $(win, 'iH').value = 'h2'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'S2';
+  win.doConnect();
+  await sleep(120);
+  let p2 = paneList(win)[0];
+  p2.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p2, {data: '', alive: true});
+  await sleep(120);
+  ok(persistCalls === 1, 'second save did NOT re-call persist; got ' + persistCalls);
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  const itpToast = Array.from(toasts).find(t =>
+    t.textContent.indexOf('Safari') !== -1 && t.textContent.indexOf('7 days') !== -1);
+  ok(!itpToast, 'Safari toast NOT re-shown on subsequent saves');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: multi-tab sync (storage events + BroadcastChannel)
 // =====================================================================
 

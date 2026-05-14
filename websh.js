@@ -2071,6 +2071,31 @@ async function decryptCredentials(iv_b64, ct_b64, conn_id) {
 // vault_id; the server validates with the same regex.
 function generateConnId() { return _generateBase32Id(); }
 
+// Heuristic Safari detection — useragent-based, intentionally
+// pessimistic about edge cases (Chrome on iOS reports as Safari and
+// gets the same IDB constraint, so the heuristic flags it too).
+function _isSafari() {
+  let ua = navigator.userAgent || '';
+  return /^((?!chrome|chromium|android).)*safari/i.test(ua);
+}
+
+// One-shot hook fired by commitPendingSave the first time a vault_id
+// gets generated. Asks the browser to retain IndexedDB across storage
+// pressure (Firefox shows a permission prompt; Chromium is silent;
+// Safari quietly ignores it outside an installed PWA — hence the
+// one-line note for Safari users so they understand why their saved
+// cards may disappear after a week.
+async function _onFirstVaultSave() {
+  if (navigator.storage && typeof navigator.storage.persist === 'function') {
+    try { await navigator.storage.persist(); } catch (e) {}
+  }
+  if (_isSafari()) {
+    showToast('On Safari, saved credentials are cleared after 7 days ' +
+              'of inactivity unless you add this site to your home screen.',
+              'warn');
+  }
+}
+
 // Cross-tab signalling. localStorage 'storage' events cover the
 // saved-card list (any tab editing websh_connections fires in every
 // other tab). IDB / sign-out are out-of-band, so we also open a
