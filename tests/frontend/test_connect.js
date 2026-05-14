@@ -1378,6 +1378,121 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: save flow — encrypt + POST /api/save after stable connect
+// =====================================================================
+
+test('vault save: doConnect with iSave → /api/save POST after stable window', async () => {
+  let saveBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-vs1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: (body) => { saveBody = body; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.1.2.3';
+  $(win, 'iU').value = 'deploy';
+  $(win, 'iPw').value = 'hunter2';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true;
+  $(win, 'iName').value = 'My Prod';
+  win.doConnect();
+  // Let the connect resolve and materialize the pane.
+  await sleep(120);
+  const ps = paneList(win);
+  ok(ps.length === 1, 'pane materialized after connect; got ' + ps.length);
+  const p = ps[0];
+  ok(p.pendingSave, 'pendingSave set on pane');
+  ok(p.pendingSave._pendingSecrets && p.pendingSave._pendingSecrets.password === 'hunter2',
+     '_pendingSecrets carry the password');
+  ok(!p.pendingSave.pass && !p.pendingSave.key,
+     'pendingSave has no legacy pass/key fields');
+  // Force the stable-window threshold by backdating connectedAt; then
+  // synthesize a healthy alive=true output frame to trigger the commit.
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  // Wait for the async encrypt + POST round-trip.
+  await sleep(80);
+  ok(saveBody, '/api/save was POSTed; got saveBody=' + JSON.stringify(saveBody));
+  ok(/^[A-Z2-7]{26}$/.test(saveBody.vault_id), 'vault_id well-formed; got ' + saveBody.vault_id);
+  ok(/^[A-Z2-7]{26}$/.test(saveBody.conn_id), 'conn_id well-formed; got ' + saveBody.conn_id);
+  ok(saveBody.host === '10.1.2.3', 'host stored cleartext');
+  ok(saveBody.username === 'deploy', 'username stored cleartext');
+  ok(saveBody.port === 22, 'port surfaced');
+  ok(typeof saveBody.iv === 'string' && Buffer.from(saveBody.iv, 'base64').length === 12,
+     'iv is 12 bytes base64');
+  ok(typeof saveBody.ct === 'string' && Buffer.from(saveBody.ct, 'base64').length >= 17,
+     'ct is at least 17 bytes (GCM tag minimum)');
+  ok(!('password' in saveBody) && !('key' in saveBody) && !('vault_key' in saveBody),
+     'no secret material in the save body');
+  // localStorage should now have the saved card without secrets.
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  ok(list.length === 1, 'one saved card in localStorage');
+  ok(list[0].conn_id === saveBody.conn_id, 'conn_id matches what was POSTed');
+  ok(!list[0].pass && !list[0].key && !list[0]._pendingSecrets,
+     'no secrets / _pendingSecrets in localStorage entry');
+  ok(list[0].name === 'My Prod' && list[0].auth === 'pw',
+     'name and auth survived');
+  cleanup(env);
+});
+
+test('vault save: failure surfaces toast, localStorage untouched, session lives', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-vs2', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: {error: 'simulated_failure'}, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h2'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true;
+  $(win, 'iName').value = 'Doomed';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  ok(list.length === 0, 'save failure does NOT write to localStorage; list len=' + list.length);
+  // Toast presence is the user-visible signal. The host element is in DOM.
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length >= 1, 'a toast was raised for the save failure; count=' + toasts.length);
+  ok(p.sid === 'sid-vs2', 'live session retained sid (connect not killed)');
+  cleanup(env);
+});
+
+test('vault save: vault_enabled=false leaves no pendingSave (even if iSave forced)', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: false}},
+    {action: 'connect', response: {session_id: 'sid-vs3', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h3'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  // Even if someone (bookmarklet, extension) toggles the hidden checkbox,
+  // doConnect must refuse to build the save entry without server backing.
+  $(win, 'iSave').checked = true;
+  $(win, 'iName').value = 'Hostile';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(!p.pendingSave, 'no pendingSave when vault_enabled=false');
+  // No /api/save action should have been called.
+  const saveLog = env.log.filter(e => e.action === 'save');
+  ok(saveLog.length === 0, '/api/save never called when vault disabled');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: saved-card list new shape (no secrets in localStorage)
 // =====================================================================
 

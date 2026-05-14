@@ -101,6 +101,14 @@
     .fg textarea:focus{border-color:var(--ac)}
     .fg-hint{font-size:10px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;display:block}
     .h{display:none!important}
+    /* Lightweight, non-blocking notification — appears bottom-right and
+       auto-dismisses. Used for background failures (e.g. /api/save) that
+       must not interrupt the live terminal but do need to surface. */
+    .toast-host{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column-reverse;gap:8px;z-index:1000;pointer-events:none}
+    .toast{padding:10px 14px;border-radius:8px;background:var(--sf);color:var(--tx);font-size:12px;line-height:1.45;border:1px solid var(--bd);box-shadow:0 4px 12px rgba(0,0,0,.4);max-width:340px;opacity:0;transform:translateY(8px);transition:opacity .18s,transform .18s;pointer-events:auto}
+    .toast.on{opacity:1;transform:none}
+    .toast.warn{border-color:var(--wn);color:var(--wn)}
+    .toast.err{border-color:var(--dg);color:var(--dg)}
     .panel .btn-p{width:100%;padding:10px;font-size:14px;margin-top:8px}
     .panel .btn-row{display:flex;gap:8px;margin-top:8px}
     .panel .btn-row .btn-p{flex:1}
@@ -221,6 +229,9 @@
   </style>
 </head>
 <body>
+
+<!-- Toast host — non-blocking notifications. showToast() appends here. -->
+<div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="false"></div>
 
 <!-- Top bar -->
 <div class="top">

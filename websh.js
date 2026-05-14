@@ -853,12 +853,56 @@ function commitPendingSave(p) {
   // and any other downgrade paths). Also capture a discovered tmux_cmd.
   entry.persistent = !!p.persistent;
   if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
+  p.pendingSave = null;
+  if ($('iSave').checked) { $('iSave').checked = false; toggleSaveName(); }
+  if (entry._pendingSecrets) {
+    // Vault path: mint conn_id, encrypt secrets, POST to /api/save; on
+    // success the entry (without _pendingSecrets) is added to the
+    // saved-card list. Failure surfaces as a toast and does not touch
+    // the list — the live session keeps running either way.
+    commitVaultSave(entry).then(() => {
+      // Best-effort UX hook for future Safari ITP / persist() prompt.
+      if (typeof _onFirstVaultSave === 'function' && _vaultFirstSave) {
+        _vaultFirstSave = false;
+        try { _onFirstVaultSave(); } catch(e){}
+      }
+    }).catch(err => {
+      console.warn('vault save failed:', err);
+      showToast('Could not save credentials to the server. The session ' +
+                'is still open; try Save again later.', 'warn');
+    });
+    return;
+  }
+  // No-vault fallback path. Currently unreachable because doConnect now
+  // only assembles a saveEntry when serverConfig.vault_enabled is true;
+  // kept defensive for any future caller that hand-builds pendingSave.
   let list = loadSaved();
   list = list.filter(c => c.name !== entry.name);
   list.unshift(entry);
   saveSaved(list);
-  p.pendingSave = null;
-  if ($('iSave').checked) { $('iSave').checked = false; toggleSaveName(); }
+  renderSaved();
+}
+
+async function commitVaultSave(entry) {
+  let conn_id = generateConnId();
+  let secrets = entry._pendingSecrets || {};
+  delete entry._pendingSecrets;
+  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id);
+  let body = {
+    vault_id, conn_id,
+    host: entry.host, port: entry.port, username: entry.user,
+    iv, ct,
+  };
+  let resp = await api('save', {body: body});
+  if (resp && resp.error) {
+    throw new Error('save: ' + resp.error);
+  }
+  entry.conn_id = conn_id;
+  // De-dup by conn_id (and by name, for the pre-vault upgrade path
+  // where an old plaintext row with the same label is still around).
+  let list = loadSaved().filter(c => c.conn_id !== conn_id && c.name !== entry.name);
+  list.unshift(entry);
+  saveSaved(list);
   renderSaved();
 }
 
@@ -1675,6 +1719,24 @@ function hideOverlay(){
 function showErr(m){ let e=$('err'); e.textContent=m; e.classList.add('on') }
 function hideErr(){ $('err').classList.remove('on') }
 
+// Non-blocking notification. `kind` is one of '', 'warn', 'err'. Used by
+// background flows (e.g. /api/save failures) so the live terminal isn't
+// interrupted but the user still sees what happened.
+function showToast(message, kind) {
+  let host = $('toastHost'); if (!host) return;
+  let el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.textContent = message;
+  host.appendChild(el);
+  // Force layout, then add .on for the transition.
+  void el.offsetWidth;
+  el.classList.add('on');
+  setTimeout(() => {
+    el.classList.remove('on');
+    setTimeout(() => { try { el.remove(); } catch(e){} }, 250);
+  }, 5000);
+}
+
 function focusFirst() {
   if($('manualForm').classList.contains('h')) return;
   let el=$('iH'); if(!el.value){el.focus();return}
@@ -1963,10 +2025,20 @@ function doConnect() {
   // probe era; that field still flows through buildConnectBody for
   // backward compatibility, but new entries don't capture it.
   let saveEntry = null;
-  if ($('iSave').checked) {
+  if ($('iSave').checked && serverConfig && serverConfig.vault_enabled) {
+    // Vault flow: the entry that lands in localStorage carries NO
+    // secrets — `_pendingSecrets` is consumed by commitVaultSave once
+    // the connection is healthy, encrypted, and successfully POSTed to
+    // /api/save. The conn_id is minted at commit-time. If vault_enabled
+    // is false (UI hidden anyway by Task 2 CSS), no save path runs at
+    // all — we deliberately don't fall back to plaintext localStorage.
     saveEntry = {name: label, host: host, port: port, user: username,
-                 auth: authMode, persistent: wantPersistent};
-    if (authMode === 'pw') saveEntry.pass = password; else saveEntry.key = key;
+                 auth: authMode, persistent: wantPersistent,
+                 _pendingSecrets: {
+                   password: authMode === 'pw' ? password : null,
+                   key:      authMode === 'key' ? key      : null,
+                   key_pass: authMode === 'key' ? $('iKeyPw').value : null,
+                 }};
     if (selectedPrompt) saveEntry.connection = selectedPrompt.name;
   }
   let opts = {
