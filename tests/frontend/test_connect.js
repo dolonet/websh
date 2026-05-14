@@ -2221,6 +2221,117 @@ test('manual pane F5 fresh-tab: sessionStorage empty → toast + body has no pas
   cleanup(env);
 });
 
+test('manual pane F5 with gap: sessionStorage re-keyed onto new pane ids, second F5 keeps creds', async () => {
+  // Regression: pane ids reset on every module load (`'p' + ++paneCounter`),
+  // so a manifest with a gap like {p1, p3} (because p2 was closed earlier)
+  // is restored as new ids {p1, p2}. tryRestoreSessions must rewrite
+  // sessionStorage onto the new ids BEFORE connectPane, otherwise the next
+  // saveSessions() writes a manifest keyed by {p1, p2} while sessionStorage
+  // still says {p1, p3} — and a SECOND F5 cannot find the secrets and the
+  // user sees a missing-creds toast + an auth-less connect body.
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-gap' + connects.length, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+
+  // Seed: manifest with a gap (p1 + p3, no p2), sessionStorage matching
+  // the manifest. paneCounter forced to 0 so createPane mints p1, p2.
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'split', dir: 'h', flex: '',
+             a: {type: 'leaf', pane: 'p1', flex: ''},
+             b: {type: 'leaf', pane: 'p3', flex: ''}},
+    panes: {
+      p1: {label: 'one', via: 'manual', host: 'h1.example.com',
+           port: 22, user: 'u1', auth: 'pw',
+           persistent: false, slot_id: null, tmux_cmd: 'tmux',
+           cols: 80, rows: 24},
+      p3: {label: 'three', via: 'manual', host: 'h3.example.com',
+           port: 22, user: 'u3', auth: 'pw',
+           persistent: false, slot_id: null, tmux_cmd: 'tmux',
+           cols: 80, rows: 24},
+    },
+  }));
+  win.sessionStorage.setItem('websh_panes_session', JSON.stringify({
+    p1: {password: 'secret-one', key: '', key_pass: ''},
+    p3: {password: 'secret-three', key: '', key_pass: ''},
+  }));
+  win.eval('paneCounter = 0');
+
+  // First F5.
+  const r1 = win.eval('tryRestoreSessions()');
+  ok(r1 === true, 'first tryRestoreSessions returned true; got ' + r1);
+  await sleep(200);
+
+  // Two connects, in iteration order over m.panes keys = [p1, p3].
+  // Layout walk mints {p1-leaf → id p1, p3-leaf → id p2}.
+  ok(connects.length === 2, 'first F5 fired 2 connects; got ' + connects.length);
+  ok(connects[0].password === 'secret-one',
+     'first connect carried secret-one; got ' + connects[0].password);
+  ok(connects[1].password === 'secret-three',
+     'second connect carried secret-three; got ' + connects[1].password);
+
+  // sessionStorage was re-keyed: p1 stays (oldId === p.id), p3 → p2.
+  let ss = JSON.parse(win.sessionStorage.getItem('websh_panes_session') || '{}');
+  ok(ss.p1 && ss.p1.password === 'secret-one',
+     'p1 entry kept (no-op re-key); got ' + JSON.stringify(ss.p1));
+  ok(ss.p2 && ss.p2.password === 'secret-three',
+     'p3 entry re-keyed onto p2; got ' + JSON.stringify(ss.p2));
+  ok(!('p3' in ss),
+     'old p3 entry dropped from sessionStorage; got keys=' + Object.keys(ss).join(','));
+
+  // No missing-creds toast on this first F5 either.
+  const toasts1 = Array.from(win.document.querySelectorAll('#toastHost .toast'))
+    .filter(t => t.textContent.indexOf('saved credentials') !== -1);
+  ok(toasts1.length === 0,
+     'first F5: no missing-creds toast; got ' + toasts1.length);
+
+  // saveSessions runs inside connectPane on success — manifest now keyed
+  // by {p1, p2}. Verify before driving the second F5.
+  const manifestPost = JSON.parse(win.localStorage.getItem('websh_panes'));
+  const keysPost = Object.keys(manifestPost.panes).sort();
+  ok(JSON.stringify(keysPost) === JSON.stringify(['p1', 'p2']),
+     'manifest re-keyed by saveSessions; got keys=' + keysPost.join(','));
+
+  // Second F5: tear down in-memory panes, reset paneCounter, restore.
+  // No need to touch storage — manifest + sessionStorage already reflect
+  // the post-first-F5 state.
+  win.eval(
+    `Object.keys(panes).forEach(k => { try{panes[k].term.dispose()}catch(e){} delete panes[k]; });` +
+    `document.getElementById('panes').innerHTML = '';` +
+    `paneCounter = 0;`);
+  const beforeSecond = connects.length;
+  const r2 = win.eval('tryRestoreSessions()');
+  ok(r2 === true, 'second tryRestoreSessions returned true; got ' + r2);
+  await sleep(200);
+
+  // Two more connects fired by the second F5. Iteration over manifest
+  // keys [p1, p2] (= post-rewrite save order) with paneCounter reset 0:
+  // p1-leaf → id p1 (no-op re-key), p2-leaf → id p2 (no-op re-key).
+  const secondConnects = connects.slice(beforeSecond);
+  ok(secondConnects.length === 2, 'second F5 fired 2 connects; got ' + secondConnects.length);
+  ok(secondConnects[0].password === 'secret-one',
+     'second F5: pane 1 has secret-one; got ' + secondConnects[0].password);
+  ok(secondConnects[1].password === 'secret-three',
+     'second F5: pane 2 has secret-three; got ' + secondConnects[1].password);
+
+  // No missing-creds toast on the second F5 — this is the regression bar.
+  const toasts2 = Array.from(win.document.querySelectorAll('#toastHost .toast'))
+    .filter(t => t.textContent.indexOf('saved credentials') !== -1);
+  ok(toasts2.length === 0,
+     'second F5: no missing-creds toast (regression); got ' + toasts2.length);
+
+  cleanup(env);
+});
+
 test('manual pane close: sessionStorage entry deleted with the pane', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],
