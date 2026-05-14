@@ -529,6 +529,10 @@ function closePane(id) {
 function _destroyPane(id, terminate) {
   let p = panes[id];
   if (!p) return;
+  // Drop any sessionStorage secrets first — the pane is going away,
+  // and so should its plaintext SSH credentials. Vault panes have no
+  // entry here; the call is a no-op for them.
+  _deletePaneSecret(id);
   // Cancel active transfers
   if (p.upload) { p.upload.cancelled = true; closeUploadSession(p.upload); }
   if (p.download) { p.download.cancelled = true; if (p.download.abort) p.download.abort(); }
@@ -609,6 +613,43 @@ function stopKeepalive(p) {
   if(p.keepaliveTimer){ clearInterval(p.keepaliveTimer); p.keepaliveTimer=null }
 }
 
+// ── Pane secret storage (sessionStorage, manual/named panes) ────────
+// localStorage[websh_panes] persists layout + non-secret pane metadata
+// across browser restarts. SSH plaintext (passwords, key PEMs, key
+// passphrases) for manual or prompt-kind connections lives in
+// sessionStorage instead — it survives F5 within a tab but doesn't
+// land in long-term profile storage (browser-history sync, FDE
+// snapshots) and is gone after a tab close. See docs/encryption.md
+// for the precise property ("never in long-term profile storage; brief
+// crash-recovery shadow during a live session"). Vault-backed panes
+// don't use this map; their credentials live on the server.
+const SS_PANE_SECRETS_KEY = 'websh_panes_session';
+function _loadPaneSecrets() {
+  try { return JSON.parse(sessionStorage.getItem(storageKey(SS_PANE_SECRETS_KEY)) || '{}'); }
+  catch (e) { return {}; }
+}
+function _savePaneSecrets(map) {
+  try { sessionStorage.setItem(storageKey(SS_PANE_SECRETS_KEY), JSON.stringify(map)); }
+  catch (e) {}
+}
+function _setPaneSecret(uuid, secrets) {
+  // No-op if nothing to store — avoid creating empty rows that later
+  // F5 would re-read as "secrets exist but are empty."
+  if (!secrets || (!secrets.password && !secrets.key && !secrets.key_pass)) {
+    return _deletePaneSecret(uuid);
+  }
+  let m = _loadPaneSecrets();
+  m[uuid] = secrets;
+  _savePaneSecrets(m);
+}
+function _getPaneSecret(uuid) { return _loadPaneSecrets()[uuid] || null; }
+function _deletePaneSecret(uuid) {
+  let m = _loadPaneSecrets();
+  if (!(uuid in m)) return;
+  delete m[uuid];
+  _savePaneSecrets(m);
+}
+
 // ── Reconnect ────────────────────────────────────────────────────────
 function showReconnectBar(p, reason) {
   let bar = p.el.querySelector('[data-reconnect]');
@@ -677,18 +718,17 @@ function paneRecord(p) {
     rec.connection = p.connection;
     rec.user = p.user || '';
     rec.auth = p.auth || (p.key ? 'key' : 'pw');
-    rec.password = p.password || '';
-    rec.key = p.key || '';
-    rec.key_pass = p.keyPass || '';
+    // Plaintext lives in sessionStorage (_setPaneSecret on materialise,
+    // _getPaneSecret on restore). Only prompt-kind named connections
+    // need a password client-side anyway; ready-kind connections rely
+    // on websh.json server-side.
   } else {
     rec.via = 'manual';
     rec.host = p.host;
     rec.port = p.port;
     rec.user = p.user;
     rec.auth = p.auth || (p.key ? 'key' : 'pw');
-    rec.password = p.password || '';
-    rec.key = p.key || '';
-    rec.key_pass = p.keyPass || '';
+    // Plaintext moved to sessionStorage — see _setPaneSecret().
   }
   return rec;
 }
@@ -1325,6 +1365,13 @@ async function connectPane(p, opts) {
       updatePaneBadge(p);
       return;
     }
+  } else if (rec) {
+    // Manual / named: paneRecord intentionally strips plaintext from the
+    // disk shape (kept in sessionStorage, see _setPaneSecret). Pass the
+    // live in-memory credentials through to the body builder.
+    rec.password = p.password || '';
+    rec.key = p.key || '';
+    rec.key_pass = p.keyPass || '';
   }
   let body = buildConnectBody(rec, p.term.cols, p.term.rows);
   if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
@@ -1636,13 +1683,23 @@ function finalizeSuccess(opts, result, run) {
   p.user = opts.user || '';
   p.connection = opts.connection || null;
   p.auth = opts.auth || (opts.key ? 'key' : 'pw');
-  // Plaintext SSH credentials live on the pane only for manual mode.
-  // Saved-variant panes carry conn_id; F5 restore (Task 6) re-derives
-  // vault_key from IDB rather than re-using a stale in-memory copy.
+  // Plaintext SSH credentials live on the pane only for manual /
+  // prompt-named modes. We mirror them into sessionStorage so F5 within
+  // the tab can restore without re-prompting; vault-backed panes carry
+  // conn_id instead (their secrets live server-side).
   p.password = opts.password || '';
   p.key = opts.key || '';
   p.keyPass = opts.keyPass || '';
   p.conn_id = opts.conn_id || null;
+  if (!p.conn_id) {
+    _setPaneSecret(p.id, {
+      password: p.password,
+      key: p.key,
+      key_pass: p.keyPass,
+    });
+  } else {
+    _deletePaneSecret(p.id);
+  }
   p.persistent = !!opts.persistent;
   p.slotId = result.slot_id || opts.slotId || null;
   p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
@@ -3333,6 +3390,7 @@ function tryRestoreSessions() {
   if (!ids.length) return false;
   activatePane(restored[ids[0]].id);
 
+  let missingCreds = 0;
   Object.keys(m.panes).forEach(oldId => {
     let rec = m.panes[oldId];
     let p = restored[oldId];
@@ -3341,16 +3399,40 @@ function tryRestoreSessions() {
     // via are treated as manual (their plaintext is in password/key
     // inline, which connectPane consumes once and saveSessions will
     // overwrite with the new shape on the next save).
+    // Plaintext for manual / prompt-named panes lives in sessionStorage
+    // (Task 7). Legacy v2 records carry password / key inline; we
+    // prefer sessionStorage when present, fall back to legacy fields,
+    // and finally surface a toast if both are empty for a non-vault
+    // pane that needs creds at connect time.
+    let secrets = _getPaneSecret(oldId);
+    let password = (secrets && secrets.password) || rec.password || '';
+    let key      = (secrets && secrets.key)      || rec.key      || '';
+    let keyPass  = (secrets && secrets.key_pass) || rec.key_pass || '';
+    let isVault  = !!rec.conn_id;
+    let isReady  = rec.via === 'named' && !password && !key;
+    // Manual mode (free-form host) needs credentials; prompt-named
+    // panes do too. Ready-kind named panes connect with no body creds
+    // (server has them in websh.json), so missing-cred toast doesn't
+    // apply to those — but we have no kind on the client, so treat
+    // empty named entries as "server provides" (`isReady` above).
+    if (!isVault && !isReady && !password && !key) {
+      missingCreds++;
+    }
     connectPane(p, {
       label: rec.label, host: rec.host, port: rec.port, user: rec.user,
       connection: rec.connection, auth: rec.auth,
-      password: rec.password, key: rec.key, keyPass: rec.key_pass,
+      password: password, key: key, keyPass: keyPass,
       conn_id: rec.conn_id,
       persistent: rec.persistent, slotId: rec.slot_id,
       tmuxCmd: rec.tmux_cmd || 'tmux',
       resume: !!rec.persistent
     });
   });
+  if (missingCreds > 0) {
+    showToast(missingCreds + ' pane' + (missingCreds === 1 ? ' was' : 's were') +
+              ' restored without saved credentials. Open the login form to re-enter.',
+              'warn');
+  }
   return true;
 }
 

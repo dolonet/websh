@@ -1378,6 +1378,139 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: manual-pane plaintext lives in sessionStorage
+// =====================================================================
+
+test('manual pane: plaintext stored in sessionStorage, NOT in localStorage manifest', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-mp1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'manual.example.com';
+  $(win, 'iU').value = 'alice';
+  $(win, 'iPw').value = 'verysecret';
+  $(win, 'iPersistent').checked = false;
+  // No iSave — pure manual mode, no vault entry.
+  win.doConnect();
+  await sleep(120);
+  // The pane manifest must NOT contain the plaintext password.
+  win.eval('saveSessions()');
+  const manifest = JSON.parse(win.localStorage.getItem('websh_panes'));
+  const rec = Object.values(manifest.panes)[0];
+  ok(rec.via === 'manual', 'manual via tag; got via=' + rec.via);
+  ok(!('password' in rec) && !('key' in rec) && !('key_pass' in rec),
+     'no plaintext credential fields in localStorage manifest');
+  // sessionStorage should hold them, keyed by the live pane id.
+  const ss = JSON.parse(win.sessionStorage.getItem('websh_panes_session') || '{}');
+  const ids = Object.keys(ss);
+  ok(ids.length === 1, 'one entry in sessionStorage; got ' + ids.length);
+  ok(ss[ids[0]].password === 'verysecret',
+     'sessionStorage holds the plaintext password');
+  cleanup(env);
+});
+
+test('manual pane F5 same-tab: secrets restored from sessionStorage', async () => {
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-mp' + connects.length, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'manual.example.com';
+  $(win, 'iU').value = 'alice';
+  $(win, 'iPw').value = 'verysecret';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(120);
+  win.eval('saveSessions()');
+  // Simulate F5: tear down in-memory panes, keep both stores.
+  win.eval(
+    `Object.keys(panes).forEach(k => { try{panes[k].term.dispose()}catch(e){} delete panes[k]; });` +
+    `document.getElementById('panes').innerHTML = '';`);
+  win.eval('tryRestoreSessions()');
+  await sleep(150);
+  ok(connects.length === 2, 'restore fired a second connect; got ' + connects.length);
+  const restoreBody = connects[1];
+  ok(restoreBody.host === 'manual.example.com', 'host restored');
+  ok(restoreBody.username === 'alice', 'username restored');
+  ok(restoreBody.password === 'verysecret',
+     'password restored from sessionStorage');
+  cleanup(env);
+});
+
+test('manual pane F5 fresh-tab: sessionStorage empty → toast + body has no password', async () => {
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      // Server-side validator would 400 — simulate that here.
+      return {error: 'password or key is required'};
+    }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed: localStorage manifest with via=manual (no plaintext), but
+  // sessionStorage empty (simulates a fresh tab open).
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'leaf', pane: 'm1', flex: ''},
+    panes: {
+      m1: {label: 'Manual', via: 'manual', host: 'manual.example.com',
+           port: 22, user: 'alice', auth: 'pw',
+           persistent: false, slot_id: null, tmux_cmd: 'tmux',
+           cols: 80, rows: 24},
+    },
+  }));
+  win.sessionStorage.removeItem('websh_panes_session');
+  win.eval('tryRestoreSessions()');
+  await sleep(150);
+  ok(connects.length === 1, 'one connect attempted');
+  const body = connects[0];
+  ok(!body.password && !body.key,
+     'no credentials sent — sessionStorage was empty');
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length >= 1, 'a toast was raised about missing credentials');
+  cleanup(env);
+});
+
+test('manual pane close: sessionStorage entry deleted with the pane', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-mp4', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'disconnect', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(120);
+  const ids = Object.keys(win.panes);
+  ok(ids.length === 1, 'one pane materialized');
+  let ss = JSON.parse(win.sessionStorage.getItem('websh_panes_session') || '{}');
+  ok(Object.keys(ss).length === 1, 'sessionStorage has the secrets');
+  win.closePane(ids[0]);
+  await sleep(60);
+  ss = JSON.parse(win.sessionStorage.getItem('websh_panes_session') || '{}');
+  ok(Object.keys(ss).length === 0,
+     'sessionStorage entry removed when pane closed; got ' + Object.keys(ss).length);
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: F5 refresh for saved panes (via=vault manifest)
 // =====================================================================
 
