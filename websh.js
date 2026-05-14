@@ -1865,8 +1865,21 @@ function _applyVaultEnabledClass() {
 }
 
 // ── Saved connections (localStorage) ────────────────────────────────
+// Post-vault shape: {name, conn_id, host, port, user, auth, persistent,
+// tmux_cmd?, connection?}. No `pass` / `key` fields — secrets live in
+// the server-side vault under `conn_id`. Legacy entries with `pass` /
+// `key` are tolerated (read-only) until the user acks the
+// legacy-plaintext banner, which drops those fields.
 function loadSaved() { try{return JSON.parse(localStorage.getItem(storageKey('websh_connections'))||'[]')}catch(e){return[]} }
 function saveSaved(list) { localStorage.setItem(storageKey('websh_connections'),JSON.stringify(list)) }
+
+// Heuristic for the "(key)" badge: trust `c.auth` first; fall back to
+// the legacy `c.key` truthy-check for pre-vault rows that don't carry
+// an explicit auth tag.
+function _entryUsesKey(c) {
+  if (c.auth) return c.auth === 'key';
+  return !!c.key;
+}
 
 function renderSaved() {
   let list=loadSaved(), el=$('savedList');
@@ -1876,7 +1889,7 @@ function renderSaved() {
     let div=document.createElement('div'); div.className='sv'; div.setAttribute('data-idx',i);
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
-      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${c.key?' (key)':''}</div></div>`+
+      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${_entryUsesKey(c)?' (key)':''}</div></div>`+
       `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });

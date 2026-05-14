@@ -1378,6 +1378,61 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: saved-card list new shape (no secrets in localStorage)
+// =====================================================================
+
+test('saved list: new-shape entry renders without secrets in DOM', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Prod', conn_id: 'A'.repeat(26), host: 'p.example.com',
+     port: 22, user: 'deploy', auth: 'pw', persistent: true}]));
+  win.eval('renderSaved()');
+  const rows = win.document.querySelectorAll('.sv');
+  ok(rows.length === 1, 'one row rendered');
+  ok(rows[0].querySelector('.sv-name').textContent === 'Prod', 'name shown');
+  ok(rows[0].textContent.indexOf('deploy@p.example.com:22') !== -1,
+     'host line shown without (key) suffix for auth=pw');
+  ok(rows[0].textContent.indexOf('(key)') === -1,
+     'auth=pw entry does not show (key) badge');
+  ok(rows[0].textContent.indexOf('password') === -1,
+     'no "password" string anywhere in the row');
+  cleanup(env);
+});
+
+test('saved list: auth=key new-shape entry shows (key) badge', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Bastion', conn_id: 'B'.repeat(26), host: 'b.example.com',
+     port: 2222, user: 'root', auth: 'key', persistent: false}]));
+  win.eval('renderSaved()');
+  const row = win.document.querySelector('.sv');
+  ok(row.textContent.indexOf('(key)') !== -1, '(key) badge shown for auth=key');
+  ok(row.textContent.indexOf('2222') !== -1, 'port surfaced');
+  cleanup(env);
+});
+
+test('saved list: legacy entry with c.key truthy keeps (key) badge', async () => {
+  // Backward-compat: pre-vault rows have c.key holding an SSH private
+  // key blob (no auth tag). Until the legacy banner drops it, the row
+  // must still render with the (key) badge so users can identify their
+  // entries before re-saving.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldKey', host: 'k.example.com', port: 22, user: 'u',
+     key: '-----BEGIN OPENSSH PRIVATE KEY-----\nABC\n-----END OPENSSH PRIVATE KEY-----'}]));
+  win.eval('renderSaved()');
+  const row = win.document.querySelector('.sv');
+  ok(row.textContent.indexOf('(key)') !== -1, 'legacy c.key truthy still shows (key)');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: vault_enabled gate (Save UI hides when server reports off)
 // =====================================================================
 
