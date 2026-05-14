@@ -1378,6 +1378,120 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: F5 refresh for saved panes (via=vault manifest)
+// =====================================================================
+
+test('vault F5: saved pane manifest stores conn_id + via=vault (no secrets)', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-pr1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Hand-seed a vault-backed live pane (skip the full save flow — this
+  // test focuses on the manifest shape, not the save round-trip).
+  const {vault_id, vault_key, conn_id} = await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(120);
+  // Force a manifest write.
+  win.eval('saveSessions()');
+  const manifest = JSON.parse(win.localStorage.getItem('websh_panes'));
+  ok(manifest && manifest.panes, 'manifest written');
+  const recs = Object.values(manifest.panes);
+  ok(recs.length === 1, 'one pane in manifest; got ' + recs.length);
+  const rec = recs[0];
+  ok(rec.via === 'vault', 'via=vault tag; got via=' + rec.via);
+  ok(rec.conn_id === conn_id, 'conn_id persisted; got ' + rec.conn_id);
+  ok(!rec.vault_key, 'NO vault_key in manifest (would defeat threat model)');
+  ok(!rec.vault_id, 'NO vault_id in manifest (derived from IDB at restore)');
+  ok(!rec.password && !rec.key && !rec.key_pass,
+     'no plaintext SSH credentials in manifest');
+  ok(rec.host === 'p.example.com', 'host kept as display hint');
+  ok(rec.user === 'deploy', 'user kept as display hint');
+  cleanup(env);
+});
+
+test('vault F5: restore rebuilds saved-variant body from manifest', async () => {
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-pr' + connects.length, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const {vault_id, vault_key, conn_id} = await _seedVaultCard(win);
+  // First connect: click the saved card.
+  win.document.querySelector('.sv').click();
+  await sleep(120);
+  ok(connects.length === 1, 'first connect fired');
+  ok(connects[0].vault_id === vault_id, 'first connect: saved-variant body');
+  win.eval('saveSessions()');
+  // Simulate F5: nuke in-memory panes, then call tryRestoreSessions
+  // (mirrors what loadServerConfig does after a page reload).
+  win.eval(
+    `Object.keys(panes).forEach(k => { try{panes[k].term.dispose()}catch(e){} delete panes[k]; });` +
+    `document.getElementById('panes').innerHTML = '';`);
+  const restored = win.eval('tryRestoreSessions()');
+  ok(restored === true, 'tryRestoreSessions returned true; got ' + restored);
+  await sleep(200);
+  ok(connects.length === 2, 'restore fired a second /api/connect; got ' + connects.length);
+  const restoreBody = connects[1];
+  ok(restoreBody.vault_id === vault_id, 'restore body has the same vault_id');
+  ok(restoreBody.conn_id === conn_id, 'restore body has the saved conn_id');
+  ok(Buffer.from(restoreBody.vault_key, 'base64').length === 32,
+     'restore body has 32-byte vault_key (re-derived from IDB)');
+  ok(!restoreBody.host && !restoreBody.password,
+     'no manual-mode fields on restore body');
+  cleanup(env);
+});
+
+test('vault F5: legacy v2 pane record (no via) still restores via manual path', async () => {
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-pr-legacy', alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed a legacy v2 manifest with inline plaintext (no via, no conn_id).
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'leaf', pane: 'leg1', flex: ''},
+    panes: {
+      leg1: {
+        label: 'Legacy', host: 'legacy.example.com', port: 22, user: 'u',
+        connection: null, auth: 'pw', password: 'oldpw', key: '', key_pass: '',
+        persistent: false, slot_id: null, tmux_cmd: 'tmux',
+        cols: 80, rows: 24,
+        // notably absent: via, conn_id
+      },
+    },
+  }));
+  const restored = win.eval('tryRestoreSessions()');
+  ok(restored === true, 'legacy v2 manifest restores; got ' + restored);
+  await sleep(200);
+  ok(connects.length === 1, 'one connect fired for legacy pane');
+  const body = connects[0];
+  ok(body.host === 'legacy.example.com', 'legacy host on body');
+  ok(body.password === 'oldpw', 'legacy password on body');
+  ok(!body.vault_id && !body.conn_id,
+     'no vault fields on legacy restore body');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: saved-card click → saved-variant /api/connect
 // =====================================================================
 

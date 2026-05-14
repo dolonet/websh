@@ -650,25 +650,47 @@ function slotIdFor(user, host, port) {
 }
 
 function paneRecord(p) {
-  // Flat, self-contained record persisted per open pane. Has everything
-  // needed to rebuild the wire request — no lookups at restore time.
-  if (!p.host && !p.connection) return null;
-  return {
+  // Disk-safe per-pane record persisted into localStorage. Vault panes
+  // store conn_id + display-hint metadata, no key bytes — F5 restore
+  // re-derives vault_key from IDB. Manual and named panes still inline
+  // plaintext for backward compatibility (manual moves to
+  // sessionStorage in the next task).
+  if (!p.host && !p.connection && !p.conn_id) return null;
+  let rec = {
     label:      p.label || '',
-    host:       p.host || '',
-    port:       p.port || 22,
-    user:       p.user || '',
-    connection: p.connection || null,
-    auth:       p.auth || (p.key ? 'key' : 'pw'),
-    password:   p.password || '',
-    key:        p.key || '',
-    key_pass:   p.keyPass || '',
     persistent: !!p.persistent,
     slot_id:    p.slotId || null,
     tmux_cmd:   p.tmuxCmd || 'tmux',
     cols:       p.term.cols,
-    rows:       p.term.rows
+    rows:       p.term.rows,
   };
+  if (p.conn_id) {
+    rec.via = 'vault';
+    rec.conn_id = p.conn_id;
+    // host/port/user persisted as UX hints (badge text + slot id);
+    // server fetches the real values from the stored vault record.
+    rec.host = p.host || '';
+    rec.port = p.port || 22;
+    rec.user = p.user || '';
+  } else if (p.connection) {
+    rec.via = 'named';
+    rec.connection = p.connection;
+    rec.user = p.user || '';
+    rec.auth = p.auth || (p.key ? 'key' : 'pw');
+    rec.password = p.password || '';
+    rec.key = p.key || '';
+    rec.key_pass = p.keyPass || '';
+  } else {
+    rec.via = 'manual';
+    rec.host = p.host;
+    rec.port = p.port;
+    rec.user = p.user;
+    rec.auth = p.auth || (p.key ? 'key' : 'pw');
+    rec.password = p.password || '';
+    rec.key = p.key || '';
+    rec.key_pass = p.keyPass || '';
+  }
+  return rec;
 }
 
 function buildConnectBody(rec, termCols, termRows) {
@@ -1262,9 +1284,12 @@ function queueInput(p, data) {
 
 // ── Unified connect ─────────────────────────────────────────────────
 // opts = { label, host, port, user, connection, auth, password, key, keyPass,
-//          persistent, slotId?, resume? }
+//          conn_id?, persistent, slotId?, resume? }
 // `resume` flag triggers attach-by-slot_id on the backend.
-function connectPane(p, opts) {
+// Vault-backed panes (opts.conn_id or p.conn_id set) re-derive vault_key
+// from IDB at every connect — caching it on the pane would let a
+// sign-out in another tab leave a stale key in memory.
+async function connectPane(p, opts) {
   p.label = opts.label || '';
   if (opts.host !== undefined) p.host = opts.host || '';
   if (opts.port !== undefined) p.port = opts.port || 22;
@@ -1274,6 +1299,7 @@ function connectPane(p, opts) {
   if (opts.password !== undefined) p.password = opts.password || '';
   if (opts.key !== undefined) p.key = opts.key || '';
   if (opts.keyPass !== undefined) p.keyPass = opts.keyPass || '';
+  if (opts.conn_id !== undefined) p.conn_id = opts.conn_id || null;
   if (opts.persistent !== undefined) p.persistent = !!opts.persistent;
   if (opts.slotId) p.slotId = opts.slotId;
   else if (p.persistent && !p.slotId) p.slotId = slotIdFor(p.user, p.host, p.port);
@@ -1288,13 +1314,30 @@ function connectPane(p, opts) {
   setTitle(p.label);
   updatePaneBadge(p);
 
-  let body = buildConnectBody(paneRecord(p), p.term.cols, p.term.rows);
+  let rec = paneRecord(p);
+  if (rec && rec.via === 'vault') {
+    try {
+      rec.vault_id = await ensureVaultId();
+      rec.vault_key = await exportRawVaultKey();
+    } catch (e) {
+      p.connecting = false;
+      showErr('Vault key not available in this browser — re-enter to re-save.');
+      updatePaneBadge(p);
+      return;
+    }
+  }
+  let body = buildConnectBody(rec, p.term.cols, p.term.rows);
   if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
 
-  console.log('connectPane: host=' + body.host + ' user=' + body.username +
-              ' persistent=' + !!body.persistent +
-              ' pw len=' + ((body.password || '').length) +
-              ' key len=' + ((body.key || '').length));
+  if (body.vault_id) {
+    console.log('connectPane: vault conn_id=' + body.conn_id +
+                ' persistent=' + !!body.persistent);
+  } else {
+    console.log('connectPane: host=' + body.host + ' user=' + body.username +
+                ' persistent=' + !!body.persistent +
+                ' pw len=' + ((body.password || '').length) +
+                ' key len=' + ((body.key || '').length));
+  }
 
   api('connect', {body: body})
     .then(r => {
@@ -3294,10 +3337,15 @@ function tryRestoreSessions() {
     let rec = m.panes[oldId];
     let p = restored[oldId];
     if (!p || !rec) return;
+    // `via` is set by paneRecord post-vault; legacy v2 records without
+    // via are treated as manual (their plaintext is in password/key
+    // inline, which connectPane consumes once and saveSessions will
+    // overwrite with the new shape on the next save).
     connectPane(p, {
       label: rec.label, host: rec.host, port: rec.port, user: rec.user,
       connection: rec.connection, auth: rec.auth,
       password: rec.password, key: rec.key, keyPass: rec.key_pass,
+      conn_id: rec.conn_id,
       persistent: rec.persistent, slotId: rec.slot_id,
       tmuxCmd: rec.tmux_cmd || 'tmux',
       resume: !!rec.persistent
