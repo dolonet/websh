@@ -1378,6 +1378,61 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: legacy-plaintext banner
+// =====================================================================
+
+test('legacy banner: hidden when no legacy entries exist', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  ok(hidden($(win, 'legacyBanner')),
+     'banner hidden by default with empty saved list');
+  cleanup(env);
+});
+
+test('legacy banner: shown when a row carries pass/key plaintext', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw'}]));
+  win.eval('_maybeShowLegacyBanner()');
+  ok(!hidden($(win, 'legacyBanner')), 'banner visible after detection');
+  cleanup(env);
+});
+
+test('legacy banner: Ack drops pass/key, keeps metadata, hides banner', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw',
+     persistent: true},
+    {name: 'OldKey',  host: 'k', port: 22, user: 'r',
+     key: '-----BEGIN OPENSSH PRIVATE KEY-----...'},
+    {name: 'Already', conn_id: 'A'.repeat(26), host: 'a', port: 22,
+     user: 'a', auth: 'pw', persistent: false}]));
+  win.eval('_maybeShowLegacyBanner()');
+  ok(!hidden($(win, 'legacyBanner')), 'banner visible');
+  // Drive the click handler — runScripts:outside-only would skip the
+  // inline-attribute path, but our wiring uses .onclick so this works.
+  $(win, 'legacyBannerAck').click();
+  await sleep(20);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(list.length === 3, 'all rows kept');
+  ok(!('pass' in list[0]) && !('key' in list[0]),
+     'OldProd: pass dropped');
+  ok(list[0].name === 'OldProd' && list[0].host === 'p',
+     'OldProd: metadata kept');
+  ok(!('pass' in list[1]) && !('key' in list[1]),
+     'OldKey: key dropped');
+  ok(list[2].conn_id === 'A'.repeat(26),
+     'vault-backed row untouched');
+  ok(hidden($(win, 'legacyBanner')), 'banner hidden after Ack');
+  cleanup(env);
+});
+
+// =====================================================================
 // Vault: manual-pane plaintext lives in sessionStorage
 // =====================================================================
 

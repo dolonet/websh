@@ -2107,6 +2107,41 @@ function _entryUsesKey(c) {
   return !!c.key;
 }
 
+// Detect rows from before the vault shipped — they still carry the
+// plaintext password or key inline. Used to surface a one-time banner
+// (next paragraph) so the user can drop the plaintext consciously
+// rather than have it silently linger.
+function _hasLegacyPlaintext() {
+  return loadSaved().some(c => c.pass || c.key);
+}
+
+// Show the legacy-plaintext banner if any saved-card row still carries
+// `pass` or `key`. On Ack we strip those two fields from every row —
+// the rest (name, host, port, user, auth, persistent) survives so the
+// user can identify the entry and re-save it under the vault. We do
+// NOT silently re-encrypt: the original plaintext may live in
+// browser-history sync or profile backups.
+function _maybeShowLegacyBanner() {
+  let banner = $('legacyBanner'); if (!banner) return;
+  if (!_hasLegacyPlaintext()) { banner.classList.add('h'); return; }
+  banner.classList.remove('h');
+  let ack = $('legacyBannerAck');
+  if (ack && !ack._wired) {
+    ack._wired = true;
+    ack.onclick = () => {
+      let cleaned = loadSaved().map(c => {
+        let copy = Object.assign({}, c);
+        delete copy.pass;
+        delete copy.key;
+        return copy;
+      });
+      saveSaved(cleaned);
+      banner.classList.add('h');
+      renderSaved();
+    };
+  }
+}
+
 function renderSaved() {
   let list=loadSaved(), el=$('savedList');
   el.innerHTML='';
@@ -2258,6 +2293,7 @@ function loadServerConfig() {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
     _applyVaultEnabledClass();
+    _maybeShowLegacyBanner();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to
