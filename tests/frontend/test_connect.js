@@ -1383,6 +1383,86 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: multi-tab sync (storage events + BroadcastChannel)
+// =====================================================================
+
+test('multi-tab: storage event on websh_connections re-renders saved list', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed empty → assert empty render.
+  win.eval('renderSaved()');
+  let rows = win.document.querySelectorAll('.sv');
+  ok(rows.length === 0, 'no rows initially');
+  // Simulate another tab writing a new entry. localStorage doesn't
+  // fire storage events for the same window's own writes, so we
+  // synthesize the event after the underlying write.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OtherTab', conn_id: 'T'.repeat(26), host: 't', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  win.dispatchEvent(new win.StorageEvent('storage', {
+    key: 'websh_connections',
+    newValue: win.localStorage.getItem('websh_connections'),
+  }));
+  rows = win.document.querySelectorAll('.sv');
+  ok(rows.length === 1, 'storage event triggered re-render; got ' + rows.length);
+  cleanup(env);
+});
+
+test('multi-tab: storage event with null key (clear) is ignored', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Should not throw, should not re-render (we have nothing to compare,
+  // so just assert that dispatching the event doesn't crash the test).
+  let threw = false;
+  try {
+    win.dispatchEvent(new win.StorageEvent('storage', {key: null}));
+  } catch (e) { threw = true; }
+  ok(!threw, 'null-key storage event handled without throwing');
+  cleanup(env);
+});
+
+test('multi-tab: BroadcastChannel signed_out clears cache and re-renders', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  // Provide a minimal BroadcastChannel shim before websh.js loads —
+  // jsdom doesn't ship one, but the cross-tab signal must work in real
+  // browsers. We assert the listener is wired correctly.
+  let lastSent = null;
+  const ChannelMock = class {
+    constructor(name) { this.name = name; ChannelMock.instances.push(this); this.onmessage = null; }
+    postMessage(d) { ChannelMock.instances.forEach(c => { if (c !== this && c.onmessage) c.onmessage({data: d}); }); }
+    close() {}
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  const log = [];
+  makeFakes(win);
+  win.fetch = makeFetch(plan, log);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  // Now create a second channel to simulate the other tab firing
+  // signed_out.
+  await win.eval('ensureVaultId()');
+  await win.eval('ensureVaultKey()');
+  // Cache is hot now.
+  ok(win.eval('_idbHasKeyCache') === true, '_idbHasKeyCache hot after ensure');
+  // Fire signed_out from a sibling channel.
+  const sibling = new ChannelMock('websh_vault');
+  sibling.postMessage({type: 'signed_out'});
+  await sleep(20);
+  ok(win.eval('_idbHasKeyCache') === false,
+     'cache invalidated by signed_out broadcast');
+  dom.window.close();
+});
+
+// =====================================================================
 // Vault: Sign out of this browser
 // =====================================================================
 

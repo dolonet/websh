@@ -2071,6 +2071,43 @@ async function decryptCredentials(iv_b64, ct_b64, conn_id) {
 // vault_id; the server validates with the same regex.
 function generateConnId() { return _generateBase32Id(); }
 
+// Cross-tab signalling. localStorage 'storage' events cover the
+// saved-card list (any tab editing websh_connections fires in every
+// other tab). IDB / sign-out are out-of-band, so we also open a
+// BroadcastChannel where signedOut signals invalidate the other tab's
+// in-memory caches. Both layers degrade gracefully — when
+// BroadcastChannel is absent the user just won't see immediate
+// invalidation in the second tab, and the next render after a manual
+// refresh picks up the wipe.
+let _vaultBroadcast = null;
+function _initVaultBroadcast() {
+  if (typeof BroadcastChannel === 'undefined' || _vaultBroadcast) return;
+  try {
+    _vaultBroadcast = new BroadcastChannel('websh_vault');
+    _vaultBroadcast.onmessage = (e) => {
+      if (!e || !e.data) return;
+      if (e.data.type === 'signed_out') {
+        invalidateVaultCache();
+        renderSaved();
+      }
+    };
+  } catch (e) { _vaultBroadcast = null; }
+}
+function _broadcastSignedOut() {
+  if (!_vaultBroadcast) return;
+  try { _vaultBroadcast.postMessage({type: 'signed_out'}); } catch (e) {}
+}
+
+window.addEventListener('storage', (e) => {
+  if (!e || !e.key) return;  // localStorage.clear() fires with key=null
+  if (e.key === storageKey('websh_connections')) {
+    // The other tab edited the saved-card list (delete, sign-out
+    // wipe, fresh save). Refresh the visible list in this tab so we
+    // don't show a stale row that's been removed elsewhere.
+    renderSaved();
+  }
+});
+
 // Sync-readable mirror of "is K present in IDB?". renderSaved checks
 // this to gray out vault-backed rows that can no longer connect
 // (Safari ITP cleared IDB after 7 days, user wiped site data, etc).
@@ -3275,6 +3312,7 @@ async function confirmSignOut() {
   saveSaved([]);
   try { sessionStorage.removeItem(storageKey(SS_PANE_SECRETS_KEY)); } catch (e) {}
   invalidateVaultCache();
+  _broadcastSignedOut();
   closeSignOutModal();
   renderSaved();
   showToast('Signed out. All saved credentials in this browser have been removed.', '');
@@ -3594,6 +3632,10 @@ function tryRestoreSessions() {
 // before the change is an orphan. Remove it once so a fresh devtools
 // pass on a returning user's browser doesn't show stray entries.
 try { localStorage.removeItem('websh_theme'); } catch(e){}
+
+// Open the vault BroadcastChannel early so a sign-out fired in another
+// tab during loadServerConfig still gets observed by this tab.
+_initVaultBroadcast();
 
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
