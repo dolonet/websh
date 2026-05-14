@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="vault-off">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -88,6 +88,11 @@
     .save-row label{font-size:13px;color:var(--dim);cursor:pointer}
     .save-name{margin-top:6px}
     .save-name.h{display:none}
+    /* Elements that only make sense when the server reports vault_enabled.
+       _applyVaultEnabledClass() in websh.js toggles vault-on/vault-off on
+       <html> after /api/config; until then we default to vault-off so the
+       UI doesn't flash a "Save" affordance the server cannot honor. */
+    .vault-off .vault-only{display:none!important}
     .auth-tabs{display:flex;gap:0;margin-bottom:12px;border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden}
     .auth-tab{flex:1;padding:6px;border:none;background:var(--bg);color:var(--dim);font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
     .auth-tab.active{background:var(--bd);color:var(--tx)}
@@ -358,11 +363,11 @@
       <input type="checkbox" id="iPersistent" checked>
       <label for="iPersistent" title="Wraps the remote shell in tmux so this pane survives browser refresh and server restart.">Persistent session (tmux)</label>
     </div>
-    <div class="save-row">
+    <div class="save-row vault-only">
       <input type="checkbox" id="iSave" onchange="toggleSaveName()">
       <label for="iSave">Save this connection</label>
     </div>
-    <div id="saveNameWrap" class="save-name h">
+    <div id="saveNameWrap" class="save-name h vault-only">
       <div class="fg"><label>Connection name</label><input id="iName" placeholder="my-server" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>
     </div>
 

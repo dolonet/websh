@@ -1378,6 +1378,52 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
 });
 
 // =====================================================================
+// Vault: vault_enabled gate (Save UI hides when server reports off)
+// =====================================================================
+
+test('vault gate: vault_enabled=true exposes Save UI', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  ok(win.document.documentElement.classList.contains('vault-on'),
+     '<html>.vault-on set after /api/config');
+  ok(!win.document.documentElement.classList.contains('vault-off'),
+     '<html>.vault-off cleared');
+  // The label is the rendered, focusable element; either parent (save-row)
+  // having .vault-only is the contract that hides the row in CSS.
+  const saveRow = $(win, 'iSave').closest('.save-row');
+  ok(saveRow && saveRow.classList.contains('vault-only'),
+     'iSave save-row carries vault-only marker');
+  cleanup(env);
+});
+
+test('vault gate: vault_enabled=false hides Save UI', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: false}}];
+  const env = await mkEnv(plan); const win = env.win;
+  ok(win.document.documentElement.classList.contains('vault-off'),
+     '<html>.vault-off set');
+  ok(!win.document.documentElement.classList.contains('vault-on'),
+     '<html>.vault-on cleared');
+  // jsdom doesn't compute CSS, so we assert the class invariant the CSS
+  // depends on rather than getComputedStyle.
+  const saveRow = $(win, 'iSave').closest('.save-row');
+  ok(saveRow && saveRow.classList.contains('vault-only'),
+     'iSave save-row still has vault-only marker (CSS handles visibility)');
+  cleanup(env);
+});
+
+test('vault gate: omitted vault_enabled treated as false', async () => {
+  // Older server (or unset) responds without the field — must not show
+  // the Save affordance.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  ok(win.document.documentElement.classList.contains('vault-off'),
+     'missing vault_enabled defaults to vault-off');
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

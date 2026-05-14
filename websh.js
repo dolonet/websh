@@ -1852,6 +1852,18 @@ function invalidateVaultCache() {
   _vaultKeyCache = null;
 }
 
+// Toggle vault-on / vault-off on <html> based on the server's
+// /api/config response. Elements with class="vault-only" are hidden
+// while the vault is off (server lacks cryptography, WEBSH_VAULT_ENABLE
+// isn't set, schema version unsupported, or just before /api/config
+// returns). Default in the HTML is vault-off — no flash of a "Save"
+// affordance the server can't honor.
+function _applyVaultEnabledClass() {
+  let on = !!(serverConfig && serverConfig.vault_enabled);
+  document.documentElement.classList.toggle('vault-on', on);
+  document.documentElement.classList.toggle('vault-off', !on);
+}
+
 // ── Saved connections (localStorage) ────────────────────────────────
 function loadSaved() { try{return JSON.parse(localStorage.getItem(storageKey('websh_connections'))||'[]')}catch(e){return[]} }
 function saveSaved(list) { localStorage.setItem(storageKey('websh_connections'),JSON.stringify(list)) }
@@ -1967,6 +1979,7 @@ function loadServerConfig() {
   api('config').then(cfg => {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
+    _applyVaultEnabledClass();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to
