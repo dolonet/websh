@@ -9,6 +9,10 @@
 const fs = require('fs');
 const path = require('path');
 const {JSDOM} = require('jsdom');
+const nodeCrypto = require('node:crypto');
+// fake-indexeddb provides a pure-JS IndexedDB; constructing a fresh
+// IDBFactory per test gives isolation without globalThis pollution.
+const {IDBFactory, IDBKeyRange} = require('fake-indexeddb');
 
 const REPO = path.resolve(__dirname, '..', '..');
 const html = fs.readFileSync(path.join(REPO, 'index.html'), 'utf8');
@@ -91,6 +95,22 @@ const EXPOSE = `
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
 })();`;
 
+// jsdom v24 ships `crypto.getRandomValues` but not `crypto.subtle`, and it
+// ships neither `TextEncoder`/`TextDecoder` nor IndexedDB. Inject them so
+// vault tests can run inside the jsdom realm. We use defineProperty on
+// `crypto.subtle` because the jsdom Crypto stub's `subtle` getter on the
+// prototype shadows a direct assignment.
+function _injectVaultGlobals(win) {
+  Object.defineProperty(win.crypto, 'subtle', {
+    value: nodeCrypto.webcrypto.subtle,
+    configurable: true,
+  });
+  win.TextEncoder = TextEncoder;
+  win.TextDecoder = TextDecoder;
+  win.indexedDB = new IDBFactory();
+  win.IDBKeyRange = IDBKeyRange;
+}
+
 async function mkEnv(plan) {
   const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
                                url: 'http://localhost/websh/'});
@@ -98,6 +118,7 @@ async function mkEnv(plan) {
   const log = [];
   makeFakes(win);
   win.fetch = makeFetch(plan, log);
+  _injectVaultGlobals(win);
   win.localStorage.clear();
   win.eval(js + EXPOSE);
   await sleep(30);
@@ -1222,6 +1243,138 @@ test('button=2 stopPropagation: parent bubble-phase listener does not see right-
      '(left-click must still bubble); got count=' + leftClicksBubbled);
 
   cleanup(env);
+});
+
+// =====================================================================
+// Vault: Web Crypto + IndexedDB primitives
+// =====================================================================
+
+test('vault primitives: ensureVaultId stable + base32 shape', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const id1 = await win.eval('ensureVaultId()');
+  const id2 = await win.eval('ensureVaultId()');
+  ok(id1 === id2, 'vault_id stable across calls');
+  ok(/^[A-Z2-7]{26}$/.test(id1), 'vault_id matches base32 regex; got ' + id1);
+  cleanup(env);
+});
+
+test('vault primitives: AES-GCM round-trip preserves payload', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const conn_id = 'C'.repeat(26);
+  const payload = {password: 'hunter2', key: null, key_pass: null};
+  const blob = await win.eval(
+    `encryptCredentials(${JSON.stringify(payload)}, ${JSON.stringify(conn_id)})`);
+  ok(typeof blob.iv === 'string' && blob.iv.length > 0, 'iv is base64 string');
+  ok(typeof blob.ct === 'string' && blob.ct.length > 0, 'ct is base64 string');
+  ok(/^[A-Z2-7]{26}$/.test(blob.vault_id), 'vault_id surfaced from encryptCredentials');
+  // IV must be 12 bytes (base64 length ~16 with padding).
+  const ivBytes = Buffer.from(blob.iv, 'base64');
+  ok(ivBytes.length === 12, 'iv is 12 bytes; got ' + ivBytes.length);
+  const recovered = await win.eval(
+    `decryptCredentials(${JSON.stringify(blob.iv)}, ` +
+    `${JSON.stringify(blob.ct)}, ${JSON.stringify(conn_id)})`);
+  ok(recovered.password === 'hunter2', 'round-trip preserves password');
+  ok(recovered.key === null, 'round-trip preserves null key');
+  cleanup(env);
+});
+
+test('vault primitives: AAD binding — wrong conn_id fails decrypt', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const conn_id = 'D'.repeat(26);
+  const blob = await win.eval(
+    `encryptCredentials({password:'x'}, ${JSON.stringify(conn_id)})`);
+  let threw = false;
+  try {
+    await win.eval(
+      `decryptCredentials(${JSON.stringify(blob.iv)}, ` +
+      `${JSON.stringify(blob.ct)}, ${JSON.stringify('E'.repeat(26))})`);
+  } catch (e) { threw = true; }
+  ok(threw, 'wrong conn_id rejects (AAD binding holds)');
+  cleanup(env);
+});
+
+test('vault primitives: each save uses a fresh IV', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const conn_id = 'F'.repeat(26);
+  // GCM IV reuse under the same key is catastrophic — must regenerate.
+  const blob1 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)})`);
+  const blob2 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)})`);
+  ok(blob1.iv !== blob2.iv, 'IVs differ across saves');
+  ok(blob1.ct !== blob2.ct, 'ciphertexts differ (same plaintext, fresh IV)');
+  cleanup(env);
+});
+
+test('vault primitives: exportRawVaultKey returns base64 of 32 bytes', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const keyB64 = await win.eval('exportRawVaultKey()');
+  const keyBytes = Buffer.from(keyB64, 'base64');
+  ok(keyBytes.length === 32, 'exported key is 32 bytes; got ' + keyBytes.length);
+  // Stable across calls — same K is reused.
+  const keyB64_2 = await win.eval('exportRawVaultKey()');
+  ok(keyB64 === keyB64_2, 'exported key is stable across calls');
+  cleanup(env);
+});
+
+test('vault primitives: generateConnId matches server regex', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const seen = new Set();
+  for (let i = 0; i < 20; i++) {
+    const id = win.eval('generateConnId()');
+    ok(/^[A-Z2-7]{26}$/.test(id), 'conn_id matches base32 regex; got ' + id);
+    seen.add(id);
+  }
+  ok(seen.size === 20, '20 conn_ids are all distinct (no collisions)');
+  cleanup(env);
+});
+
+test('vault primitives: isolate_storage scopes vault_id by path', async () => {
+  // Two deployments at /a/ and /b/ on the same origin must get independent
+  // vault keys + vault_ids. Storage prefix is derived from URL pathname.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true,
+                                                isolate_storage: true}}];
+  const domA = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                 url: 'http://localhost/a/'});
+  const domB = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                 url: 'http://localhost/b/'});
+  // Both share the same underlying FDBFactory (different scopes within the
+  // same IDB), proving the isolation comes from the key namespace.
+  const sharedIDB = new IDBFactory();
+  for (const dom of [domA, domB]) {
+    const win = dom.window;
+    makeFakes(win);
+    win.fetch = makeFetch(JSON.parse(JSON.stringify(plan)), []);
+    // Same global injection as mkEnv, but reuse a single FDBFactory so
+    // the path-scoping under storagePrefix is what creates the namespace
+    // boundary (not a separate database).
+    Object.defineProperty(win.crypto, 'subtle', {
+      value: nodeCrypto.webcrypto.subtle, configurable: true});
+    win.TextEncoder = TextEncoder;
+    win.TextDecoder = TextDecoder;
+    win.indexedDB = sharedIDB;
+    win.IDBKeyRange = IDBKeyRange;
+    win.localStorage.clear();
+    win.eval(js + EXPOSE);
+    await sleep(30);
+  }
+  const idA = await domA.window.eval('ensureVaultId()');
+  const idB = await domB.window.eval('ensureVaultId()');
+  ok(/^[A-Z2-7]{26}$/.test(idA), 'A vault_id well-formed');
+  ok(/^[A-Z2-7]{26}$/.test(idB), 'B vault_id well-formed');
+  ok(idA !== idB, 'path-scoped vault_ids differ (got both ' + idA + ')');
+  domA.window.close(); domB.window.close();
 });
 
 // =====================================================================

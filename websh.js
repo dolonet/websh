@@ -1692,6 +1692,166 @@ function setAuthTab(mode) {
   $('authKey').className=mode==='key'?'fg':'fg h';
 }
 
+// ── Vault primitives (IndexedDB + Web Crypto AES-GCM) ───────────────
+// K (AES-256-GCM CryptoKey, extractable=true) and vault_id (128-bit
+// base32) live in IndexedDB. extractable is required because the
+// /api/connect handshake ships the raw key bytes — the IDB layer is
+// not the confidentiality boundary; the absence of ciphertext blobs
+// from the client is what closes the threat. See docs/encryption.md.
+
+const IDB_NAME = 'websh_vault';
+const IDB_STORE = 'kv';
+const IDB_K_KEY = 'K';
+const IDB_VAULT_ID_KEY = 'vault_id';
+
+function _idbOpen() {
+  return new Promise((resolve, reject) => {
+    let req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function _idbGet(key) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readonly');
+    let req = tx.objectStore(IDB_STORE).get(_idbScopedKey(key));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function _idbPut(key, value) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, _idbScopedKey(key));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+function _idbDelete(key) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(_idbScopedKey(key));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+// isolate_storage support: scope IDB keys by URL path the same way
+// storageKey() scopes localStorage. Two deployments on the same origin
+// at different paths thus get independent vault keys + vault_ids.
+function _idbScopedKey(name) {
+  return storagePrefix ? storagePrefix + name : name;
+}
+
+// 26-char Crockford-style base32 of 128 random bits. Matches the
+// server's _VAULT_ID_RE / _CONN_ID_RE: ^[A-Z2-7]{26}$.
+const _B32_ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function _generateBase32Id() {
+  let bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let s = '';
+  let acc = 0, accBits = 0;
+  for (let b of bytes) {
+    acc = (acc << 8) | b;
+    accBits += 8;
+    while (accBits >= 5) {
+      accBits -= 5;
+      s += _B32_ALPHA[(acc >> accBits) & 0x1f];
+    }
+  }
+  if (accBits > 0) s += _B32_ALPHA[(acc << (5 - accBits)) & 0x1f];
+  return s;  // 26 chars
+}
+
+let _vaultIdCache = null;
+let _vaultKeyCache = null;  // CryptoKey
+let _vaultFirstSave = false;  // set when ensureVaultId generates a new id
+
+async function ensureVaultId() {
+  if (_vaultIdCache) return _vaultIdCache;
+  let id = await _idbGet(IDB_VAULT_ID_KEY);
+  if (!id) {
+    id = _generateBase32Id();
+    await _idbPut(IDB_VAULT_ID_KEY, id);
+    _vaultFirstSave = true;
+  }
+  _vaultIdCache = id;
+  return id;
+}
+
+async function ensureVaultKey() {
+  if (_vaultKeyCache) return _vaultKeyCache;
+  let key = await _idbGet(IDB_K_KEY);
+  if (!key) {
+    key = await crypto.subtle.generateKey(
+      {name: 'AES-GCM', length: 256},
+      true,                              // extractable — connect ships raw bytes
+      ['encrypt', 'decrypt']);
+    await _idbPut(IDB_K_KEY, key);
+  }
+  _vaultKeyCache = key;
+  return key;
+}
+
+async function exportRawVaultKey() {
+  let key = await ensureVaultKey();
+  let raw = await crypto.subtle.exportKey('raw', key);
+  return _bufToB64(raw);
+}
+
+function _bufToB64(buf) {
+  let bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function _b64ToBytes(b64) {
+  let s = atob(b64);
+  let bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+
+async function encryptCredentials(plaintext, conn_id) {
+  let vault_id = await ensureVaultId();
+  let key = await ensureVaultKey();
+  // GCM IV reuse under the same key is catastrophic; draw a fresh
+  // 12-byte IV on every encrypt. See docs/encryption.md.
+  let iv = crypto.getRandomValues(new Uint8Array(12));
+  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let pt = new TextEncoder().encode(JSON.stringify(plaintext));
+  let ct = await crypto.subtle.encrypt(
+    {name: 'AES-GCM', iv, additionalData: aad}, key, pt);
+  return {iv: _bufToB64(iv), ct: _bufToB64(ct), vault_id};
+}
+
+async function decryptCredentials(iv_b64, ct_b64, conn_id) {
+  let vault_id = await ensureVaultId();
+  let key = await ensureVaultKey();
+  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let pt = await crypto.subtle.decrypt(
+    {name: 'AES-GCM', iv: _b64ToBytes(iv_b64), additionalData: aad},
+    key, _b64ToBytes(ct_b64));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+// Fresh conn_id for a new saved card. Same alphabet/length as
+// vault_id; the server validates with the same regex.
+function generateConnId() { return _generateBase32Id(); }
+
+// Invalidate in-memory caches without touching IDB. Used when another
+// tab signs out, when sign-out completes locally, and when /api/config
+// reports the vault has been disabled out from under us.
+function invalidateVaultCache() {
+  _vaultIdCache = null;
+  _vaultKeyCache = null;
+}
+
 // ── Saved connections (localStorage) ────────────────────────────────
 function loadSaved() { try{return JSON.parse(localStorage.getItem(storageKey('websh_connections'))||'[]')}catch(e){return[]} }
 function saveSaved(list) { localStorage.setItem(storageKey('websh_connections'),JSON.stringify(list)) }
