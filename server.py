@@ -978,6 +978,19 @@ _creds_cache_key = (0, 0)   # (mtime, size); bare mtime is 1s on some FS
 _CREDS_EMPTY = {"version": 1, "vaults": {}}
 _CREDS_SCHEMA_VERSION = 1
 
+# Cap incoming bodies for vault endpoints. Legitimate payloads are well
+# under 4 KB (small JSON + 12-byte iv + ~200-byte ct, base64'd). 16 KB
+# leaves headroom for ssh_options/host strings and stops a misuser from
+# filling the on-disk store via repeated multi-MB ct fields.
+_MAX_VAULT_REQUEST_BYTES = 16 * 1024
+# Keys that are ALLOW-listed for connections from websh.json but
+# REJECTED inside vault-stored ssh_options: a browser-side write to the
+# vault could otherwise point ssh at an arbitrary file path and use the
+# ssh parse-error timing as a read-oracle for files readable by the
+# websh uid. Operator-managed websh.json is the trusted source for
+# file-path options.
+_VAULT_DENY_SSH_OPTIONS = frozenset({"identityfile"})
+
 
 def _creds_path():
     """Path to websh.creds.json.
@@ -1018,6 +1031,12 @@ def _load_creds():
     except (OSError, ValueError) as e:
         _log("WARN", "failed to load creds: {}".format(e))
         return dict(_CREDS_EMPTY, vaults={})
+    if not isinstance(data, dict):
+        # Operator typo or partial write from an external tool produced
+        # a JSON array/string/number at the root. Treat as empty store.
+        _log("WARN", "creds file {}: root is not an object; "
+             "treating as empty".format(path))
+        return dict(_CREDS_EMPTY, vaults={})
     if data.get("version") != _CREDS_SCHEMA_VERSION:
         if not _vault_disabled:
             _log("WARN",
@@ -1056,13 +1075,27 @@ def _save_creds_atomic(data):
     with _creds_lock:
         fd, tmp = tempfile.mkstemp(prefix=".websh.creds.", suffix=".tmp",
                                    dir=parent)
+        # If anything between mkstemp and the successful replace raises
+        # (chmod EACCES, replace cross-device, OOM serialising) we must
+        # unlink the tmp file ourselves — mkstemp doesn't autoclean and
+        # repeated failures would otherwise accumulate hidden files in
+        # the operator's config dir.
+        ok = False
         try:
-            os.write(fd, json.dumps(data, separators=(",", ":")).encode())
-            os.fsync(fd)
+            try:
+                os.write(fd, json.dumps(data, separators=(",", ":")).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            ok = True
         finally:
-            os.close(fd)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+            if not ok:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         # fsync the parent dir so the rename is durable across crash.
         try:
             dir_fd = os.open(parent, os.O_DIRECTORY)
@@ -1086,8 +1119,9 @@ def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
     """Decrypt one stored blob.
 
     Raises ValueError on malformed inputs (wrong key length, bad
-    base64, wrong IV length, ct too short). Raises InvalidTag when
-    authentication fails — callers map that to 400 vault_decrypt_failed.
+    base64, wrong IV length, ct too short, non-string iv/ct). Raises
+    InvalidTag when authentication fails — callers map that to 400
+    vault_decrypt_failed.
 
     AAD = utf8(vault_id + ":" + conn_id) so blobs cannot be moved
     between slots even by an operator with shell access to the file.
@@ -1096,10 +1130,12 @@ def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
         raise RuntimeError("cryptography not installed")
     if not isinstance(key_bytes, (bytes, bytearray)) or len(key_bytes) != 32:
         raise ValueError("key must be 32 bytes")
+    if not isinstance(iv_b64, str) or not isinstance(ct_b64, str):
+        raise ValueError("iv/ct must be base64 strings")
     try:
         iv = base64.b64decode(iv_b64, validate=True)
         ct = base64.b64decode(ct_b64, validate=True)
-    except (binascii.Error, ValueError) as e:
+    except (binascii.Error, ValueError, TypeError) as e:
         raise ValueError("invalid base64: {}".format(e))
     if len(iv) != 12:
         raise ValueError("iv must be 12 bytes")
@@ -2484,6 +2520,13 @@ class Handler(BaseHTTPRequestHandler):
                         "see server log)"}, 501)
             return
         try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > _MAX_VAULT_REQUEST_BYTES:
+            self._json({"error": "request body too large"}, 413)
+            return
+        try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
             self._json({"error": "invalid json"}, 400)
@@ -2517,7 +2560,15 @@ class Handler(BaseHTTPRequestHandler):
             return _bad("iv must be 12 bytes")
         if len(ct) < 17:
             return _bad("ct too short for GCM tag")
-        ssh_options, dropped = _filter_ssh_options(body.get("ssh_options", {}))
+        raw_opts = body.get("ssh_options", {})
+        if raw_opts is not None and not isinstance(raw_opts, dict):
+            return _bad("ssh_options must be an object")
+        ssh_options, dropped = _filter_ssh_options(raw_opts or {})
+        # Reject vault-side identityfile (read-oracle via ssh parse timing).
+        for k in list(ssh_options.keys()):
+            if isinstance(k, str) and k.lower() in _VAULT_DENY_SSH_OPTIONS:
+                dropped.append(k)
+                del ssh_options[k]
         if dropped:
             _log("WARN", "save dropped ssh_options keys: {}".format(dropped))
 
@@ -2686,12 +2737,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "vault_decrypt_failed",
                             "detail": "blob plaintext is not JSON"}, 400)
                 return
+            if not isinstance(creds, dict):
+                # AAD-bound blob decrypted cleanly but plaintext isn't a
+                # JSON object — hand-edited file, or a vault payload from
+                # a future schema. Cannot extract password/key safely.
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "blob plaintext is not a JSON object"}, 400)
+                return
             host = (rec.get("host") or "").strip()
             port = clamp(rec.get("port"), MIN_PORT, MAX_PORT, 22)
             username = (rec.get("username") or "").strip()
             ssh_options = rec.get("ssh_options") or {}
+            if isinstance(ssh_options, dict):
+                # Drop vault-side identityfile entries even if a prior version
+                # stored them; the operator config (websh.json) is the trusted
+                # source for file-path options.
+                ssh_options = {k: v for k, v in ssh_options.items()
+                               if isinstance(k, str)
+                               and k.lower() not in _VAULT_DENY_SSH_OPTIONS}
+            else:
+                ssh_options = {}
             password = creds.get("password") or ""
             key = creds.get("key") or ""
+            if not isinstance(password, str) or not isinstance(key, str):
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "non-string credential field"}, 400)
+                return
             # key_pass is in the plaintext for forward-compat but the
             # current SSHSession ctor doesn't accept it — drop silently.
             # Best-effort scrub of bytearrays. Python str copies in

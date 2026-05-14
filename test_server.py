@@ -324,6 +324,16 @@ class TestVaultLoad(unittest.TestCase):
         self._write({"version": 1})  # no 'vaults' key
         self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
 
+    def test_non_dict_root_returns_empty_store(self):
+        # Operator typo or partial write leaves a JSON array / string at
+        # the root. _load_creds must not crash; it returns empty store.
+        with open(self.path, "w") as f:
+            json.dump([1, 2, 3], f)
+        self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
+        with open(self.path, "w") as f:
+            json.dump("oops", f)
+        self.assertEqual(server._load_creds(), {"version": 1, "vaults": {}})
+
     def test_cache_reuses_parse_when_key_unchanged(self):
         # Mutate the file to a same-size payload + restore the original
         # mtime via os.utime. Cache key (mtime,size) matches → loader
@@ -6245,6 +6255,7 @@ class TestApiSave(unittest.TestCase):
         # Reset the creds cache so each test sees a fresh file
         server._creds_cache = None
         server._creds_cache_key = (0, 0)
+        server._rate_limits.clear()
         if os.path.exists(self.creds_path):
             os.unlink(self.creds_path)
 
@@ -6388,10 +6399,46 @@ class TestApiSave(unittest.TestCase):
         self.assertEqual(results[v2], 200)
         with open(self.creds_path) as f:
             data = json.load(f)
-        self.assertIn(v1, data["vaults"])
-        self.assertIn(v2, data["vaults"])
-        self.assertIn(c1, data["vaults"][v1])
-        self.assertIn(c2, data["vaults"][v2])
+        # Full-record assertions catch a buggy interleave that drops or
+        # swaps inner records — the key-only check would miss that.
+        rec1 = data["vaults"][v1][c1]
+        rec2 = data["vaults"][v2][c2]
+        self.assertEqual(rec1["host"], "h.example.com")
+        self.assertEqual(rec1["username"], "deploy")
+        self.assertEqual(rec1["iv"], base64.b64encode(bytes(12)).decode())
+        self.assertEqual(rec2["host"], "h.example.com")
+        self.assertEqual(rec2["username"], "deploy")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_oversize_body_returns_413(self):
+        # Synthesize a body whose Content-Length exceeds the cap. The
+        # cap fires before json.loads so the payload itself can be
+        # anything; pad ct to push the length past _MAX_VAULT_REQUEST_BYTES.
+        big_ct = base64.b64encode(b"x" * (server._MAX_VAULT_REQUEST_BYTES * 2)).decode()
+        body, code = self._post("/api/save", self._valid_body(ct=big_ct))
+        self.assertEqual(code, 413)
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_non_dict_ssh_options_rejected(self):
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options=["not", "a", "dict"]))
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_input_invalid")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_identityfile_stripped_from_saved_ssh_options(self):
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options={
+                "IdentityFile": "/etc/shadow",
+                "StrictHostKeyChecking": "yes",
+            }))
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        stored = data["vaults"][self.VAULT][self.CONN].get("ssh_options", {})
+        self.assertNotIn("IdentityFile", stored)
+        self.assertNotIn("identityfile", stored)
+        self.assertIn("StrictHostKeyChecking", stored)
 
 
 class TestApiSaveDelete(unittest.TestCase):
@@ -6435,6 +6482,7 @@ class TestApiSaveDelete(unittest.TestCase):
     def setUp(self):
         server._creds_cache = None
         server._creds_cache_key = (0, 0)
+        server._rate_limits.clear()
         # Seed with one entry
         server._save_creds_atomic({
             "version": 1,
@@ -6557,6 +6605,7 @@ class TestApiConnectSaved(unittest.TestCase):
     def setUp(self):
         server._creds_cache = None
         server._creds_cache_key = (0, 0)
+        server._rate_limits.clear()
         # Seed a stored entry encrypted with self.key/self.iv
         if server.HAS_CRYPTOGRAPHY:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -6671,7 +6720,9 @@ class TestApiConnectSaved(unittest.TestCase):
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_existing_manual_path_still_works(self):
         # Regression: a body with host/username (no vault fields) routes
-        # to the manual flow exactly as before.
+        # to the manual flow exactly as before. Asserting username +
+        # password too catches a hypothetical bug where the saved-variant
+        # branch fires and finds a stored record with the same host.
         with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
             instance = unittest.mock.MagicMock(alive=True, auth_failed=False,
                                                 tmux_cmd="tmux")
@@ -6683,6 +6734,69 @@ class TestApiConnectSaved(unittest.TestCase):
             self.assertEqual(code, 200)
             kwargs = MockSSH.call_args.kwargs
             self.assertEqual(kwargs.get("host"), "manual.example.com")
+            self.assertEqual(kwargs.get("username"), "alice")
+            self.assertEqual(kwargs.get("password"), "p")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_non_dict_plaintext_returns_decrypt_failed(self):
+        # Re-seed with a blob whose plaintext decrypts to a JSON list,
+        # not a dict. Server must return 400 vault_decrypt_failed, not
+        # propagate an AttributeError as a 500.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = AESGCM.generate_key(bit_length=256)
+        iv = os.urandom(12)
+        aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+        ct = AESGCM(key).encrypt(iv, b'["password","is_a_list"]', aad)
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {self.CONN: {
+                "host": "h.example.com", "port": 22, "username": "u",
+                "iv": base64.b64encode(iv).decode(),
+                "ct": base64.b64encode(ct).decode(),
+            }}},
+        })
+        body, code = self._post({
+            "vault_id": self.VAULT, "conn_id": self.CONN,
+            "vault_key": base64.b64encode(key).decode(),
+            "cols": 80, "rows": 24,
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(body.get("error"), "vault_decrypt_failed")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_identityfile_in_stored_options_stripped_at_load(self):
+        # Backward-compat: a record stored before the save-side filter
+        # landed could still have identityfile. Verify load-side strips
+        # it before the value reaches SSHSession.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = AESGCM.generate_key(bit_length=256)
+        iv = os.urandom(12)
+        aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+        ct = AESGCM(key).encrypt(iv, b'{"password":"p","key":null}', aad)
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {self.CONN: {
+                "host": "h.example.com", "port": 22, "username": "u",
+                "iv": base64.b64encode(iv).decode(),
+                "ct": base64.b64encode(ct).decode(),
+                "ssh_options": {"IdentityFile": "/etc/shadow",
+                                "StrictHostKeyChecking": "yes"},
+            }}},
+        })
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            instance = unittest.mock.MagicMock(alive=True, auth_failed=False,
+                                                tmux_cmd="tmux")
+            MockSSH.return_value = instance
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(key).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 200)
+            opts = MockSSH.call_args.kwargs.get("ssh_options", {})
+            self.assertNotIn("IdentityFile", opts)
+            self.assertNotIn("identityfile", opts)
+            self.assertIn("StrictHostKeyChecking", opts)
 
 
 if __name__ == "__main__":
