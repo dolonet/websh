@@ -1003,6 +1003,10 @@ async function commitVaultSave(entry) {
   // probe here because the first-ever save legitimately has empty
   // IDB. (Findings 1 + 4 in the PR-67 review.)
   if (_vaultRecentlySignedOut) {
+    // Best-effort scrub before the entry falls out of scope. Symmetric
+    // to the post-encrypt + post-POST scrub paths below.
+    let s = entry && entry.__ephemeralSecrets;
+    if (s) { try { s.password = null; s.key = null; s.key_pass = null; } catch (e) {} }
     showToast('Sign-out happened during save — credentials were NOT saved. ' +
               'Re-enter to save again.', 'warn');
     return;
@@ -1023,7 +1027,11 @@ async function commitVaultSave(entry) {
   // server has no way to GC. (Finding 1 in the PR-67 review.)
   let idbVaultIdAfter = null;
   try { idbVaultIdAfter = await _idbGet(IDB_VAULT_ID_KEY); } catch (e) {}
-  if (idbVaultIdAfter !== vault_id) {
+  // Belt-and-braces: also re-check the sign-out flag. The
+  // BroadcastChannel handler sets it synchronously, but in theory the
+  // wipe + new mint could have completed during the encrypt yield and
+  // left IDB matching our `vault_id`. The flag closes that window.
+  if (idbVaultIdAfter !== vault_id || _vaultRecentlySignedOut) {
     invalidateVaultCache();
     // Best-effort scrub of the local plaintext copy — strings are
     // immutable in JS so this only nulls references, but at least the
@@ -2016,8 +2024,8 @@ function hideErr(){ $('err').classList.remove('on') }
 // Non-blocking notification. `kind` is one of '', 'warn', 'err'. Used by
 // background flows (e.g. /api/save failures) so the live terminal isn't
 // interrupted but the user still sees what happened. Dedups identical
-// messages (e.g. _disconnectAllVaultPanesForNoKey iterates N panes on
-// sibling sign-out → N stacked toasts otherwise). Click to dismiss.
+// messages (e.g. two overlapping save-failure retries from the same
+// pane would otherwise stack identical toasts). Click to dismiss.
 // Error toasts get a longer auto-dismiss and an assertive role so AT
 // users hear them — aria-live=polite on the host alone is fine for
 // info but wrong for actionable errors. (Finding 5a/b/d, PR-67 review.)
@@ -3604,6 +3612,11 @@ function closeOptions(){ $('ovOpt').classList.add('h'); }
 let _signOutPrevFocus = null;
 let _signOutKeyHandler = null;
 function openSignOutModal() {
+  // Defensive: if a previous open left a keydown listener wired (no
+  // current call site does this, but a future programmatic open might),
+  // tear it down first so we don't leak listeners or stomp on
+  // _signOutPrevFocus.
+  if (_signOutKeyHandler) closeSignOutModal();
   let input = $('signOutInput');
   let confirm = $('signOutConfirm');
   let status = $('signOutStatus');

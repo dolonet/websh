@@ -3087,11 +3087,11 @@ test('F2: hideOverlay scrubs iPw / iKey / iKeyPw / iName', async () => {
   cleanup(env);
 });
 
-test('F3: connectPane saved-branch with throwing exportKey surfaces reconnect bar', async () => {
-  // Web Crypto's exportKey can throw on a corrupt CryptoKey / OOM. The
-  // saved-variant connect branch wraps the call so the pane lands on
-  // the no-key reconnect bar with a toast — not an unhandled rejection
-  // that leaves connecting=false with no UI feedback.
+test('F3: connectSaved click with throwing exportKey bails before /api/connect', async () => {
+  // Web Crypto's exportKey can throw on a corrupt CryptoKey / OOM.
+  // connectSaved (the .sv click path) wraps the call so the failure
+  // surfaces a toast instead of an unhandled rejection that leaves
+  // the click in an indeterminate state with no UI feedback.
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],
                                     vault_enabled: true}},
@@ -3208,7 +3208,7 @@ test('F9: openSignOutModal scope copy with zero vault cards', async () => {
   cleanup(env);
 });
 
-test('F8 ("status code" tests are actually error-string mapping)', async () => {
+test('F6: "status code" mapping tests actually exercise error-string mapping', async () => {
   // Documentary test: api() always parses JSON and ignores HTTP status.
   // If a future refactor exposes status to dispatch, this test should
   // start failing (it asserts the same dispatch as the existing three
