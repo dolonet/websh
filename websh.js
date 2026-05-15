@@ -1168,7 +1168,16 @@ document.addEventListener('visibilitychange', () => {
 // is unreliable on this path; pageshow with event.persisted=true is
 // the canonical signal per the WICG Page Lifecycle spec.
 window.addEventListener('pageshow', (e) => {
-  if (e.persisted) kickPanesAfterAbsence();
+  if (e.persisted) {
+    kickPanesAfterAbsence();
+    // Our pagehide handler closes _vaultBroadcast so a frozen bfcache
+    // tab doesn't get spurious replays. Re-open on restore — otherwise
+    // a sign-out in another tab while this one was bfcache'd would
+    // never reach us. _initVaultBroadcast is idempotent (guards on
+    // existing channel) so calling it on every persisted pageshow is
+    // safe and covers cold loads where it's already a no-op.
+    _initVaultBroadcast();
+  }
 });
 
 // Apply one decoded JSON payload from either transport. Returns true if

@@ -3208,6 +3208,52 @@ test('F9: openSignOutModal scope copy with zero vault cards', async () => {
   cleanup(env);
 });
 
+test('bfcache: pagehide closes BroadcastChannel; pageshow(persisted=true) re-opens it', async () => {
+  // The reviewer's concern: Safari bfcache + an alive BroadcastChannel
+  // could replay queued messages into a frozen tab. The fix closes on
+  // pagehide and re-inits on pageshow when persisted=true so multi-tab
+  // sign-out sync keeps working after Back-navigation.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  // Mock BroadcastChannel so we can observe close() + re-construction.
+  let constructed = 0, closed = 0;
+  const ChannelMock = class {
+    constructor(name) {
+      this.name = name; constructed++; this.onmessage = null;
+      ChannelMock.instances.push(this);
+    }
+    postMessage() {}
+    close() { closed++; }
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  // _initVaultBroadcast runs at module load → first channel.
+  ok(constructed === 1, 'channel constructed at boot; got ' + constructed);
+  // Fire pagehide → channel.close() must run.
+  win.dispatchEvent(new win.Event('pagehide'));
+  ok(closed === 1, 'channel closed on pagehide; got ' + closed);
+  // Fire pageshow with persisted=true → channel must be re-constructed.
+  const ev = new win.Event('pageshow');
+  Object.defineProperty(ev, 'persisted', {value: true});
+  win.dispatchEvent(ev);
+  ok(constructed === 2, 'channel re-constructed after bfcache restore; got ' + constructed);
+  // pageshow with persisted=false (cold load) must NOT mint another channel.
+  const ev2 = new win.Event('pageshow');
+  Object.defineProperty(ev2, 'persisted', {value: false});
+  win.dispatchEvent(ev2);
+  ok(constructed === 2, 'cold-load pageshow does NOT re-init; got ' + constructed);
+  dom.window.close();
+});
+
 test('F6: "status code" mapping tests actually exercise error-string mapping', async () => {
   // Documentary test: api() always parses JSON and ignores HTTP status.
   // If a future refactor exposes status to dispatch, this test should
