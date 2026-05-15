@@ -418,8 +418,9 @@ required to recover (downgrade the file to v1 or upgrade websh).
 ## Hardened deployment
 
 For deployments where the websh host is multi-tenant or otherwise
-untrusted, the recipe below ships in PR-D as a new section of
-[`security.md`](security.md). Until that PR lands, the gist is:
+untrusted, the additive recipe below is intended for a future
+hardening pass (no tracking issue yet — feel free to apply now; it
+needs no client or server changes). The gist is:
 
 ```ini
 # /etc/systemd/system/websh.service (additions)

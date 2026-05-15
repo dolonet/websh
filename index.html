@@ -351,11 +351,18 @@
   </div>
 </div>
 
-<!-- Sign-out confirmation modal — typed-DELETE gate -->
-<div id="signOutModal" class="ov h" onclick="if(event.target===this)closeSignOutModal()">
+<!-- Sign-out confirmation modal — typed-DELETE gate.
+     WCAG: role=dialog + aria-modal so screen readers announce a modal
+     context; aria-labelledby points at the title; focus trap + Escape
+     are wired in openSignOutModal/closeSignOutModal. -->
+<div id="signOutModal" class="ov h"
+     role="dialog" aria-modal="true"
+     aria-labelledby="signOutTitle" aria-describedby="signOutDesc"
+     onclick="if(event.target===this)closeSignOutModal()">
   <div class="tm-panel">
-    <h2>Sign out of this browser?</h2>
-    <div class="tm-sub">This permanently deletes every saved credential in this vault from the server and clears the key in this browser. Other browsers you've used keep their own copies. There is no recovery.</div>
+    <h2 id="signOutTitle">Sign out of this browser?</h2>
+    <div id="signOutDesc" class="tm-sub">This permanently deletes every saved credential in this vault from the server and clears the key in this browser. Other browsers you've used keep their own copies. There is no recovery.</div>
+    <div id="signOutScope" class="tm-sub" style="margin-top:12px"></div>
     <div class="tm-sub" style="margin-top:12px">Type <strong>DELETE</strong> below to confirm:</div>
     <input id="signOutInput" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" style="margin-top:8px;width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:13px;outline:none">
     <div id="signOutStatus" class="tm-status"></div>
@@ -432,6 +439,12 @@
     <div class="save-row vault-only">
       <input type="checkbox" id="iSave" onchange="toggleSaveName()">
       <label for="iSave">Save this connection</label>
+    </div>
+    <!-- Multi-device hint: each browser/device has its own vault key,
+         so a card saved here will not appear on phones or other browsers.
+         Surfaces under the checkbox so it doesn't compete with the form. -->
+    <div id="saveHint" class="opt-hint vault-only" style="margin:-4px 0 6px;font-size:11px">
+      Saved to this browser only. Other browsers and devices start with an empty list.
     </div>
     <div id="saveNameWrap" class="save-name h vault-only">
       <div class="fg"><label>Connection name</label><input id="iName" placeholder="my-server" autocomplete="off" data-lpignore="true" data-1p-ignore="true"></div>

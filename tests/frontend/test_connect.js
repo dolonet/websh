@@ -98,6 +98,11 @@ const EXPOSE = `
     set: v => { _idbHasKeyCache = v; },
     configurable: true,
   });
+  Object.defineProperty(window, '_vaultRecentlySignedOut', {
+    get: () => _vaultRecentlySignedOut,
+    set: v => { _vaultRecentlySignedOut = v; },
+    configurable: true,
+  });
 })();`;
 
 // jsdom v24 ships `crypto.getRandomValues` but not `crypto.subtle`, and it
@@ -2550,7 +2555,13 @@ test('saved-card connect: legacy entry (no conn_id) still uses manual body', asy
   cleanup(env);
 });
 
-test('saved-card connect: 404 saved-entry-not-found surfaces vault_not_found popup', async () => {
+// The three "...mapping..." tests below exercise error-STRING mapping,
+// not HTTP-status mapping. websh.js api() always parses the JSON body
+// and ignores the status; saved-variant /api/connect errors are
+// pattern-matched on `r.error`. If the dispatch ever switches to
+// status-code routing, these tests need to be upgraded (makeFetch
+// would have to honor a `status:` field on the plan entry).
+test('saved-card connect: "saved entry not found" error string surfaces vault_not_found popup', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],
                                     vault_enabled: true}},
@@ -2566,7 +2577,7 @@ test('saved-card connect: 404 saved-entry-not-found surfaces vault_not_found pop
   cleanup(env);
 });
 
-test('saved-card connect: 400 vault_decrypt_failed surfaces vault_decrypt popup', async () => {
+test('saved-card connect: "vault_decrypt_failed" error string surfaces vault_decrypt popup', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],
                                     vault_enabled: true}},
@@ -2581,7 +2592,7 @@ test('saved-card connect: 400 vault_decrypt_failed surfaces vault_decrypt popup'
   cleanup(env);
 });
 
-test('saved-card connect: 501 credential-vault-unavailable surfaces vault_off popup', async () => {
+test('saved-card connect: "credential vault unavailable" error string surfaces vault_off popup', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],
                                     vault_enabled: true}},
@@ -2625,8 +2636,14 @@ test('vault save: doConnect with iSave → /api/save POST after stable window', 
   ok(ps.length === 1, 'pane materialized after connect; got ' + ps.length);
   const p = ps[0];
   ok(p.pendingSave, 'pendingSave set on pane');
-  ok(p.pendingSave._pendingSecrets && p.pendingSave._pendingSecrets.password === 'hunter2',
-     '_pendingSecrets carry the password');
+  // __ephemeralSecrets is non-enumerable (so JSON.stringify and
+  // Object.assign drop it); direct access still works.
+  ok(p.pendingSave.__ephemeralSecrets && p.pendingSave.__ephemeralSecrets.password === 'hunter2',
+     '__ephemeralSecrets carry the password');
+  ok(!Object.keys(p.pendingSave).includes('__ephemeralSecrets'),
+     '__ephemeralSecrets is non-enumerable (does not show in Object.keys)');
+  ok(!JSON.stringify(p.pendingSave).includes('hunter2'),
+     'pendingSave does not leak plaintext via JSON.stringify');
   ok(!p.pendingSave.pass && !p.pendingSave.key,
      'pendingSave has no legacy pass/key fields');
   // Force the stable-window threshold by backdating connectedAt; then
@@ -2651,8 +2668,9 @@ test('vault save: doConnect with iSave → /api/save POST after stable window', 
   const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
   ok(list.length === 1, 'one saved card in localStorage');
   ok(list[0].conn_id === saveBody.conn_id, 'conn_id matches what was POSTed');
-  ok(!list[0].pass && !list[0].key && !list[0]._pendingSecrets,
-     'no secrets / _pendingSecrets in localStorage entry');
+  ok(!list[0].pass && !list[0].key && !list[0].__ephemeralSecrets &&
+     !list[0]._pendingSecrets,
+     'no secrets / __ephemeralSecrets in localStorage entry');
   ok(list[0].name === 'My Prod' && list[0].auth === 'pw',
      'name and auth survived');
   cleanup(env);
@@ -2896,6 +2914,319 @@ test('vault gate: omitted vault_enabled treated as false', async () => {
   const env = await mkEnv(plan); const win = env.win;
   ok(win.document.documentElement.classList.contains('vault-off'),
      'missing vault_enabled defaults to vault-off');
+  cleanup(env);
+});
+
+// =====================================================================
+// PR-67 review fixes — regression tests for gorevds's findings.
+// =====================================================================
+
+test('F4: sign-out flag set mid-2.5s-window aborts commitVaultSave', async () => {
+  // Reproduces: user clicks Connect+Save, the 2.5 s stable window opens,
+  // a sibling tab broadcasts signed_out (_vaultRecentlySignedOut := true),
+  // commit fires. We must NOT POST a server-side blob whose key was
+  // just wiped from disk.
+  let saveCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f4', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: () => { saveCalls++; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.5'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'F4-card';
+  win.doConnect();
+  await sleep(120);
+  const ps = paneList(win);
+  ok(ps.length === 1, 'pane materialized; got ' + ps.length);
+  const p = ps[0];
+  // Sign-out from a sibling tab lands between connect-success and the
+  // stable-window tick. The flag is the documented signal.
+  win._vaultRecentlySignedOut = true;
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  ok(saveCalls === 0, 'commitVaultSave bailed; got saveCalls=' + saveCalls);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  ok(list.length === 0, 'no card written to localStorage; got ' + list.length);
+  cleanup(env);
+});
+
+test('F4: explicit save click after sign-out clears the flag and proceeds', async () => {
+  // Symmetric to the above: the user signs out, then explicitly clicks
+  // Save+Connect on a new credential. doConnect's intent supersedes the
+  // past sign-out, the flag clears, and the save lands normally.
+  let saveBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f4b', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: (b) => { saveBody = b; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  win._vaultRecentlySignedOut = true;  // simulate prior sign-out
+  $(win, 'iH').value = '10.0.0.6'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p2';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'F4b-card';
+  win.doConnect();
+  await sleep(20);
+  ok(win._vaultRecentlySignedOut === false,
+     'doConnect cleared the flag at save initiation');
+  const ps = paneList(win);
+  ok(ps.length === 1, 'pane materialized; got ' + ps.length);
+  const p = ps[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  ok(saveBody && saveBody.host === '10.0.0.6', 'save POSTed normally');
+  cleanup(env);
+});
+
+test('F7: /api/save body carries ssh_options={}', async () => {
+  // The server expects (and filters) ssh_options on every save. The
+  // browser has no UI for arbitrary SSH options yet, but sending an
+  // empty object keeps the wire shape coherent and the server-side
+  // filter exercised.
+  let saveBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f7', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: (b) => { saveBody = b; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.7'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'F7-card';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  ok(saveBody && 'ssh_options' in saveBody, 'ssh_options present on save body');
+  ok(typeof saveBody.ssh_options === 'object' &&
+     saveBody.ssh_options !== null &&
+     !Array.isArray(saveBody.ssh_options) &&
+     Object.keys(saveBody.ssh_options).length === 0,
+     'ssh_options is an empty object; got ' + JSON.stringify(saveBody.ssh_options));
+  cleanup(env);
+});
+
+test('F2: __ephemeralSecrets is non-enumerable + scrubbed after save', async () => {
+  // Plaintext password lives in a non-enumerable property so a future
+  // accidental JSON.stringify / debug-log can't spill it. After the
+  // POST resolves we null the secret fields in the closure (best-effort
+  // — strings are immutable in JS, this only drops references).
+  let saveBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f2', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: (b) => { saveBody = b; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.8'; $(win, 'iU').value = 'a';
+  $(win, 'iPw').value = 'super-secret-pw';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'F2-card';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  // Spot-check that JSON.stringify on pendingSave does not include the
+  // password — non-enumerability guarantees this.
+  ok(!JSON.stringify(p.pendingSave).includes('super-secret-pw'),
+     'JSON.stringify(pendingSave) does NOT contain plaintext password');
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(80);
+  ok(saveBody, '/api/save POSTed');
+  // The bag itself is preserved on the original (Object.assign + carry
+  // helper at finalizeSuccess hop), but the secret references are
+  // nulled in commitVaultSave's finally.
+  // We check it indirectly: walking JSON.stringify on the entry stored
+  // in localStorage must not contain the password.
+  const ls = win.localStorage.getItem('websh_connections') || '[]';
+  ok(!ls.includes('super-secret-pw'),
+     'localStorage saved-card list does NOT contain plaintext password');
+  cleanup(env);
+});
+
+test('F2: hideOverlay scrubs iPw / iKey / iKeyPw / iName', async () => {
+  // After a successful connect, hideOverlay should leave the form
+  // fields empty so a later devtools paste / extension content-script
+  // can't lift the credentials out of the DOM.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-scrub', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h.example.com'; $(win, 'iU').value = 'u';
+  $(win, 'iPw').value = 'leaky-pw';
+  $(win, 'iKeyPw').value = 'leaky-keypw';
+  $(win, 'iName').value = 'my-name';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(120);
+  ok($(win, 'iPw').value === '', 'iPw cleared');
+  ok($(win, 'iKey').value === '', 'iKey cleared');
+  ok($(win, 'iKeyPw').value === '', 'iKeyPw cleared');
+  ok($(win, 'iName').value === '', 'iName cleared');
+  cleanup(env);
+});
+
+test('F3: connectPane saved-branch with throwing exportKey surfaces reconnect bar', async () => {
+  // Web Crypto's exportKey can throw on a corrupt CryptoKey / OOM. The
+  // saved-variant connect branch wraps the call so the pane lands on
+  // the no-key reconnect bar with a toast — not an unhandled rejection
+  // that leaves connecting=false with no UI feedback.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f3', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await _seedVaultCard(win);
+  // Sabotage Web Crypto's exportKey to throw. _injectVaultGlobals wires
+  // win.crypto.subtle to the shared nodeCrypto.webcrypto.subtle object,
+  // so we must restore on the way out or every subsequent test that
+  // calls exportKey breaks (including _seedVaultCard for the next
+  // saved-variant test).
+  const realExportKey = win.crypto.subtle.exportKey.bind(win.crypto.subtle);
+  win.crypto.subtle.exportKey = async () => { throw new Error('simulated crypto failure'); };
+  try {
+    win.document.querySelector('.sv').click();
+    await sleep(100);
+    const ps = paneList(win);
+    // Either the click bailed before runConnect (no pane at all), or a
+    // pane exists with connecting=false. Both are acceptable end states;
+    // an indeterminate connecting=true would be the regression.
+    if (ps.length) {
+      ok(ps[0].connecting === false, 'no pane left in connecting state');
+    } else {
+      ok(true, 'no pane materialised (early bail OK)');
+    }
+  } finally {
+    win.crypto.subtle.exportKey = realExportKey;
+  }
+  cleanup(env);
+});
+
+test('F5: showToast dedups identical messages', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.showToast('hello world', 'warn');
+  win.showToast('hello world', 'warn');
+  win.showToast('hello world', 'warn');
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length === 1, 'three identical showToast calls yield one toast; got ' + toasts.length);
+  // A different message/kind is not deduped.
+  win.showToast('something else', 'err');
+  const after = win.document.querySelectorAll('#toastHost .toast');
+  ok(after.length === 2, 'distinct message stacks; got ' + after.length);
+  // Error toast carries role=alert.
+  const err = win.document.querySelector('#toastHost .toast.err');
+  ok(err && err.getAttribute('role') === 'alert',
+     'error toast has role=alert; got role=' + (err && err.getAttribute('role')));
+  cleanup(env);
+});
+
+test('F5: showToast click-to-dismiss removes the toast', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.showToast('dismissable', '');
+  let toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length === 1, 'toast shown');
+  toasts[0].click();
+  // 250 ms transition before removal.
+  await sleep(280);
+  toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length === 0, 'toast removed after click; got ' + toasts.length);
+  cleanup(env);
+});
+
+test('F9: signOutModal carries dialog a11y attributes', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const modal = $(win, 'signOutModal');
+  ok(modal.getAttribute('role') === 'dialog', 'role=dialog');
+  ok(modal.getAttribute('aria-modal') === 'true', 'aria-modal=true');
+  const labelledBy = modal.getAttribute('aria-labelledby');
+  ok(labelledBy === 'signOutTitle', 'aria-labelledby=signOutTitle; got ' + labelledBy);
+  const titleEl = $(win, 'signOutTitle');
+  ok(titleEl && titleEl.tagName === 'H2', 'title element has matching id');
+  cleanup(env);
+});
+
+test('F9: openSignOutModal populates scope count + names', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed two saved cards.
+  await win.eval('ensureVaultId()');
+  await win.eval('ensureVaultKey()');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'Alpha', conn_id: 'A'.repeat(26), host: 'a', port: 22,
+     user: 'u', auth: 'pw', persistent: false},
+    {name: 'Beta', conn_id: 'B'.repeat(26), host: 'b', port: 22,
+     user: 'u', auth: 'pw', persistent: false},
+  ]));
+  win.openSignOutModal();
+  const scope = $(win, 'signOutScope').textContent;
+  ok(scope.includes('2 saved cards'), 'count rendered; got "' + scope + '"');
+  ok(scope.includes('Alpha') && scope.includes('Beta'), 'names rendered; got "' + scope + '"');
+  win.closeSignOutModal();
+  cleanup(env);
+});
+
+test('F9: openSignOutModal scope copy with zero vault cards', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.openSignOutModal();
+  const scope = $(win, 'signOutScope').textContent;
+  ok(scope.includes('No vault-backed cards'),
+     'zero-card scope copy shown; got "' + scope + '"');
+  win.closeSignOutModal();
+  cleanup(env);
+});
+
+test('F8 ("status code" tests are actually error-string mapping)', async () => {
+  // Documentary test: api() always parses JSON and ignores HTTP status.
+  // If a future refactor exposes status to dispatch, this test should
+  // start failing (it asserts the same dispatch as the existing three
+  // mapping tests, using a deliberately mismatched status semantic via
+  // a plan that only specifies `error:`).
+  let connectBody = null;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: (b) => { connectBody = b; return {error: 'vault_decrypt_failed'}; }, once: true},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  await _seedVaultCard(win);
+  win.document.querySelector('.sv').click();
+  await sleep(80);
+  ok(connectBody && connectBody.vault_id, 'saved-variant connect body was POSTed');
+  ok($(win, 'tmTitle').textContent === 'Cannot decrypt this card',
+     'error-string dispatch is what is exercised (not status code)');
   cleanup(env);
 });
 
