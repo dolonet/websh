@@ -2127,6 +2127,68 @@ test('legacy auto-drop: pass/key stripped automatically + modal shown', async ()
   cleanup(env);
 });
 
+test('legacy auto-drop: post-drop click opens form pre-filled, no /api/connect', async () => {
+  // After auto-drop strips c.pass / c.key, clicking the saved card
+  // must NOT fire /api/connect with empty creds (which the server
+  // would auth-fail). Instead the connect form opens with the saved
+  // metadata pre-filled, focus on the password input.
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: () => { connectCalls++; return {auth_failed: true}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed a legacy row that has just been auto-dropped (no pass, no key,
+  // no conn_id — metadata only).
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: '10.0.0.42', port: 22, user: 'deploy',
+     auth: 'pw', persistent: true}]));
+  win.eval('renderSaved()');
+  win.document.querySelector('.sv').click();
+  await sleep(40);
+  ok(connectCalls === 0, 'no /api/connect with empty creds; got ' + connectCalls);
+  ok(!hidden($(win, 'ov')), 'connect form opened');
+  ok($(win, 'iH').value === '10.0.0.42', 'host pre-filled');
+  ok($(win, 'iP').value == 22, 'port pre-filled');
+  ok($(win, 'iU').value === 'deploy', 'user pre-filled');
+  ok($(win, 'iName').value === 'OldProd', 'name pre-filled');
+  ok($(win, 'iSave').checked === true, 'Save pre-checked (re-save under vault)');
+  ok($(win, 'iPersistent').checked === true, 'persistent pre-checked from row');
+  ok($(win, 'iPw').value === '', 'password field empty — user types');
+  cleanup(env);
+});
+
+test('legacy auto-drop: post-drop click routes through named prompt connection', async () => {
+  // The classic case: a legacy saved row that points at a named
+  // prompt connection ("hetzner-hel"). After auto-drop the row has
+  // no pass; clicking it must route through selectPromptConnection
+  // so a restrict_hosts deployment still accepts the connect.
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true, vault_enabled: true,
+      connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                     username: '', kind: 'prompt'}]}},
+    {action: 'connect', response: () => { connectCalls++; return {auth_failed: true}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'HH', host: 'h.example.com', port: 22, user: 'deploy',
+     connection: 'hh', auth: 'pw', persistent: true}]));
+  win.eval('renderSaved()');
+  // Target the saved-list .sv specifically; #serverList also uses .sv
+  // for prompt server-connection cards and appears first in the DOM.
+  win.document.querySelector('#savedList .sv').click();
+  await sleep(40);
+  ok(connectCalls === 0, 'no /api/connect with empty creds; got ' + connectCalls);
+  ok(!hidden($(win, 'ov')), 'connect form opened');
+  // selectPromptConnection locks host/port and sets the prompt-target banner.
+  ok($(win, 'iH').disabled === true, 'host locked by prompt connection');
+  ok(!hidden($(win, 'promptTarget')), 'prompt-target banner shown');
+  ok($(win, 'iU').value === 'deploy', 'user pre-filled from saved row');
+  cleanup(env);
+});
+
 test('legacy auto-drop: modal carries dialog a11y + Got-it dismisses', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
                                                 vault_enabled: true}}];

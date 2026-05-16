@@ -2639,6 +2639,42 @@ async function connectSaved(c) {
     });
     return;
   }
+  // Legacy row whose plaintext was dropped by _maybeAutoDropLegacy
+  // (or never had it in the first place). The metadata (name/host/
+  // port/user/auth/persistent/connection) is still useful — open the
+  // connect form pre-filled and let the user type the password once.
+  // We pre-check Save so the next connect re-saves under the vault.
+  // For restrict_hosts deployments where the row matches a named
+  // prompt connection, route through selectPromptConnection so the
+  // server actually accepts the connect (manual host would be denied).
+  if (!c.pass && !c.key) {
+    let useKey = c.auth === 'key';
+    let routedViaPrompt = false;
+    if (c.connection && serverConfig && serverConfig.connections) {
+      let m = serverConfig.connections.find(
+        e => e.name === c.connection && e.kind === 'prompt');
+      if (m) { selectPromptConnection(c.connection); routedViaPrompt = true; }
+    }
+    if (!routedViaPrompt) {
+      $('iH').value = c.host || '';
+      $('iP').value = c.port || 22;
+      setAuthTab(useKey ? 'key' : 'pw');
+    }
+    // Username: selectPromptConnection may have locked iU when the
+    // named connection fixes it; fill from the saved card otherwise.
+    if (!$('iU').disabled && c.user) $('iU').value = c.user;
+    $('iName').value = c.name || '';
+    if ($('iPersistent')) $('iPersistent').checked = c.persistent !== false;
+    if (serverConfig && serverConfig.vault_enabled) {
+      $('iSave').checked = true;
+      toggleSaveName();
+    }
+    showOverlay();
+    setTimeout(() => {
+      try { (useKey ? $('iKey') : $('iPw')).focus(); } catch(e){}
+    }, 0);
+    return;
+  }
   // Auto-match legacy entries (saved before we tagged with connection name)
   // to a config entry by host:port so they still work under restrict_hosts.
   let connName = c.connection;
