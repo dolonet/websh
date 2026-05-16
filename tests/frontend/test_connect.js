@@ -2068,30 +2068,33 @@ test('cross-tab signed_out tears down live vault panes in sibling tab', async ()
 // Vault: legacy-plaintext banner
 // =====================================================================
 
-test('legacy banner: hidden when no legacy entries exist', async () => {
+test('legacy auto-drop: no plaintext rows → modal stays hidden, list untouched', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
                                                 vault_enabled: true}}];
   const env = await mkEnv(plan); const win = env.win;
-  ok(hidden($(win, 'legacyBanner')),
-     'banner hidden by default with empty saved list');
-  cleanup(env);
-});
-
-test('legacy banner: shown when a row carries pass/key plaintext', async () => {
-  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
-                                                vault_enabled: true}}];
-  const env = await mkEnv(plan); const win = env.win;
+  // Empty list at boot. loadServerConfig already ran via mkEnv.
+  ok(hidden($(win, 'legacyUpdateModal')),
+     'modal hidden by default with empty saved list');
+  // Vault-only row — should not trigger drop or modal.
   win.localStorage.setItem('websh_connections', JSON.stringify([
-    {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw'}]));
-  win.eval('_maybeShowLegacyBanner()');
-  ok(!hidden($(win, 'legacyBanner')), 'banner visible after detection');
+    {name: 'Vaulted', conn_id: 'V'.repeat(26), host: 'v', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  win.eval('_maybeAutoDropLegacy()');
+  ok(hidden($(win, 'legacyUpdateModal')),
+     'modal stays hidden for vault-only row');
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(list.length === 1 && list[0].conn_id === 'V'.repeat(26),
+     'vault row untouched');
   cleanup(env);
 });
 
-test('legacy banner: Ack drops pass/key, keeps metadata, hides banner', async () => {
+test('legacy auto-drop: pass/key stripped automatically + modal shown', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
                                                 vault_enabled: true}}];
   const env = await mkEnv(plan); const win = env.win;
+  // Pre-seed legacy rows BEFORE loadServerConfig fires — easiest way
+  // is to set localStorage and re-call _maybeAutoDropLegacy directly
+  // (mkEnv already finished its boot).
   win.localStorage.setItem('websh_connections', JSON.stringify([
     {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw',
      persistent: true},
@@ -2099,23 +2102,49 @@ test('legacy banner: Ack drops pass/key, keeps metadata, hides banner', async ()
      key: '-----BEGIN OPENSSH PRIVATE KEY-----...'},
     {name: 'Already', conn_id: 'A'.repeat(26), host: 'a', port: 22,
      user: 'a', auth: 'pw', persistent: false}]));
-  win.eval('_maybeShowLegacyBanner()');
-  ok(!hidden($(win, 'legacyBanner')), 'banner visible');
-  // Drive the click handler — runScripts:outside-only would skip the
-  // inline-attribute path, but our wiring uses .onclick so this works.
-  $(win, 'legacyBannerAck').click();
-  await sleep(20);
+  win.eval('_maybeAutoDropLegacy()');
+  ok(!hidden($(win, 'legacyUpdateModal')),
+     'modal shown because legacy rows were dropped');
   const list = JSON.parse(win.localStorage.getItem('websh_connections'));
-  ok(list.length === 3, 'all rows kept');
+  ok(list.length === 3, 'all rows kept (metadata-only)');
   ok(!('pass' in list[0]) && !('key' in list[0]),
      'OldProd: pass dropped');
-  ok(list[0].name === 'OldProd' && list[0].host === 'p',
+  ok(list[0].name === 'OldProd' && list[0].host === 'p' &&
+     list[0].user === 'u' && list[0].persistent === true,
      'OldProd: metadata kept');
   ok(!('pass' in list[1]) && !('key' in list[1]),
      'OldKey: key dropped');
+  ok(list[1].name === 'OldKey' && list[1].user === 'r',
+     'OldKey: metadata kept');
   ok(list[2].conn_id === 'A'.repeat(26),
      'vault-backed row untouched');
-  ok(hidden($(win, 'legacyBanner')), 'banner hidden after Ack');
+  // Re-running auto-drop is a no-op (no more legacy).
+  win.eval('closeLegacyUpdateModal()');
+  ok(hidden($(win, 'legacyUpdateModal')), 'modal closed by close fn');
+  win.eval('_maybeAutoDropLegacy()');
+  ok(hidden($(win, 'legacyUpdateModal')),
+     'second auto-drop call is a no-op — modal stays hidden');
+  cleanup(env);
+});
+
+test('legacy auto-drop: modal carries dialog a11y + Got-it dismisses', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const modal = $(win, 'legacyUpdateModal');
+  ok(modal.getAttribute('role') === 'dialog', 'role=dialog');
+  ok(modal.getAttribute('aria-modal') === 'true', 'aria-modal=true');
+  ok(modal.getAttribute('aria-labelledby') === 'legacyUpdateTitle',
+     'aria-labelledby points at title');
+  ok($(win, 'legacyUpdateTitle').tagName === 'H2',
+     'title h2 present with matching id');
+  // Drive open + close from JS.
+  win.eval('openLegacyUpdateModal()');
+  ok(!hidden(modal), 'modal opens');
+  // Got-it click closes (runScripts:outside-only — eval the onclick).
+  clickBtn(win, 'legacyUpdateOk');
+  await sleep(10);
+  ok(hidden(modal), 'modal hidden after Got it');
   cleanup(env);
 });
 
@@ -2856,9 +2885,10 @@ test('saved list: auth=key new-shape entry shows (key) badge', async () => {
 
 test('saved list: legacy entry with c.key truthy keeps (key) badge', async () => {
   // Backward-compat: pre-vault rows have c.key holding an SSH private
-  // key blob (no auth tag). Until the legacy banner drops it, the row
-  // must still render with the (key) badge so users can identify their
-  // entries before re-saving.
+  // key blob (no auth tag). In a fresh page load _maybeAutoDropLegacy
+  // would strip c.key before the first render — this test bypasses
+  // that by calling renderSaved directly on freshly-seeded legacy
+  // data so the (key) badge logic itself is exercised.
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
                                                 vault_enabled: true}}];
   const env = await mkEnv(plan); const win = env.win;

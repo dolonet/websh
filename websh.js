@@ -2478,38 +2478,50 @@ function _entryUsesKey(c) {
 }
 
 // Detect rows from before the vault shipped — they still carry the
-// plaintext password or key inline. Used to surface a one-time banner
-// (next paragraph) so the user can drop the plaintext consciously
-// rather than have it silently linger.
+// plaintext password or key inline. _maybeAutoDropLegacy consumes the
+// signal once on load: strips pass/key from every legacy row,
+// persists the cleaned list, then opens an informational modal so
+// the user knows their saved cards will ask for the password the
+// next time they're used.
 function _hasLegacyPlaintext() {
   return loadSaved().some(c => c.pass || c.key);
 }
 
-// Show the legacy-plaintext banner if any saved-card row still carries
-// `pass` or `key`. On Ack we strip those two fields from every row —
-// the rest (name, host, port, user, auth, persistent) survives so the
-// user can identify the entry and re-save it under the vault. We do
-// NOT silently re-encrypt: the original plaintext may live in
-// browser-history sync or profile backups.
-function _maybeShowLegacyBanner() {
-  let banner = $('legacyBanner'); if (!banner) return;
-  if (!_hasLegacyPlaintext()) { banner.classList.add('h'); return; }
-  banner.classList.remove('h');
-  let ack = $('legacyBannerAck');
-  if (ack && !ack._wired) {
-    ack._wired = true;
-    ack.onclick = () => {
-      let cleaned = loadSaved().map(c => {
-        let copy = Object.assign({}, c);
-        delete copy.pass;
-        delete copy.key;
-        return copy;
-      });
-      saveSaved(cleaned);
-      banner.classList.add('h');
-      renderSaved();
-    };
-  }
+// Strip pass/key from every legacy row, persist, and open the
+// "Saved connections updated" modal. The earlier design asked the
+// user to click "Drop plaintext now"; in practice that was just
+// bureaucracy — the user can't make a different choice (we'd never
+// silently re-encrypt; the original may live in browser-history sync
+// or profile backups, and auto-encrypting would create a false sense
+// of security). Dropping is purely defensive: it shrinks this
+// browser's localStorage footprint without claiming to recover from
+// any prior leak. So we do it automatically and just inform.
+function _maybeAutoDropLegacy() {
+  if (!_hasLegacyPlaintext()) return;
+  let cleaned = loadSaved().map(c => {
+    let copy = Object.assign({}, c);
+    delete copy.pass;
+    delete copy.key;
+    return copy;
+  });
+  saveSaved(cleaned);
+  // No renderSaved here — loadServerConfig calls it next, after
+  // _refreshIdbHasKey, so we'd otherwise paint twice with a brief
+  // .nokey flash on vault rows.
+  openLegacyUpdateModal();
+}
+
+function openLegacyUpdateModal() {
+  let modal = $('legacyUpdateModal'); if (!modal) return;
+  modal.classList.remove('h');
+  // Initial focus on the Got-it button so Enter dismisses; matches
+  // the implicit-default convention used by the connect form.
+  setTimeout(() => { try { $('legacyUpdateOk').focus(); } catch(e){} }, 0);
+}
+
+function closeLegacyUpdateModal() {
+  let modal = $('legacyUpdateModal'); if (!modal) return;
+  modal.classList.add('h');
 }
 
 function renderSaved() {
@@ -2586,7 +2598,8 @@ async function connectSaved(c) {
   // vault record, browser supplies vault_key. Legacy rows (still
   // carrying c.pass / c.key in localStorage from before the vault
   // shipped) keep the old manual-mode flow so they continue to work
-  // until the user acks the legacy banner or re-saves.
+  // until _maybeAutoDropLegacy strips those fields on next load or
+  // the user re-saves.
   if (c.conn_id) {
     // Non-minting: IDB may be empty (Safari ITP, site-data clear,
     // sign-out in another tab). renderSaved's onclick handler pre-gates
@@ -2738,10 +2751,13 @@ function loadServerConfig() {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
     _applyVaultEnabledClass();
-    _maybeShowLegacyBanner();
     // Pre-cache the IDB key presence so the first renderSaved doesn't
     // flash all vault-backed rows as no-key while we wait on IDB.
     await _refreshIdbHasKey();
+    // Auto-drop legacy plaintext rows BEFORE the first render so the
+    // saved-card list paints in its final shape. Surfaces a modal
+    // when something was actually dropped.
+    _maybeAutoDropLegacy();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to

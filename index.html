@@ -115,12 +115,6 @@
     .toast.on{opacity:1;transform:none}
     .toast.warn{border-color:var(--wn);color:var(--wn)}
     .toast.err{border-color:var(--dg);color:var(--dg)}
-    /* Persistent banner — shown until acknowledged. Used by the
-       legacy-plaintext one-time prompt. */
-    .banner{position:fixed;top:50px;left:18px;right:18px;display:flex;align-items:center;gap:12px;padding:10px 14px;background:rgba(210,153,34,.08);border:1px solid var(--wn);border-radius:8px;color:var(--tx);font-size:12px;line-height:1.45;z-index:900}
-    .banner span{flex:1}
-    .banner button{padding:6px 10px;border-radius:6px;border:1px solid var(--wn);background:var(--bg);color:var(--wn);cursor:pointer;font-size:12px;font-weight:600}
-    .banner button:hover{background:rgba(210,153,34,.15)}
     .panel .btn-p{width:100%;padding:10px;font-size:14px;margin-top:8px}
     .panel .btn-row{display:flex;gap:8px;margin-top:8px}
     .panel .btn-row .btn-p{flex:1}
@@ -246,23 +240,28 @@
 <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="false"></div>
 
 <!--
-  Legacy-plaintext banner. Surfaces on first load when localStorage
-  carries saved-card entries from before the encrypted vault shipped
-  (c.pass or c.key set). One click drops the plaintext fields — the
-  user re-enters and re-saves under the vault. We don't silently
-  re-encrypt: the original plaintext may live in browser-history sync
-  / profile backups, so "encrypted now" would create a false sense of
-  security. Hidden by default; _maybeShowLegacyBanner() reveals it.
+  Legacy-plaintext one-time modal. On first load after upgrade, if
+  localStorage carries saved-card entries from before the encrypted
+  vault shipped (c.pass or c.key set), _maybeAutoDropLegacy strips
+  those fields, persists the cleaned list, and opens this modal as
+  a heads-up. We deliberately do NOT silently re-encrypt — the
+  original plaintext may live in browser-history sync or profile
+  backups, so auto-encrypting would create a false sense of security.
+  Wording avoids "plaintext / encrypted vault / sync backups" because
+  the user can't act on those distinctions; what they need to know is
+  that some saved connections will ask for the password once more.
 -->
-<div id="legacyBanner" class="banner h" role="alert">
-  <span>
-    Some of your saved connections were stored as plaintext from before
-    encrypted credentials shipped. Click below to drop the plaintext
-    from this browser — you can re-enter and re-save them under the
-    encrypted vault. We do not silently re-encrypt: the original
-    plaintext may live in browser-history sync or profile backups.
-  </span>
-  <button id="legacyBannerAck" type="button">Drop plaintext now</button>
+<div id="legacyUpdateModal" class="ov h"
+     role="dialog" aria-modal="true"
+     aria-labelledby="legacyUpdateTitle" aria-describedby="legacyUpdateDesc"
+     onclick="if(event.target===this)closeLegacyUpdateModal()">
+  <div class="tm-panel">
+    <h2 id="legacyUpdateTitle">Saved connections updated</h2>
+    <div id="legacyUpdateDesc" class="tm-sub">Type your password once when you next connect to a saved server.</div>
+    <div class="tm-row">
+      <button id="legacyUpdateOk" class="btn btn-p" onclick="closeLegacyUpdateModal()">Got it</button>
+    </div>
+  </div>
 </div>
 
 <!-- Top bar -->
