@@ -188,6 +188,7 @@ function createPane(container) {
     `</div>` +
     `<div class="reconnect-bar h" data-reconnect="${id}">` +
       `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
+      `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
       `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
     `</div>` +
     `<div class="pane-term"></div>`;
@@ -651,13 +652,30 @@ function _deletePaneSecret(uuid) {
 }
 
 // ── Reconnect ────────────────────────────────────────────────────────
+// For manual / named panes whose in-memory password was lost (fresh-tab
+// F5 with empty sessionStorage, or _maybeAutoDropLegacy on the source
+// saved card before they cliked reconnect), we expose an inline password
+// input on the bar so the user can recover in place without opening the
+// full connect form. Vault-backed panes follow the "no_vault_key" path
+// instead (their fix is sign-in, not a typed password). Key-auth panes
+// fall back to "Reconnect" only (a multi-line key blob doesn't fit a bar
+// input; user opens a new pane to re-enter the key).
+function _needsReconnectPwInput(p, reason) {
+  if (!p || reason === 'no_vault_key') return false;
+  if (p.conn_id) return false;             // vault-backed: different recovery
+  if (p.auth === 'key') return false;      // key auth: bar input too narrow
+  if (p.password || p.key) return false;   // creds already in memory
+  return !!(p.host || p.connection);
+}
 function showReconnectBar(p, reason) {
   let bar = p.el.querySelector('[data-reconnect]');
   if (!bar) return;
   let msg = bar.querySelector('span');
+  let pwInput = bar.querySelector('input[type=password]');
+  let showInput = _needsReconnectPwInput(p, reason);
   if (msg) {
     if (reason === 'auth_failed') {
-      msg.textContent = 'Authentication failed';
+      msg.textContent = showInput ? 'Authentication failed — type password' : 'Authentication failed';
       msg.style.color = 'var(--dg)';
     } else if (reason === 'no_vault_key') {
       // Distinct from auth-fail (creds rejected): the encryption key
@@ -668,8 +686,17 @@ function showReconnectBar(p, reason) {
       msg.textContent = 'Vault key missing — sign in again to recover';
       msg.style.color = 'var(--wn)';
     } else {
-      msg.textContent = 'Disconnected';
+      msg.textContent = showInput ? 'Disconnected — type password to reconnect' : 'Disconnected';
       msg.style.color = 'var(--dim)';
+    }
+  }
+  if (pwInput) {
+    pwInput.classList.toggle('h', !showInput);
+    if (showInput) {
+      pwInput.value = '';
+      // Auto-focus when the bar is revealing the input for the first
+      // time so the user can start typing immediately.
+      setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
   bar.classList.remove('h');
@@ -680,6 +707,18 @@ function hideReconnectBar(p) {
 }
 function reconnectPane(id) {
   let p = panes[id]; if (!p || (!p.host && !p.connection)) return;
+  let bar = p.el.querySelector('[data-reconnect]');
+  let pwInput = bar && bar.querySelector('input[type=password]');
+  // Inline password recovery: if the input is showing and the user
+  // typed something, feed it into connectPane as opts.password.
+  // Empty input → focus and wait for them to type.
+  if (pwInput && !pwInput.classList.contains('h')) {
+    let typed = pwInput.value || '';
+    if (!typed) { try { pwInput.focus(); } catch(e){} return; }
+    hideReconnectBar(p);
+    connectPane(p, {label: p.label, resume: p.persistent, password: typed});
+    return;
+  }
   hideReconnectBar(p);
   connectPane(p, {label: p.label, resume: p.persistent});
 }

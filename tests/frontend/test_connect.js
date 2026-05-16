@@ -2189,6 +2189,109 @@ test('legacy auto-drop: post-drop click routes through named prompt connection',
   cleanup(env);
 });
 
+test('reconnect-bar: inline password input shown when manual pane has no creds', async () => {
+  // Manual / named pane that lost its in-memory password (auth failed
+  // after empty creds, fresh-tab F5 with empty sessionStorage, etc).
+  // The reconnect bar exposes an inline password input so the user can
+  // recover in place without opening the connect form.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-rb', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Materialize a real pane via the connect flow.
+  $(win, 'iH').value = '10.0.0.50'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p1';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(p, 'pane materialized');
+  // Simulate a disconnect that lost creds (drop p.password) and trigger
+  // the bar via showReconnectBar.
+  p.password = '';
+  win.eval(`showReconnectBar(panes['${p.id}'], 'auth_failed')`);
+  await sleep(20);
+  const bar = p.el.querySelector('[data-reconnect]');
+  ok(!bar.classList.contains('h'), 'bar visible');
+  const pwInput = bar.querySelector('input[type=password]');
+  ok(pwInput, 'password input present');
+  ok(!pwInput.classList.contains('h'), 'pw input revealed for manual+no-creds');
+  ok(bar.querySelector('span').textContent.indexOf('type password') !== -1,
+     'message hints at typing; got "' + bar.querySelector('span').textContent + '"');
+  cleanup(env);
+});
+
+test('reconnect-bar: inline password input hidden for vault-backed pane', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-vrb', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.51'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p2';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  // Fake a vault-backed pane state.
+  p.conn_id = 'X'.repeat(26);
+  p.password = '';
+  win.eval(`showReconnectBar(panes['${p.id}'], 'no_vault_key')`);
+  const bar = p.el.querySelector('[data-reconnect]');
+  const pwInput = bar.querySelector('input[type=password]');
+  ok(pwInput.classList.contains('h'),
+     'pw input hidden for vault-backed pane (no_vault_key reason)');
+  ok(bar.querySelector('span').textContent.indexOf('Vault key missing') !== -1,
+     'no_vault_key message shown');
+  cleanup(env);
+});
+
+test('reconnect-bar: Enter / Reconnect with typed password feeds connectPane', async () => {
+  // The inline-input recovery uses the typed value as opts.password and
+  // dispatches the body with it. We assert the body that lands at the
+  // server carries the freshly-typed password.
+  let lastConnectBody = null;
+  let connectCount = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    // First connect goes through with the initial password.
+    {action: 'connect', match: b => (b.password === 'p3-original'),
+     response: {session_id: 'sid-rb3', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    // Catch-all for the typed-password reconnect attempt.
+    {action: 'connect', response: (b) => {
+      lastConnectBody = b; connectCount++;
+      return {session_id: 'sid-rb3-retry', alive: true};
+    }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.52'; $(win, 'iU').value = 'a';
+  $(win, 'iPw').value = 'p3-original';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(p && p.sid === 'sid-rb3', 'initial connect landed');
+  // Clear in-memory creds, raise the bar.
+  p.password = '';
+  win.eval(`showReconnectBar(panes['${p.id}'], 'auth_failed')`);
+  // Type the new password into the inline input.
+  const pwInput = p.el.querySelector('input[type=password][data-reconnect-pw]');
+  pwInput.value = 'p3-typed';
+  // Trigger reconnect via the Reconnect button (clickBtn-style eval
+  // since runScripts:outside-only).
+  win.eval(`reconnectPane('${p.id}')`);
+  await sleep(80);
+  ok(lastConnectBody && lastConnectBody.password === 'p3-typed',
+     'typed password reached /api/connect body; got ' + (lastConnectBody && lastConnectBody.password));
+  cleanup(env);
+});
+
 test('legacy auto-drop: modal carries dialog a11y + Got-it dismisses', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
                                                 vault_enabled: true}}];
