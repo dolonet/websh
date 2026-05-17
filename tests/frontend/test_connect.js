@@ -103,6 +103,12 @@ const EXPOSE = `
     set: v => { _vaultRecentlySignedOut = v; },
     configurable: true,
   });
+  Object.defineProperty(window, 'selectedPrompt', {get: () => selectedPrompt, configurable: true});
+  Object.defineProperty(window, 'authMode', {get: () => authMode, configurable: true});
+  Object.defineProperty(window, '_deferredAfterLegacyModal', {
+    get: () => _deferredAfterLegacyModal,
+    configurable: true,
+  });
 })();`;
 
 // jsdom v24 ships `crypto.getRandomValues` but not `crypto.subtle`, and it
@@ -2310,6 +2316,216 @@ test('legacy auto-drop: modal carries dialog a11y + Got-it dismisses', async () 
   clickBtn(win, 'legacyUpdateOk');
   await sleep(10);
   ok(hidden(modal), 'modal hidden after Got it');
+  cleanup(env);
+});
+
+// =====================================================================
+// Vault: legacy-migration cluster regressions (PR-67 follow-up review)
+// =====================================================================
+
+test('legacy auto-drop: skipped when vault_enabled=false (no silent data loss)', async () => {
+  // On a vault-off deployment (cryptography missing, schema downgrade,
+  // WEBSH_VAULT_ENABLE unset) legacy plaintext rows are the only
+  // working storage path. Stripping them would orphan the user — Save
+  // UI is hidden by .vault-only CSS so they can't re-save, and every
+  // saved-card click would open an empty-password form. _maybeAutoDrop
+  // must be gated on serverConfig.vault_enabled.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: false}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed a legacy row carrying plaintext, then re-run loadServerConfig
+  // (the boot one already ran in mkEnv without legacy rows).
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw',
+     auth: 'pw', persistent: true}]));
+  // Re-run the auto-drop gating path explicitly. With vault_enabled=false
+  // _maybeAutoDropLegacy must NOT be called by the load flow.
+  win.eval('loadServerConfig()');
+  await sleep(40);
+  ok(hidden($(win, 'legacyUpdateModal')),
+     'legacy modal NOT opened on vault-off deployment');
+  const list = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(list.length === 1 && list[0].pass === 'oldpw',
+     'legacy plaintext row STILL has pass on vault-off deployment');
+  cleanup(env);
+});
+
+test('legacy fallback: host:port lookup routes through prompt under restrict_hosts', async () => {
+  // Pre-naming legacy row (no c.connection) on a restrict_hosts
+  // deployment with a prompt connection matching its host:port. The
+  // fallback must route through selectPromptConnection — otherwise the
+  // manual form stays hidden and the user can't identify or use the row.
+  let connectCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true, vault_enabled: true,
+      connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                     username: '', kind: 'prompt'}]}},
+    {action: 'connect', response: () => { connectCalls++; return {auth_failed: true}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Legacy row with no c.connection (pre-naming) but host:port match.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'LegacyNoName', host: 'h.example.com', port: 22, user: 'deploy',
+     auth: 'pw', persistent: true}]));
+  win.eval('renderSaved()');
+  win.document.querySelector('#savedList .sv').click();
+  await sleep(40);
+  ok(connectCalls === 0, 'no /api/connect with empty creds');
+  // selectPromptConnection locks host and shows the promptTarget banner;
+  // those are the observable effects we pin on.
+  ok($(win, 'iH').disabled === true,
+     'host locked by prompt routing (host:port fallback worked)');
+  ok(!hidden($(win, 'promptTarget')),
+     'prompt-target banner shown after host:port routing');
+  ok($(win, 'iU').value === 'deploy',
+     'user pre-filled from saved row');
+  cleanup(env);
+});
+
+test('legacy fallback: clears stale selectedPrompt when no prompt match', async () => {
+  // User opens the form, selects a prompt connection (locking it via
+  // selectedPrompt), then WITHOUT submitting clicks a legacy manual
+  // saved card whose host:port doesn't match any prompt. Without
+  // clearPromptSelection, doConnect would still ship connection:
+  // selectedPrompt.name and route to the wrong host.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, vault_enabled: true,
+      connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                     username: '', kind: 'prompt'}]}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Pre-select the prompt connection (form is open).
+  win.eval('selectPromptConnection("hh")');
+  ok(win.selectedPrompt && win.selectedPrompt.name === 'hh',
+     'selectedPrompt set to hh');
+  // Legacy row with NO host:port match against any prompt.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OtherBox', host: 'other.example.com', port: 22, user: 'admin',
+     auth: 'pw', persistent: true}]));
+  win.eval('renderSaved()');
+  win.document.querySelector('#savedList .sv').click();
+  await sleep(40);
+  ok(win.selectedPrompt === null,
+     'selectedPrompt cleared by legacy fallback (no host:port match)');
+  // Host now reflects the saved row, not the prompt's host.
+  ok($(win, 'iH').value === 'other.example.com',
+     'host filled from legacy row, not stale prompt target');
+  ok($(win, 'iH').disabled === false,
+     'host input unlocked (prompt selection cleared)');
+  cleanup(env);
+});
+
+test('legacy modal: autoconnect deferred until Got-it (no focus theft / no overlap)', async () => {
+  // Legacy rows present → _maybeAutoDropLegacy opens its modal during
+  // loadServerConfig. Without the deferral, doAutoConnect would call
+  // showOverlay() in the same tick and the connect overlay would paint
+  // on top (later in DOM), stealing focus to iPw. The fix queues
+  // doAutoConnect inside closeLegacyUpdateModal.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Seed legacy row + re-trigger the load flow so _maybeAutoDropLegacy
+  // fires after the mkEnv-time empty boot. mkEnv's boot already showed
+  // the connect overlay (no panes, no legacy rows) — hide it so the
+  // assertion below tests the actual deferral path, not stale state.
+  $(win, 'ov').classList.add('h');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'OldProd', host: 'p', port: 22, user: 'u', pass: 'oldpw',
+     auth: 'pw', persistent: true}]));
+  win.eval('loadServerConfig()');
+  await sleep(40);
+  // Legacy modal is up; connect overlay deferred.
+  ok(!hidden($(win, 'legacyUpdateModal')), 'legacy modal opened');
+  ok(hidden($(win, 'ov')),
+     'connect overlay NOT shown while legacy modal is up');
+  ok(typeof win._deferredAfterLegacyModal === 'function',
+     'doAutoConnect queued for after modal close');
+  // Focus is on the Got-it button, not iPw.
+  ok(win.document.activeElement === $(win, 'legacyUpdateOk'),
+     'focus on Got-it button, not stolen by connect overlay');
+  // Dismiss → connect overlay drains.
+  clickBtn(win, 'legacyUpdateOk');
+  await sleep(20);
+  ok(hidden($(win, 'legacyUpdateModal')), 'legacy modal closed');
+  ok(!hidden($(win, 'ov')),
+     'connect overlay shown after legacy modal dismissed');
+  ok(win._deferredAfterLegacyModal === null,
+     'deferred callback drained');
+  cleanup(env);
+});
+
+test('legacy fallback: key-auth row matching prompt opens on KEY tab', async () => {
+  // Legacy auth:'key' row whose host:port matches a prompt connection.
+  // The routing path calls selectPromptConnection which unconditionally
+  // sets the pw tab. After the fix, setAuthTab(useKey ? 'key' : 'pw')
+  // runs AFTER routing so the key tab wins. Otherwise the user would
+  // see a hidden iKey textarea and type a password into iPw.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true, vault_enabled: true,
+      connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                     username: '', kind: 'prompt'}]}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'HHKey', host: 'h.example.com', port: 22, user: 'deploy',
+     connection: 'hh', auth: 'key', persistent: true}]));
+  win.eval('renderSaved()');
+  win.document.querySelector('#savedList .sv').click();
+  await sleep(40);
+  // Auth mode flipped to key AFTER prompt routing.
+  ok(win.authMode === 'key',
+     'authMode is key after routing (got: ' + win.authMode + ')');
+  // iKey form-group visible, iPw form-group hidden.
+  ok(!$(win, 'authKey').classList.contains('h'),
+     'key form-group visible');
+  ok($(win, 'authPw').classList.contains('h'),
+     'pw form-group hidden');
+  // Prompt routing still happened: host locked, banner shown.
+  ok($(win, 'iH').disabled === true,
+     'host locked by prompt routing');
+  ok(!hidden($(win, 'promptTarget')), 'prompt-target banner shown');
+  cleanup(env);
+});
+
+test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
+  // a11y parity with signOutModal: keydown Escape dismisses, Tab is
+  // trapped to the focusables inside the dialog, focus is restored to
+  // the element that was active before opening.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const modal = $(win, 'legacyUpdateModal');
+  // Pre-focus on an element OUTSIDE the modal so we can verify restore.
+  // iH is a focusable text input present in the connect form.
+  $(win, 'iH').focus();
+  ok(win.document.activeElement === $(win, 'iH'),
+     'baseline focus on iH before opening modal');
+  win.eval('openLegacyUpdateModal()');
+  await sleep(10);
+  ok(!hidden(modal), 'modal open');
+  ok(win.document.activeElement === $(win, 'legacyUpdateOk'),
+     'focus moved to Got-it button');
+  // Esc closes.
+  const evt = new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true,
+                                                 cancelable: true});
+  win.document.dispatchEvent(evt);
+  await sleep(10);
+  ok(hidden(modal), 'Esc keydown closes the modal');
+  ok(win.document.activeElement === $(win, 'iH'),
+     'focus restored to the element that opened the modal');
+  // Tab trap: open again, send Tab — only one focusable, so Tab from
+  // the (sole) Got-it button cycles back to itself, not out to the page.
+  $(win, 'iH').focus();
+  win.eval('openLegacyUpdateModal()');
+  await sleep(10);
+  ok(win.document.activeElement === $(win, 'legacyUpdateOk'),
+     'focus on Got-it before Tab');
+  const tabEvt = new win.KeyboardEvent('keydown', {key: 'Tab', bubbles: true,
+                                                    cancelable: true});
+  win.document.dispatchEvent(tabEvt);
+  // Tab from the only focusable wraps back to the first (= same button).
+  ok(win.document.activeElement === $(win, 'legacyUpdateOk'),
+     'Tab trapped inside modal');
+  // Cleanup — close so we don't leak the keydown listener.
+  win.eval('closeLegacyUpdateModal()');
   cleanup(env);
 });
 

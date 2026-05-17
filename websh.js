@@ -2550,8 +2550,41 @@ function _maybeAutoDropLegacy() {
   openLegacyUpdateModal();
 }
 
+// One-shot callback queued by loadServerConfig when the legacy modal
+// preempts doAutoConnect. closeLegacyUpdateModal drains it so the
+// user sees the connect overlay only AFTER they've acknowledged the
+// migration message.
+let _deferredAfterLegacyModal = null;
+// A11y plumbing mirrors signOutModal: Esc closes, Tab traps focus
+// inside the dialog, focus is restored on close. Without these the
+// modal had role=dialog/aria-modal but Tab leaked to the page behind
+// it and Esc did nothing.
+let _legacyUpdatePrevFocus = null;
+let _legacyUpdateKeyHandler = null;
 function openLegacyUpdateModal() {
   let modal = $('legacyUpdateModal'); if (!modal) return;
+  // Defensive: if a previous open left a keydown listener wired
+  // (programmatic re-open without close), tear it down first so we
+  // don't leak listeners or stomp on _legacyUpdatePrevFocus.
+  if (_legacyUpdateKeyHandler) {
+    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
+    _legacyUpdateKeyHandler = null;
+  }
+  _legacyUpdatePrevFocus = document.activeElement;
+  _legacyUpdateKeyHandler = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeLegacyUpdateModal(); return; }
+    if (e.key !== 'Tab') return;
+    let m = $('legacyUpdateModal'); if (!m) return;
+    let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
+    if (!focusables.length) return;
+    let first = focusables[0], last = focusables[focusables.length - 1];
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  };
+  document.addEventListener('keydown', _legacyUpdateKeyHandler);
   modal.classList.remove('h');
   // Initial focus on the Got-it button so Enter dismisses; matches
   // the implicit-default convention used by the connect form.
@@ -2560,7 +2593,25 @@ function openLegacyUpdateModal() {
 
 function closeLegacyUpdateModal() {
   let modal = $('legacyUpdateModal'); if (!modal) return;
+  if (_legacyUpdateKeyHandler) {
+    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
+    _legacyUpdateKeyHandler = null;
+  }
   modal.classList.add('h');
+  // Restore focus to whatever opened the modal before draining the
+  // deferred autoconnect — otherwise focus would briefly land back
+  // on (e.g.) the page body and the connect form's focusFirst would
+  // race against it.
+  if (_legacyUpdatePrevFocus && typeof _legacyUpdatePrevFocus.focus === 'function') {
+    try { _legacyUpdatePrevFocus.focus(); } catch (e) {}
+  }
+  _legacyUpdatePrevFocus = null;
+  // Drain the queued post-modal action (typically doAutoConnect).
+  if (_deferredAfterLegacyModal) {
+    let fn = _deferredAfterLegacyModal;
+    _deferredAfterLegacyModal = null;
+    try { fn(); } catch (e) {}
+  }
 }
 
 function renderSaved() {
@@ -2689,15 +2740,31 @@ async function connectSaved(c) {
   if (!c.pass && !c.key) {
     let useKey = c.auth === 'key';
     let routedViaPrompt = false;
-    if (c.connection && serverConfig && serverConfig.connections) {
-      let m = serverConfig.connections.find(
-        e => e.name === c.connection && e.kind === 'prompt');
-      if (m) { selectPromptConnection(c.connection); routedViaPrompt = true; }
+    if (serverConfig && serverConfig.connections) {
+      // First: name match (rows saved after connection-naming shipped).
+      let m = null;
+      if (c.connection) {
+        m = serverConfig.connections.find(
+          e => e.name === c.connection && e.kind === 'prompt');
+      }
+      // Fallback: pre-naming legacy rows have no c.connection. Match
+      // by host:port so restrict_hosts deployments don't drop the
+      // user into a hidden manual form with no way back. Only the
+      // host:port pair uniquely identifies a connection in practice,
+      // so this is safe.
+      if (!m) {
+        m = serverConfig.connections.find(
+          e => e.kind === 'prompt' && e.host === c.host && e.port === c.port);
+      }
+      if (m) { selectPromptConnection(m.name); routedViaPrompt = true; }
     }
     if (!routedViaPrompt) {
+      // No prompt match: clear any stale selectedPrompt that a prior
+      // in-form selection may have left behind. Otherwise doConnect
+      // would use selectedPrompt.name and route to the wrong host.
+      if (selectedPrompt) clearPromptSelection();
       $('iH').value = c.host || '';
       $('iP').value = c.port || 22;
-      setAuthTab(useKey ? 'key' : 'pw');
     }
     // Username: selectPromptConnection may have locked iU when the
     // named connection fixes it; fill from the saved card otherwise.
@@ -2708,6 +2775,10 @@ async function connectSaved(c) {
       $('iSave').checked = true;
       toggleSaveName();
     }
+    // Auth-tab + focus run AFTER routing so a legacy key-auth row
+    // matching a prompt connection lands on the key tab (the
+    // selectPromptConnection call inside routing always sets 'pw').
+    setAuthTab(useKey ? 'key' : 'pw');
     showOverlay();
     setTimeout(() => {
       try { (useKey ? $('iKey') : $('iPw')).focus(); } catch(e){}
@@ -2831,8 +2902,13 @@ function loadServerConfig() {
     await _refreshIdbHasKey();
     // Auto-drop legacy plaintext rows BEFORE the first render so the
     // saved-card list paints in its final shape. Surfaces a modal
-    // when something was actually dropped.
-    _maybeAutoDropLegacy();
+    // when something was actually dropped. Gated on vault_enabled:
+    // on a vault-off deployment (cryptography missing, schema
+    // downgrade, WEBSH_VAULT_ENABLE unset) the legacy plaintext rows
+    // are the ONLY working storage path — stripping them strands
+    // the user with empty-password forms forever, since the Save UI
+    // is hidden by .vault-only CSS so they can't re-save either.
+    if (cfg.vault_enabled === true) _maybeAutoDropLegacy();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to
@@ -2840,7 +2916,16 @@ function loadServerConfig() {
     // submit, so the user sees the overlay on an empty workspace.
     if(!tryRestoreSessions()) {
       overlayMode = 'initial';
-      doAutoConnect();
+      // Defer autoconnect while the legacy-migration modal is open:
+      // both .ov divs share z-index, and #ov paints on top (later in
+      // DOM) — autoconnect would hide the migration message and steal
+      // focus to iPw. closeLegacyUpdateModal drains the queued call.
+      let legacy = $('legacyUpdateModal');
+      if (legacy && !legacy.classList.contains('h')) {
+        _deferredAfterLegacyModal = doAutoConnect;
+      } else {
+        doAutoConnect();
+      }
     }
   }).catch(() => {
     overlayMode = 'initial';
