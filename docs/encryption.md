@@ -287,9 +287,11 @@ entries even though the origin is shared.
   — but the client's post-POST IDB re-check then sees a different
   `vault_id` (or none) and skips both the local list write and any
   follow-up delete, leaving the blob server-side with no client
-  reference. The encrypting `K` was wiped from IDB by the sibling's
-  sign-out, so the blob is cryptographically unreachable (no
-  plaintext leak); it just adds ~200 B to `websh.creds.json` until
+  reference. The encrypting `K` is wiped from IDB by the sibling's
+  sign-out and from this tab's in-memory `_vaultKeyCache` by the
+  receive-side `invalidateVaultCache()`, so the blob is
+  cryptographically unreachable (no plaintext leak); it just adds
+  ~200 B to `websh.creds.json` until
   the same `--vault-gc` CLI above reaps it. The race window is the
   `/api/save` round-trip time, typically &lt;100 ms.
 
