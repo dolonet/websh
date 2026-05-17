@@ -1668,6 +1668,107 @@ test('sign out: confirm wipes everything (server + IDB + localStorage + sessionS
   cleanup(env);
 });
 
+test('sign out: empty-vault path does NOT mint vault_id or broadcast', async () => {
+  // Fresh tab, user clicks Sign Out without ever having signed in.
+  // The old code called ensureVaultId() (minting) just to delete the
+  // freshly-minted vault_id on the next line, and then unconditionally
+  // _broadcastSignedOut() — telling sibling tabs (which may have a
+  // live unrelated vault session) to invalidate caches and tear down
+  // panes for nothing. The fix: ensureVaultIdIfPresent + preexisting
+  // gate around the broadcast and pane teardown.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  let broadcasts = 0;
+  const ChannelMock = class {
+    constructor(name) { this.name = name; this.onmessage = null;
+                        ChannelMock.instances.push(this); }
+    postMessage(d) {
+      broadcasts++;
+      ChannelMock.instances.forEach(c => {
+        if (c !== this && c.onmessage) c.onmessage({data: d});
+      });
+    }
+    close() {}
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(40);
+  // No ensureVaultId / ensureVaultKey calls — IDB stays empty.
+  ok(!(await win.eval('_idbGet("vault_id")')),
+     'vault_id empty pre-test');
+  win.openSignOutModal();
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  await win.confirmSignOut();
+  // No broadcast — sibling tabs unbothered.
+  ok(broadcasts === 0,
+     'no broadcast on empty-vault sign-out; got ' + broadcasts);
+  // No minted vault_id — IDB stays empty.
+  ok(!(await win.eval('_idbGet("vault_id")')),
+     'IDB vault_id still empty (no mint just to delete)');
+  // Sign-out flag NOT set — would otherwise block legit saves in
+  // sibling tabs until they re-doConnect.
+  ok(win.eval('_vaultRecentlySignedOut') === false,
+     '_vaultRecentlySignedOut NOT set on empty path');
+  // Modal closed regardless — the user did click Sign Out.
+  ok(hidden($(win, 'signOutModal')), 'sign-out modal closed');
+  dom.window.close();
+});
+
+test('sign out: populated-vault path DOES broadcast to siblings', async () => {
+  // Counter-test for the preexisting gate: when there was a vault to
+  // sign out of, the broadcast and pane teardown must still fire.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}},
+                {action: 'save_delete', response: () => ({})}];
+  let broadcasts = 0;
+  const ChannelMock = class {
+    constructor(name) { this.name = name; this.onmessage = null;
+                        ChannelMock.instances.push(this); }
+    postMessage(d) {
+      broadcasts++;
+      ChannelMock.instances.forEach(c => {
+        if (c !== this && c.onmessage) c.onmessage({data: d});
+      });
+    }
+    close() {}
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(40);
+  // Populate: mint vault_id + K, add a saved card so save_delete fires.
+  await win.eval('ensureVaultId()');
+  await win.eval('ensureVaultKey()');
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'A', conn_id: 'A'.repeat(26), host: 'a', port: 22, user: 'u',
+     auth: 'pw', persistent: false}]));
+  win.openSignOutModal();
+  $(win, 'signOutInput').value = 'DELETE';
+  $(win, 'signOutInput').dispatchEvent(new win.Event('input', {bubbles: true}));
+  await win.confirmSignOut();
+  ok(broadcasts === 1,
+     'one broadcast on populated-vault sign-out; got ' + broadcasts);
+  ok(win.eval('_vaultRecentlySignedOut') === true,
+     '_vaultRecentlySignedOut SET on populated path');
+  dom.window.close();
+});
+
 test('sign out: tolerates server-side failures (local wipe still happens)', async () => {
   let attempts = 0;
   const plan = [

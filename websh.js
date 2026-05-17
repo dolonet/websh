@@ -3912,8 +3912,17 @@ async function confirmSignOut() {
   // continue on per-row failure (404/network) — the local wipe still
   // happens, and the orphaned server-side blob (if any) is just a
   // namespace squat with no plaintext leak.
+  //
+  // Use the non-minting variant: on a fresh tab where the user clicks
+  // Sign Out without ever having signed in, ensureVaultId() would MINT
+  // a vault_id just to delete it on the next line, and worse —
+  // _broadcastSignedOut at the end would still fire, telling sibling
+  // tabs to invalidate their active vault session for nothing.
+  // `preexisting` records whether there was ever anything to sign out;
+  // the pane teardown / broadcast are gated on it.
   let vault_id = null;
-  try { vault_id = await ensureVaultId(); } catch (e) {}
+  try { vault_id = await ensureVaultIdIfPresent(); } catch (e) {}
+  let preexisting = !!vault_id;
   let list = loadSaved();
   for (let c of list) {
     if (!vault_id || !c.conn_id) continue;
@@ -3953,14 +3962,21 @@ async function confirmSignOut() {
   } catch (e) {}
   // Tear down any live vault-backed panes in this tab — they're now
   // running with a key that was just wiped from disk, so the next
-  // disconnect/reconnect would silently re-mint a fresh K.
-  _disconnectAllVaultPanesForNoKey();
-  invalidateVaultCache();
-  _vaultRecentlySignedOut = true;
-  _broadcastSignedOut();
+  // disconnect/reconnect would silently re-mint a fresh K. Only fire
+  // the broadcast + tear-down when there was a vault to sign out of:
+  // on the empty-vault path no panes exist and there's nothing to
+  // signal sibling tabs about.
+  if (preexisting) {
+    _disconnectAllVaultPanesForNoKey();
+    invalidateVaultCache();
+    _vaultRecentlySignedOut = true;
+    _broadcastSignedOut();
+  }
   closeSignOutModal();
   renderSaved();
-  showToast('Signed out. All saved credentials in this browser have been removed.', '');
+  showToast(preexisting
+    ? 'Signed out. All saved credentials in this browser have been removed.'
+    : 'No saved credentials in this browser to remove.', '');
 }
 function resetOptions(){
   settings = { ...DEFAULT_SETTINGS };
