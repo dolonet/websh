@@ -281,6 +281,17 @@ entries even though the origin is shared.
   A future minor lands `GET /api/vault/stats` (operator-auth) and a
   `python3 server.py --vault-gc --older-than 90d` CLI when that
   becomes load-bearing.
+- Save-during-sign-out orphan blobs. If a sibling tab signs out
+  while this tab's `/api/save` is in flight (between the POST and
+  the local list write), the server has already accepted the blob
+  — but the client's post-POST IDB re-check then sees a different
+  `vault_id` (or none) and skips both the local list write and any
+  follow-up delete, leaving the blob server-side with no client
+  reference. The encrypting `K` was wiped from IDB by the sibling's
+  sign-out, so the blob is cryptographically unreachable (no
+  plaintext leak); it just adds ~200 B to `websh.creds.json` until
+  the same `--vault-gc` CLI above reaps it. The race window is the
+  `/api/save` round-trip time, typically &lt;100 ms.
 
 ## Recovery and the panic button
 
