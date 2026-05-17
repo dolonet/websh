@@ -2415,9 +2415,10 @@ function _initVaultBroadcast() {
   // force-disconnect their unrelated vault panes (the BC handler
   // doesn't re-check that the wipe matched this path's IDB before
   // tearing down the live panes). Re-mint when storagePrefix changes
-  // — module-init opens 'websh_vault:' with the empty default and
+  // — module-init opens 'websh_vault' with the empty default and
   // loadServerConfig re-inits once cfg.isolate_storage is known.
-  let expected = 'websh_vault:' + storagePrefix;
+  // Shape matches storageKey() / _idbScopedKey(): prefix-then-name.
+  let expected = storagePrefix + 'websh_vault';
   if (_vaultBroadcast && _vaultBroadcast.name === expected) return;
   if (_vaultBroadcast) {
     try { _vaultBroadcast.close(); } catch (e) {}

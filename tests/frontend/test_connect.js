@@ -1582,10 +1582,8 @@ test('multi-tab: BroadcastChannel signed_out clears cache and re-renders', async
   await win.eval('ensureVaultKey()');
   // Cache is hot now.
   ok(win.eval('_idbHasKeyCache') === true, '_idbHasKeyCache hot after ensure');
-  // Fire signed_out from a sibling channel. Default storagePrefix is
-  // empty (isolate_storage off), so the production channel name is
-  // 'websh_vault:' with a trailing colon.
-  const sibling = new ChannelMock('websh_vault:');
+  // Fire signed_out from a sibling channel.
+  const sibling = new ChannelMock('websh_vault');
   sibling.postMessage({type: 'signed_out'});
   await sleep(20);
   ok(win.eval('_idbHasKeyCache') === false,
@@ -2048,9 +2046,8 @@ test('cross-tab signed_out tears down live vault panes in sibling tab', async ()
   const livePane = panesArr[0];
   ok(livePane.sid === 'sid-xt', 'live vault pane has sid');
   ok(livePane.conn_id === conn_id, 'live vault pane carries conn_id');
-  // Sibling tab fires signed_out. Production channel name is
-  // 'websh_vault:' (empty storagePrefix since isolate_storage is off).
-  const sibling = new ChannelMock('websh_vault:');
+  // Sibling tab fires signed_out.
+  const sibling = new ChannelMock('websh_vault');
   sibling.postMessage({type: 'signed_out'});
   await sleep(40);
   // Live vault pane torn down: sid cleared, reconnect bar up, server
@@ -3694,10 +3691,11 @@ test('vault BroadcastChannel name is path-scoped under isolate_storage', async (
   win.eval(js + EXPOSE);
   await sleep(40);
   // First open at module init (storagePrefix=''), then re-open after
-  // loadServerConfig resolves the path.
-  ok(names[0] === 'websh_vault:',
+  // loadServerConfig resolves the path. Name shape is prefix+'websh_vault'
+  // (matches storageKey() convention).
+  ok(names[0] === 'websh_vault',
      'module-init opens with empty prefix; got ' + JSON.stringify(names[0]));
-  ok(names[names.length - 1] === 'websh_vault:/team-a/',
+  ok(names[names.length - 1] === '/team-a/websh_vault',
      'final open is path-scoped to /team-a/; got ' +
      JSON.stringify(names[names.length - 1]));
   dom.window.close();
@@ -3744,7 +3742,7 @@ test('sibling tab on a different path does NOT trigger sign-out handler', async 
   ok(win.eval('_idbHasKeyCache') === true, 'cache hot pre-test');
   ok(win.eval('_vaultRecentlySignedOut') === false, 'flag clear pre-test');
   // Sibling on a DIFFERENT path fires signed_out.
-  const otherTab = new ChannelMock('websh_vault:/team-b/');
+  const otherTab = new ChannelMock('/team-b/websh_vault');
   otherTab.postMessage({type: 'signed_out'});
   await sleep(40);
   // Our caches are untouched — the cross-path broadcast didn't reach us.
@@ -3754,7 +3752,7 @@ test('sibling tab on a different path does NOT trigger sign-out handler', async 
      'sign-out flag NOT set by cross-path broadcast');
   // Same-path sibling DOES reach us — sanity check that scoping is the
   // discriminator, not a global block on cross-channel messages.
-  const samePath = new ChannelMock('websh_vault:/team-a/');
+  const samePath = new ChannelMock('/team-a/websh_vault');
   samePath.postMessage({type: 'signed_out'});
   await sleep(40);
   ok(win.eval('_vaultRecentlySignedOut') === true,
