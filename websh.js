@@ -2409,9 +2409,22 @@ let _vaultBroadcastPagehideWired = false;
 // stable-connection window. (Finding 4 in the PR-67 review.)
 let _vaultRecentlySignedOut = false;
 function _initVaultBroadcast() {
-  if (typeof BroadcastChannel === 'undefined' || _vaultBroadcast) return;
+  if (typeof BroadcastChannel === 'undefined') return;
+  // Path-scope the channel name under isolate_storage. Otherwise a
+  // sign-out on /team-a/ would broadcast into /team-b/'s tabs and
+  // force-disconnect their unrelated vault panes (the BC handler
+  // doesn't re-check that the wipe matched this path's IDB before
+  // tearing down the live panes). Re-mint when storagePrefix changes
+  // — module-init opens 'websh_vault:' with the empty default and
+  // loadServerConfig re-inits once cfg.isolate_storage is known.
+  let expected = 'websh_vault:' + storagePrefix;
+  if (_vaultBroadcast && _vaultBroadcast.name === expected) return;
+  if (_vaultBroadcast) {
+    try { _vaultBroadcast.close(); } catch (e) {}
+    _vaultBroadcast = null;
+  }
   try {
-    _vaultBroadcast = new BroadcastChannel('websh_vault');
+    _vaultBroadcast = new BroadcastChannel(expected);
     _vaultBroadcast.onmessage = (e) => {
       if (!e || !e.data) return;
       if (e.data.type === 'signed_out') {
@@ -2928,6 +2941,11 @@ function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
+    // Re-mint the vault BroadcastChannel with the now-known storagePrefix
+    // so sign-out signals don't cross path-scoped namespaces. No-op if
+    // the prefix matches what the module-init open already used (i.e.
+    // isolate_storage is off).
+    _initVaultBroadcast();
     _applyVaultEnabledClass();
     // Pre-cache the IDB key presence so the first renderSaved doesn't
     // flash all vault-backed rows as no-key while we wait on IDB.
