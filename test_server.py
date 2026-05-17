@@ -6704,6 +6704,88 @@ class TestApiConnectSaved(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertEqual(body.get("error"), "vault_input_invalid")
 
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_saved_variant_routes_key_pass_to_password(self):
+        # Passphrase-protected key: vault stores {key, key_pass} but
+        # SSHSession only takes `password` (the PTY auth-detector pipes
+        # it as the answer to whatever ssh prompts). The decrypt path
+        # must route key_pass into password, otherwise saved
+        # passphrase-protected keys silently fail at connect time.
+        # Mirror of manual-mode client routing at websh.js:816.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+               "fakekeybytes\n"
+               "-----END OPENSSH PRIVATE KEY-----\n")
+        self.iv = os.urandom(12)
+        aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+        pt = json.dumps({"password": "", "key": pem,
+                         "key_pass": "secret-passphrase"}).encode()
+        self.ct = AESGCM(self.key).encrypt(self.iv, pt, aad)
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {self.CONN: {
+                "host": "h.example.com", "port": 22, "username": "u",
+                "iv": base64.b64encode(self.iv).decode(),
+                "ct": base64.b64encode(self.ct).decode(),
+            }}},
+        })
+        server._creds_cache = None
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            instance = unittest.mock.MagicMock(alive=True,
+                                               auth_failed=False,
+                                               tmux_cmd="tmux")
+            MockSSH.return_value = instance
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(self.key).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 200)
+            kwargs = MockSSH.call_args.kwargs
+            # key passes through unchanged
+            self.assertEqual(kwargs.get("key"), pem)
+            # key_pass routed into password so the PTY auth-detector
+            # can answer the passphrase prompt
+            self.assertEqual(kwargs.get("password"), "secret-passphrase")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_saved_variant_password_takes_precedence_over_key_pass(self):
+        # Defensive: if a malformed entry has both password and
+        # key_pass set, the password field wins (no overwrite). Mirror
+        # of the conservative `not password` guard in the routing.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+               "fakekeybytes\n"
+               "-----END OPENSSH PRIVATE KEY-----\n")
+        self.iv = os.urandom(12)
+        aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+        pt = json.dumps({"password": "primary-pw", "key": pem,
+                         "key_pass": "passphrase"}).encode()
+        self.ct = AESGCM(self.key).encrypt(self.iv, pt, aad)
+        server._save_creds_atomic({
+            "version": 1,
+            "vaults": {self.VAULT: {self.CONN: {
+                "host": "h.example.com", "port": 22, "username": "u",
+                "iv": base64.b64encode(self.iv).decode(),
+                "ct": base64.b64encode(self.ct).decode(),
+            }}},
+        })
+        server._creds_cache = None
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            instance = unittest.mock.MagicMock(alive=True,
+                                               auth_failed=False,
+                                               tmux_cmd="tmux")
+            MockSSH.return_value = instance
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(self.key).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 200)
+            kwargs = MockSSH.call_args.kwargs
+            # password wins; key_pass NOT used since password was set
+            self.assertEqual(kwargs.get("password"), "primary-pw")
+
     def test_gate_returns_501_when_crypto_missing(self):
         original = server.HAS_CRYPTOGRAPHY
         try:

@@ -2759,12 +2759,20 @@ class Handler(BaseHTTPRequestHandler):
                 ssh_options = {}
             password = creds.get("password") or ""
             key = creds.get("key") or ""
-            if not isinstance(password, str) or not isinstance(key, str):
+            key_pass = creds.get("key_pass") or ""
+            if not isinstance(password, str) or not isinstance(key, str) \
+                    or not isinstance(key_pass, str):
                 self._json({"error": "vault_decrypt_failed",
                             "detail": "non-string credential field"}, 400)
                 return
-            # key_pass is in the plaintext for forward-compat but the
-            # current SSHSession ctor doesn't accept it — drop silently.
+            # Mirror manual-mode client routing (websh.js:816): for a
+            # passphrase-protected key, the passphrase rides into the
+            # password field so the PTY auth-detector answers the
+            # "Enter passphrase for key" prompt with it. SSHSession
+            # doesn't have a separate key_pass arg by design — it
+            # pipes whatever's in `password` to whatever ssh prompts.
+            if key and key_pass and not password:
+                password = key_pass
             # Best-effort scrub of bytearrays. Python str copies in
             # `password`/`key` linger until GC; hardened deploy recipe
             # is what actually closes the read window.
