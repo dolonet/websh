@@ -1103,6 +1103,27 @@ async function commitVaultSave(entry) {
   if (resp && resp.error) {
     throw new Error('save: ' + resp.error);
   }
+  // Post-POST re-check: the api('save') round-trip yielded the event
+  // loop a second time, and a sibling tab's signed_out broadcast may
+  // have wiped IDB during that gap. Without this, list.unshift(entry)
+  // below would zombify the entry into the locally-cleared list —
+  // bound to a vault_id the server no longer recognises (the BC
+  // handler in this tab already cleared its own /api/save_delete loop
+  // copy of the entry, but the row we just POSTed was minted after
+  // that loop ran so a server-side orphan blob is unavoidable here;
+  // the local list is the one we can keep coherent). Symmetric to the
+  // pre-encrypt + post-encrypt windows that already guard this.
+  // (Original review item F4.)
+  let idbVaultIdAfterPOST = null;
+  try { idbVaultIdAfterPOST = await _idbGet(IDB_VAULT_ID_KEY); } catch (e) {}
+  if (idbVaultIdAfterPOST !== vault_id || _vaultRecentlySignedOut) {
+    invalidateVaultCache();
+    // No secret scrubbing needed: the finally above already nulled
+    // the closure refs, and entry.__ephemeralSecrets was deleted
+    // before the encrypt call. The BC sign-out handler surfaces its
+    // own toast, so we stay silent here to avoid double-noise.
+    return;
+  }
   entry.conn_id = conn_id;
   // De-dup by conn_id (and by name, for the pre-vault upgrade path
   // where an old plaintext row with the same label is still around).
@@ -1216,6 +1237,17 @@ window.addEventListener('pageshow', (e) => {
     // existing channel) so calling it on every persisted pageshow is
     // safe and covers cold loads where it's already a no-op.
     _initVaultBroadcast();
+    // bfcache also froze the in-memory vault caches: a sibling tab
+    // could have signed out while we were bfcache'd, wiping IDB. The
+    // BC re-init above won't replay that past event (closed channel ⇒
+    // no queue), so we'd render saved cards as connectable until the
+    // next IDB touch even though K is gone. Mirror the other "IDB
+    // may have changed underneath us" call sites: drop in-memory
+    // caches first, then re-read presence from IDB, then re-paint.
+    invalidateVaultCache();
+    _refreshIdbHasKey().then(() => {
+      try { renderSaved(); } catch (err) {}
+    }, () => {});
   }
 });
 

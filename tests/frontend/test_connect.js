@@ -3665,6 +3665,190 @@ test('bfcache: pagehide closes BroadcastChannel; pageshow(persisted=true) re-ope
   dom.window.close();
 });
 
+test('F1: post-encrypt vault_id race (sign-out between subtle.encrypt and POST) aborts save', async () => {
+  // The actual race the post-encrypt re-check was added for: sign-out
+  // lands AFTER the pre-encrypt flag check has cleared but DURING the
+  // subtle.encrypt yield, so by the time commitVaultSave returns from
+  // encrypt, IDB has a fresh vault_id (or is empty). The existing F4
+  // test only exercises the synchronous pre-encrypt bail; reverting
+  // the post-encrypt branch passed every other test in the suite. This
+  // test wraps subtle.encrypt so we can interleave an IDB wipe right
+  // when the ciphertext resolves — _vaultRecentlySignedOut stays false
+  // throughout, forcing the IDB-mismatch arm of the check.
+  let saveCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-f1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: () => { saveCalls++; return {}; }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  // Wrap subtle.encrypt: after the real call resolves, simulate a
+  // sibling-tab signed_out by wiping IDB. We do NOT set the
+  // _vaultRecentlySignedOut flag — the post-encrypt branch must catch
+  // this via the IDB re-read alone.
+  const realEncrypt = win.crypto.subtle.encrypt.bind(win.crypto.subtle);
+  let racePulled = false;
+  Object.defineProperty(win.crypto.subtle, 'encrypt', {
+    value: async function(...args) {
+      const ct = await realEncrypt(...args);
+      if (!racePulled) {
+        racePulled = true;
+        // Wipe IDB. Mirrors what confirmSignOut does on the sibling.
+        await win.eval('_idbDelete("vault_id")');
+        await win.eval('_idbDelete("K")');
+      }
+      return ct;
+    },
+    configurable: true, writable: true,
+  });
+  $(win, 'iH').value = '10.0.0.9'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'F1-card';
+  win.doConnect();
+  await sleep(120);
+  const ps = paneList(win);
+  ok(ps.length === 1, 'pane materialized; got ' + ps.length);
+  const p = ps[0];
+  // Flag stays false through pre-encrypt; the IDB wipe happens during
+  // the subtle.encrypt yield triggered by commitVaultSave.
+  ok(win._vaultRecentlySignedOut === false,
+     'pre-encrypt flag stays false (test exercises IDB-mismatch arm)');
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(120);
+  ok(racePulled, 'subtle.encrypt wrapper actually fired (sanity)');
+  ok(saveCalls === 0,
+     'post-encrypt IDB re-read aborted POST; got saveCalls=' + saveCalls);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  ok(list.length === 0,
+     'no card written to localStorage after post-encrypt race; got ' + list.length);
+  cleanup(env);
+});
+
+test('commitVaultSave: post-POST sign-out aborts local list write', async () => {
+  // Sibling tab signs out DURING the /api/save round-trip — the POST
+  // itself lands (server orphans the blob; we accept that), but the
+  // local list write would otherwise zombify the entry into the
+  // sign-out-wiped localStorage. The pre-encrypt and post-encrypt
+  // windows are already guarded; this test covers the post-POST gap.
+  let saveCalls = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                    vault_enabled: true}},
+    {action: 'connect', response: {session_id: 'sid-pp', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'save', response: function() {
+      saveCalls++;
+      // Pretend a sibling tab signed out while the POST was in flight.
+      // Setting the flag synchronously here makes the post-POST IDB
+      // re-read run with the sign-out state in place. (We also wipe
+      // IDB so the IDB-mismatch arm fires too; matches the real
+      // multi-tab sequence.)
+      return Promise.resolve()
+        .then(() => win.eval('_idbDelete("vault_id")'))
+        .then(() => win.eval('_idbDelete("K")'))
+        .then(() => { win._vaultRecentlySignedOut = true; return {}; });
+    }, once: true},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.10'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'pp-card';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(p, 'pane materialized');
+  p.connectedAt = Date.now() - 3000;
+  win.handleOutputPayload(p, {data: '', alive: true});
+  await sleep(120);
+  ok(saveCalls === 1, '/api/save did POST; got saveCalls=' + saveCalls);
+  const list = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
+  ok(list.length === 0,
+     'local list write was skipped after post-POST sign-out; got ' + list.length);
+  cleanup(env);
+});
+
+test('bfcache restore invalidates vault caches and re-renders saved list', async () => {
+  // If a sibling tab signs out while this one is bfcache'd, the
+  // _vaultKeyCache / _vaultIdCache / _idbHasKeyCache in-memory state
+  // survives the freeze and would paint saved rows as connectable
+  // until the next IDB touch. The pageshow(persisted=true) handler
+  // must invalidate caches, re-read IDB, and re-render so the rows
+  // gray out immediately. We probe the in-memory cache state through
+  // ensureVaultIdIfPresent (cache-hit-first, IDB-fallback) since
+  // `let`-scope vars aren't reachable via win.eval directly.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const ChannelMock = class {
+    constructor(name) { this.name = name; ChannelMock.instances.push(this); this.onmessage = null; }
+    postMessage() {}
+    close() {}
+  };
+  ChannelMock.instances = [];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                                url: 'http://localhost/websh/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.BroadcastChannel = ChannelMock;
+  win.localStorage.clear();
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  // Seed: vault_id + K in IDB, one saved card, caches warm.
+  const {vault_id, conn_id} = await _seedVaultCard(win);
+  ok(win._idbHasKeyCache === true, 'cache hot after _seedVaultCard');
+  // ensureVaultIdIfPresent returns from _vaultIdCache when non-null,
+  // so a positive read here proves the in-memory cache is populated.
+  const cachedBefore = await win.eval('ensureVaultIdIfPresent()');
+  ok(cachedBefore === vault_id,
+     '_vaultIdCache populated; got=' + cachedBefore);
+  // Simulate the sibling-tab sign-out that happened while bfcache'd:
+  // wipe IDB directly (the BC broadcast in the real world never
+  // reaches us because our channel was closed on pagehide). In-memory
+  // caches stay hot — that's the bug.
+  await win.eval('_idbDelete("vault_id")');
+  await win.eval('_idbDelete("K")');
+  // Caches are still hot pre-restore (proving the bug exists without
+  // the fix). The saved row would render as connectable.
+  ok(win._idbHasKeyCache === true,
+     'in-memory _idbHasKeyCache STILL hot before pageshow (pre-fix state)');
+  const cachedStale = await win.eval('ensureVaultIdIfPresent()');
+  ok(cachedStale === vault_id,
+     '_vaultIdCache still returns stale vault_id pre-pageshow (pre-fix state)');
+  // Confirm the painted DOM row also isn't yet greyed out.
+  const rowsBefore = win.document.querySelectorAll('.sv');
+  ok(rowsBefore.length === 1, 'saved card row present');
+  ok(!rowsBefore[0].classList.contains('nokey'),
+     'row not greyed out before bfcache restore (cache is stale-hot)');
+  // Fire pageshow with persisted=true — must invalidate caches, re-
+  // read IDB, re-render.
+  const ev = new win.Event('pageshow');
+  Object.defineProperty(ev, 'persisted', {value: true});
+  win.dispatchEvent(ev);
+  // invalidateVaultCache is synchronous; _refreshIdbHasKey is async.
+  // _idbHasKeyCache resets synchronously by invalidateVaultCache.
+  ok(win._idbHasKeyCache === false,
+     '_idbHasKeyCache reset by invalidateVaultCache on pageshow');
+  // _vaultIdCache also reset; ensureVaultIdIfPresent now falls through
+  // to the (empty) IDB and returns null.
+  const afterRestore = await win.eval('ensureVaultIdIfPresent()');
+  ok(afterRestore === null,
+     '_vaultIdCache invalidated; ensureVaultIdIfPresent() returns null after restore (got=' + afterRestore + ')');
+  // Async leg: after _refreshIdbHasKey resolves, _idbHasKeyCache stays
+  // false (IDB really is empty now) and the re-render greys the row.
+  await sleep(40);
+  const rowsAfter = win.document.querySelectorAll('.sv');
+  ok(rowsAfter.length === 1, 'saved card row still present after re-render');
+  ok(rowsAfter[0].classList.contains('nokey'),
+     'row greyed out after bfcache restore + IDB refresh');
+  dom.window.close();
+});
+
 test('F6: "status code" mapping tests actually exercise error-string mapping', async () => {
   // Documentary test: api() always parses JSON and ignores HTTP status.
   // If a future refactor exposes status to dispatch, this test should
