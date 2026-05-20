@@ -50,6 +50,7 @@ function makeFakes(win) {
     activate() {} fit() {}
     proposeDimensions() { return {cols: 80, rows: 24}; }
   }};
+  win.SearchAddon = {SearchAddon: class {}};
   win.WebLinksAddon = {WebLinksAddon: class {}};
   win.Unicode11Addon = {Unicode11Addon: class {}};
   win.ResizeObserver = class { observe() {} disconnect() {} };

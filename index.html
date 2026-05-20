@@ -179,6 +179,14 @@
     .tm-status{font-size:12px;color:var(--dim);margin-top:10px;min-height:16px}
     .tm-status.err{color:var(--dg)}
 
+    /* ── Search bar ── */
+    .search-bar{position:absolute;top:28px;right:12px;display:flex;gap:4px;z-index:50;background:var(--sf);border:1px solid var(--bd);border-radius:var(--radius);padding:4px 6px;align-items:center}
+    .search-bar.h{display:none}
+    .search-bar input{background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx);padding:3px 8px;font-size:12px;width:200px;outline:none}
+    .search-bar input:focus{border-color:var(--ac)}
+    .search-bar button{background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;padding:2px 4px}
+    .search-bar button:hover{color:var(--tx)}
+
     /* ── Top bar buttons ── */
     .top-r{display:flex;align-items:center;gap:6px}
     .tbtn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:15px;padding:4px;border-radius:4px;transition:.15s;line-height:1}
@@ -274,6 +282,7 @@
     <span class="top-slogan">Lite but powerful web terminal</span>
   </div>
   <div class="top-r">
+    <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search">&#x1F50D;</button>
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
     <button class="tbtn" onclick="exportTerminal()" title="Export terminal" aria-label="Export terminal">&#x1F4CB;</button>
@@ -504,6 +513,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-search@0.15.0/lib/addon-search.min.js"></script>
 <script src="websh.js"></script>
 </body>
 </html>
