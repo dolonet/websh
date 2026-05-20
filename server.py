@@ -1182,6 +1182,24 @@ def find_config_connection(name):
     return None
 
 
+def find_prompt_connection_by_host(host, port):
+    """First named `prompt` connection whose (host, port) matches.
+
+    A saved vault card carries no `connection` name; under restrict_hosts
+    it is authorized by matching its target to a configured prompt
+    connection. `ready` (fixed-credential) connections are intentionally
+    not matched — they connect with operator-stored credentials, not a
+    user's saved card. Returns the entry dict, or None.
+    """
+    cfg = load_config()
+    for c in cfg["connections"]:
+        if (c.get("kind") == "prompt"
+                and c.get("host", "") == host
+                and clamp(c.get("port"), MIN_PORT, MAX_PORT, 22) == port):
+            return c
+    return None
+
+
 def is_host_allowed(host, port, username):
     """Manual-connect gate.
 
@@ -1226,6 +1244,39 @@ def check_prompt_user(entry, username):
     if du:
         if username in du:
             return False, "username is not allowed on this connection"
+    return True, None
+
+
+def authorize_target(host, port, username, is_saved):
+    """Authorize a connect that carries no `connection` name.
+
+    Connects made through a named connection are vetted separately
+    (find_config_connection + check_prompt_user). This gate covers the
+    other two shapes:
+
+      * Saved vault card (is_saved): under restrict_hosts it carries no
+        `connection` name, but it is as legitimate as the named
+        connection whose host:port it targets. Authorize it that way —
+        a fixed-username connection pins the user; an open one runs
+        check_prompt_user. With restrict_hosts off it is gated by the
+        deny-list, like a manual connect.
+      * Free-form manual POST: allowed only when is_host_allowed() says
+        so (restrict_hosts off and the host is not deny-listed).
+
+    Returns (True, None) when allowed, else (False, error_message).
+    """
+    if is_saved and load_config()["restrict_hosts"]:
+        named = find_prompt_connection_by_host(host, port)
+        if named is None:
+            return False, "connections to this host are not allowed"
+        fixed_user = named.get("username", "")
+        if fixed_user:
+            if username == fixed_user:
+                return True, None
+            return False, "username is not allowed on this connection"
+        return check_prompt_user(named, username)
+    if not is_host_allowed(host, port, username):
+        return False, "connections to this host are not allowed"
     return True, None
 
 
@@ -2833,29 +2884,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid host or username"}, 400)
             return
 
-        # Free-form manual connect is unrestricted unless restrict_hosts
-        # pins the user to a ready server-side connection.
-        if not conn_name and not is_host_allowed(host, port, username):
-            _access_log_emit("connect", ip, result="deny_blocked",
-                             target_host=host, target_user=username)
-            # Only feed the scan-pattern detector when the rejection
-            # actually came from the deny-list. Under restrict_hosts:
-            # true, is_host_allowed() returns False unconditionally —
-            # that's a different policy ("manual connects disabled,
-            # use named connections") and a buggy or stale UI POSTing
-            # `host` instead of `connection` could rapidly accumulate
-            # against an honest user. The deny_blocked record is still
-            # emitted so operators see the misconfigured client; the
-            # scanner heuristic just doesn't count it.
-            cfg = load_config()
-            if not cfg["restrict_hosts"] and _record_deny_for_scan(ip, host):
-                # Emit a separate scan_pattern record so fail2ban can
-                # ban specifically on this signal without also banning
-                # one-off deny_blocked typos.
-                _access_log_emit("connect", ip, result="scan_pattern",
+        # A connect without a `connection` name is a saved vault card or
+        # a free-form manual POST; authorize_target() gates both. (Named
+        # connections were vetted above.) Under restrict_hosts a vault
+        # card is allowed when its target matches a configured prompt
+        # connection — a manual POST is not.
+        if not conn_name:
+            ok, deny_err = authorize_target(host, port, username, is_saved)
+            if not ok:
+                _access_log_emit("connect", ip, result="deny_blocked",
                                  target_host=host, target_user=username)
-            self._json({"error": "connections to this host are not allowed"}, 403)
-            return
+                # Feed the scan-pattern detector only for deny-list
+                # rejections (real scans). A restrict_hosts rejection is
+                # policy, and a stale UI POSTing `host` instead of
+                # `connection` should not accumulate against an honest
+                # user — the deny_blocked record still surfaces it.
+                cfg = load_config()
+                if not cfg["restrict_hosts"] and _record_deny_for_scan(ip, host):
+                    # Separate scan_pattern record so fail2ban can ban on
+                    # this signal without also banning deny_blocked typos.
+                    _access_log_emit("connect", ip, result="scan_pattern",
+                                     target_host=host, target_user=username)
+                self._json({"error": deny_err}, 403)
+                return
 
         # Check session limits and reserve a counted slot atomically.
         # Per-IP cap (if enabled) runs first so a single abuser cannot

@@ -575,6 +575,104 @@ class TestIsHostAllowed(unittest.TestCase):
         self.assertFalse(server.is_host_allowed("ok.com", 22, "admin"))
         self.assertFalse(server.is_host_allowed("evil.com", 22, "x"))
 
+    # ── authorize_target: gate for connects with no `connection` name
+    #    (saved vault cards + free-form manual POSTs) ──
+
+    def test_authorize_unrestricted_allows_manual_and_saved(self):
+        """restrict_hosts off: a manual POST and a saved vault card are
+        both allowed when the host is not deny-listed."""
+        self._write_config({"restrict_hosts": False, "connections": []})
+        self.assertEqual(
+            server.authorize_target("any.com", 22, "root", is_saved=False),
+            (True, None))
+        self.assertEqual(
+            server.authorize_target("any.com", 22, "root", is_saved=True),
+            (True, None))
+
+    def test_authorize_manual_rejected_under_restrict_hosts(self):
+        """restrict_hosts on: a free-form manual POST is always rejected,
+        even to a configured host — it must use the named connection."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": ""}],
+        })
+        ok, err = server.authorize_target("h.example", 22, "alice",
+                                          is_saved=False)
+        self.assertFalse(ok)
+        self.assertIn("not allowed", err)
+
+    def test_authorize_saved_card_matches_named_prompt_connection(self):
+        """A saved vault card whose host:port matches a named prompt
+        connection is authorized under restrict_hosts, even though it
+        carries no `connection` name."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": "",
+                             "denied_users": ["root"]}],
+        })
+        self.assertEqual(
+            server.authorize_target("h.example", 22, "alice", is_saved=True),
+            (True, None))
+
+    def test_authorize_saved_card_rejected_when_host_not_configured(self):
+        """A saved vault card to a host with no matching named connection
+        stays rejected under restrict_hosts."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": ""}],
+        })
+        ok, err = server.authorize_target("other.example", 22, "alice",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertIn("not allowed", err)
+
+    def test_authorize_saved_card_honors_denied_users(self):
+        """A saved vault card matching a prompt connection is still
+        subject to that connection's denied_users list."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": "",
+                             "denied_users": ["root"]}],
+        })
+        ok, err = server.authorize_target("h.example", 22, "root",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertIn("not allowed", err)
+
+    def test_authorize_saved_card_honors_allowed_users(self):
+        """allowed_users on the matched prompt connection constrains the
+        saved card's username."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": "",
+                             "allowed_users": ["alice"]}],
+        })
+        self.assertEqual(
+            server.authorize_target("h.example", 22, "alice", is_saved=True),
+            (True, None))
+        ok, _ = server.authorize_target("h.example", 22, "bob", is_saved=True)
+        self.assertFalse(ok)
+
+    def test_authorize_saved_card_pinned_to_fixed_username(self):
+        """When the matched prompt connection fixes a username, a saved
+        card with a different username does not slip past restrict_hosts."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example",
+                             "port": 22, "username": "deploy"}],
+        })
+        self.assertEqual(
+            server.authorize_target("h.example", 22, "deploy", is_saved=True),
+            (True, None))
+        ok, _ = server.authorize_target("h.example", 22, "intruder",
+                                        is_saved=True)
+        self.assertFalse(ok)
+
 
 class TestParseDeniedHosts(unittest.TestCase):
     """Unit tests for _parse_denied_hosts splitting hostnames vs IP/CIDR."""
