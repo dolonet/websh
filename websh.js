@@ -383,7 +383,17 @@ function createPane(container) {
 function activatePane(id) {
   if (activeId === id) return;
   let prev = activeId ? panes[activeId] : null;
-  if (prev) prev.el.classList.remove('active');
+  if (prev) {
+    prev.el.classList.remove('active');
+    // Hide search bar on outgoing pane so it doesn't leak across switches.
+    // toggleSearch/closeSearch act on panes[activeId] only, so without this
+    // the bar stays visible on prev and the next Escape targets the new pane.
+    let prevBar = prev.el.querySelector('[data-search]');
+    if (prevBar && !prevBar.classList.contains('h')) {
+      prevBar.classList.add('h');
+      if (prev.searchAddon) prev.searchAddon.clearDecorations();
+    }
+  }
   activeId = id;
   let p = panes[id];
   if (!p) return;
@@ -3553,6 +3563,19 @@ function fbDownloadManual() {
 }
 
 // ── Search ──────────────────────────────────────────────────────────
+// Passing `decorations` to findNext/findPrevious is what engages
+// highlight-all (every match in the SearchAddon's highlightLimit window
+// gets painted, not just the current one). Without it, only the active
+// match is rendered — and the PR-description perf note about
+// highlightLimit defends a code path the addon never takes.
+const SEARCH_OPTS = {decorations: {
+  matchBackground: '#264f78',
+  matchBorder: '#3a6fa5',
+  matchOverviewRuler: '#58a6ff',
+  activeMatchBackground: '#a07b00',
+  activeMatchBorder: '#d29922',
+  activeMatchColorOverviewRuler: '#d29922',
+}};
 function activeSearch() { let p=panes[activeId]; return p?p.searchAddon:null }
 function toggleSearch() {
   let p=panes[activeId]; if(!p) return;
@@ -3565,8 +3588,8 @@ function closeSearch(){
   p.el.querySelector('[data-search]').classList.add('h');
   p.searchAddon.clearDecorations(); p.term.focus();
 }
-function searchNext(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findNext(p.el.querySelector('[data-search] input').value)} }
-function searchPrev(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findPrevious(p.el.querySelector('[data-search] input').value)} }
+function searchNext(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findNext(p.el.querySelector('[data-search] input').value, SEARCH_OPTS)} }
+function searchPrev(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findPrevious(p.el.querySelector('[data-search] input').value, SEARCH_OPTS)} }
 
 // Search input events — delegated
 document.addEventListener('keydown', e => {

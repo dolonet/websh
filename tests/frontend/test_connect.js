@@ -50,7 +50,26 @@ function makeFakes(win) {
     activate() {} fit() {}
     proposeDimensions() { return {cols: 80, rows: 24}; }
   }};
-  win.SearchAddon = {SearchAddon: class {}};
+  win.SearchAddon = {SearchAddon: class {
+    constructor() {
+      this.findNextCalls = [];
+      this.findPrevCalls = [];
+      this.clearDecorationsCalls = 0;
+      this.disposeCalls = 0;
+      this._resultsCb = null;
+    }
+    activate() {}
+    findNext(query, opts) { this.findNextCalls.push({query, opts}); return true; }
+    findPrevious(query, opts) { this.findPrevCalls.push({query, opts}); return true; }
+    clearDecorations() { this.clearDecorationsCalls++; }
+    dispose() { this.disposeCalls++; }
+    onDidChangeResults(cb) {
+      this._resultsCb = cb;
+      let self = this;
+      return { dispose() { self._resultsCb = null; } };
+    }
+    _fireResults(results) { if (this._resultsCb) this._resultsCb(results); }
+  }};
   win.WebLinksAddon = {WebLinksAddon: class {}};
   win.Unicode11Addon = {Unicode11Addon: class {}};
   win.ResizeObserver = class { observe() {} disconnect() {} };
@@ -4065,6 +4084,235 @@ test('F6: "status code" mapping tests actually exercise error-string mapping', a
   ok(connectBody && connectBody.vault_id, 'saved-variant connect body was POSTed');
   ok($(win, 'tmTitle').textContent === 'Cannot decrypt this card',
      'error-string dispatch is what is exercised (not status code)');
+  cleanup(env);
+});
+
+// =====================================================================
+// Scrollback search (PR #72 review-followup)
+// =====================================================================
+
+// Helper: bring up two connected non-persistent panes (A then split→B).
+async function _twoPanes(win) {
+  $(win, 'iH').value = 'a.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const a = paneList(win)[0];
+  if (!a) return [null, null];
+  win.splitPane(a.id, 'h');
+  await sleep(10);
+  $(win, 'iH').value = 'b.host'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const all = paneList(win);
+  const b = all.find(p => p.id !== a.id);
+  return [a, b];
+}
+
+const SEARCH_PANE_PLAN = () => ([
+  {action: 'config', response: {restrict_hosts: false, connections: []}},
+  {action: 'connect', match: b => b.host === 'a.host',
+   response: {session_id: 'sa', alive: true}, once: true},
+  {action: 'connect', match: b => b.host === 'b.host',
+   response: {session_id: 'sb', alive: true}, once: true},
+  {action: 'resize', response: {ok: true}},
+  {action: 'output', response: {data: '', alive: true}},
+  {action: 'disconnect', response: {ok: true}},
+]);
+
+test('search bar: pane switch hides outgoing pane search and clears its decorations', async () => {
+  // gorevds review #1: toggleSearch / closeSearch only act on the active
+  // pane. Without coupling to activatePane, opening search on A then
+  // switching to B leaves A's bar visible — and the next Escape clears B's
+  // (now-active) decorations instead of A's.
+  const env = await mkEnv(SEARCH_PANE_PLAN()); const win = env.win;
+  const [a, b] = await _twoPanes(win);
+  if (!a || !b) { ok(false, 'two panes needed'); cleanup(env); return; }
+  win.activatePane(a.id);
+  win.toggleSearch();
+  const aBar = a.el.querySelector('[data-search]');
+  ok(!aBar.classList.contains('h'), 'A search bar visible after toggle');
+  const beforeClears = a.searchAddon.clearDecorationsCalls;
+  win.activatePane(b.id);
+  ok(aBar.classList.contains('h'), 'A search bar hidden after switching to B');
+  ok(a.searchAddon.clearDecorationsCalls === beforeClears + 1,
+     'A clearDecorations called exactly once on switch, got delta=' +
+     (a.searchAddon.clearDecorationsCalls - beforeClears));
+  cleanup(env);
+});
+
+test('search bar: pane switch is a no-op when outgoing search was already closed', async () => {
+  // Guard against gratuitous clearDecorations calls on every pane switch.
+  const env = await mkEnv(SEARCH_PANE_PLAN()); const win = env.win;
+  const [a, b] = await _twoPanes(win);
+  if (!a || !b) { ok(false, 'two panes needed'); cleanup(env); return; }
+  win.activatePane(a.id);
+  const beforeClears = a.searchAddon.clearDecorationsCalls;
+  win.activatePane(b.id);
+  ok(a.searchAddon.clearDecorationsCalls === beforeClears,
+     'A clearDecorations NOT called when search was closed, got delta=' +
+     (a.searchAddon.clearDecorationsCalls - beforeClears));
+  cleanup(env);
+});
+
+test('searchNext passes decorations option for highlight-all', async () => {
+  // gorevds review #3: findNext is called with only the query, no
+  // decorations — so only the current match highlights, the PR
+  // description's "highlight-all" / highlightLimit note becomes moot, and
+  // clearDecorations() in closeSearch is dead code. The fix passes a
+  // decorations object so highlight-all is actually engaged.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  win.toggleSearch();
+  p.el.querySelector('[data-search] input').value = 'foo';
+  win.searchNext();
+  const calls = p.searchAddon.findNextCalls;
+  ok(calls.length === 1, 'findNext called once, got ' + calls.length);
+  ok(calls[0] && calls[0].query === 'foo', 'query=foo, got ' + (calls[0] && calls[0].query));
+  ok(calls[0] && calls[0].opts && calls[0].opts.decorations,
+     'opts.decorations passed (enables highlight-all); got opts=' +
+     JSON.stringify(calls[0] && calls[0].opts));
+  cleanup(env);
+});
+
+test('searchPrev passes decorations option for highlight-all', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  win.toggleSearch();
+  p.el.querySelector('[data-search] input').value = 'bar';
+  win.searchPrev();
+  const calls = p.searchAddon.findPrevCalls;
+  ok(calls.length === 1, 'findPrevious called once, got ' + calls.length);
+  ok(calls[0] && calls[0].query === 'bar', 'query=bar');
+  ok(calls[0] && calls[0].opts && calls[0].opts.decorations,
+     'opts.decorations passed; got opts=' +
+     JSON.stringify(calls[0] && calls[0].opts));
+  cleanup(env);
+});
+
+test('toggleSearch shows then hides the active pane search bar', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  const bar = p.el.querySelector('[data-search]');
+  ok(bar.classList.contains('h'), 'bar hidden on boot');
+  win.toggleSearch();
+  ok(!bar.classList.contains('h'), 'bar visible after first toggle');
+  win.toggleSearch();
+  ok(bar.classList.contains('h'), 'bar hidden after second toggle');
+  ok(p.searchAddon.clearDecorationsCalls >= 1,
+     'closeSearch path clears decorations (>=1), got ' + p.searchAddon.clearDecorationsCalls);
+  cleanup(env);
+});
+
+test('Ctrl+Shift+F triggers toggleSearch', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  const bar = p.el.querySelector('[data-search]');
+  ok(bar.classList.contains('h'), 'bar hidden before chord');
+  const ev = new win.KeyboardEvent('keydown',
+    {key: 'F', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true});
+  win.document.body.dispatchEvent(ev);
+  ok(!bar.classList.contains('h'), 'bar visible after Ctrl+Shift+F');
+  cleanup(env);
+});
+
+test('Enter inside search input dispatches findNext, Shift+Enter dispatches findPrevious', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  win.toggleSearch();
+  const input = p.el.querySelector('[data-search] input');
+  input.value = 'needle';
+  const enter = new win.KeyboardEvent('keydown',
+    {key: 'Enter', bubbles: true, cancelable: true});
+  input.dispatchEvent(enter);
+  ok(p.searchAddon.findNextCalls.length === 1, 'Enter → findNext, got ' +
+     p.searchAddon.findNextCalls.length);
+  const shiftEnter = new win.KeyboardEvent('keydown',
+    {key: 'Enter', shiftKey: true, bubbles: true, cancelable: true});
+  input.dispatchEvent(shiftEnter);
+  ok(p.searchAddon.findPrevCalls.length === 1, 'Shift+Enter → findPrevious, got ' +
+     p.searchAddon.findPrevCalls.length);
+  cleanup(env);
+});
+
+test('Escape inside search input closes the bar', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's1', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  if (!p) { ok(false, 'pane needed'); cleanup(env); return; }
+  win.toggleSearch();
+  const bar = p.el.querySelector('[data-search]');
+  ok(!bar.classList.contains('h'), 'bar visible after toggle');
+  const input = bar.querySelector('input');
+  const esc = new win.KeyboardEvent('keydown',
+    {key: 'Escape', bubbles: true, cancelable: true});
+  input.dispatchEvent(esc);
+  ok(bar.classList.contains('h'), 'bar hidden after Escape inside input');
   cleanup(env);
 });
 
