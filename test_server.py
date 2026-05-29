@@ -1126,8 +1126,6 @@ class TestHTTPApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Use a random port to avoid conflicts
-        cls.port = 18765
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
 
@@ -1144,7 +1142,9 @@ class TestHTTPApi(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.2)
@@ -1732,8 +1732,6 @@ class TestPromptConnectHTTP(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18766
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -1753,7 +1751,9 @@ class TestPromptConnectHTTP(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.2)
@@ -2312,8 +2312,6 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18768
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -2322,7 +2320,9 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
         os.environ["WEBSH_CONFIG"] = path
         server._config_cache = None
         server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -2469,8 +2469,6 @@ class TestPerIpSessionCapConcurrency(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18785
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -2479,7 +2477,9 @@ class TestPerIpSessionCapConcurrency(unittest.TestCase):
         os.environ["WEBSH_CONFIG"] = path
         server._config_cache = None
         server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -3373,8 +3373,6 @@ class TestConnectValidation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18767
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         # No restrict_hosts, no connections — tests only exercise the
@@ -3386,7 +3384,9 @@ class TestConnectValidation(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -4356,10 +4356,10 @@ class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18768
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -4750,10 +4750,10 @@ class TestUploadFinalizeHTTPDispatch(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18769
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -4943,10 +4943,10 @@ class TestUploadPathNULRejection(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18770
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -5040,8 +5040,6 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18768
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -5050,7 +5048,9 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
         os.environ["WEBSH_CONFIG"] = path
         server._config_cache = None
         server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -5477,10 +5477,10 @@ class TestLsHTTPDispatch(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18781
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -5544,10 +5544,10 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18782
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -5946,8 +5946,6 @@ class TestAccessLogConnectEvents(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18769
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -5961,7 +5959,9 @@ class TestAccessLogConnectEvents(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -6147,8 +6147,6 @@ class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18786
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -6162,7 +6160,9 @@ class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -6257,8 +6257,6 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18770
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
         cls.tmpdir = tempfile.mkdtemp()
         path = os.path.join(cls.tmpdir, "websh.json")
@@ -6267,7 +6265,9 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
         os.environ["WEBSH_CONFIG"] = path
         server._config_cache = None
         server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
@@ -6399,7 +6399,6 @@ class TestApiSave(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18772
         cls.tmpdir = tempfile.mkdtemp()
         cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
         os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
@@ -6413,9 +6412,10 @@ class TestApiSave(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.2)
@@ -6628,7 +6628,6 @@ class TestApiSaveDelete(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18773
         cls.tmpdir = tempfile.mkdtemp()
         cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
         os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
@@ -6641,9 +6640,10 @@ class TestApiSaveDelete(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.2)
@@ -6751,7 +6751,6 @@ class TestApiConnectSaved(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18774
         cls.tmpdir = tempfile.mkdtemp()
         cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
         os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
@@ -6764,9 +6763,10 @@ class TestApiConnectSaved(unittest.TestCase):
         server._config_cache = None
         server._config_mtime = 0
 
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         time.sleep(0.2)
@@ -7480,10 +7480,10 @@ class TestSecurityHeaders(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = 18799
-        server.PORT = cls.port
         server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
