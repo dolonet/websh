@@ -1503,92 +1503,123 @@ class TestHTTPApi(unittest.TestCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
-    def test_stream_returns_undelivered_bytes_to_buffer(self):
-        """Regression: when the client closes /api/stream mid-flight,
-        bytes the SSE handler had already drained from the session must
-        not vanish. The handler peeks the socket for FIN before each
-        read(); if it sees FIN after a read but before delivery, it
-        pushes the bytes back via session.unread(). Either way the next
-        consumer (e.g. long-poll fallback) can still pick them up."""
-        import socket as _socket
-        sid = str(uuid.uuid4())
+    def test_stream_session_path_a_skips_read_when_client_gone(self):
+        """White-box (deterministic): if _client_gone() is already True when
+        the stream loop ticks, the handler must NOT call session.read() —
+        draining destructive PTY output into a socket we know is dead would
+        lose it. Replaces the former timing-dependent integration test
+        (test_stream_returns_undelivered_bytes_to_buffer), whose 'buffer
+        empty' assertion could not distinguish a lost byte from one
+        successfully written into a half-closed socket (the first write
+        after a peer FIN always succeeds). FIN peek itself is covered by
+        test_client_gone_detects_fin / _false_with_pending_data.
 
-        # Real-ish session: holds bytes in output_buf under buf_lock and
-        # supports the same read()/unread() contract as SSHSession.
-        class Sess(_FakeNotifyMixin):
+        Discriminating: fails if the `if self._client_gone()` guard before
+        `data = session.read()` is removed from _stream_session — the loop
+        would then read() (read_calls > 0)."""
+        class _Wfile(object):
+            def __init__(self):
+                self.chunks = []
+            def write(self, b):
+                self.chunks.append(b)
+            def flush(self):
+                pass
+
+        class _Sess(object):
             def __init__(self):
                 self.alive = True
                 self.auth_failed = False
-                self.buf_lock = __import__("threading").Lock()
-                self.output_buf = b""
+                self.read_calls = 0
+                self.unread_calls = []
                 self.last_activity = 0
             def read(self):
-                with self.buf_lock:
-                    d = self.output_buf
-                    self.output_buf = b""
-                return d
+                self.read_calls += 1
+                return b""
             def unread(self, data):
-                if not data:
-                    return
-                with self.buf_lock:
-                    self.output_buf = data + self.output_buf
-            def feed(self, b):
-                with self.buf_lock:
-                    self.output_buf += b
+                self.unread_calls.append(data)
+            def wait_for_data(self, client_socket, timeout, selector=None):
+                # Should never be reached on this path; if it is, end the
+                # session so the test can't hang.
+                self.alive = False
 
-        sess = Sess()
-        with server.sessions_lock:
-            server.sessions[sid] = sess
-        try:
-            # Raw socket so we can read what's actually arrived without
-            # blocking on http.client buffering. We just need to confirm
-            # the handler reached its main loop (the ': ok' priming
-            # comment was sent).
-            s = _socket.create_connection(("127.0.0.1", self.port),
-                                          timeout=5)
-            req = ("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
-                   "Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            s.sendall(req.encode("ascii"))
-            buf = b""
-            deadline = time.time() + 2
-            s.settimeout(0.2)
-            while time.time() < deadline and b": ok" not in buf:
-                try:
-                    chunk = s.recv(256)
-                    if not chunk:
-                        break
-                    buf += chunk
-                except _socket.timeout:
-                    pass
-            self.assertIn(b": ok", buf,
-                "handler did not reach its main loop")
+        h = server.Handler.__new__(server.Handler)
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda *a, **k: None
+        h.connection = None
+        h._build_session_selector = lambda session: type(
+            "_Sel", (), {"close": lambda self: None})()
+        h._client_gone = lambda: True
+        h.wfile = _Wfile()
 
-            # Plant bytes, then tear down the client. The handler may
-            # either (a) peek FIN first and leave the buffer untouched,
-            # or (b) read the bytes, hit a write failure, and unread()
-            # them. Both paths must end with the bytes still in the
-            # session for the next reader.
-            sess.feed(b"do-not-lose-me\r\n")
-            try:
-                s.shutdown(_socket.SHUT_RDWR)
-            except OSError:
+        sess = _Sess()
+        h._stream_session(sess)
+
+        self.assertEqual(sess.read_calls, 0,
+            "handler drained a socket already known dead (FIN seen) — "
+            "_client_gone() guard before read() is missing or ineffective")
+        self.assertEqual(sess.unread_calls, [],
+            "nothing was read, so nothing should have been unread")
+
+    def test_stream_session_path_b_unreads_on_write_failure(self):
+        """White-box (deterministic): if wfile.write() of a real data event
+        fails (peer FIN/RST), the bytes the handler drained from the session
+        must be pushed back via session.unread() so the long-poll fallback
+        (or a reconnecting EventSource) can still deliver them.
+
+        Discriminating: fails if the except-clause `if data: session.unread(
+        data)` is removed from _stream_session — unread_calls would be
+        empty (bytes silently lost). The empty-data priming event must
+        still succeed: only the chunk carrying base64(planted) raises,
+        proving the unread targets the real-data write, not priming."""
+        planted = b"do-not-lose-me\r\n"
+        marker = base64.b64encode(planted)
+
+        class _Wfile(object):
+            def __init__(self):
+                self.chunks = []
+            def write(self, b):
+                # Priming ('data: ""') must go through; only the real
+                # base64-bearing payload fails, mimicking a peer that
+                # FIN'd after the stream opened.
+                if marker in b:
+                    raise BrokenPipeError("peer closed")
+                self.chunks.append(b)
+            def flush(self):
                 pass
-            s.close()
 
-            deadline = time.time() + 3
-            recovered = False
-            while time.time() < deadline:
-                with sess.buf_lock:
-                    if b"do-not-lose-me" in sess.output_buf:
-                        recovered = True
-                        break
-                time.sleep(0.05)
-            self.assertTrue(recovered,
-                "bytes drained by SSE handler were lost when client "
-                "disconnected; peek/unread did not preserve them")
-        finally:
-            with server.sessions_lock:
-                server.sessions.pop(sid, None)
+        class _Sess(object):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._reads = [planted]
+                self.read_calls = 0
+                self.unread_calls = []
+                self.last_activity = 0
+            def read(self):
+                self.read_calls += 1
+                return self._reads.pop(0) if self._reads else b""
+            def unread(self, data):
+                self.unread_calls.append(data)
+            def wait_for_data(self, client_socket, timeout, selector=None):
+                self.alive = False
+
+        h = server.Handler.__new__(server.Handler)
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda *a, **k: None
+        h.connection = None
+        h._build_session_selector = lambda session: type(
+            "_Sel", (), {"close": lambda self: None})()
+        h._client_gone = lambda: False
+        h.wfile = _Wfile()
+
+        sess = _Sess()
+        h._stream_session(sess)
+
+        self.assertEqual(sess.unread_calls, [planted],
+            "drained bytes were not pushed back exactly once after the "
+            "data-event write failed — except-clause unread() is missing")
 
     def test_client_gone_detects_fin(self):
         """_client_gone() returns True after the peer half-closes (sends
@@ -7087,6 +7118,116 @@ class TestUploadFileNoDeadlock(unittest.TestCase):
         self.assertIn("ssh exit 7", err)
         self.assertIn("E", err)  # stderr text preserved for the user
 
+    def test_broken_pipe_surfaces_remote_stderr(self):
+        # Remote `cat >` dies mid-upload (disk full): ssh exits and tears down
+        # our stdin pipe; the next write() raises BrokenPipeError. The captured
+        # remote stderr must be surfaced, not discarded for a bare Broken pipe.
+        s = self._fake_session("/tmp/fake.sock")
+        child = [
+            sys.executable, "-c",
+            "import sys; sys.stderr.buffer.write(b'No space left on device');"
+            " sys.stderr.flush(); sys.exit(1)",
+        ]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen(child, **kw)
+
+        body = io.BytesIO(b"D" * (8 * 1024 * 1024))
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen):
+                result["v"] = s.upload_file("dest", body, 8 * 1024 * 1024,
+                                            timeout=20)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(15)
+        self.assertFalse(t.is_alive(),
+                         "upload_file deadlocked (still running after 15s)")
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("No space left on device", err)
+
+    def test_local_stream_error_without_stderr_stays_generic(self):
+        # Purely local failure (body read raises) with no remote stderr must
+        # NOT grow a spurious "(remote: ...)" suffix.
+        s = self._fake_session("/tmp/fake.sock")
+        child = [
+            sys.executable, "-c",
+            "import sys; sys.stdin.buffer.read(); sys.exit(0)",
+        ]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen(child, **kw)
+
+        class BoomReader(object):
+            def read(self_, n):
+                raise IOError("local disk read failed")
+
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen):
+                result["v"] = s.upload_file("dest", BoomReader(), 4096,
+                                            timeout=20)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("local disk read failed", err)
+        self.assertNotIn("remote:", err)
+
+    def test_local_error_with_stderr_banner_not_attributed_to_remote(self):
+        # A purely-local failure (body read raises) must NOT be blamed on the
+        # remote even when ssh wrote a benign banner to stderr — only a
+        # torn-down pipe (BrokenPipe/ConnectionReset) earns the "(remote: ...)"
+        # suffix. Guards the isinstance() gate. (Safe under load: if the banner
+        # is not captured in time the message is generic anyway, so this can
+        # only false-PASS, never false-FAIL.)
+        s = self._fake_session("/tmp/fake.sock")
+        child = [
+            sys.executable, "-c",
+            "import sys; sys.stderr.buffer.write(b'Welcome to Ubuntu (MOTD)');"
+            " sys.stderr.flush(); sys.stdin.buffer.read(); sys.exit(0)",
+        ]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen(child, **kw)
+
+        class SlowBoomReader(object):
+            def read(self_, n):
+                # Give the child time to emit its stderr banner (which the
+                # drain thread captures) before the local read fails, so the
+                # _err_buf-is-non-empty path is actually exercised.
+                time.sleep(0.3)
+                raise IOError("local disk read failed")
+
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen):
+                result["v"] = s.upload_file("dest", SlowBoomReader(), 4096,
+                                            timeout=20)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("local disk read failed", err)
+        self.assertNotIn("remote:", err)  # local cause must not blame remote
+
 
 class TestBodySizeCap(unittest.TestCase):
     """_body() must reject an oversize Content-Length BEFORE reading it, so
@@ -7250,6 +7391,88 @@ class TestReapChild(unittest.TestCase):
             except (OSError, ChildProcessError):
                 pass
 
+    def test_poll_child_exit_holds_lock_during_waitpid(self):
+        """#85: the inline self-exit reap must take _reap_lock BEFORE calling
+        os.waitpid and keep it held while writing _exit_status. waitpid frees
+        the child's pid for OS recycling the instant it reaps; if the lock is
+        not held across waitpid+write, a concurrent _reap_child() can see
+        _exit_status None / _child_reaped False and SIGTERM the recycled pid."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._reap_lock = threading.Lock()
+        s._exit_status = None
+        s._child_reaped = False
+        s.pid = 4242  # never signalled: mocked waitpid reports immediate exit
+
+        observed = {}
+
+        def fake_waitpid(pid, flags):
+            # The whole point of the fix: the reap-serializing lock must
+            # already be held at the moment waitpid (which reaps + frees the
+            # pid) is invoked, and stay held through the status write.
+            observed["locked_at_waitpid"] = s._reap_lock.locked()
+            self.assertTrue(
+                s._reap_lock.locked(),
+                "os.waitpid called WITHOUT _reap_lock held — the reaped pid "
+                "can be recycled before _exit_status is recorded (#85)")
+            return (pid, 0)  # exited, status 0
+
+        with unittest.mock.patch("os.waitpid", side_effect=fake_waitpid):
+            broke = s._poll_child_exit()
+
+        self.assertTrue(broke, "_poll_child_exit must return True on child exit")
+        self.assertTrue(observed.get("locked_at_waitpid"),
+                        "waitpid did not run under _reap_lock")
+        self.assertEqual(s._exit_status, 0,
+                         "_exit_status not recorded from the reap")
+        self.assertTrue(s._child_reaped,
+                        "_child_reaped not set — finally's _reap_child would "
+                        "then re-issue a kill on a possibly-recycled pid")
+        # Lock must be released again afterwards (no leak across the gate).
+        self.assertFalse(s._reap_lock.locked())
+
+    def test_reap_child_is_noop_after_poll_recorded_exit(self):
+        """#85 second half: once _poll_child_exit records the self-exit and
+        sets _child_reaped, the finally's _reap_child() must issue NO os.kill
+        (the child is already gone; any kill now races a recycled pid)."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._reap_lock = threading.Lock()
+        s._exit_status = None
+        s._child_reaped = False
+        s.pid = 4242
+
+        with unittest.mock.patch("os.waitpid", return_value=(4242, 0)):
+            self.assertTrue(s._poll_child_exit())
+
+        # _reap_child must take the same one-shot guard and bail without
+        # signalling. Patch BOTH kill and waitpid so any teardown syscall
+        # would be loud.
+        with unittest.mock.patch(
+                "os.kill",
+                side_effect=AssertionError("reap_child must not kill after "
+                                           "poll already reaped the child")), \
+             unittest.mock.patch(
+                "os.waitpid",
+                side_effect=AssertionError("reap_child must not waitpid after "
+                                           "poll already reaped the child")):
+            s._reap_child()  # must be a clean no-op
+
+        self.assertEqual(s._exit_status, 0)
+        self.assertTrue(s._child_reaped)
+
+    def test_poll_child_exit_returns_false_while_child_alive(self):
+        """Steady state: WNOHANG returns (0, 0) while the child runs, so
+        _poll_child_exit reports 'keep looping' and records nothing."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._reap_lock = threading.Lock()
+        s._exit_status = None
+        s._child_reaped = False
+        s.pid = 4242
+        with unittest.mock.patch("os.waitpid", return_value=(0, 0)):
+            self.assertFalse(s._poll_child_exit())
+        self.assertIsNone(s._exit_status)
+        self.assertFalse(s._child_reaped)
+        self.assertFalse(s._reap_lock.locked())
+
 
 class TestSecurityHeaders(unittest.TestCase):
     """The credential-handling page must ship CSP + companion hardening
@@ -7353,6 +7576,142 @@ class TestUploadRenameCollision(unittest.TestCase):
         remote = calls[0][-1]
         self.assertIn('o="$f"', remote)
         self.assertNotIn('${f%(*)}', remote)
+
+
+class TestCloseAllSessions(unittest.TestCase):
+    """_close_all_sessions() — the teardown helper the SIGINT/SIGTERM path
+    runs on the main thread (moved out of the signal handler)."""
+
+    def setUp(self):
+        server.sessions.clear()
+
+    def tearDown(self):
+        server.sessions.clear()
+
+    def test_closes_every_session_and_clears_registry(self):
+        closed = []
+
+        class Sess(object):
+            def __init__(self, sid):
+                self.id = sid
+            def close(self):
+                closed.append(self.id)
+
+        for i in range(3):
+            server.sessions["s{}".format(i)] = Sess("s{}".format(i))
+        server._close_all_sessions()
+        self.assertEqual(sorted(closed), ["s0", "s1", "s2"])
+        self.assertEqual(len(server.sessions), 0)
+
+    def test_one_failing_close_does_not_skip_the_rest(self):
+        closed = []
+
+        class GoodSess(object):
+            def __init__(self, sid):
+                self.id = sid
+            def close(self):
+                closed.append(self.id)
+
+        class BadSess(object):
+            id = "bad"
+            def close(self):
+                raise RuntimeError("wedged teardown")
+
+        server.sessions["a"] = GoodSess("a")
+        server.sessions["bad"] = BadSess()
+        server.sessions["b"] = GoodSess("b")
+        server._close_all_sessions()  # must not propagate
+        self.assertEqual(sorted(closed), ["a", "b"])
+        self.assertEqual(len(server.sessions), 0)
+
+    def test_empty_registry_is_a_noop(self):
+        server._close_all_sessions()
+        self.assertEqual(len(server.sessions), 0)
+
+
+class TestShutdownTopology(unittest.TestCase):
+    """server.shutdown() called from a NON-serving thread must terminate a
+    real serve_forever() promptly — guards against re-introducing a shutdown
+    that hangs (the deadlock was calling it from the serve_forever thread)."""
+
+    def test_shutdown_from_other_thread_stops_serve_forever(self):
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        try:
+            serve_thread = threading.Thread(
+                target=httpd.serve_forever, daemon=True)
+            serve_thread.start()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                try:
+                    s = socket.create_connection(
+                        httpd.server_address, timeout=0.5)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            done = threading.Event()
+
+            def _stop():
+                httpd.shutdown()
+                done.set()
+
+            threading.Thread(target=_stop, daemon=True).start()
+            self.assertTrue(
+                done.wait(timeout=5.0),
+                "server.shutdown() did not return within 5s "
+                "(deadlock regression)")
+            serve_thread.join(timeout=5.0)
+            self.assertFalse(serve_thread.is_alive(),
+                             "serve_forever() did not exit after shutdown()")
+        finally:
+            httpd.server_close()
+
+
+class TestMainSigtermSubprocess(unittest.TestCase):
+    """End-to-end discriminator: run server.main() in a child, SIGTERM it,
+    require a prompt clean exit. FAILS on the original bug (the handler called
+    server.shutdown() on the serve_forever thread -> deadlock; the child even
+    swallowed SIGTERM and only died at the systemd timeout via SIGKILL)."""
+
+    _DRIVER = (
+        "import os, signal, threading, time, sys; "
+        "import server; "
+        "server.HOST='127.0.0.1'; server.PORT=0; "
+        "threading.Thread("
+        "target=lambda: (time.sleep(0.5), "
+        "os.kill(os.getpid(), signal.SIGTERM)), daemon=True).start(); "
+        "server.main(); "
+        "sys.stdout.write('MAIN_RETURNED_CLEANLY'); sys.stdout.flush()"
+    )
+
+    def test_sigterm_shuts_down_promptly(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = (
+            os.path.dirname(os.path.abspath(__file__))
+            + os.pathsep + env.get("PYTHONPATH", ""))
+        env["WEBSH_VAULT_ENABLE"] = "0"
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", self._DRIVER], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "server.main() did not exit within 20s of SIGTERM — the "
+                "shutdown deadlock has regressed (the signal handler must not "
+                "call server.shutdown() on the serve_forever thread).")
+        # The 20s subprocess timeout above is the real discriminator: the
+        # buggy topology hangs forever (TimeoutExpired -> fail) while the fix
+        # exits in well under a second. We deliberately do NOT assert a tight
+        # wall-clock bound — it would only add false-RED risk under heavy CI
+        # load without catching any failure the timeout doesn't already.
+        self.assertEqual(
+            proc.returncode, 0,
+            "main() exited non-zero after SIGTERM: rc={} stderr={!r}".format(
+                proc.returncode, proc.stderr.decode("utf-8", "replace")))
+        self.assertIn(
+            b"MAIN_RETURNED_CLEANLY", proc.stdout,
+            "main() did not return cleanly; stderr={!r}".format(
+                proc.stderr.decode("utf-8", "replace")))
 
 
 if __name__ == "__main__":

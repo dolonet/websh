@@ -1613,13 +1613,12 @@ class SSHSession(object):
                             self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
                     self._signal()
 
-                # Check if child exited
-                try:
-                    pid, status = os.waitpid(self.pid, os.WNOHANG)
-                    if pid != 0:
-                        self._exit_status = status
-                        break
-                except ChildProcessError:
+                # Check if child exited. Done under _reap_lock (see
+                # _poll_child_exit) so the waitpid + status/flag writes are
+                # atomic w.r.t. a concurrent close()->_reap_child: otherwise
+                # the pid could be reaped here and recycled by the OS before
+                # we record it, and the other thread would SIGTERM a stranger.
+                if self._poll_child_exit():
                     break
         finally:
             # Drain remaining PTY data (exit escape sequences, etc.)
@@ -1677,6 +1676,32 @@ class SSHSession(object):
             # Wake any consumer parked in wait_for_data so it observes
             # alive=False without waiting up to KEEPALIVE_INTERVAL.
             self._signal()
+
+    def _poll_child_exit(self):
+        """Non-blocking WNOHANG check for the ssh child's self-exit, run from
+        the read loop. The waitpid AND the resulting _exit_status/_child_reaped
+        writes happen under _reap_lock so they are atomic with respect to a
+        concurrent close()->_reap_child(): once waitpid() reaps the child its
+        pid is free for OS recycling, so if the status write happened outside
+        the lock _reap_child could observe _exit_status is None / _child_reaped
+        False and SIGTERM a recycled (innocent) pid in the gap. Setting
+        _child_reaped here also makes the finally's _reap_child() a clean
+        no-op. Returns True when the loop should break."""
+        with self._reap_lock:
+            if self._exit_status is not None or self._child_reaped:
+                return True
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                # No such child — already reaped elsewhere, or never ours.
+                # Mark reaped so _reap_child() won't kill a recycled pid.
+                self._child_reaped = True
+                return True
+            if pid != 0:
+                self._exit_status = status
+                self._child_reaped = True
+                return True
+        return False
 
     def _reap_child(self):
         """Bounded reap of the ssh child: SIGTERM, poll WNOHANG, then
@@ -2076,6 +2101,12 @@ class SSHSession(object):
             except Exception:
                 pass
         except Exception as e:
+            # Close our write end too (the success path does; the error
+            # path must as well, or the BufferedWriter fd lingers until GC).
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
             try:
                 proc.kill()
             except Exception:
@@ -2085,6 +2116,18 @@ class SSHSession(object):
             except Exception:
                 pass
             _drain.join(timeout=5)
+            # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
+            # remote `cat >` already died (e.g. "No space left on device")
+            # and ssh tore the pipe down before we finished writing — so the
+            # *useful* cause is in the drained stderr, not "[Errno 32] Broken
+            # pipe". Surface its tail in that case only. A purely-local
+            # failure (upload timeout, body read error) keeps the generic
+            # message even if ssh happened to print a banner to stderr, so we
+            # never misattribute a local cause to the remote.
+            remote = b"".join(_err_buf).decode("utf-8", "replace").strip()
+            if remote and isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                return False, "stream error: %s (remote: %s)" % (
+                    str(e), remote[:300])
             return False, "stream error: " + str(e)
 
         try:
@@ -4003,6 +4046,23 @@ def _warn_max_threads_misconfig():
             MAX_THREADS))
 
 
+def _close_all_sessions():
+    """Snapshot the session registry under the lock, clear it, then close
+    each session OUTSIDE the lock — close() runs SIGTERM/WNOHANG/SIGKILL/
+    waitpid, and holding sessions_lock across that batch would stall every
+    lock-taking endpoint (same rationale as cleanup()). One wedged teardown
+    is isolated so it can't skip the rest. Used by the shutdown path."""
+    with sessions_lock:
+        victims = list(sessions.values())
+        sessions.clear()
+    for s in victims:
+        try:
+            s.close()
+        except Exception as e:
+            _log("WARN", "shutdown: session {} close failed: {}".format(
+                getattr(s, "id", "?"), e))
+
+
 def main():
     _warn_per_ip_misconfig()
     _warn_max_threads_misconfig()
@@ -4012,24 +4072,30 @@ def main():
 
     server = Server((HOST, PORT), Handler)
 
-    def shutdown(signum, frame):
-        # Snapshot under the lock, then close OUTSIDE it: close() runs the
-        # SIGTERM -> WNOHANG-poll -> SIGKILL -> blocking-waitpid reap, and
-        # holding sessions_lock across that batch stalls every lock-taking
-        # endpoint (the same rationale cleanup() already follows).
-        with sessions_lock:
-            victims = list(sessions.values())
-            sessions.clear()
-        for s in victims:
-            try:
-                s.close()
-            except Exception:
-                pass
-        server.shutdown()
-        sys.exit(0)
+    stop_event = Event()
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    def _request_stop(signum, frame):
+        # Signal handlers run on the main thread. Do the MINIMUM that is
+        # safe here — just wake main(). The real teardown (session close(),
+        # which runs kill/waitpid/sleep, and server.shutdown(), which MUST
+        # run on a thread other than serve_forever() or it self-deadlocks)
+        # happens back on the main thread below. The previous version called
+        # server.shutdown() directly from here, i.e. from inside the
+        # serve_forever() thread, which blocked forever waiting for that same
+        # loop to acknowledge the stop — the process only died at the systemd
+        # stop-timeout via SIGKILL.
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
+    # serve_forever() on a daemon thread so the signal handler can return
+    # immediately and main() can call server.shutdown() from here — a
+    # DIFFERENT thread than the serve loop, which is what BaseServer.shutdown()
+    # requires. daemon=True so a wedged accept loop can never block interpreter
+    # exit.
+    serve_thread = Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
 
     _log("INFO", "websh v{} listening on http://{}:{}".format(
         __version__, HOST, PORT))
@@ -4041,7 +4107,12 @@ def main():
         _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
     else:
         _log("INFO", "credential vault: enabled")
-    server.serve_forever()
+
+    stop_event.wait()
+    _log("INFO", "shutting down")
+    _close_all_sessions()
+    server.shutdown()
+    server.server_close()
 
 
 if __name__ == "__main__":
