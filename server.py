@@ -4011,9 +4011,18 @@ def main():
     server = Server((HOST, PORT), Handler)
 
     def shutdown(signum, frame):
+        # Snapshot under the lock, then close OUTSIDE it: close() runs the
+        # SIGTERM -> WNOHANG-poll -> SIGKILL -> blocking-waitpid reap, and
+        # holding sessions_lock across that batch stalls every lock-taking
+        # endpoint (the same rationale cleanup() already follows).
         with sessions_lock:
-            for s in sessions.values():
+            victims = list(sessions.values())
+            sessions.clear()
+        for s in victims:
+            try:
                 s.close()
+            except Exception:
+                pass
         server.shutdown()
         sys.exit(0)
 

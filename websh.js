@@ -1684,6 +1684,10 @@ async function connectPane(p, opts) {
       startOutput(p);
     })
     .catch(e => {
+      // Mirror the .then guard above: if the pane was destroyed while the
+      // request was in flight, it failed so there is no session to reap —
+      // just bail rather than flashing a global error for a closed pane.
+      if (panes[p.id] !== p) return;
       p.connecting = false;
       showErr('Connection failed: ' + e.message);
       updatePaneBadge(p);
@@ -3066,7 +3070,8 @@ function renderServerConnections() {
   let el=$('serverList'); el.innerHTML='';
   serverConfig.connections.forEach(c => {
     let div=document.createElement('div'); div.className='sv'; div.setAttribute('data-name',c.name);
-    let userDisplay = c.username || (c.allowed_users && c.allowed_users.length===1 ? c.allowed_users[0] : '<em>user</em>');
+    let userDisplay = c.username ? esc(c.username)
+      : (c.allowed_users && c.allowed_users.length===1 ? esc(c.allowed_users[0]) : '<em>user</em>');
     let kindBadge = c.kind === 'prompt' ? `<span class="sv-kind" title="Password required on click">prompt</span>` : '';
     div.innerHTML=`<div class="sv-info"><div class="sv-name">${esc(c.name)}${kindBadge}</div>`+
       `<div class="sv-host">${userDisplay}@${esc(c.host)}:${Number(c.port) || 22}</div></div>`;

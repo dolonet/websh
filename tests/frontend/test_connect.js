@@ -4794,6 +4794,24 @@ test('makeUploadMvCmd builds the collision counter from the original name', asyn
 });
 
 // =====================================================================
+// renderServerConnections interpolates the operator-config username; it must
+// esc() it like c.name/c.host (renderSaved already escapes every field). An
+// operator-supplied username with markup would otherwise inject into the
+// credential page. Sibling hardening to the #90 saved-port fix.
+test('renderServerConnections escapes a malicious connection username', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: true, connections:
+    [{name: 'evil', kind: 'prompt', host: 'h', port: 22,
+      username: '<img src=x onerror=window.__xss=1>'}]}}]);
+  const win = env.win;
+  win.renderServerConnections();
+  const host = win.document.querySelector('#serverList .sv-host');
+  ok(host, 'rendered a server connection');
+  ok(host.innerHTML.indexOf('<img') === -1,
+     'username escaped, no injected markup; got ' + host.innerHTML);
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
