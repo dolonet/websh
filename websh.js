@@ -137,6 +137,10 @@ const SSE_FIRST_MSG_TIMEOUT_MS = 5000;
 // or trusted-but-misbehaving server can't OOM the tab. 2 GB matches the
 // upload limit and modern browsers' Blob ceilings.
 const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+// The server caps the JSON request body at MAX_BODY_SIZE (8 MB). A huge
+// terminal paste is sent via /api/input; refuse one that would exceed the
+// cap and tell the user, rather than letting the POST 400 and vanish.
+const MAX_INPUT_BODY = 8 * 1024 * 1024;
 let authMode = 'pw';
 
 const darkTheme = {
@@ -1509,6 +1513,15 @@ function queueInput(p, data) {
     p.flushTimer=null;
     if(!p.sid||!p.inputQueue.length) return;
     let d=p.inputQueue.join(''); p.inputQueue=[];
+    // Only a large paste can approach the server body cap; for those, check
+    // the real UTF-8 body size and surface an error instead of a silent 400.
+    if(d.length > 1048576){
+      let body=JSON.stringify({session_id:p.sid,data:d});
+      if(new TextEncoder().encode(body).length > MAX_INPUT_BODY){
+        showErr('Paste too large to send (server limit ~8 MB) — not sent.');
+        return;
+      }
+    }
     api('input',{body:{session_id:p.sid,data:d}}).catch(() => {});
   }, 10);
 }

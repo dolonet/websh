@@ -4812,6 +4812,39 @@ test('renderServerConnections escapes a malicious connection username', async ()
 });
 
 // =====================================================================
+// The server caps the /api/input body at MAX_BODY_SIZE (8 MB). queueInput
+// must refuse a paste that would exceed it and surface an error, instead of
+// firing a POST that 400s and silently vanishes.
+test('queueInput refuses an oversize paste and surfaces an error', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-big';
+  let errs = 0; win.showErr = () => { errs++; };
+  win.queueInput(p, 'x'.repeat(9 * 1024 * 1024));  // 9 MB > 8 MB body cap
+  await sleep(40);
+  const sent = log.filter(e => e.action === 'input' && e.body && e.body.session_id === 'sid-big');
+  ok(sent.length === 0, 'oversize input not sent; got ' + sent.length);
+  ok(errs === 1, 'error surfaced exactly once; got ' + errs);
+  cleanup(env);
+});
+
+test('queueInput still sends a large-but-under-cap paste', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'input', response: {ok: true}},
+  ]);
+  const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-ok';
+  win.queueInput(p, 'y'.repeat(2 * 1024 * 1024));  // 2 MB < 8 MB cap
+  await sleep(40);
+  const sent = log.filter(e => e.action === 'input' && e.body && e.body.session_id === 'sid-ok');
+  ok(sent.length === 1, '2 MB paste sent; got ' + sent.length);
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
