@@ -100,13 +100,21 @@ server {
 
     # nginx caps request bodies at 1m by default, which 413s any file
     # upload larger than that before it ever reaches websh. Raise it to
-    # at least the backend's MAX_UPLOAD_SIZE (2 GiB default); the server
-    # still enforces its own limit, so this is just the proxy ceiling.
+    # the largest upload you want to allow — up to the backend's
+    # MAX_UPLOAD_SIZE (2 GiB default); the server still enforces its own
+    # limit, so this is just the proxy ceiling. On a public / multi-user
+    # relay prefer a bounded value (e.g. 200m) over 2g, so one client
+    # can't push multi-gigabyte requests through you.
     client_max_body_size 2g;
 
     location / {
         proxy_pass http://127.0.0.1:8765;
-        proxy_read_timeout 60s;
+        # Covers the SSE/long-poll idle gaps AND large uploads: with
+        # request buffering on (nginx default) the proxy waits on this
+        # timeout while websh streams a buffered upload to the remote and
+        # replies. 60s is enough for SSE but cuts off large/slow uploads
+        # with a 504; 300s leaves headroom.
+        proxy_read_timeout 300s;
 
         # OVERWRITE the client-IP header with the real peer. Do not
         # append — a client can pre-populate X-Forwarded-For and bypass
@@ -118,10 +126,16 @@ server {
 }
 ```
 
-`proxy_read_timeout` must comfortably exceed both the long-poll window
-(10 s) and the SSE keep-alive interval (15 s) — 60 s leaves plenty of
-headroom. The backend sets `X-Accel-Buffering: no` on the SSE response,
-so nginx flushes each event immediately without further configuration.
+`proxy_read_timeout` must comfortably exceed the long-poll window (10 s),
+the SSE keep-alive interval (15 s), and — usually the binding constraint —
+the time websh needs to stream a large upload to the remote host before
+it replies. With request buffering on (nginx's default) the proxy holds
+the connection on this timeout for the whole upload-and-respond phase, so
+a value sized only for SSE (e.g. 60 s) silently cuts large or slow uploads
+off with a `504`. 300 s covers both; raise it further if you allow very
+large files over slow links. The backend sets `X-Accel-Buffering: no` on
+the SSE response, so nginx flushes each event immediately without further
+configuration.
 
 `client_max_body_size` must be at least as large as the files you intend
 to upload. nginx defaults to `1m` and rejects anything bigger with
@@ -130,8 +144,11 @@ proxy that omits this directive silently breaks uploads of ordinary files
 (PDFs, images, archives). The backend independently caps uploads at
 `MAX_UPLOAD_SIZE` (2 GiB default, specified in bytes — not nginx-style
 size suffixes), so the proxy value only needs to not be the bottleneck.
-Caddy v2 has no default body-size limit, so no equivalent setting is
-required there.
+On a single-user deployment `2g` (matching the backend cap) is the
+simplest choice; on a public or multi-user relay set a bounded ceiling
+(e.g. `200m`) instead, so one client can't tie up bandwidth and a
+request-body temp file with a multi-gigabyte push. Caddy v2 has no default
+body-size limit, so no equivalent setting is required there.
 
 If the proxy runs on a different host, add its IP to `TRUSTED_PROXIES`
 so rate limiting uses the real client IP — see
