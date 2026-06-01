@@ -83,19 +83,25 @@ the same as with the free manual form.
 ## Restrict mode
 
 Set `"restrict_hosts": true` to hide the free-form manual connection form
-entirely. Users can only go through a configured connection card. Raw
-manual-path POSTs to `/api/connect` (bypassing the UI) are also rejected.
-With a single connection, the UI auto-selects it on load — Ready connects
-immediately, Prompt surfaces the locked form ready for a password.
+entirely. A connect is then allowed only when it goes through a configured
+connection — either by name, or as a saved credential card, which is
+authorized against the prompt connection whose host:port it targets (and
+that connection's `allowed_users` / `denied_users`). Free-form manual-path
+POSTs to `/api/connect` (raw `host`/`username`, no connection name or saved
+card) are rejected. With a single connection, the UI auto-selects it on
+load — Ready connects immediately, Prompt surfaces the locked form ready
+for a password.
 
 ## Security note on user lists
 
-`allowed_users` / `denied_users` apply only inside the **named** connection
-flow (`{connection: "<name>"}` on `/api/connect`). When `restrict_hosts`
-is off, the free manual form and raw manual-path POSTs are not bound by
-those lists — they're a UX-guided allowlist for your team, not a hardening
-boundary against a determined caller. Combine with `restrict_hosts: true`
-if you need the rules to be enforced against direct API access too.
+`allowed_users` / `denied_users` are enforced on the **named** connection
+flow (`{connection: "<name>"}` on `/api/connect`) and, under
+`restrict_hosts`, on saved credential cards too — via the prompt connection
+their host:port matches. When `restrict_hosts` is off, the free manual form
+and raw manual-path POSTs are not bound by those lists — they're a
+UX-guided allowlist for your team, not a hardening boundary against a
+determined caller. Combine with `restrict_hosts: true` if you need the
+rules enforced against direct API access too.
 
 ## Deny-list for free-form connect
 

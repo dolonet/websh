@@ -771,6 +771,10 @@ function paneRecord(p) {
     rec.host = p.host || '';
     rec.port = p.port || 22;
     rec.user = p.user || '';
+    // The prompt connection this card was saved from, if any. Sent as an
+    // authorization disambiguation hint; the server only honours it when it
+    // matches the card's stored host:port (so it can't escalate).
+    rec.connection = p.connection || null;
   } else if (p.connection) {
     rec.via = 'named';
     rec.connection = p.connection;
@@ -813,6 +817,11 @@ function buildConnectBody(rec, termCols, termRows) {
       if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
     }
     if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
+    // Connection-name hint: lets the server authorize the card against the
+    // exact prompt connection it was saved from (rename/duplicate-safe),
+    // falling back to host:port matching when absent. See
+    // _resolve_saved_card_connection in server.py.
+    if (rec.connection) b.connection = rec.connection;
     return b;
   }
   let b = {

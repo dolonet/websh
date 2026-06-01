@@ -600,7 +600,7 @@ class TestIsHostAllowed(unittest.TestCase):
         ok, err = server.authorize_target("h.example", 22, "alice",
                                           is_saved=False)
         self.assertFalse(ok)
-        self.assertIn("not allowed", err)
+        self.assertEqual(err, "connections to this host are not allowed")
 
     def test_authorize_saved_card_matches_named_prompt_connection(self):
         """A saved vault card whose host:port matches a named prompt
@@ -627,7 +627,7 @@ class TestIsHostAllowed(unittest.TestCase):
         ok, err = server.authorize_target("other.example", 22, "alice",
                                           is_saved=True)
         self.assertFalse(ok)
-        self.assertIn("not allowed", err)
+        self.assertEqual(err, "connections to this host are not allowed")
 
     def test_authorize_saved_card_honors_denied_users(self):
         """A saved vault card matching a prompt connection is still
@@ -641,7 +641,7 @@ class TestIsHostAllowed(unittest.TestCase):
         ok, err = server.authorize_target("h.example", 22, "root",
                                           is_saved=True)
         self.assertFalse(ok)
-        self.assertIn("not allowed", err)
+        self.assertEqual(err, "username is not allowed on this connection")
 
     def test_authorize_saved_card_honors_allowed_users(self):
         """allowed_users on the matched prompt connection constrains the
@@ -672,6 +672,224 @@ class TestIsHostAllowed(unittest.TestCase):
         ok, _ = server.authorize_target("h.example", 22, "intruder",
                                         is_saved=True)
         self.assertFalse(ok)
+
+    def test_authorize_saved_card_hint_selects_named_connection(self):
+        """When two prompt connections share host:port, the client-supplied
+        connection hint selects the exact one — deterministic, not the
+        file-order first match (resolves the ambiguity in #74)."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [
+                {"name": "primary", "host": "h.example", "port": 22,
+                 "username": "", "denied_users": ["alice"]},
+                {"name": "secondary", "host": "h.example", "port": 22,
+                 "username": "", "allowed_users": ["alice"]},
+            ],
+        })
+        # No hint → first match ('primary') governs → alice denied.
+        ok, _ = server.authorize_target("h.example", 22, "alice",
+                                        is_saved=True)
+        self.assertFalse(ok)
+        # Hint to 'secondary' → that connection governs → alice allowed.
+        self.assertEqual(
+            server.authorize_target("h.example", 22, "alice", is_saved=True,
+                                    conn_hint="secondary"),
+            (True, None))
+
+    def test_authorize_saved_card_hint_ignored_when_host_mismatch(self):
+        """Security: the client-supplied hint can only disambiguate among
+        connections that match the card's (server-resolved) host:port. A hint
+        pointing at a different host is ignored — it must not borrow that
+        connection's policy (which would bypass denied_users)."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [
+                {"name": "host-a", "host": "a.example", "port": 22,
+                 "username": "", "denied_users": ["bob"]},
+                {"name": "host-b", "host": "b.example", "port": 22,
+                 "username": "", "allowed_users": ["bob"]},
+            ],
+        })
+        # Card targets host A (denies bob); hint claims 'host-b' (allows bob).
+        # The hint is ignored — host-a's denied_users still applies.
+        ok, err = server.authorize_target("a.example", 22, "bob",
+                                          is_saved=True, conn_hint="host-b")
+        self.assertFalse(ok)
+        self.assertEqual(err, "username is not allowed on this connection")
+
+    def test_authorize_saved_card_hint_cannot_reach_unconfigured_host(self):
+        """Security: a hint to a real connection cannot authorize a card whose
+        host matches no connection — restrict_hosts stays un-bypassable by
+        attaching a permissive connection name to an arbitrary saved card."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "real", "host": "ok.example",
+                             "port": 22, "username": ""}],
+        })
+        ok, err = server.authorize_target("evil.example", 22, "alice",
+                                          is_saved=True, conn_hint="real")
+        self.assertFalse(ok)
+        self.assertEqual(err, "connections to this host are not allowed")
+
+    def test_authorize_saved_card_host_match_case_insensitive(self):
+        """A saved card whose host casing differs from websh.json still
+        matches its prompt connection (denied_hosts already casefolds)."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "hel", "host": "h.example", "port": 22,
+                             "username": "", "allowed_users": ["alice"]}],
+        })
+        self.assertEqual(
+            server.authorize_target("H.Example", 22, "alice", is_saved=True),
+            (True, None))
+
+    def test_authorize_saved_card_not_matched_to_ready_connection(self):
+        """A `ready` (fixed-credential) connection is never matched for a
+        saved card — those connect with operator-stored creds, not a user's
+        card. A card targeting a ready connection's host:port is rejected."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "r", "host": "r.example", "port": 22,
+                             "username": "svc", "password": "p"}],
+        })
+        ok, err = server.authorize_target("r.example", 22, "svc",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertEqual(err, "connections to this host are not allowed")
+
+    def test_authorize_saved_card_rejected_on_port_mismatch(self):
+        """A card whose port differs from the prompt connection's is not
+        matched (host alone is not enough)."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "p", "host": "h.example", "port": 2222,
+                             "username": ""}],
+        })
+        ok, err = server.authorize_target("h.example", 22, "alice",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertEqual(err, "connections to this host are not allowed")
+
+    def test_authorize_saved_card_deny_listed_when_restrict_off(self):
+        """restrict_hosts off: a saved card is gated by the deny-list, like a
+        manual connect — a deny-listed host is rejected."""
+        self._write_config({
+            "restrict_hosts": False,
+            "denied_hosts": ["bad.example"],
+            "connections": [],
+        })
+        ok, err = server.authorize_target("bad.example", 22, "alice",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertEqual(err, "connections to this host are not allowed")
+
+
+@unittest.skipUnless(server.HAS_CRYPTOGRAPHY,
+                     "cryptography not installed; saved-card HTTP path needs AES-GCM")
+class TestSavedCardConnectAuthz(unittest.TestCase):
+    """Integration: a saved vault card POSTed to /api/connect is gated by
+    authorize_target even when it carries a `connection` hint — the hint must
+    not let it skip the gate (call-site wiring). Covers the is_saved
+    derivation + host/port/username-resolved-from-vault path the unit tests
+    bypass (#74 item 3)."""
+
+    VAULT = "A" * 26
+    CONN = "B" * 26
+    CARD_HOST = "192.0.2.10"   # TEST-NET-1 (RFC 5737) — never routable
+
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        cls.tmpdir = tempfile.mkdtemp()
+        cfg_path = os.path.join(cls.tmpdir, "websh.json")
+        with open(cfg_path, "w") as f:
+            json.dump({
+                "restrict_hosts": True,
+                "connections": [
+                    {"name": "gate", "host": cls.CARD_HOST, "port": 22,
+                     "username": "", "denied_users": ["root"]},
+                ],
+            }, f)
+        os.environ["WEBSH_CONFIG"] = cfg_path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        # A credential blob AAD-bound to (VAULT, CONN), stored under a record
+        # whose host/username are what authorize_target will see.
+        cls.key = AESGCM.generate_key(bit_length=256)
+        iv = os.urandom(12)
+        aad = "{}:{}".format(cls.VAULT, cls.CONN).encode()
+        ct = AESGCM(cls.key).encrypt(iv, b'{"password":"x"}', aad)
+        creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
+        with open(creds_path, "w") as f:
+            json.dump({"version": server._CREDS_SCHEMA_VERSION, "vaults": {
+                cls.VAULT: {cls.CONN: {
+                    "host": cls.CARD_HOST, "port": 22, "username": "root",
+                    "iv": base64.b64encode(iv).decode(),
+                    "ct": base64.b64encode(ct).decode(),
+                }},
+            }}, f)
+        os.environ["WEBSH_CREDS_PATH"] = creds_path
+        server._creds_cache = None
+        server._creds_cache_key = (0, 0)
+
+        cls._vault_enable = server.WEBSH_VAULT_ENABLE
+        cls._vault_disabled = server._vault_disabled
+        server.WEBSH_VAULT_ENABLE = True
+        server._vault_disabled = False
+
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        server.WEBSH_VAULT_ENABLE = cls._vault_enable
+        server._vault_disabled = cls._vault_disabled
+        os.environ.pop("WEBSH_CONFIG", None)
+        os.environ.pop("WEBSH_CREDS_PATH", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+
+    def _connect(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_saved_card_with_connection_hint_still_enforces_denied_users(self):
+        """The card (server-resolved user 'root') targets a host whose only
+        prompt connection denies 'root'. A `connection` hint on the body must
+        NOT let it skip the gate and connect — it must 403. Without the
+        call-site guard the hint makes conn_name truthy, the gate is skipped,
+        and a session is spawned (200)."""
+        body, code = self._connect({
+            "vault_id": self.VAULT, "conn_id": self.CONN,
+            "vault_key": base64.b64encode(self.key).decode(),
+            "connection": "gate",          # hint — must not bypass the gate
+            "cols": 80, "rows": 24,
+        })
+        self.assertEqual(code, 403, "expected gate 403, got {}: {}".format(
+            code, body))
+        self.assertEqual(body["error"],
+                         "username is not allowed on this connection")
 
 
 class TestParseDeniedHosts(unittest.TestCase):

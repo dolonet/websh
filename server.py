@@ -1190,6 +1190,19 @@ def find_config_connection(name):
     return None
 
 
+def _prompt_conn_matches(c, host, port):
+    """True if config entry `c` is a prompt connection targeting (host, port).
+
+    Host comparison is case-insensitive — matching the denied_hosts
+    convention (_parse_denied_hosts lowercases), so a card whose host casing
+    differs from websh.json is not falsely rejected. Port is clamped the same
+    way the connect path resolves it.
+    """
+    return (c.get("kind") == "prompt"
+            and c.get("host", "").casefold() == (host or "").casefold()
+            and clamp(c.get("port"), MIN_PORT, MAX_PORT, 22) == port)
+
+
 def find_prompt_connection_by_host(host, port):
     """First named `prompt` connection whose (host, port) matches.
 
@@ -1201,11 +1214,29 @@ def find_prompt_connection_by_host(host, port):
     """
     cfg = load_config()
     for c in cfg["connections"]:
-        if (c.get("kind") == "prompt"
-                and c.get("host", "") == host
-                and clamp(c.get("port"), MIN_PORT, MAX_PORT, 22) == port):
+        if _prompt_conn_matches(c, host, port):
             return c
     return None
+
+
+def _resolve_saved_card_connection(host, port, conn_hint):
+    """Pick the prompt connection that governs a saved card's (host, port).
+
+    `conn_hint` is the connection name the client stamped on the card at save
+    time. It reaches us in the connect body, so it is attacker-controllable —
+    used ONLY to disambiguate among connections that already match the card's
+    server-resolved host:port (e.g. two prompt connections on one bastion with
+    different allowed_users). A hint naming a connection on a *different*
+    host:port is ignored: it can never select a policy for a target the card
+    does not actually address, so it cannot escalate past restrict_hosts or a
+    connection's denied_users. Falls back to the first host:port match for
+    legacy cards (saved before name tagging) and for stale/deleted hints.
+    """
+    if conn_hint:
+        entry = find_config_connection(conn_hint)
+        if entry is not None and _prompt_conn_matches(entry, host, port):
+            return entry
+    return find_prompt_connection_by_host(host, port)
 
 
 def is_host_allowed(host, port, username):
@@ -1255,26 +1286,28 @@ def check_prompt_user(entry, username):
     return True, None
 
 
-def authorize_target(host, port, username, is_saved):
-    """Authorize a connect that carries no `connection` name.
+def authorize_target(host, port, username, is_saved, conn_hint=None):
+    """Authorize a connect that is not a fully-vetted named connection.
 
     Connects made through a named connection are vetted separately
     (find_config_connection + check_prompt_user). This gate covers the
     other two shapes:
 
-      * Saved vault card (is_saved): under restrict_hosts it carries no
-        `connection` name, but it is as legitimate as the named
-        connection whose host:port it targets. Authorize it that way —
-        a fixed-username connection pins the user; an open one runs
-        check_prompt_user. With restrict_hosts off it is gated by the
-        deny-list, like a manual connect.
+      * Saved vault card (is_saved): under restrict_hosts it is as
+        legitimate as the named connection whose host:port it targets.
+        Authorize it that way — a fixed-username connection pins the user;
+        an open one runs check_prompt_user. `conn_hint` (the connection
+        name the card was saved from) only disambiguates among connections
+        matching the card's host:port; see _resolve_saved_card_connection
+        for why it cannot escalate. With restrict_hosts off the card is
+        gated by the deny-list, like a manual connect.
       * Free-form manual POST: allowed only when is_host_allowed() says
         so (restrict_hosts off and the host is not deny-listed).
 
     Returns (True, None) when allowed, else (False, error_message).
     """
     if is_saved and load_config()["restrict_hosts"]:
-        named = find_prompt_connection_by_host(host, port)
+        named = _resolve_saved_card_connection(host, port, conn_hint)
         if named is None:
             return False, "connections to this host are not allowed"
         fixed_user = named.get("username", "")
@@ -3048,23 +3081,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid host or username"}, 400)
             return
 
-        # A connect without a `connection` name is a saved vault card or
-        # a free-form manual POST; authorize_target() gates both. (Named
-        # connections were vetted above.) Under restrict_hosts a vault
-        # card is allowed when its target matches a configured prompt
-        # connection — a manual POST is not.
-        if not conn_name:
-            ok, deny_err = authorize_target(host, port, username, is_saved)
+        # A saved vault card or a free-form manual POST must pass
+        # authorize_target() (named connections were vetted above). A saved
+        # card may carry the `connection` name it was saved from — passed as
+        # a disambiguation hint only; is_saved still routes it here, so a
+        # card cannot skip the gate by also setting `connection`.
+        if is_saved or not conn_name:
+            conn_hint = conn_name if is_saved else None
+            ok, deny_err = authorize_target(host, port, username, is_saved,
+                                            conn_hint=conn_hint)
             if not ok:
                 _access_log_emit("connect", ip, result="deny_blocked",
                                  target_host=host, target_user=username)
-                # Feed the scan-pattern detector only for deny-list
-                # rejections (real scans). A restrict_hosts rejection is
-                # policy, and a stale UI POSTing `host` instead of
-                # `connection` should not accumulate against an honest
-                # user — the deny_blocked record still surfaces it.
+                # Feed the scan-pattern detector for deny-list rejections
+                # (real scans, restrict_hosts off) and for saved-card
+                # rejections under restrict_hosts — a saved card is a real
+                # accept/reject surface, so host/slot probing through it
+                # should accumulate. A stale-UI manual POST under
+                # restrict_hosts still does NOT (the deny_blocked record
+                # still surfaces it); the detector keys on distinct hosts,
+                # so one honest broken card never trips it, only a sweep does.
                 cfg = load_config()
-                if not cfg["restrict_hosts"] and _record_deny_for_scan(ip, host):
+                if ((not cfg["restrict_hosts"] or is_saved)
+                        and _record_deny_for_scan(ip, host)):
                     # Separate scan_pattern record so fail2ban can ban on
                     # this signal without also banning deny_blocked typos.
                     _access_log_emit("connect", ip, result="scan_pattern",

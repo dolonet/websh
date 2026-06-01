@@ -4845,6 +4845,29 @@ test('queueInput still sends a large-but-under-cap paste', async () => {
 });
 
 // =====================================================================
+test('buildConnectBody: vault card forwards the connection hint', async () => {
+  // The saved connection name must ride in the vault POST so the server can
+  // authorize the card against the exact prompt connection it was saved from
+  // (server-side _resolve_saved_card_connection). Regression guard for the
+  // original #74 drop where the vault branch returned before stamping it.
+  const env = await mkEnv({});
+  const {win} = env;
+  const build = (extra) => win.buildConnectBody(
+    Object.assign({vault_id: 'V', conn_id: 'C', vault_key: 'K', user: 'u',
+                   cols: 80, rows: 24}, extra), 80, 24);
+
+  const withHint = build({connection: 'prod-bastion'});
+  ok(withHint.vault_id === 'V', 'vault tuple still shipped');
+  ok(withHint.connection === 'prod-bastion',
+     'connection hint forwarded; got ' + JSON.stringify(withHint.connection));
+
+  const noHint = build({connection: null});
+  ok(!('connection' in noHint),
+     'no connection key when card has none; got ' + JSON.stringify(noHint));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
