@@ -2817,6 +2817,11 @@ async function connectSaved(c) {
       vault_id: vault_id,
       conn_id: c.conn_id,
       vault_key: vault_key,
+      // The prompt connection this card was saved from — forwarded as the
+      // server-side authorization hint (see _resolve_saved_card_connection).
+      // Without it, re-connecting a saved card silently falls back to
+      // host:port matching.
+      connection: c.connection || null,
       // host/port/user are display hints for the connect popup; the
       // server derives the real values from the stored vault record.
       host: c.host, port: c.port || 22, user: c.user,

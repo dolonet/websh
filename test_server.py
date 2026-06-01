@@ -695,6 +695,11 @@ class TestIsHostAllowed(unittest.TestCase):
             server.authorize_target("h.example", 22, "alice", is_saved=True,
                                     conn_hint="secondary"),
             (True, None))
+        # An empty hint (what the call site sends after .strip() of a blank
+        # `connection`) is falsy → falls back to the first host:port match.
+        ok, _ = server.authorize_target("h.example", 22, "alice",
+                                        is_saved=True, conn_hint="")
+        self.assertFalse(ok)
 
     def test_authorize_saved_card_hint_ignored_when_host_mismatch(self):
         """Security: the client-supplied hint can only disambiguate among
@@ -742,6 +747,25 @@ class TestIsHostAllowed(unittest.TestCase):
         self.assertEqual(
             server.authorize_target("H.Example", 22, "alice", is_saved=True),
             (True, None))
+
+    def test_authorize_saved_card_host_match_not_unicode_casefolded(self):
+        """Host match uses .lower() (the denied_hosts convention), NOT
+        .casefold() — casefold over-collapses distinct IDN labels (German
+        'straße' → 'strasse', Turkish dotless-i, Greek final sigma), which
+        would let a card escape restrict_hosts to a different, unconfigured
+        host that merely casefold-collides with a configured one."""
+        self._write_config({
+            "restrict_hosts": True,
+            "connections": [{"name": "idn", "host": "strasse.example",
+                             "port": 22, "username": "",
+                             "allowed_users": ["root"]}],
+        })
+        # 'straße.example'.casefold() == 'strasse.example', but they are
+        # different DNS names — must NOT match.
+        ok, err = server.authorize_target("straße.example", 22, "root",
+                                          is_saved=True)
+        self.assertFalse(ok)
+        self.assertEqual(err, "connections to this host are not allowed")
 
     def test_authorize_saved_card_not_matched_to_ready_connection(self):
         """A `ready` (fixed-credential) connection is never matched for a
@@ -795,7 +819,11 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
 
     VAULT = "A" * 26
     CONN = "B" * 26
+    SCAN1 = "C" * 26
+    SCAN2 = "D" * 26
+    SCAN3 = "E" * 26
     CARD_HOST = "192.0.2.10"   # TEST-NET-1 (RFC 5737) — never routable
+    SCAN_HOSTS = ("198.51.100.1", "198.51.100.2", "198.51.100.3")  # TEST-NET-2
 
     @classmethod
     def setUpClass(cls):
@@ -805,30 +833,43 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
         with open(cfg_path, "w") as f:
             json.dump({
                 "restrict_hosts": True,
+                # Two prompt connections share the card's host:port — 'gate'
+                # (first) denies 'root', 'alt' allows it. A connection-name
+                # hint must be able to select 'alt' over the file-order first
+                # match.
                 "connections": [
                     {"name": "gate", "host": cls.CARD_HOST, "port": 22,
                      "username": "", "denied_users": ["root"]},
+                    {"name": "alt", "host": cls.CARD_HOST, "port": 22,
+                     "username": "", "allowed_users": ["root"]},
                 ],
             }, f)
         os.environ["WEBSH_CONFIG"] = cfg_path
         server._config_cache = None
         server._config_mtime = 0
 
-        # A credential blob AAD-bound to (VAULT, CONN), stored under a record
-        # whose host/username are what authorize_target will see.
+        # Credential blobs AAD-bound to (VAULT, conn_id), each decryptable with
+        # the one vault key. host/username here are what authorize_target sees.
         cls.key = AESGCM.generate_key(bit_length=256)
-        iv = os.urandom(12)
-        aad = "{}:{}".format(cls.VAULT, cls.CONN).encode()
-        ct = AESGCM(cls.key).encrypt(iv, b'{"password":"x"}', aad)
+
+        def _rec(conn, host, user):
+            iv = os.urandom(12)
+            aad = "{}:{}".format(cls.VAULT, conn).encode()
+            ct = AESGCM(cls.key).encrypt(iv, b'{"password":"x"}', aad)
+            return {"host": host, "port": 22, "username": user,
+                    "iv": base64.b64encode(iv).decode(),
+                    "ct": base64.b64encode(ct).decode()}
+
+        slot = {cls.CONN: _rec(cls.CONN, cls.CARD_HOST, "root")}
+        # Cards to distinct, unconfigured hosts — each rejected at the gate;
+        # used to exercise scan-pattern accumulation.
+        for conn, host in zip((cls.SCAN1, cls.SCAN2, cls.SCAN3),
+                              cls.SCAN_HOSTS):
+            slot[conn] = _rec(conn, host, "root")
         creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
         with open(creds_path, "w") as f:
-            json.dump({"version": server._CREDS_SCHEMA_VERSION, "vaults": {
-                cls.VAULT: {cls.CONN: {
-                    "host": cls.CARD_HOST, "port": 22, "username": "root",
-                    "iv": base64.b64encode(iv).decode(),
-                    "ct": base64.b64encode(ct).decode(),
-                }},
-            }}, f)
+            json.dump({"version": server._CREDS_SCHEMA_VERSION,
+                       "vaults": {cls.VAULT: slot}}, f)
         os.environ["WEBSH_CREDS_PATH"] = creds_path
         server._creds_cache = None
         server._creds_cache_key = (0, 0)
@@ -859,6 +900,8 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
 
     def setUp(self):
         server._rate_limits.clear()
+        with server.sessions_lock:
+            server.sessions.clear()
 
     def _connect(self, body):
         from urllib.request import urlopen, Request
@@ -890,6 +933,85 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
             code, body))
         self.assertEqual(body["error"],
                          "username is not allowed on this connection")
+
+    def test_saved_card_hint_selects_allowing_connection(self):
+        """Disambiguation end-to-end: 'gate' (file-order first) denies the
+        card's user, 'alt' allows it, both on the card's host:port. A
+        `connection: alt` hint must select 'alt' and authorize the connect —
+        proving the hint string flows body → authorize_target (not just the
+        first host:port match). SSH spawn is stubbed so no real connect runs.
+        If the call-site dropped conn_hint, this would fall back to 'gate'
+        and 403."""
+        class _FakeSession(object):
+            alive = True
+            auth_failed = False
+
+            def __init__(self, **kw):
+                self.tmux_cmd = kw.get("tmux_cmd", "tmux")
+                self.is_background = bool(kw.get("is_background"))
+                self.client_ip = kw.get("client_ip")
+                self.host = kw.get("host")
+                self.username = kw.get("username")
+
+            def close(self):
+                pass
+
+        orig = server.SSHSession
+        server.SSHSession = _FakeSession
+        try:
+            body, code = self._connect({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(self.key).decode(),
+                "connection": "alt",   # selects the allowing connection
+                "cols": 80, "rows": 24,
+            })
+        finally:
+            server.SSHSession = orig
+        self.assertEqual(code, 200,
+                         "expected authorized connect, got {}: {}".format(
+                             code, body))
+        self.assertIn("session_id", body)
+
+    def test_saved_card_rejections_feed_scan_pattern(self):
+        """A saved-card rejection under restrict_hosts feeds the scan-pattern
+        detector (#74 item 2) — probing distinct hosts via saved cards trips a
+        `scan_pattern` record once the distinct-host threshold is reached. The
+        detector keys on distinct hosts, so one honest broken card (single
+        host) never would."""
+        logf = tempfile.NamedTemporaryFile(mode="w", suffix=".log",
+                                           delete=False)
+        logf.close()
+        orig_log = server.ACCESS_LOG_PATH
+        orig_thr = server.SCAN_PATTERN_THRESHOLD
+        server.ACCESS_LOG_PATH = logf.name
+        server.SCAN_PATTERN_THRESHOLD = 3
+        with server._scan_pattern_lock:
+            server._scan_pattern.clear()
+        try:
+            vk = base64.b64encode(self.key).decode()
+            for cid in (self.SCAN1, self.SCAN2, self.SCAN3):
+                body, code = self._connect({
+                    "vault_id": self.VAULT, "conn_id": cid, "vault_key": vk,
+                    "cols": 80, "rows": 24,
+                })
+                self.assertEqual(code, 403,
+                                 "scan card {} expected 403, got {}: {}".format(
+                                     cid, code, body))
+            with open(logf.name, "r", encoding="utf-8") as f:
+                recs = [json.loads(line) for line in f if line.strip()]
+        finally:
+            server.ACCESS_LOG_PATH = orig_log
+            server.SCAN_PATTERN_THRESHOLD = orig_thr
+            with server._scan_pattern_lock:
+                server._scan_pattern.clear()
+            os.unlink(logf.name)
+        deny = [r for r in recs if r.get("result") == "deny_blocked"]
+        scan = [r for r in recs if r.get("result") == "scan_pattern"]
+        self.assertEqual(len(deny), 3,
+                         "expected 3 deny_blocked, got {}".format(recs))
+        self.assertEqual(len(scan), 1,
+                         "expected one scan_pattern on the 3rd distinct host, "
+                         "got {}".format(recs))
 
 
 class TestParseDeniedHosts(unittest.TestCase):

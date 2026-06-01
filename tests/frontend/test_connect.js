@@ -4868,6 +4868,58 @@ test('buildConnectBody: vault card forwards the connection hint', async () => {
 });
 
 // =====================================================================
+test('connectSaved: vault re-click forwards the connection hint (#74)', async () => {
+  // The dominant flow — clicking a saved vault card after a page reload —
+  // must send `connection` so the server can authorize by name. Regression
+  // guard: connectSaved built the connect body without it, silently dropping
+  // the hint on this path (buildConnectBody/paneRecord were fixed, but the
+  // value never reached them here).
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true, connections: [],
+                                  vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's1', status: 'connecting',
+                                    alive: true, auth_failed: false}},
+  ];
+  const env = await mkEnv(plan); const {win, log} = env;
+  await win.eval('ensureVaultId()');   // seed vault_id + K so the
+  await win.eval('ensureVaultKey()');  // no-key guard in connectSaved passes
+  await win.connectSaved({
+    name: 'card', conn_id: 'C'.repeat(26), host: 'h.ex', port: 22,
+    user: 'root', connection: 'prod-bastion', persistent: false,
+  });
+  await sleep(80);
+  const connects = log.filter(e => e.action === 'connect');
+  ok(connects.length === 1, 'one /api/connect; got ' + connects.length);
+  ok(connects[0].body.vault_id && connects[0].body.conn_id, 'vault tuple sent');
+  ok(connects[0].body.connection === 'prod-bastion',
+     'connection hint forwarded from saved row; got ' +
+     JSON.stringify(connects[0].body.connection));
+  cleanup(env);
+});
+
+// =====================================================================
+test('paneRecord: vault pane carries the connection hint (#74)', async () => {
+  // The connectPane (in-session reconnect / F5) path builds its body from
+  // paneRecord(p); the vault branch must copy p.connection so the hint
+  // survives a reconnect too.
+  const env = await mkEnv({}); const {win} = env;
+  const rec = win.paneRecord({
+    conn_id: 'C'.repeat(26), connection: 'prod-bastion',
+    host: 'h', port: 22, user: 'u', term: {cols: 80, rows: 24},
+  });
+  ok(rec.via === 'vault', 'vault rec; got ' + rec.via);
+  ok(rec.connection === 'prod-bastion',
+     'paneRecord carries connection; got ' + JSON.stringify(rec.connection));
+  const recNone = win.paneRecord({
+    conn_id: 'C'.repeat(26), host: 'h', port: 22, user: 'u',
+    term: {cols: 80, rows: 24},
+  });
+  ok(recNone.connection === null,
+     'null when pane has none; got ' + JSON.stringify(recNone.connection));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

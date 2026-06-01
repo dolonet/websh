@@ -1193,13 +1193,15 @@ def find_config_connection(name):
 def _prompt_conn_matches(c, host, port):
     """True if config entry `c` is a prompt connection targeting (host, port).
 
-    Host comparison is case-insensitive — matching the denied_hosts
+    Host comparison uses .lower() on both sides — the same as the denied_hosts
     convention (_parse_denied_hosts lowercases), so a card whose host casing
-    differs from websh.json is not falsely rejected. Port is clamped the same
-    way the connect path resolves it.
+    differs from websh.json is not falsely rejected. (.lower(), not
+    .casefold(): casefold over-collapses distinct IDN labels — e.g. German
+    'straße' → 'strasse' — which would let a card match a different host.)
+    Port is clamped the same way the connect path resolves it.
     """
     return (c.get("kind") == "prompt"
-            and c.get("host", "").casefold() == (host or "").casefold()
+            and c.get("host", "").lower() == (host or "").lower()
             and clamp(c.get("port"), MIN_PORT, MAX_PORT, 22) == port)
 
 
