@@ -558,6 +558,13 @@ function _destroyPane(id, terminate) {
     clearTimeout(p._stuckTimer);
     p._stuckTimer = null;
   }
+  // Deferred-save timer (scheduleSaveCommit): same rationale as the
+  // _stuckTimer above. The p.sid guard inside the timer would NOT catch
+  // a pane closed mid-window — _destroyPane leaves p.sid set (it only
+  // reads it for the disconnect body) — so without this a Save ticked
+  // then aborted by closing the pane within SAVE_COMMIT_DELAY_MS would
+  // still POST and add a card. Clearing it also drops the closure's `p` ref.
+  clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
   // Disconnect main session
   if (p.sid) {
@@ -2588,6 +2595,7 @@ function _disconnectVaultPaneForNoKey(p) {
     p.polling = false;
     stopKeepalive(p);
     closeStream(p);
+    clearTimeout(p.saveCommitTimer);   // drop the armed deferred-save timer
     api('disconnect', {body: {session_id: sid}}).catch(() => {});
     p.sid = null;
   }

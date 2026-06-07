@@ -645,6 +645,36 @@ test('finalizeSuccess arms the deferred-save timer when Save is ticked', async (
   cleanup(env);
 });
 
+test('deferred save timer: cleared when the pane is closed within the window', async () => {
+  // Closing the pane within SAVE_COMMIT_DELAY_MS must NOT save a session the
+  // user just tore down. _destroyPane leaves p.sid set (it only reads it for
+  // the disconnect body), so the timer's guard wouldn't catch this — the
+  // clearTimeout in _destroyPane is what does.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-close', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'disconnect', response: {ok: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Closed';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(p && p.saveCommitTimer, 'timer armed before close');
+  win._destroyPane(p.id, true);   // user closes the pane within the window
+  await sleep(2800);
+  ok(saveCalled === 0,
+     'no save POST after closing the pane within the window; got ' + saveCalled);
+  cleanup(env);
+});
+
 test('auto-connect failure → user dismiss popup → form appears', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: true, connections:
