@@ -2649,6 +2649,36 @@ test('legacy modal: autoconnect deferred until Got-it (no focus theft / no overl
   cleanup(env);
 });
 
+test('restrict_hosts single prompt: host pre-filled even when a saved card exists', async () => {
+  // Single-target kiosk (restrict_hosts + exactly one prompt connection): the
+  // host is the only allowed target, so doAutoConnect must pre-lock it via
+  // selectPromptConnection on load even when localStorage already holds a
+  // saved card. The old `loadSaved().length === 0` guard suppressed the
+  // pre-fill once any card was saved, stranding the user on an empty host
+  // field. Regression for a single fixed-target restrict_hosts setup.
+  const plan = [{action: 'config', response: {restrict_hosts: true, vault_enabled: false,
+    connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                   username: '', kind: 'prompt'}]}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // mkEnv booted with empty localStorage, so the initial doAutoConnect
+  // already pre-filled iH. Reset the form so the assertion reflects the
+  // re-trigger below (with a saved card present), not the empty-boot fill.
+  win.selectedPrompt = null;
+  $(win, 'iH').value = ''; $(win, 'iH').disabled = false;
+  // A saved card present — this used to suppress the host pre-fill.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'HH', host: 'h.example.com', port: 22, user: 'sber',
+     connection: 'hh', auth: 'pw', persistent: true}]));
+  win.loadServerConfig();
+  await sleep(40);
+  ok($(win, 'iH').value === 'h.example.com',
+     'host pre-filled to the single prompt target despite a saved card');
+  ok($(win, 'iH').disabled === true, 'host input locked');
+  ok(win.selectedPrompt && win.selectedPrompt.name === 'hh',
+     'prompt connection auto-selected on load despite saved card');
+  cleanup(env);
+});
+
 test('legacy fallback: key-auth row matching prompt opens on KEY tab', async () => {
   // Legacy auth:'key' row whose host:port matches a prompt connection.
   // The routing path calls selectPromptConnection which unconditionally

@@ -431,8 +431,7 @@ function splitPane(id, dir) {
   if (selectedPrompt) clearPromptSelection();
   showOverlay();
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
-      && serverConfig.connections[0].kind === 'prompt'
-      && loadSaved().length === 0) {
+      && serverConfig.connections[0].kind === 'prompt') {
     selectPromptConnection(serverConfig.connections[0].name);
   }
   renderSaved();
@@ -4374,12 +4373,13 @@ function doAutoConnect() {
   // Single server connection with restrict_hosts:
   //   - Ready  → connect immediately (no overlay, no form).
   //   - Prompt → show the overlay with the form pre-locked, password focused.
-  //     Skip the pre-lock if saved connections exist — user can click one.
+  //     Always pre-lock: there is exactly one allowed host, so pre-filling it
+  //     is unambiguous. Saved cards still render below for one-click reconnect.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1) {
     let only = serverConfig.connections[0];
     if (only.kind === 'prompt') {
       showOverlay();
-      if (loadSaved().length === 0) selectPromptConnection(only.name);
+      selectPromptConnection(only.name);
       return;
     }
     connectByName(only.name);
