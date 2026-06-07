@@ -1011,8 +1011,27 @@ function _carryEphemeralSecrets(src, dst) {
   });
 }
 
+// The output-gated commit in handleOutputPayload only fires when the
+// session emits a terminal frame ≥SAVE_COMMIT_DELAY_MS after connect. An
+// idle session over SSE (connect, see the prompt, type nothing) emits no
+// such frame — EventSource only delivers on real output, and the 30s
+// empty-input keepalive doesn't route through handleOutputPayload — so the
+// deferred save would never land. Back it with a timer so "tick Save +
+// connect" persists regardless of output. Idempotent with the output path:
+// commitPendingSave bails once pendingSave is cleared (by the commit itself
+// or an auth failure, which also nulls p.sid), and the p.sid guard skips a
+// session that has since died.
+const SAVE_COMMIT_DELAY_MS = 2600;
+function scheduleSaveCommit(p) {
+  clearTimeout(p.saveCommitTimer);
+  p.saveCommitTimer = setTimeout(() => {
+    if (p.sid && p.pendingSave) commitPendingSave(p);
+  }, SAVE_COMMIT_DELAY_MS);
+}
+
 function commitPendingSave(p) {
   if (!p.pendingSave) return;
+  clearTimeout(p.saveCommitTimer);
   let entry = Object.assign({}, p.pendingSave);
   _carryEphemeralSecrets(p.pendingSave, entry);
   // Overwrite persistent with the actual live mode (handles tmux-skip
@@ -1969,8 +1988,10 @@ function finalizeSuccess(opts, result, run) {
   p.connectedAt = Date.now();
   p.recentOutput = '';
   p.connecting = false;
-  // Deferred save: commitPendingSave writes it to localStorage once the
-  // session has proven healthy for ≥2.5s with no auth failure. The
+  // Deferred save: commitPendingSave writes it once the session has proven
+  // healthy for ≥2.5s with no auth failure — driven both by a healthy output
+  // frame (handleOutputPayload) and an output-independent timer
+  // (scheduleSaveCommit) so an idle SSE session still commits. The
   // non-enumerable __ephemeralSecrets bag rides along (Finding 2a).
   if (opts.saveEntry) {
     let entry = Object.assign({}, opts.saveEntry);
@@ -1978,6 +1999,7 @@ function finalizeSuccess(opts, result, run) {
     entry.persistent = !!p.persistent;
     if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
     p.pendingSave = entry;
+    scheduleSaveCommit(p);
   }
 
   hideReconnectBar(p);

@@ -567,6 +567,84 @@ test('pendingSave: NOT committed on auth-fail shortly after connect', async () =
   cleanup(env);
 });
 
+test('idle session: deferred save commits via timer with no output frame', async () => {
+  // The output-gated commit in handleOutputPayload only fires on a terminal
+  // frame ≥2.5s after connect. Over SSE an idle session emits none, so the
+  // timer armed by finalizeSuccess (scheduleSaveCommit) is the only path
+  // that can land the save. Simulate it: arm the timer and never call
+  // handleOutputPayload.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const entry = {name: 'Idle', host: 'h.example', port: 22, user: 'u',
+                 auth: 'pw', persistent: false};
+  Object.defineProperty(entry, '__ephemeralSecrets', {
+    value: {password: 'pw', key: null, key_pass: null},
+    enumerable: false, configurable: true, writable: true});
+  const p = {id: 'pi', sid: 'sid-idle', pendingSave: entry,
+             persistent: false, tmuxCmd: 'tmux', connectedAt: Date.now()};
+  win.scheduleSaveCommit(p);
+  await sleep(2800);  // > SAVE_COMMIT_DELAY_MS (2600)
+  ok(saveCalled === 1,
+     'idle session POSTed the deferred save via timer; got ' + saveCalled);
+  ok(!p.pendingSave, 'pendingSave cleared after commit');
+  cleanup(env);
+});
+
+test('deferred save timer: no-op when the session died before it fired', async () => {
+  // Auth failure / disconnect nulls p.sid (and pendingSave). The timer must
+  // not resurrect a save for a dead session.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const entry = {name: 'Dead', host: 'h', port: 22, user: 'u', auth: 'pw',
+                 persistent: false};
+  Object.defineProperty(entry, '__ephemeralSecrets', {
+    value: {password: 'pw', key: null, key_pass: null},
+    enumerable: false, configurable: true, writable: true});
+  const p = {id: 'pd', sid: 'sid-dead', pendingSave: entry,
+             persistent: false, tmuxCmd: 'tmux', connectedAt: Date.now()};
+  win.scheduleSaveCommit(p);
+  p.sid = null;        // session died before the timer fired
+  await sleep(2800);
+  ok(saveCalled === 0,
+     'no save POST when the session died before the timer; got ' + saveCalled);
+  cleanup(env);
+});
+
+test('finalizeSuccess arms the deferred-save timer when Save is ticked', async () => {
+  // Wiring guard: a successful connect with Save ticked must arm
+  // p.saveCommitTimer (the output-independent commit). Without the
+  // scheduleSaveCommit call in finalizeSuccess, an idle SSE session never
+  // saves. Checked at 120ms, well before the 2.6s timer or the 2.5s
+  // output-gated commit could fire.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-arm', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'save', response: {}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Armed';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(p && p.saveCommitTimer, 'finalizeSuccess armed p.saveCommitTimer');
+  cleanup(env);
+});
+
 test('auto-connect failure → user dismiss popup → form appears', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: true, connections:
