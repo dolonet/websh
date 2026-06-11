@@ -7014,6 +7014,7 @@ class TestApiSave(unittest.TestCase):
         self.assertNotIn("identityfile", stored)
         self.assertIn("StrictHostKeyChecking", stored)
 
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_routing_and_knownhosts_options_stripped_from_saved(self):
         # ProxyJump (deny-list bypass) and known-hosts file paths (arbitrary
         # file write under StrictHostKeyChecking=no) are operator-only —
