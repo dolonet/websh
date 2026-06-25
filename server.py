@@ -1653,8 +1653,17 @@ class SSHSession(object):
             return
         try:
             while self.alive:
+                # The timeout only bounds how fast we notice alive=False
+                # when the fd was NOT closed (close() resets master_fd to
+                # -1 first, so the next select raises ValueError and we
+                # break instantly; data / child-exit EOF-EIO wake select
+                # immediately). 0.25s cuts idle wakeups 5x vs the old
+                # 0.05s — 50 idle sessions burn 200 wakeups/s instead of
+                # 1000 — at the cost of ≤250ms extra on the rare
+                # alive-flag-only exits (e.g. write() hitting OSError).
+                # Output latency is unaffected.
                 try:
-                    r, _, _ = select.select([self.master_fd], [], [], 0.05)
+                    r, _, _ = select.select([self.master_fd], [], [], 0.25)
                 except (ValueError, OSError):
                     break
 
