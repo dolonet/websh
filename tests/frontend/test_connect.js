@@ -5469,6 +5469,50 @@ test('document title follows the active pane across switches', async () => {
   cleanup(env);
 });
 
+test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
+  // After endSession tears a pane down (p.polling=false), an in-flight
+  // auto-reconnect sets p.connecting=true. A late fetch/SSE rejection from
+  // the OLD transport must NOT re-banner the pane and must NOT reset
+  // p.connecting — that would defuse connectPane's duplicate-connect guard
+  // and re-open the double-/api/connect + leaked-PTY race. This pins the
+  // endSession refactor's `if (!p.polling) return` guard.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-tf', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+
+  // Reconnect window: endSession dropped polling; connectPane set connecting.
+  p.polling = false;
+  p.connecting = true;
+  p.sid = 's-stale';
+  const writes = [];
+  p.term.write = (s) => { writes.push(String(s)); };
+
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.length === 0,
+     'guarded: no banner on a torn-down transport; got ' + JSON.stringify(writes));
+  ok(p.connecting === true,
+     'guarded: p.connecting preserved (in-flight reconnect guard intact)');
+  ok(p.sid === 's-stale', 'guarded: p.sid not nulled');
+
+  // Positive control: a LIVE transport (polling=true) must still surface.
+  p.polling = true;
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.some(s => /backend restarted|connection lost/.test(s)),
+     'live transport still banners; got ' + JSON.stringify(writes));
+  ok(p.polling === false, 'live transportFatal tore the pane down via endSession');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
