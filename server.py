@@ -2808,66 +2808,68 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
 
     # ── Dispatch ────────────────────────────────────────────────────
+    #
+    # One table per HTTP method, action → handler-method name. Adding an
+    # endpoint is one table row (plus a row in the PHP proxy's switch for
+    # shared-hosting mode). Values are attribute names rather than bound
+    # methods so the tables can live on the class.
+
+    _POST_ROUTES = {
+        "connect":         "_connect",
+        "input":           "_input",
+        "resize":          "_resize",
+        "disconnect":      "_disconnect",
+        "upload":          "_upload",
+        "upload_finalize": "_upload_finalize",
+        "upload_cancel":   "_upload_cancel",
+        "tmux_options":    "_tmux_options",
+        "save":            "_save_credential",
+        # Compatibility with the bundled frontend in Python-only mode.
+        # The PHP shim translates POST ?action=save_delete into
+        # DELETE /api/save; when server.py serves api.php-style URLs
+        # directly, do the same dispatch here.
+        "save_delete":     "_delete_credential",
+    }
+
+    _GET_ROUTES = {
+        "output":       "_output",
+        "stream":       "_stream",
+        "config":       "_config",
+        "ping":         "_ping",
+        "tmux_capture": "_tmux_capture",
+        "ls":           "_ls",
+        "download":     "_download",
+    }
+
+    _DELETE_ROUTES = {
+        "save": "_delete_credential",
+    }
+
+    def _dispatch(self, routes):
+        name = routes.get(self._resolve_action())
+        if name is None:
+            self._json({"error": "not found"}, 404)
+            return
+        getattr(self, name)()
 
     def do_POST(self):
-        action = self._resolve_action()
-        if action == "connect":
-            self._connect()
-        elif action == "input":
-            self._input()
-        elif action == "resize":
-            self._resize()
-        elif action == "disconnect":
-            self._disconnect()
-        elif action == "upload":
-            self._upload()
-        elif action == "upload_finalize":
-            self._upload_finalize()
-        elif action == "upload_cancel":
-            self._upload_cancel()
-        elif action == "tmux_options":
-            self._tmux_options()
-        elif action == "save":
-            self._save_credential()
-        elif action == "save_delete":
-            # Compatibility with the bundled frontend in Python-only
-            # mode. The PHP shim translates POST ?action=save_delete
-            # into DELETE /api/save; when server.py serves api.php-style
-            # URLs directly, do the same dispatch here.
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._POST_ROUTES)
 
     def do_GET(self):
-        p = self._path()
-        static = _STATIC_FILES.get(p)
+        static = _STATIC_FILES.get(self._path())
         if static:
             self._serve_static(*static)
             return
-        action = self._resolve_action()
-        if action == "output":
-            self._output()
-        elif action == "stream":
-            self._stream()
-        elif action == "config":
-            self._json(config_public())
-        elif action == "ping":
-            self._json({"ok": True, "version": __version__})
-        elif action == "tmux_capture":
-            self._tmux_capture()
-        elif action == "ls":
-            self._ls()
-        elif action == "download":
-            self._download()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._GET_ROUTES)
 
     def do_DELETE(self):
-        action = self._resolve_action()
-        if action == "save":
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._DELETE_ROUTES)
+
+    def _config(self):
+        self._json(config_public())
+
+    def _ping(self):
+        self._json({"ok": True, "version": __version__})
 
     # ── Source-IP / session-ID validation ───────────────────────────
 

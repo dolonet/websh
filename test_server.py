@@ -8272,6 +8272,24 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
         )
         self.assertEqual(missing, [])
 
+    def test_server_routes_are_routed_by_php_proxy(self):
+        """Every action server.py dispatches must have a case in api.php's
+        switch — otherwise the endpoint silently 404s on shared hosting
+        only. The route tables make the server-side action set machine-
+        readable; keep the PHP shim in lockstep."""
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "api.php"), "r") as f:
+            php = f.read()
+        actions = set(server.Handler._POST_ROUTES)
+        actions.update(server.Handler._GET_ROUTES)
+        # DELETE /api/save reaches the shim as POST ?action=save_delete,
+        # which the POST table already carries.
+        missing = sorted(
+            action for action in actions
+            if "case '{}':".format(action) not in php
+        )
+        self.assertEqual(missing, [])
+
 
 class TestMainSigtermSubprocess(unittest.TestCase):
     """End-to-end discriminator: run server.main() in a child, SIGTERM it,
