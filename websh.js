@@ -407,10 +407,25 @@ function updatePaneBadge(p) {
   let badge = p.el.querySelector('[data-pane-badge]');
   if (!badge) return;
   let s = p.sid ? 'connected' : (p.connecting ? 'connecting' : 'disconnected');
+  let busy = !!p.upload || !!p.download;
+  // Title upkeep stays OUTSIDE the memo below: it depends on activeId,
+  // which changes without this pane's own state changing (pane switch),
+  // so a memoized skip here could leave a stale document title. setTitle
+  // is itself memoized, so per-frame upkeep is one string compare.
+  if (activeId === p.id) setTitle(p.label || '');
+  // Early-return when nothing rendered below can have changed. This runs
+  // on EVERY output frame (handleOutputPayload): during noisy output
+  // (cat, build logs) the remove/recreate dance in updatePaneTag
+  // allocated a fresh element and invalidated layout hundreds of times a
+  // second, racing xterm's own renderer. The key covers every input the
+  // remaining DOM writes depend on, so a skipped call is a true no-op.
+  let state = [s, busy ? 1 : 0,
+               p.label || '', p.host || '', p.connection || '',
+               p.persistent ? 1 : 0].join('');
+  if (p._badgeState === state) return;
+  p._badgeState = state;
   badge.className = 'pane-badge ' + (s==='connected'?'s-on':s==='connecting'?'s-wait':'s-off');
   badge.textContent = s.charAt(0).toUpperCase() + s.slice(1);
-  if (activeId === p.id) setTitle(p.label || '');
-  let busy = !!p.upload || !!p.download;
   let ub = p.el.querySelector('[data-upload-btn]');
   if (ub) ub.disabled = !p.sid || busy;
   let db = p.el.querySelector('[data-download-btn]');
@@ -1585,6 +1600,32 @@ function queueInput(p, data) {
 // Vault-backed panes (opts.conn_id or p.conn_id set) re-derive vault_key
 // from IDB at every connect — caching it on the pane would let a
 // sign-out in another tab leave a stale key in memory.
+// Shared tail of BOTH connect pipelines (the form flow's
+// finalizeSuccess and the reconnect/restore flow in connectPane): the
+// session is confirmed, the pane fields are set — close the login
+// surfaces and start I/O. The two pipelines genuinely differ in
+// everything BEFORE this point (materialize-vs-reuse, opts copying,
+// deferred-save arming, slot semantics), so only this verbatim-
+// identical tail is shared; do not try to merge more of them without
+// re-reading both flows end to end.
+function beginSessionIO(p) {
+  hideOverlay();
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+  p.term.focus();
+  p.polling = true;
+  p.pollRetries = 0;
+  // Force a resize so resumed tmux sessions redraw at the real size.
+  // flushPaneResize uses p.term.cols/rows post-fit and updates
+  // p.lastSent* so subsequent refit triggers can dedup.
+  p.fitAddon.fit();
+  flushPaneResize(p);
+  startKeepalive(p);
+  saveSessions();
+  startOutput(p);
+}
+
 async function connectPane(p, opts) {
   // In-flight guard: a connect is already running for this pane. A second
   // entrant (double Reconnect click, a manual reconnect racing the
@@ -1617,7 +1658,9 @@ async function connectPane(p, opts) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   let rec = paneRecord(p);
@@ -1742,21 +1785,7 @@ async function connectPane(p, opts) {
         if (dirty) saveSaved(list);
       }
       hideTmuxBar(p);
-      hideOverlay();
-      connectingFor = null;
-      overlayMode = null;
-      pendingSplit = null;
-      p.term.focus();
-      p.polling = true;
-      p.pollRetries = 0;
-      // Force a resize so resumed tmux sessions redraw at the real size.
-      // flushPaneResize uses p.term.cols/rows post-fit and updates
-      // p.lastSent* so subsequent refit triggers can dedup.
-      p.fitAddon.fit();
-      flushPaneResize(p);
-      startKeepalive(p);
-      saveSessions();
-      startOutput(p);
+      beginSessionIO(p);
     })
     .catch(e => {
       // Mirror the .then guard above: if the pane was destroyed while the
@@ -2046,25 +2075,15 @@ function finalizeSuccess(opts, result, run) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   // Close the status popup and login form as a single success step.
   $('tmuxOv').classList.add('h');
-  hideOverlay();
-  connectingFor = null;
-  overlayMode = null;
-  pendingSplit = null;
   currentConnectRun = null;
-
-  p.term.focus();
-  p.polling = true;
-  p.pollRetries = 0;
-  p.fitAddon.fit();
-  flushPaneResize(p);
-  startKeepalive(p);
-  saveSessions();
-  startOutput(p);
+  beginSessionIO(p);
 }
 
 function cleanupRun(run) {
@@ -2097,66 +2116,79 @@ function mapConnectError(err, opts) {
 }
 
 // One popup, many states. Only [OK]/[Cancel] (dismissConnectStatus).
+// Connect-status popup content, keyed by outcome kind. `sub` is a
+// function of {host, user} (host pre-defaulted to 'target'). `status`:
+// the literal 'msg' shows ctx.msg (when present) as an error line; any
+// other string is fixed error text; absent = no status line. `btn`
+// defaults to 'OK'. Unknown kinds fall back to the generic error entry.
+// Adding an outcome is one table row.
+const CONNECT_STATUS = {
+  connecting: {
+    title: 'Connecting',
+    sub: c => 'Connecting to ' + c.host + '\u2026',
+    btn: 'Cancel',
+  },
+  auth_failed: {
+    title: 'Authentication failed',
+    sub: c => 'Could not log in to ' + c.host + '.',
+    status: 'Check your password or key and try again.',
+  },
+  policy_deny: {
+    title: 'Connection not allowed',
+    sub: c => "The username '" + (c.user || '?') +
+              "' is not authorized to connect to " + c.host + '.',
+    status: 'msg',
+  },
+  host_down: {
+    title: 'Host unreachable',
+    sub: c => 'Could not reach ' + c.host + '.',
+    status: 'msg',
+  },
+  timeout: {
+    title: 'Connection timed out',
+    sub: c => 'The connection to ' + c.host + ' timed out.',
+  },
+  rate_limited: {
+    title: 'Too many connection attempts',
+    sub: () => 'Please wait and try again shortly.',
+    status: 'msg',
+  },
+  vault_not_found: {
+    title: 'Saved entry missing on server',
+    sub: () => 'This card was deleted or the server vault was cleared.',
+    status: 'Delete this card from the saved list, then re-enter to re-save.',
+  },
+  vault_decrypt: {
+    title: 'Cannot decrypt this card',
+    sub: () => 'The vault key in this browser does not match the stored blob.',
+    status: 'Re-enter the credentials to re-save this connection.',
+  },
+  vault_off: {
+    title: 'Vault is disabled on the server',
+    sub: () => 'The server is not accepting saved credentials right now.',
+    status: 'msg',
+  },
+  error: {
+    title: 'Connection error',
+    sub: c => 'Could not connect to ' + c.host + '.',
+    status: 'msg',
+  },
+};
+
 function showConnectStatus(kind, ctx) {
   let title = $('tmTitle'), sub = $('tmSub'), status = $('tmStatus'), btn = $('tmCancel');
-  let host = ctx.host || 'target';
   status.textContent = ''; status.className = 'tm-status';
   btn.classList.remove('h');
-
-  if (kind === 'connecting') {
-    title.textContent = 'Connecting';
-    sub.textContent = 'Connecting to ' + host + '…';
-    btn.textContent = 'Cancel';
-  } else if (kind === 'auth_failed') {
-    title.textContent = 'Authentication failed';
-    sub.textContent = 'Could not log in to ' + host + '.';
-    status.textContent = 'Check your password or key and try again.';
+  let e = CONNECT_STATUS[kind] || CONNECT_STATUS.error;
+  title.textContent = e.title;
+  sub.textContent = e.sub({host: ctx.host || 'target', user: ctx.user});
+  if (e.status === 'msg') {
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+  } else if (e.status) {
+    status.textContent = e.status;
     status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'policy_deny') {
-    title.textContent = 'Connection not allowed';
-    sub.textContent =
-      "The username '" + (ctx.user || '?') +
-      "' is not authorized to connect to " + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'host_down') {
-    title.textContent = 'Host unreachable';
-    sub.textContent = 'Could not reach ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'timeout') {
-    title.textContent = 'Connection timed out';
-    sub.textContent = 'The connection to ' + host + ' timed out.';
-    btn.textContent = 'OK';
-  } else if (kind === 'rate_limited') {
-    title.textContent = 'Too many connection attempts';
-    sub.textContent = 'Please wait and try again shortly.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_not_found') {
-    title.textContent = 'Saved entry missing on server';
-    sub.textContent = 'This card was deleted or the server vault was cleared.';
-    status.textContent = 'Delete this card from the saved list, then re-enter to re-save.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_decrypt') {
-    title.textContent = 'Cannot decrypt this card';
-    sub.textContent = 'The vault key in this browser does not match the stored blob.';
-    status.textContent = 'Re-enter the credentials to re-save this connection.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_off') {
-    title.textContent = 'Vault is disabled on the server';
-    sub.textContent = 'The server is not accepting saved credentials right now.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else {
-    title.textContent = 'Connection error';
-    sub.textContent = 'Could not connect to ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
   }
+  btn.textContent = e.btn || 'OK';
   $('tmuxOv').classList.remove('h');
 }
 
@@ -2182,8 +2214,15 @@ function dismissConnectStatus() {
 }
 
 // ── UI ──────────────────────────────────────────────────────────────
+let _lastTitle = null;
 function setTitle(label) {
-  document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  // Memoized: updatePaneBadge re-asserts the title on every output frame
+  // (cheap upkeep that also heals stray writes); skip the DOM write when
+  // nothing changed. document.title is written nowhere else.
+  let t = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  if (t === _lastTitle) return;
+  _lastTitle = t;
+  document.title = t;
 }
 
 
@@ -3104,9 +3143,40 @@ function doConnect() {
 }
 
 // ── Server config ───────────────────────────────────────────────────
+// Wire-protocol version this client speaks; the server ships its own in
+// /api/config ("proto"). A mismatch at page load means the browser is
+// running a stale CACHED websh.js against an upgraded server - surface
+// a reload prompt instead of letting requests fail obscurely. An absent
+// field (older server) stays silent.
+const CLIENT_PROTO = 1;
+
+function checkProtoVersion(cfg) {
+  if (cfg && cfg.proto !== undefined && cfg.proto !== CLIENT_PROTO) {
+    showToast('websh was updated on the server \u2014 reload the page ' +
+              '(Ctrl+Shift+R) to get the matching client.', 'warn');
+  }
+}
+
+// Prefill the manual connect form from websh.json "form_defaults"
+// (shipped via /api/config). Only fields the user hasn't already typed
+// into are touched, and the port only when it still shows the markup
+// default — so a half-filled form or a restored session is never
+// overwritten. Skipped when restrict_hosts is on AND connections are
+// configured (the manual form is locked to those connections there).
+function applyFormDefaults(cfg) {
+  let fd = cfg && cfg.form_defaults;
+  if (!fd || (cfg.restrict_hosts && (cfg.connections || []).length)) return;
+  let h = $('iH'), po = $('iP'), u = $('iU');
+  if (fd.host && h && !h.value) h.value = fd.host;
+  if (fd.port && po && (!po.value || po.value === '22')) po.value = fd.port;
+  if (fd.username && u && !u.value) u.value = fd.username;
+}
+
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
+    checkProtoVersion(cfg);
+    applyFormDefaults(cfg);
     if(cfg.isolate_storage) {
       storagePrefix = location.pathname.replace(/[^/]*$/, '');
       // `settings`/`fontSize` were loaded at module init under the empty
@@ -3203,6 +3273,9 @@ function clearPromptSelection() {
   $('promptTarget').classList.add('h');
   $('iH').disabled = false; $('iP').disabled = false; $('iU').disabled = false;
   $('iH').value = ''; $('iP').value = '22'; $('iU').value = '';
+  // The reset wiped any server-provided prefill; bring it back so the
+  // post-card-dismiss form matches the first-load state.
+  applyFormDefaults(serverConfig);
   // Restore restrict_hosts kiosk mode if configured.
   if(serverConfig && serverConfig.restrict_hosts) {
     $('manualForm').classList.add('h');
@@ -3496,6 +3569,24 @@ function closeUploadSession(u) {
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
 }
 
+// Shared tail of every transfer outcome (upload/download x finish/cancel):
+// paint the progress bar + text for this outcome, then after `delay` clear
+// the transfer slot, hide the bar and refresh the badge. Painting differs
+// per outcome and stays at the call sites via `paint(bar, text)`.
+function settleTransfer(p, slot, delay, paint) {
+  let el = p.el && p.el.querySelector('[data-upload-progress]');
+  if (el && paint) {
+    paint(el.querySelector('.upload-progress-bar'),
+          el.querySelector('.upload-progress-text'));
+  }
+  setTimeout(() => {
+    p[slot] = null;
+    hideUploadProgress(p);
+    updatePaneBadge(p);
+    if (el) el.querySelector('.upload-progress-bar').style.background = '';
+  }, delay);
+}
+
 function finishUpload(p, success, reason) {
   if (!p.upload) return;
   let u = p.upload;
@@ -3503,10 +3594,12 @@ function finishUpload(p, success, reason) {
   closeUploadSession(u);
   let staged = u.staged || [];
   let placed = u.placed || [];
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  // Banner stays visible longer when there's something the user needs to
+  // read and act on — a destination path, or a specific failure reason —
+  // so it doesn't vanish before they can take it in.
+  let dismissAfter = (!success || staged.length || placed.length === 1)
+    ? 6000 : 2000;
+  settleTransfer(p, 'upload', dismissAfter, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       if (staged.length) {
@@ -3525,18 +3618,7 @@ function finishUpload(p, success, reason) {
       bar.style.background = 'var(--dg)';
       text.textContent = reason ? 'Upload failed: ' + reason : 'Upload failed';
     }
-  }
-  // Banner stays visible longer when there's something the user needs to
-  // read and act on — a destination path, or a specific failure reason —
-  // so it doesn't vanish before they can take it in.
-  let dismissAfter = (!success || staged.length || placed.length === 1)
-    ? 6000 : 2000;
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, dismissAfter);
+  });
 }
 
 function cancelUpload(id) {
@@ -3554,17 +3636,10 @@ function cancelUpload(id) {
       .catch(() => {});
   }
 
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'upload', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 function cancelTransfer(id) {
@@ -3659,10 +3734,7 @@ function finishDownload(p, success, msg) {
   let dl = p.download;
   if (!dl) return;
   dl.cancelled = true;
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  settleTransfer(p, 'download', 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -3670,13 +3742,7 @@ function finishDownload(p, success, msg) {
       bar.style.background = 'var(--dg)';
       text.textContent = msg || 'Download failed';
     }
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  });
 }
 
 function cancelDownload(id) {
@@ -3684,17 +3750,10 @@ function cancelDownload(id) {
   if (!p || !p.download) return;
   p.download.cancelled = true;
   if (p.download.abort) p.download.abort();
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'download', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 // ── File browser ─────────────────────────────────────────────────────
