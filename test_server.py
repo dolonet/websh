@@ -214,6 +214,134 @@ class LiveServerCase(unittest.TestCase):
         return self._request_raw(path, method="DELETE")
 
 
+class TestParkedWaiterWake(unittest.TestCase):
+    """The per-wait socketpair path: instant wake from _signal while
+    parked in ONE blocking select, FIN wake via the client socket, and
+    teardown while a waiter is parked."""
+
+    def _session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._data_event = threading.Event()
+        s._waiters = set()
+        s._waiters_lock = threading.Lock()
+        return s
+
+    def test_signal_wakes_parked_waiter_fast(self):
+        s = self._session()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)            # let it park
+        t0 = time.time()
+        s._signal()
+        th.join(2)
+        self.assertTrue(woke, "waiter never returned")
+        self.assertLess(time.time() - t0, 0.5,
+                        "signal wake took too long")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0, "wake socket leaked")
+
+    def test_client_fin_wakes_parked_waiter(self):
+        import socket as _socket
+        s = self._session()
+        a, b = _socket.socketpair()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(a, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        b.close()                  # FIN
+        th.join(2)
+        a.close()
+        self.assertTrue(woke and woke[0] < 1.0,
+                        "FIN did not wake the parked waiter; %r" % woke)
+
+    def test_close_while_parked_does_not_hang_or_crash(self):
+        s = self._session()
+        s.alive = True
+        s.master_fd = -1
+        s.pid = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = True
+        s._exit_status = 0
+        s._key_file = None
+        s._control_path = None
+        s.persistent = False
+        s.slot_id = None
+        done = []
+        def waiter():
+            s.wait_for_data(None, timeout=5)
+            done.append(1)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        s.close()                  # signals via _signal()
+        th.join(2)
+        self.assertTrue(done, "waiter did not return after close()")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0)
+
+    def test_signal_in_registration_window_is_not_lost(self):
+        # The lost-wakeup window: a signal that lands AFTER the first
+        # is_set() check but BEFORE the wake socket is registered gets
+        # no byte — the post-registration re-check must catch it.
+        # Deterministic: fire the signal from inside socketpair(),
+        # which runs exactly inside that window.
+        s = self._session()
+        import socket as _socket
+        real_pair = _socket.socketpair
+        def evil_pair(*a, **kw):
+            s._data_event.set()      # the signal, mid-window
+            return real_pair(*a, **kw)
+        orig = server.socket.socketpair
+        server.socket.socketpair = evil_pair
+        try:
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            self.assertLess(time.time() - t0, 0.5,
+                            "mid-window signal was lost")
+            self.assertFalse(s._data_event.is_set())
+        finally:
+            server.socket.socketpair = orig
+
+    def test_socketpair_exhaustion_falls_back_to_slice_loop(self):
+        s = self._session()
+        orig = server.socket.socketpair
+        server.socket.socketpair = unittest.mock.Mock(
+            side_effect=OSError("EMFILE"))
+        try:
+            woke = []
+            def waiter():
+                t0 = time.time()
+                s.wait_for_data(None, timeout=5)
+                woke.append(time.time() - t0)
+            th = threading.Thread(target=waiter, daemon=True)
+            th.start()
+            time.sleep(0.1)
+            s._signal()
+            th.join(2)
+            self.assertTrue(woke, "fallback waiter never returned")
+            self.assertLess(woke[0], 1.0,
+                            "slice-loop fallback did not wake on signal")
+        finally:
+            server.socket.socketpair = orig
+
+    def test_pre_set_event_returns_immediately_without_socketpair(self):
+        s = self._session()
+        s._data_event.set()
+        t0 = time.time()
+        s.wait_for_data(None, timeout=5)
+        self.assertLess(time.time() - t0, 0.1)
+        self.assertFalse(s._data_event.is_set(), "event consumed")
+
+
 class TestClamp(unittest.TestCase):
 
     def test_valid(self):
@@ -1588,6 +1716,58 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertEqual(p["kind"], "prompt")
         self.assertEqual(p["allowed_users"], ["a"])
 
+    def _config_with(self, extra):
+        path = os.path.join(self.tmpdir, "websh.json")
+        body = {"connections": []}
+        body.update(extra)
+        with open(path, "w") as f:
+            json.dump(body, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        return server.config_public()
+
+    def test_form_defaults_passed_through(self):
+        pub = self._config_with({"form_defaults": {
+            "host": " 192.0.2.10 ", "port": 22, "username": "deploy"}})
+        self.assertEqual(pub["form_defaults"],
+                         {"host": "192.0.2.10", "port": 22,
+                          "username": "deploy"})
+
+    def test_form_defaults_field_level_validation(self):
+        # Bad types/ranges drop the FIELD, never the response; a section
+        # with nothing valid left is omitted entirely.
+        pub = self._config_with({"form_defaults": {
+            "host": 12345,            # not a string -> dropped
+            "port": "22",             # not an int -> dropped
+            "username": "x" * 65,     # over-long -> dropped
+        }})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {
+            "host": "ok.example", "port": 99999}})   # port out of range
+        self.assertEqual(pub["form_defaults"], {"host": "ok.example"})
+        # bool is an int subclass in Python; must NOT pass as a port.
+        pub = self._config_with({"form_defaults": {"port": True}})
+        self.assertNotIn("form_defaults", pub)
+        # Port boundaries: 1 and 65535 pass, 0 and floats don't.
+        pub = self._config_with({"form_defaults": {"port": 1}})
+        self.assertEqual(pub["form_defaults"], {"port": 1})
+        pub = self._config_with({"form_defaults": {"port": 65535}})
+        self.assertEqual(pub["form_defaults"], {"port": 65535})
+        pub = self._config_with({"form_defaults": {"port": 0}})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {"port": 22.0}})
+        self.assertNotIn("form_defaults", pub)
+        # Whitespace-only host is as good as absent.
+        pub = self._config_with({"form_defaults": {"host": "   "}})
+        self.assertNotIn("form_defaults", pub)
+
+    def test_form_defaults_non_dict_ignored(self):
+        pub = self._config_with({"form_defaults": ["not", "a", "dict"]})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({})
+        self.assertNotIn("form_defaults", pub)
+
 
 class TestHTTPApi(LiveServerCase):
     """Integration tests: start the server and hit the API with HTTP."""
@@ -1605,6 +1785,9 @@ class TestHTTPApi(LiveServerCase):
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
         self.assertIn("version", body)
+        # Wire-protocol version: the client decides "reload the page"
+        # from this field; both meta endpoints must carry it.
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
 
     def test_config_returns_no_secrets(self):
         body, code = self._get("/api/config")
@@ -1612,6 +1795,7 @@ class TestHTTPApi(LiveServerCase):
         self.assertTrue(body["restrict_hosts"])
         self.assertIn("session_timeout", body)
         self.assertIn("version", body)
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
         self.assertEqual(len(body["connections"]), 1)
         conn = body["connections"][0]
         self.assertEqual(conn["name"], "allowed")
@@ -1683,6 +1867,16 @@ class TestHTTPApi(LiveServerCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def test_non_dict_json_body_returns_400(self):
+        """_json_body must reject valid-JSON-but-not-an-object bodies
+        (bare list/string/number) with the same 400 malformed JSON gets.
+        Previously body.get() raised AttributeError and the client saw a
+        dropped connection with no response at all."""
+        for payload in ([1, 2, 3], "just a string", 42, None, True):
+            body, code = self._post("/api/resize", payload)
+            self.assertEqual(code, 400, "payload %r" % (payload,))
+            self.assertEqual(body.get("error"), "invalid json")
+
     def test_stream_on_placeholder_session_404s_not_500(self):
         """During the connect window the registry holds a _SessionPlaceholder
         (no _stream_active slot). /api/stream must treat it as not-ready and
@@ -1698,6 +1892,34 @@ class TestHTTPApi(LiveServerCase):
                 server.sessions.pop(sid, None)
         self.assertEqual(code, 404)
         self.assertIn("error", body)
+
+    def test_placeholder_session_404s_on_plain_endpoints(self):
+        """_require_session must reject _SessionPlaceholder slots on every
+        endpoint, not just /api/stream. Before the helper, hitting input/
+        output/resize inside the connect window dereferenced attributes the
+        placeholder's __slots__ omit — an AttributeError surfacing as a 500
+        from /api/input (its write is wrapped in try/except) and as a
+        dropped connection with no response from the other endpoints. /api/ls
+        rides along to pin one side-channel-throttled endpoint too."""
+        sid = str(uuid.uuid4())
+        placeholder = server._SessionPlaceholder("1.2.3.4", False)
+        with server.sessions_lock:
+            server.sessions[sid] = placeholder
+        try:
+            for fetch in (
+                lambda: self._get("/api/output?session_id=" + sid),
+                lambda: self._post("/api/input",
+                                   {"session_id": sid, "data": "x"}),
+                lambda: self._post("/api/resize",
+                                   {"session_id": sid, "cols": 80, "rows": 24}),
+                lambda: self._get("/api/ls?session_id=" + sid),
+            ):
+                body, code = fetch()
+                self.assertEqual(code, 404)
+                self.assertIn("error", body)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
 
     def test_stream_happy_path(self):
         """Plant a fake session that emits one chunk then dies.
@@ -7728,6 +7950,24 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
         # config is built by loadServerConfig via api('config'), and
         # ping is used by the PHP proxy itself rather than the browser.
         actions.update(["config", "ping"])
+        missing = sorted(
+            action for action in actions
+            if "case '{}':".format(action) not in php
+        )
+        self.assertEqual(missing, [])
+
+    def test_server_routes_are_routed_by_php_proxy(self):
+        """Every action server.py dispatches must have a case in api.php's
+        switch — otherwise the endpoint silently 404s on shared hosting
+        only. The route tables make the server-side action set machine-
+        readable; keep the PHP shim in lockstep."""
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "api.php"), "r") as f:
+            php = f.read()
+        actions = set(server.Handler._POST_ROUTES)
+        actions.update(server.Handler._GET_ROUTES)
+        # DELETE /api/save reaches the shim as POST ?action=save_delete,
+        # which the POST table already carries.
         missing = sorted(
             action for action in actions
             if "case '{}':".format(action) not in php
