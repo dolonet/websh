@@ -1020,6 +1020,8 @@ def load_config():
             "isolate_storage": bool(cfg.get("isolate_storage", False)),
             "denied_host_set": denied_host_set,
             "denied_net_list": denied_net_list,
+            # Raw passthrough; validated field-by-field in config_public.
+            "form_defaults": cfg.get("form_defaults"),
         }
         _config_cache = result
         _config_mtime = mtime
@@ -1239,7 +1241,7 @@ def config_public():
             if c.get("denied_users") is not None:
                 item["denied_users"] = c["denied_users"]
         safe.append(item)
-    return {
+    out = {
         "connections": safe,
         "restrict_hosts": cfg["restrict_hosts"],
         "isolate_storage": cfg.get("isolate_storage", False),
@@ -1247,6 +1249,29 @@ def config_public():
         "version": __version__,
         "vault_enabled": _vault_available(),
     }
+    # Optional connect-form prefill (websh.json "form_defaults"): lets a
+    # deployment seed host/port/username in the manual form without
+    # resorting to HTML rewriting in the front proxy (the nginx
+    # sub_filter hack this replaces). Validated field-by-field — a bad
+    # type or range drops that field, never the response. The client
+    # ignores the section when restrict_hosts is on and connections are
+    # configured (the manual form is locked to those connections).
+    fd = cfg.get("form_defaults")
+    if isinstance(fd, dict):
+        clean = {}
+        host = fd.get("host")
+        if isinstance(host, str) and 0 < len(host.strip()) <= 255:
+            clean["host"] = host.strip()
+        username = fd.get("username")
+        if isinstance(username, str) and 0 < len(username.strip()) <= 64:
+            clean["username"] = username.strip()
+        port = fd.get("port")
+        if isinstance(port, int) and not isinstance(port, bool) \
+                and MIN_PORT <= port <= MAX_PORT:
+            clean["port"] = port
+        if clean:
+            out["form_defaults"] = clean
+    return out
 
 
 def find_config_connection(name):

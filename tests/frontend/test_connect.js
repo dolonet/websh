@@ -2875,6 +2875,54 @@ test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
   cleanup(env);
 });
 
+test('form_defaults from /api/config prefill the manual form', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+      form_defaults: {host: '192.0.2.10', port: 2222, username: 'deploy'}}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  ok($(win, 'iH').value === '192.0.2.10',
+     'host prefilled; got ' + $(win, 'iH').value);
+  ok(String($(win, 'iP').value) === '2222',
+     'port prefilled over the markup default; got ' + $(win, 'iP').value);
+  ok($(win, 'iU').value === 'deploy',
+     'username prefilled; got ' + $(win, 'iU').value);
+  cleanup(env);
+});
+
+test('form_defaults never overwrite user-typed values or apply under restrict_hosts', async () => {
+  // applyFormDefaults runs when /api/config lands; anything the user
+  // already typed must win, and under restrict_hosts with configured
+  // connections the section is ignored outright.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true,
+      connections: [{name: 'only', kind: 'ready', host: 'h', port: 22,
+                     username: 'u', persistent: false}],
+      form_defaults: {host: 'ignored.example', username: 'ignored'}}},
+    // restrict_hosts+single ready connection auto-connects on boot:
+    {action: 'connect', response: {auth_failed: true, alive: false}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  ok($(win, 'iH').value !== 'ignored.example',
+     'restrict_hosts: defaults ignored; got ' + $(win, 'iH').value);
+  cleanup(env);
+
+  // Pre-typed value wins over the default.
+  const env2 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+      form_defaults: {host: 'default.example'}}},
+  ]);
+  // Simulate the user-typed case by calling applyFormDefaults again on
+  // a filled form — it must not overwrite.
+  const win2 = env2.win;
+  $(win2, 'iH').value = 'typed.example';
+  win2.applyFormDefaults({restrict_hosts: false, connections: [],
+                          form_defaults: {host: 'default.example'}});
+  ok($(win2, 'iH').value === 'typed.example',
+     'user-typed host not overwritten; got ' + $(win2, 'iH').value);
+  cleanup(env2);
+});
+
 // =====================================================================
 // Vault: manual-pane plaintext lives in sessionStorage
 // =====================================================================

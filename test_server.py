@@ -1588,6 +1588,58 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertEqual(p["kind"], "prompt")
         self.assertEqual(p["allowed_users"], ["a"])
 
+    def _config_with(self, extra):
+        path = os.path.join(self.tmpdir, "websh.json")
+        body = {"connections": []}
+        body.update(extra)
+        with open(path, "w") as f:
+            json.dump(body, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        return server.config_public()
+
+    def test_form_defaults_passed_through(self):
+        pub = self._config_with({"form_defaults": {
+            "host": " 192.0.2.10 ", "port": 22, "username": "deploy"}})
+        self.assertEqual(pub["form_defaults"],
+                         {"host": "192.0.2.10", "port": 22,
+                          "username": "deploy"})
+
+    def test_form_defaults_field_level_validation(self):
+        # Bad types/ranges drop the FIELD, never the response; a section
+        # with nothing valid left is omitted entirely.
+        pub = self._config_with({"form_defaults": {
+            "host": 12345,            # not a string -> dropped
+            "port": "22",             # not an int -> dropped
+            "username": "x" * 65,     # over-long -> dropped
+        }})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {
+            "host": "ok.example", "port": 99999}})   # port out of range
+        self.assertEqual(pub["form_defaults"], {"host": "ok.example"})
+        # bool is an int subclass in Python; must NOT pass as a port.
+        pub = self._config_with({"form_defaults": {"port": True}})
+        self.assertNotIn("form_defaults", pub)
+        # Port boundaries: 1 and 65535 pass, 0 and floats don't.
+        pub = self._config_with({"form_defaults": {"port": 1}})
+        self.assertEqual(pub["form_defaults"], {"port": 1})
+        pub = self._config_with({"form_defaults": {"port": 65535}})
+        self.assertEqual(pub["form_defaults"], {"port": 65535})
+        pub = self._config_with({"form_defaults": {"port": 0}})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {"port": 22.0}})
+        self.assertNotIn("form_defaults", pub)
+        # Whitespace-only host is as good as absent.
+        pub = self._config_with({"form_defaults": {"host": "   "}})
+        self.assertNotIn("form_defaults", pub)
+
+    def test_form_defaults_non_dict_ignored(self):
+        pub = self._config_with({"form_defaults": ["not", "a", "dict"]})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({})
+        self.assertNotIn("form_defaults", pub)
+
 
 class TestHTTPApi(unittest.TestCase):
     """Integration tests: start the server and hit the API with HTTP."""

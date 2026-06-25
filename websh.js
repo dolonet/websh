@@ -3075,9 +3075,25 @@ function doConnect() {
 }
 
 // ── Server config ───────────────────────────────────────────────────
+// Prefill the manual connect form from websh.json "form_defaults"
+// (shipped via /api/config). Only fields the user hasn't already typed
+// into are touched, and the port only when it still shows the markup
+// default — so a half-filled form or a restored session is never
+// overwritten. Skipped when restrict_hosts is on AND connections are
+// configured (the manual form is locked to those connections there).
+function applyFormDefaults(cfg) {
+  let fd = cfg && cfg.form_defaults;
+  if (!fd || (cfg.restrict_hosts && (cfg.connections || []).length)) return;
+  let h = $('iH'), po = $('iP'), u = $('iU');
+  if (fd.host && h && !h.value) h.value = fd.host;
+  if (fd.port && po && (!po.value || po.value === '22')) po.value = fd.port;
+  if (fd.username && u && !u.value) u.value = fd.username;
+}
+
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
+    applyFormDefaults(cfg);
     if(cfg.isolate_storage) {
       storagePrefix = location.pathname.replace(/[^/]*$/, '');
       // `settings`/`fontSize` were loaded at module init under the empty
@@ -3174,6 +3190,9 @@ function clearPromptSelection() {
   $('promptTarget').classList.add('h');
   $('iH').disabled = false; $('iP').disabled = false; $('iU').disabled = false;
   $('iH').value = ''; $('iP').value = '22'; $('iU').value = '';
+  // The reset wiped any server-provided prefill; bring it back so the
+  // post-card-dismiss form matches the first-load state.
+  applyFormDefaults(serverConfig);
   // Restore restrict_hosts kiosk mode if configured.
   if(serverConfig && serverConfig.restrict_hosts) {
     $('manualForm').classList.add('h');
