@@ -683,6 +683,18 @@ def _check_side_channel_rate_limit(ip):
                             ip, SIDE_CHANNEL_RATE_MAX, SIDE_CHANNEL_RATE_WINDOW)
 
 
+def _prune_stale(store, lock, cutoff, ts_of=lambda e: e):
+    """Drop every IP from a per-IP event store whose newest event is older
+    than `cutoff`. `ts_of` extracts the timestamp from one stored entry
+    (the scan-pattern store keeps (ts, host) tuples). Shared by cleanup()
+    for the two rate-limit stores and the scan-pattern store."""
+    with lock:
+        stale = [ip for ip, entries in store.items()
+                 if not any(ts_of(e) > cutoff for e in entries)]
+        for ip in stale:
+            del store[ip]
+
+
 # ─── Scan-pattern detection ─────────────────────────────────────────
 #
 # Per-IP record of recent connects so we can spot one IP probing many
@@ -1233,7 +1245,7 @@ def config_public():
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
-        "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
+        "vault_enabled": _vault_available(),
     }
 
 
@@ -1388,6 +1400,34 @@ def clamp(value, lo, hi, default):
         return max(lo, min(hi, v))
     except (TypeError, ValueError):
         return default
+
+
+def _bad_rel_path(p):
+    """True when `p` is unusable as a $HOME-relative remote path: empty,
+    oversized, absolute, NUL-bearing, or traversing (a `..` segment).
+    Shared by the upload family — keep the rules in one place so the
+    staging path and its cleanup path can never drift apart."""
+    return (not p or len(p) > 4096 or p.startswith("/")
+            or "\x00" in p or ".." in p.split("/"))
+
+
+def _kill_reap(proc):
+    """Best-effort kill + reap of a side-channel subprocess so it can't
+    linger as a zombie. Both steps are individually guarded: the process
+    may already be gone (kill) or stuck in the kernel (wait timeout)."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _vault_available():
+    """True when the encrypted credential vault can serve requests."""
+    return HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled
 
 
 # ─── Session management ─────────────────────────────────────────────
@@ -2248,14 +2288,7 @@ class SSHSession(object):
                 proc.stdin.close()
             except Exception:
                 pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
             # remote `cat >` already died (e.g. "No space left on device")
@@ -2274,14 +2307,7 @@ class SSHSession(object):
         try:
             proc.wait(timeout=max(60, timeout))
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             return False, "ssh side-channel timeout"
 
@@ -2596,31 +2622,18 @@ def cleanup():
             s.close()
         except Exception as e:
             _log("WARN", "session {} close failed: {}".format(sid, e))
-    # Prune stale rate limit entries to prevent unbounded memory growth
+    # Prune stale per-IP entries to prevent unbounded memory growth.
+    # Without this the dicts grow proportionally to attacker activity and
+    # never shrink — the worst possible scaling profile for a long-running
+    # deploy. An IP whose newest event has aged out of the window
+    # disappears from RAM entirely.
     now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    with _rate_lock:
-        stale = [ip for ip, times in _rate_limits.items()
-                 if not any(t > cutoff for t in times)]
-        for ip in stale:
-            del _rate_limits[ip]
-    sc_cutoff = now - SIDE_CHANNEL_RATE_WINDOW
-    with _side_channel_rate_lock:
-        stale = [ip for ip, times in _side_channel_rate_limits.items()
-                 if not any(t > sc_cutoff for t in times)]
-        for ip in stale:
-            del _side_channel_rate_limits[ip]
-    # Prune stale scan-pattern entries the same way. Without this the
-    # dict grows proportionally to attacker activity and never shrinks
-    # — the worst possible scaling profile for a long-running deploy.
-    # Drop any IP whose newest event has aged out of the window (so an
-    # attacker that stops probing eventually disappears from RAM).
-    scan_cutoff = now - SCAN_PATTERN_WINDOW
-    with _scan_pattern_lock:
-        stale = [ip for ip, events in _scan_pattern.items()
-                 if not any(t > scan_cutoff for t, _ in events)]
-        for ip in stale:
-            del _scan_pattern[ip]
+    _prune_stale(_rate_limits, _rate_lock, now - RATE_LIMIT_WINDOW)
+    _prune_stale(_side_channel_rate_limits, _side_channel_rate_lock,
+                 now - SIDE_CHANNEL_RATE_WINDOW)
+    # Scan-pattern values are (ts, host) tuples, not bare timestamps.
+    _prune_stale(_scan_pattern, _scan_pattern_lock,
+                 now - SCAN_PATTERN_WINDOW, ts_of=lambda e: e[0])
 
 
 def _cleanup_loop():
@@ -2941,18 +2954,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Vault save / delete ─────────────────────────────────────────
 
+    def _reply_vault_unavailable(self):
+        """The shared 501 for every vault-gated path; pairs with
+        _vault_available()."""
+        self._json({"error": "credential vault unavailable "
+                    "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                    "set / websh.creds.json schema unsupported — "
+                    "see server log)"}, 501)
+
     def _save_credential(self):
         ip = self._client_ip()
         if not _check_rate_limit(ip):
             _access_log_emit("save", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -3035,12 +3052,8 @@ class Handler(BaseHTTPRequestHandler):
             _access_log_emit("save_delete", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
@@ -3121,12 +3134,8 @@ class Handler(BaseHTTPRequestHandler):
         ssh_options = {}
         if is_saved:
             # ── Saved-variant: resolve host/username/password from vault ──
-            if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                    and not _vault_disabled):
-                self._json({"error": "credential vault unavailable "
-                            "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                            "set / websh.creds.json schema unsupported — "
-                            "see server log)"}, 501)
+            if not _vault_available():
+                self._reply_vault_unavailable()
                 return
             if not _VAULT_ID_RE.match(sv_vault) or not _CONN_ID_RE.match(sv_conn):
                 self._json({"error": "vault_input_invalid",
@@ -3774,10 +3783,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not rel_path or len(rel_path) > 4096
-                or rel_path.startswith("/")
-                or "\x00" in rel_path
-                or ".." in rel_path.split("/")):
+        if _bad_rel_path(rel_path):
             # NUL would survive base64 encoding but bash strips it from
             # variable values, so the file would silently land at a
             # different name than the client asked for. Fail loud instead.
@@ -3844,9 +3850,7 @@ class Handler(BaseHTTPRequestHandler):
         # tmp uses the same rules as the upload path. final is a basename
         # — no slashes, no traversal, no NUL — because finalize_upload
         # cd's into the pane cwd and does `mv -- "$HOME/$t" "./$f"`.
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
         if (not final or len(final) > 4096
@@ -3888,9 +3892,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
         session = self._require_session(sid)
@@ -3948,14 +3950,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
 
-        def _reap():
-            # Reap the side-channel ssh after kill so it doesn't linger as
-            # a zombie. Mirrors the upload_file TimeoutExpired branch.
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-
         # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
         header_line = b""
         try:
@@ -3965,15 +3959,13 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 header_line += c
         except Exception:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "download failed"}, 502)
             return
 
         parts = header_line.decode("utf-8", "replace").split("\t", 1)
         if not parts or parts[0] != "OK":
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             msg = parts[1].strip() if len(parts) > 1 else "download failed"
             self._json({"error": msg}, 404)
             return
@@ -3992,8 +3984,7 @@ class Handler(BaseHTTPRequestHandler):
         # any HTTP response headers, so the browser doesn't try to
         # accumulate a multi-GB Blob into memory.
         if content_length is not None and content_length > MAX_DOWNLOAD_SIZE:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "file too large"}, 413)
             return
 
@@ -4042,8 +4033,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                _reap()
+                _kill_reap(proc)
         session.last_activity = time.time()
         # Audit the transfer so bulk exfiltration through a logged-in
         # session is visible to WEBSH_ACCESS_LOG / fail2ban. `bytes` is the
