@@ -2230,6 +2230,47 @@ class SSHSession(object):
             # died, peer FIN, etc.) — best-effort, fall through.
             pass
 
+    # ── ControlMaster side-channel plumbing ─────────────────────────
+    #
+    # Every side-channel operation (tmux capture/options, file transfer,
+    # ls) runs a one-shot command over the existing ControlMaster socket
+    # with the same ssh argv. Build it in exactly one place so a future
+    # option change can't silently miss one of the seven call sites.
+    # terminate_remote_tmux is deliberately NOT on this helper: it
+    # re-dials with -p/-l/ConnectTimeout because its socket may belong
+    # to a master that is still authenticating.
+
+    def _mux_ready(self):
+        """True when the ControlMaster socket exists and can be dialed."""
+        return bool(self._control_path) and os.path.exists(self._control_path)
+
+    def _mux_argv(self, remote_cmd):
+        """argv for a one-shot remote command over the ControlMaster."""
+        return [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+
+    def _mux_run(self, remote_cmd, timeout, timeout_msg,
+                 err_prefix="ssh error: "):
+        """subprocess.run a remote command over the ControlMaster with
+        the shared timeout/exception handling. Returns (CompletedProcess,
+        None) on spawn success — the caller still interprets returncode/
+        stdout/stderr, which genuinely differ per operation — or
+        (None, error_string)."""
+        try:
+            proc = subprocess.run(self._mux_argv(remote_cmd),
+                                  capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, timeout_msg
+        except Exception as e:
+            # `or repr(e)` keeps the error truthy even for the rare
+            # exception with an empty str() — callers branch on `if err:`.
+            return None, err_prefix + (str(e) or repr(e))
+        return proc, None
+
     def tmux_capture(self):
         """Capture the full tmux pane buffer (scrollback + visible) over
         the ControlMaster channel. Only meaningful for persistent
@@ -2237,7 +2278,7 @@ class SSHSession(object):
         (bytes, error)."""
         if not self.persistent or not self.slot_id:
             return None, "not a persistent session"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, "control socket not ready"
         # `-S -<N>` reads the most recent N lines of history (was `-S -`,
         # the whole history, which on a 10M-line scrollback buffers
@@ -2248,19 +2289,9 @@ class SSHSession(object):
         tname = "websh-" + self.slot_id
         remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S -" +
                       str(MAX_TMUX_CAPTURE_LINES) + " -t " + tname)
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(
-                ssh_cmd, capture_output=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            return None, "tmux capture timeout"
-        except Exception as e:
-            return None, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 30, "tmux capture timeout")
+        if err:
+            return None, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return None, "tmux exit %d: %s" % (proc.returncode, err)
@@ -2283,7 +2314,7 @@ class SSHSession(object):
         used at connect time. Returns (ok, error)."""
         if not self.persistent or not self.slot_id:
             return False, "not a persistent session"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
         if not options:
             return True, ""
@@ -2294,19 +2325,9 @@ class SSHSession(object):
         # connect time.
         parts = ["set -g " + opt + " " + val for opt, val in options]
         remote_cmd = self.tmux_cmd + " " + " \\; ".join(parts)
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(
-                ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return False, "tmux set timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 10, "tmux set timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "tmux exit %d: %s" % (proc.returncode, err)
@@ -2321,7 +2342,7 @@ class SSHSession(object):
         re-auth and no PTY overhead. Returns (ok, error)."""
         if not self.alive:
             return False, "session is dead"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
 
         # rel_path is base64-encoded and decoded inside the remote shell so
@@ -2334,14 +2355,8 @@ class SSHSession(object):
             'cat > "$HOME/$n"'
         )
 
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
         proc = subprocess.Popen(
-            ssh_cmd,
+            self._mux_argv(remote_cmd),
             stdin=subprocess.PIPE,
             # `cat >` produces no stdout; discard it. stderr is kept (for the
             # "ssh exit N: <msg>" error below) but MUST be drained while we
@@ -2452,7 +2467,7 @@ class SSHSession(object):
         guard for vim/less/htop)."""
         if not self.persistent or not self.slot_id:
             return False, "non-persistent"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
 
         # Both names are base64-encoded in case the user picked a file
@@ -2493,18 +2508,9 @@ class SSHSession(object):
             'fi; '
             'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=15)
-        except subprocess.TimeoutExpired:
-            return False, "finalize timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 15, "finalize timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "finalize exit %d: %s" % (proc.returncode, err)
@@ -2516,7 +2522,7 @@ class SSHSession(object):
         the user cancelled — keystroke-free, so no risk of poking a
         running editor in the foreground PTY. Idempotent. rel_path
         must come from the caller's path validator."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
         b = base64.b64encode(rel_path.encode("utf-8")).decode("ascii")
         # The `--` after rm protects against an attacker-supplied path
@@ -2526,18 +2532,9 @@ class SSHSession(object):
             'n=$(printf %s ' + b + ' | base64 -d) && '
             'rm -f -- "$HOME/$n"'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return False, "rm timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 10, "rm timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             return False, "rm exit %d" % proc.returncode
         return True, ""
@@ -2546,7 +2543,7 @@ class SSHSession(object):
         """List a directory via the ControlMaster side-channel.
         remote_path may be absolute, ~, ~/sub, or relative-to-$HOME.
         Returns (entries, abs_path, error_string)."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, None, "control socket not ready"
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
@@ -2581,18 +2578,10 @@ class SSHSession(object):
               'printf "%s\\t%s\\t%s\\t%s\\0" "$t" "$s" "$m" "$f"; '
             'done'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            result = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return None, None, "timeout"
-        except Exception as e:
-            return None, None, str(e)
+        # err_prefix="" keeps this method's historical bare str(e) message.
+        result, err = self._mux_run(remote_cmd, 10, "timeout", err_prefix="")
+        if err:
+            return None, None, err
         if result.returncode != 0:
             return None, None, "directory not found"
 
@@ -2628,7 +2617,7 @@ class SSHSession(object):
         Subprocess stdout starts with a header "OK\\t<size>\\n" or
         "ERR\\t<msg>\\n" so the caller can detect failure before
         sending HTTP response headers."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, "control socket not ready"
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
@@ -2646,12 +2635,6 @@ class SSHSession(object):
               'cat -- "$F"; '
             'else printf "ERR\\tFile not found\\n"; fi'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
         try:
             # stderr→DEVNULL: the protocol header (OK/ERR on stdout) already
             # signals failure to the caller, and a PIPE that nobody drains
@@ -2659,7 +2642,7 @@ class SSHSession(object):
             # (host-key prompts, banners, debug). Same pattern as
             # terminate_remote_tmux.
             proc = subprocess.Popen(
-                ssh_cmd,
+                self._mux_argv(remote_cmd),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
