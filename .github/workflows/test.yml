@@ -41,12 +41,30 @@ jobs:
 
   php-lint:
     # The PHP proxy shipped untested — not even syntax-checked. The
-    # ubuntu-latest runner image includes the PHP CLI.
+    # ubuntu-latest runner image includes the PHP CLI (with curl).
+    # The behavioral smoke boots api.php under `php -S` against an echo
+    # backend and asserts the proxy contract: method/query/body
+    # passthrough, X-Forwarded-For injection, save_delete POST→DELETE.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: php -l api.php
         run: php -l api.php
+      - name: Behavioral smoke (php -S vs echo backend)
+        run: bash tests/php/smoke.sh
+
+  ruff:
+    # Correctness-only families (F/E9/B/PLE — see ruff.toml); style
+    # rules are deliberately off so real findings aren't buried in
+    # churn on a codebase that predates the linter.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install 'ruff==0.15.*'
+      - run: ruff check .
 
   docker:
     # The image could break (bad base rebase, missing COPY) without CI
@@ -67,6 +85,17 @@ jobs:
             fi
             sleep 1
           done
+          # Beyond liveness: config must be JSON with the expected keys
+          # (a broken websh.json default or missing env shows up here),
+          # and the static bundle must actually be served.
+          cfg=
+          page=
+          if [ -n "$ok" ]; then
+            curl -fsS http://127.0.0.1:8765/api/config | grep -q '"restrict_hosts"' && cfg=1
+            curl -fsS http://127.0.0.1:8765/ | grep -qi '<title>' && page=1
+          fi
           docker logs websh
           docker rm -f websh >/dev/null
           test -n "$ok" || { echo "backend never answered /api/ping"; exit 1; }
+          test -n "$cfg" || { echo "/api/config missing or malformed"; exit 1; }
+          test -n "$page" || { echo "static index not served"; exit 1; }

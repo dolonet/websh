@@ -1,0 +1,20 @@
+# Correctness-only lint for a deliberately stdlib, single-file backend.
+# Style families are intentionally NOT enabled: the codebase predates
+# the linter and a style sweep would bury real findings in churn.
+#   F    pyflakes        (undefined names, unused imports, f-string bugs)
+#   E9   syntax errors   (IndentationError-class problems)
+#   B    bugbear         (mutable defaults, useless expressions, ...)
+#   PLE  pylint errors   (invalid all, nonlocal without binding, ...)
+target-version = "py39"
+
+[lint]
+select = ["F", "E9", "B", "PLE"]
+# B904 (raise-from) stays off globally: server.py's except blocks
+# deliberately collapse exception detail before it reaches a client.
+ignore = ["B904"]
+
+[lint.per-file-ignores]
+# Test fixtures DELIBERATELY embed control characters / zero-width
+# spaces (the log-sanitizer tests) and unused destructured locals.
+"test_server.py" = ["PLE2502", "PLE2515", "F841", "F401", "B011"]
+"tests/**" = ["PLE2502", "PLE2515", "F841", "F401", "B011"]
