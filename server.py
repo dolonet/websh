@@ -690,6 +690,18 @@ def _check_side_channel_rate_limit(ip):
                             ip, SIDE_CHANNEL_RATE_MAX, SIDE_CHANNEL_RATE_WINDOW)
 
 
+def _prune_stale(store, lock, cutoff, ts_of=lambda e: e):
+    """Drop every IP from a per-IP event store whose newest event is older
+    than `cutoff`. `ts_of` extracts the timestamp from one stored entry
+    (the scan-pattern store keeps (ts, host) tuples). Shared by cleanup()
+    for the two rate-limit stores and the scan-pattern store."""
+    with lock:
+        stale = [ip for ip, entries in store.items()
+                 if not any(ts_of(e) > cutoff for e in entries)]
+        for ip in stale:
+            del store[ip]
+
+
 # ─── Scan-pattern detection ─────────────────────────────────────────
 #
 # Per-IP record of recent connects so we can spot one IP probing many
@@ -1015,6 +1027,8 @@ def load_config():
             "isolate_storage": bool(cfg.get("isolate_storage", False)),
             "denied_host_set": denied_host_set,
             "denied_net_list": denied_net_list,
+            # Raw passthrough; validated field-by-field in config_public.
+            "form_defaults": cfg.get("form_defaults"),
         }
         _config_cache = result
         _config_mtime = mtime
@@ -1234,15 +1248,38 @@ def config_public():
             if c.get("denied_users") is not None:
                 item["denied_users"] = c["denied_users"]
         safe.append(item)
-    return {
+    out = {
         "connections": safe,
         "restrict_hosts": cfg["restrict_hosts"],
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
         "proto": PROTO_VERSION,
-        "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
+        "vault_enabled": _vault_available(),
     }
+    # Optional connect-form prefill (websh.json "form_defaults"): lets a
+    # deployment seed host/port/username in the manual form without
+    # resorting to HTML rewriting in the front proxy (the nginx
+    # sub_filter hack this replaces). Validated field-by-field — a bad
+    # type or range drops that field, never the response. The client
+    # ignores the section when restrict_hosts is on and connections are
+    # configured (the manual form is locked to those connections).
+    fd = cfg.get("form_defaults")
+    if isinstance(fd, dict):
+        clean = {}
+        host = fd.get("host")
+        if isinstance(host, str) and 0 < len(host.strip()) <= 255:
+            clean["host"] = host.strip()
+        username = fd.get("username")
+        if isinstance(username, str) and 0 < len(username.strip()) <= 64:
+            clean["username"] = username.strip()
+        port = fd.get("port")
+        if isinstance(port, int) and not isinstance(port, bool) \
+                and MIN_PORT <= port <= MAX_PORT:
+            clean["port"] = port
+        if clean:
+            out["form_defaults"] = clean
+    return out
 
 
 def find_config_connection(name):
@@ -1398,6 +1435,34 @@ def clamp(value, lo, hi, default):
         return default
 
 
+def _bad_rel_path(p):
+    """True when `p` is unusable as a $HOME-relative remote path: empty,
+    oversized, absolute, NUL-bearing, or traversing (a `..` segment).
+    Shared by the upload family — keep the rules in one place so the
+    staging path and its cleanup path can never drift apart."""
+    return (not p or len(p) > 4096 or p.startswith("/")
+            or "\x00" in p or ".." in p.split("/"))
+
+
+def _kill_reap(proc):
+    """Best-effort kill + reap of a side-channel subprocess so it can't
+    linger as a zombie. Both steps are individually guarded: the process
+    may already be gone (kill) or stuck in the kernel (wait timeout)."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _vault_available():
+    """True when the encrypted credential vault can serve requests."""
+    return HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled
+
+
 # ─── Session management ─────────────────────────────────────────────
 
 sessions = OrderedDict()
@@ -1447,6 +1512,11 @@ class SSHSession(object):
         # uses a selector — see _build_session_selector and the
         # interleaved-short-waits loop in wait_for_data.
         self._data_event = Event()
+        # Write ends of per-WAIT wake socketpairs (see wait_for_data):
+        # _signal() pokes one byte into each so a parked waiter wakes
+        # from a single blocking select instead of polling in slices.
+        self._waiters = set()
+        self._waiters_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
         # At most one /api/stream consumer per session. SSHSession.read()
@@ -1661,8 +1731,17 @@ class SSHSession(object):
             return
         try:
             while self.alive:
+                # The timeout only bounds how fast we notice alive=False
+                # when the fd was NOT closed (close() resets master_fd to
+                # -1 first, so the next select raises ValueError and we
+                # break instantly; data / child-exit EOF-EIO wake select
+                # immediately). 0.25s cuts idle wakeups 5x vs the old
+                # 0.05s — 50 idle sessions burn 200 wakeups/s instead of
+                # 1000 — at the cost of ≤250ms extra on the rare
+                # alive-flag-only exits (e.g. write() hitting OSError).
+                # Output latency is unaffected.
                 try:
-                    r, _, _ = select.select([self.master_fd], [], [], 0.05)
+                    r, _, _ = select.select([self.master_fd], [], [], 0.25)
                 except (ValueError, OSError):
                     break
 
@@ -1881,11 +1960,28 @@ class SSHSession(object):
     def _signal(self):
         """Wake any consumer thread blocked in wait_for_data(). Setting
         an already-set Event is a no-op, so wakeups coalesce naturally.
-        Event.set() does not raise."""
+        Event.set() does not raise. Parked waiters additionally get one
+        byte on their per-wait wake socket so they return from a single
+        blocking select; a full pipe / closed peer is irrelevant (any
+        readable byte means wake, and the waiter is tearing down)."""
         ev = self._data_event
         if ev is None:
             return
         ev.set()
+        waiters = getattr(self, "_waiters", None)
+        if not waiters:
+            return
+        # Send UNDER the lock: the waiter's finally discards its socket
+        # under the same lock before closing it, so a send can never
+        # overlap a close — without this, a send racing the close could
+        # in principle hit a recycled fd number (send is non-blocking,
+        # so the hold time is bounded).
+        with self._waiters_lock:
+            for w in list(waiters):
+                try:
+                    w.send(b"x")
+                except (OSError, ValueError):
+                    pass
 
     # Slice length for the interleaved short-wait loop in wait_for_data.
     # The Event itself wakes within microseconds of _signal(); the slice
@@ -1933,6 +2029,69 @@ class SSHSession(object):
         if ev.is_set():
             ev.clear()
             return
+        waiters = getattr(self, "_waiters", None)
+        if waiters is not None:
+            # Parked path: one blocking select on (wake socket, client
+            # socket) for the whole timeout — zero wakeups while idle,
+            # vs 50/second in the slice loop below. The socketpair is
+            # PER WAIT: registered under the lock, discarded under
+            # the same lock before closing (and _signal sends under it
+            # too), so nothing outlives the wait and a signal can never
+            # touch a closed/recycled fd. The Event stays as the state
+            # carrier.
+            try:
+                wake_r, wake_w = socket.socketpair()
+            except OSError:
+                wake_r = wake_w = None   # fd exhaustion: slice fallback
+            if wake_r is not None:
+                sel = None
+                try:
+                    wake_r.setblocking(False)
+                    wake_w.setblocking(False)
+                    with self._waiters_lock:
+                        waiters.add(wake_w)
+                    # A signal may have landed between the is_set()
+                    # check above and our registration — it would have
+                    # missed our wake socket. Re-check.
+                    if ev.is_set():
+                        ev.clear()
+                        return
+                    try:
+                        sel = selectors.DefaultSelector()
+                    except OSError:
+                        # epoll-fd exhaustion: fall through to the slice
+                        # loop below (the finally cleans the pair up).
+                        sel = None
+                    if sel is None:
+                        wake_r_failed = True
+                    else:
+                        wake_r_failed = False
+                        sel.register(wake_r, selectors.EVENT_READ)
+                    if not wake_r_failed:
+                        if client_socket is not None:
+                            try:
+                                sel.register(client_socket,
+                                             selectors.EVENT_READ)
+                            except (KeyError, ValueError, OSError):
+                                pass
+                        sel.select(timeout)
+                        if ev.is_set():
+                            ev.clear()
+                        return
+                finally:
+                    with self._waiters_lock:
+                        waiters.discard(wake_w)
+                    if sel is not None:
+                        try:
+                            sel.close()
+                        except Exception:
+                            pass
+                    for sock in (wake_r, wake_w):
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+
         deadline = time.time() + timeout
         while True:
             remaining = deadline - time.time()
@@ -2247,14 +2406,7 @@ class SSHSession(object):
                 proc.stdin.close()
             except Exception:
                 pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
             # remote `cat >` already died (e.g. "No space left on device")
@@ -2273,14 +2425,7 @@ class SSHSession(object):
         try:
             proc.wait(timeout=max(60, timeout))
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             return False, "ssh side-channel timeout"
 
@@ -2595,31 +2740,18 @@ def cleanup():
             s.close()
         except Exception as e:
             _log("WARN", "session {} close failed: {}".format(sid, e))
-    # Prune stale rate limit entries to prevent unbounded memory growth
+    # Prune stale per-IP entries to prevent unbounded memory growth.
+    # Without this the dicts grow proportionally to attacker activity and
+    # never shrink — the worst possible scaling profile for a long-running
+    # deploy. An IP whose newest event has aged out of the window
+    # disappears from RAM entirely.
     now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    with _rate_lock:
-        stale = [ip for ip, times in _rate_limits.items()
-                 if not any(t > cutoff for t in times)]
-        for ip in stale:
-            del _rate_limits[ip]
-    sc_cutoff = now - SIDE_CHANNEL_RATE_WINDOW
-    with _side_channel_rate_lock:
-        stale = [ip for ip, times in _side_channel_rate_limits.items()
-                 if not any(t > sc_cutoff for t in times)]
-        for ip in stale:
-            del _side_channel_rate_limits[ip]
-    # Prune stale scan-pattern entries the same way. Without this the
-    # dict grows proportionally to attacker activity and never shrinks
-    # — the worst possible scaling profile for a long-running deploy.
-    # Drop any IP whose newest event has aged out of the window (so an
-    # attacker that stops probing eventually disappears from RAM).
-    scan_cutoff = now - SCAN_PATTERN_WINDOW
-    with _scan_pattern_lock:
-        stale = [ip for ip, events in _scan_pattern.items()
-                 if not any(t > scan_cutoff for t, _ in events)]
-        for ip in stale:
-            del _scan_pattern[ip]
+    _prune_stale(_rate_limits, _rate_lock, now - RATE_LIMIT_WINDOW)
+    _prune_stale(_side_channel_rate_limits, _side_channel_rate_lock,
+                 now - SIDE_CHANNEL_RATE_WINDOW)
+    # Scan-pattern values are (ts, host) tuples, not bare timestamps.
+    _prune_stale(_scan_pattern, _scan_pattern_lock,
+                 now - SCAN_PATTERN_WINDOW, ts_of=lambda e: e[0])
 
 
 def _cleanup_loop():
@@ -2731,6 +2863,23 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
         return self.rfile.read(n) if n else b""
 
+    def _json_body(self):
+        """Parse the request body as a JSON object. Returns the dict, or
+        None after replying 400. Non-dict JSON (a bare list / string /
+        number) is rejected too: every caller immediately does
+        body.get(), which previously blew up with AttributeError — a
+        dropped connection — instead of the 400 the malformed-JSON case
+        gets."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return None
+        if not isinstance(body, dict):
+            self._json({"error": "invalid json"}, 400)
+            return None
+        return body
+
     def _path(self):
         p = self.path.split("?")[0].rstrip("/")
         return p or "/"
@@ -2790,67 +2939,68 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
 
     # ── Dispatch ────────────────────────────────────────────────────
+    #
+    # One table per HTTP method, action → handler-method name. Adding an
+    # endpoint is one table row (plus a row in the PHP proxy's switch for
+    # shared-hosting mode). Values are attribute names rather than bound
+    # methods so the tables can live on the class.
+
+    _POST_ROUTES = {
+        "connect":         "_connect",
+        "input":           "_input",
+        "resize":          "_resize",
+        "disconnect":      "_disconnect",
+        "upload":          "_upload",
+        "upload_finalize": "_upload_finalize",
+        "upload_cancel":   "_upload_cancel",
+        "tmux_options":    "_tmux_options",
+        "save":            "_save_credential",
+        # Compatibility with the bundled frontend in Python-only mode.
+        # The PHP shim translates POST ?action=save_delete into
+        # DELETE /api/save; when server.py serves api.php-style URLs
+        # directly, do the same dispatch here.
+        "save_delete":     "_delete_credential",
+    }
+
+    _GET_ROUTES = {
+        "output":       "_output",
+        "stream":       "_stream",
+        "config":       "_config",
+        "ping":         "_ping",
+        "tmux_capture": "_tmux_capture",
+        "ls":           "_ls",
+        "download":     "_download",
+    }
+
+    _DELETE_ROUTES = {
+        "save": "_delete_credential",
+    }
+
+    def _dispatch(self, routes):
+        name = routes.get(self._resolve_action())
+        if name is None:
+            self._json({"error": "not found"}, 404)
+            return
+        getattr(self, name)()
 
     def do_POST(self):
-        action = self._resolve_action()
-        if action == "connect":
-            self._connect()
-        elif action == "input":
-            self._input()
-        elif action == "resize":
-            self._resize()
-        elif action == "disconnect":
-            self._disconnect()
-        elif action == "upload":
-            self._upload()
-        elif action == "upload_finalize":
-            self._upload_finalize()
-        elif action == "upload_cancel":
-            self._upload_cancel()
-        elif action == "tmux_options":
-            self._tmux_options()
-        elif action == "save":
-            self._save_credential()
-        elif action == "save_delete":
-            # Compatibility with the bundled frontend in Python-only
-            # mode. The PHP shim translates POST ?action=save_delete
-            # into DELETE /api/save; when server.py serves api.php-style
-            # URLs directly, do the same dispatch here.
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._POST_ROUTES)
 
     def do_GET(self):
-        p = self._path()
-        static = _STATIC_FILES.get(p)
+        static = _STATIC_FILES.get(self._path())
         if static:
             self._serve_static(*static)
             return
-        action = self._resolve_action()
-        if action == "output":
-            self._output()
-        elif action == "stream":
-            self._stream()
-        elif action == "config":
-            self._json(config_public())
-        elif action == "ping":
-            self._json({"ok": True, "version": __version__,
-                        "proto": PROTO_VERSION})
-        elif action == "tmux_capture":
-            self._tmux_capture()
-        elif action == "ls":
-            self._ls()
-        elif action == "download":
-            self._download()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._GET_ROUTES)
 
     def do_DELETE(self):
-        action = self._resolve_action()
-        if action == "save":
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._DELETE_ROUTES)
+
+    def _config(self):
+        self._json(config_public())
+
+    def _ping(self):
+        self._json({"ok": True, "version": __version__, "proto": PROTO_VERSION})
 
     # ── Source-IP / session-ID validation ───────────────────────────
 
@@ -2888,6 +3038,28 @@ class Handler(BaseHTTPRequestHandler):
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
 
+    def _require_session(self, sid):
+        """Validate `sid`, look it up, and reply 404 when it does not name
+        a live session. Returns the SSHSession, or None when a response
+        has already been written.
+
+        Rejects `_SessionPlaceholder` slots too: a placeholder only exists
+        for the duration of `_connect`'s ssh spawn, and no endpoint can do
+        anything useful with one — before this helper, hitting a non-stream
+        endpoint inside that window raised AttributeError (a 500 from
+        /api/input, whose write sits in a try/except; a dropped connection
+        with no response everywhere else) instead of the 404 the registry
+        miss gets a moment later."""
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return None
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session or isinstance(session, _SessionPlaceholder):
+            self._json({"error": "session not found"}, 404)
+            return None
+        return session
+
     def _side_channel_throttled(self):
         """Apply the per-IP side-channel rate limit. Returns True (and has
         already written a 429) when the caller should stop. Each
@@ -2900,18 +3072,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Vault save / delete ─────────────────────────────────────────
 
+    def _reply_vault_unavailable(self):
+        """The shared 501 for every vault-gated path; pairs with
+        _vault_available()."""
+        self._json({"error": "credential vault unavailable "
+                    "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                    "set / websh.creds.json schema unsupported — "
+                    "see server log)"}, 501)
+
     def _save_credential(self):
         ip = self._client_ip()
         if not _check_rate_limit(ip):
             _access_log_emit("save", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -2920,10 +3096,8 @@ class Handler(BaseHTTPRequestHandler):
         if content_length > _MAX_VAULT_REQUEST_BYTES:
             self._json({"error": "request body too large"}, 413)
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         vault_id = (body.get("vault_id") or "").strip()
         conn_id  = (body.get("conn_id") or "").strip()
@@ -2996,12 +3170,8 @@ class Handler(BaseHTTPRequestHandler):
             _access_log_emit("save_delete", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
@@ -3045,10 +3215,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "too many connection attempts"}, 429)
             return
 
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3084,12 +3252,8 @@ class Handler(BaseHTTPRequestHandler):
         ssh_options = {}
         if is_saved:
             # ── Saved-variant: resolve host/username/password from vault ──
-            if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                    and not _vault_disabled):
-                self._json({"error": "credential vault unavailable "
-                            "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                            "set / websh.creds.json schema unsupported — "
-                            "see server log)"}, 501)
+            if not _vault_available():
+                self._reply_vault_unavailable()
                 return
             if not _VAULT_ID_RE.match(sv_vault) or not _CONN_ID_RE.match(sv_conn):
                 self._json({"error": "vault_input_invalid",
@@ -3384,13 +3548,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         try:
@@ -3405,13 +3564,8 @@ class Handler(BaseHTTPRequestHandler):
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
 
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
@@ -3666,20 +3820,13 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _resize(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3698,13 +3845,8 @@ class Handler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         data, err = session.tmux_capture()
         if err:
@@ -3724,19 +3866,12 @@ class Handler(BaseHTTPRequestHandler):
         same allow-list used at connect time."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         opts = _validate_tmux_options(body)
         ok, err = session.push_tmux_options(opts)
@@ -3760,13 +3895,13 @@ class Handler(BaseHTTPRequestHandler):
         sid = params.get("session_id", [""])[0]
         rel_path = params.get("path", [""])[0]
 
+        # Order matters (and is pinned by the dispatch tests): sid shape,
+        # then path/size validation, then registry existence — so a bad
+        # request is called out as bad even when the session is long gone.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not rel_path or len(rel_path) > 4096
-                or rel_path.startswith("/")
-                or "\x00" in rel_path
-                or ".." in rel_path.split("/")):
+        if _bad_rel_path(rel_path):
             # NUL would survive base64 encoding but bash strips it from
             # variable values, so the file would silently land at a
             # different name than the client asked for. Fail loud instead.
@@ -3784,10 +3919,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "file too large"}, 413)
             return
 
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         ok, err = session.upload_file(rel_path, self.rfile, length)
@@ -3821,33 +3954,29 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp, final }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
         final = body.get("final", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp/final
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
         # tmp uses the same rules as the upload path. final is a basename
         # — no slashes, no traversal, no NUL — because finalize_upload
         # cd's into the pane cwd and does `mv -- "$HOME/$t" "./$f"`.
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
         if (not final or len(final) > 4096
                 or "/" in final or "\x00" in final or final in ("..", ".")):
             self._json({"error": "invalid final"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, msg = session.finalize_upload(tmp, final)
         if not ok:
@@ -3871,25 +4000,21 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, err = session.remove_remote_tmp(tmp)
         if not ok:
@@ -3910,13 +4035,8 @@ class Handler(BaseHTTPRequestHandler):
         if "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         entries, abs_path, err = session.list_dir(path)
@@ -3939,27 +4059,14 @@ class Handler(BaseHTTPRequestHandler):
         if not path or "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         proc, err = session.download_file(path)
         if err:
             self._json({"error": err}, 502)
             return
-
-        def _reap():
-            # Reap the side-channel ssh after kill so it doesn't linger as
-            # a zombie. Mirrors the upload_file TimeoutExpired branch.
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
 
         # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
         header_line = b""
@@ -3970,15 +4077,13 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 header_line += c
         except Exception:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "download failed"}, 502)
             return
 
         parts = header_line.decode("utf-8", "replace").split("\t", 1)
         if not parts or parts[0] != "OK":
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             msg = parts[1].strip() if len(parts) > 1 else "download failed"
             self._json({"error": msg}, 404)
             return
@@ -3997,8 +4102,7 @@ class Handler(BaseHTTPRequestHandler):
         # any HTTP response headers, so the browser doesn't try to
         # accumulate a multi-GB Blob into memory.
         if content_length is not None and content_length > MAX_DOWNLOAD_SIZE:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "file too large"}, 413)
             return
 
@@ -4047,8 +4151,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                _reap()
+                _kill_reap(proc)
         session.last_activity = time.time()
         # Audit the transfer so bulk exfiltration through a logged-in
         # session is visible to WEBSH_ACCESS_LOG / fail2ban. `bytes` is the
@@ -4061,10 +4164,8 @@ class Handler(BaseHTTPRequestHandler):
     # ── Disconnect ──────────────────────────────────────────────────
 
     def _disconnect(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
