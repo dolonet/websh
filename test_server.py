@@ -1609,6 +1609,16 @@ class TestHTTPApi(unittest.TestCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def test_non_dict_json_body_returns_400(self):
+        """_json_body must reject valid-JSON-but-not-an-object bodies
+        (bare list/string/number) with the same 400 malformed JSON gets.
+        Previously body.get() raised AttributeError and the client saw a
+        dropped connection with no response at all."""
+        for payload in ([1, 2, 3], "just a string", 42, None, True):
+            body, code = self._post("/api/resize", payload)
+            self.assertEqual(code, 400, "payload %r" % (payload,))
+            self.assertEqual(body.get("error"), "invalid json")
+
     def test_stream_on_placeholder_session_404s_not_500(self):
         """During the connect window the registry holds a _SessionPlaceholder
         (no _stream_active slot). /api/stream must treat it as not-ready and
