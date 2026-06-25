@@ -30,20 +30,20 @@ Environment=SESSION_TIMEOUT=300
 Environment=MAX_SESSIONS=50
 EnvironmentFile=/etc/websh/%i.env
 
-# Per-instance writable state (the credential vault lives here when
-# enabled: WEBSH_CREDS_PATH=/var/lib/websh-%i/websh.creds.json).
+# Per-instance writable state. StateDirectory pre-creates
+# /var/lib/websh-%i owned by the service user and keeps it writable
+# despite ProtectSystem=strict / ProtectHome=read-only, so the lazily
+# created websh.creds.json (mode 0600) has somewhere to live the moment
+# the vault is enabled. It is per-instance, so instances never share a
+# credential store.
 StateDirectory=websh-%i
 
 # The encrypted credential vault is available but OFF by default. To turn
-# it on, `systemctl edit websh` and add `Environment=WEBSH_VAULT_ENABLE=1`
-# (the cryptography wheel from requirements.txt must be installed; without
-# it the server still runs and the saved-credential UI just stays hidden).
-# StateDirectory pre-creates /var/lib/websh owned by the service user and
-# keeps it writable despite ProtectSystem=strict / ProtectHome=read-only,
-# so the lazily created websh.creds.json (mode 0600) has somewhere to live
-# the moment the vault is enabled.
-Environment=WEBSH_CREDS_PATH=/var/lib/websh/websh.creds.json
-StateDirectory=websh
+# it on, `systemctl edit websh@<instance>` and add
+# `Environment=WEBSH_VAULT_ENABLE=1` (the cryptography wheel from
+# requirements.txt must be installed; without it the server still runs and
+# the saved-credential UI just stays hidden).
+Environment=WEBSH_CREDS_PATH=/var/lib/websh-%i/websh.creds.json
 
 User=websh
 Group=websh
