@@ -1872,20 +1872,24 @@ function tmuxSwitchToShortLived(id) {
 // for future closes (preference lives in localStorage).
 let pendingTerminate = null;
 
+const _confirmTrap = makeModalTrap('confirmOv', () => confirmCancel());
 function showTerminateModal(p, onConfirm) {
   pendingTerminate = onConfirm;
   // Prefer the human label (saved name or connection name) over the raw
   // host IP — matches what the user sees in the pane's title bar.
   let name = p.label || p.connection || p.host || 'server';
   $('cfTitle').textContent = 'Terminate session on ' + name + '?';
-  $('confirmOv').classList.remove('h');
+  // Initial focus on Cancel — the safe default for a destructive
+  // confirm; Escape cancels too (previously this dialog trapped
+  // neither focus nor Escape).
+  _confirmTrap.open(() => $('confirmOv').querySelector('button'));
 }
 function confirmCancel() {
-  $('confirmOv').classList.add('h');
+  _confirmTrap.close();
   pendingTerminate = null;
 }
 function confirmTerminate(neverAgain) {
-  $('confirmOv').classList.add('h');
+  _confirmTrap.close();
   let cb = pendingTerminate;
   pendingTerminate = null;
   if (cb) cb(!!neverAgain);
@@ -2772,57 +2776,82 @@ function _maybeAutoDropLegacy() {
 // user sees the connect overlay only AFTER they've acknowledged the
 // migration message.
 let _deferredAfterLegacyModal = null;
-// A11y plumbing mirrors signOutModal: Esc closes, Tab traps focus
-// inside the dialog, focus is restored on close. Without these the
-// modal had role=dialog/aria-modal but Tab leaked to the page behind
-// it and Esc did nothing.
-let _legacyUpdatePrevFocus = null;
-let _legacyUpdateKeyHandler = null;
-function openLegacyUpdateModal() {
-  let modal = $('legacyUpdateModal'); if (!modal) return;
-  // Defensive: if a previous open left a keydown listener wired
-  // (programmatic re-open without close), tear it down first so we
-  // don't leak listeners or stomp on _legacyUpdatePrevFocus.
-  if (_legacyUpdateKeyHandler) {
-    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
-    _legacyUpdateKeyHandler = null;
-  }
-  _legacyUpdatePrevFocus = document.activeElement;
-  _legacyUpdateKeyHandler = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeLegacyUpdateModal(); return; }
-    if (e.key !== 'Tab') return;
-    let m = $('legacyUpdateModal'); if (!m) return;
-    let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
-    if (!focusables.length) return;
-    let first = focusables[0], last = focusables[focusables.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-    } else {
-      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-    }
+
+// ── Shared modal a11y plumbing ──────────────────────────────────────
+// Tab focus trap + Escape-to-close + focus restore, shared by every
+// dialog. makeModalTrap returns {open, close}; per-modal setup (field
+// resets, scope text, deferred actions) stays in the modal's own
+// open/close functions, which call into the trap.
+//   modalId   — element id of the dialog container
+//   onEscape  — called on Escape (the modal's own close/cancel function,
+//               so modal-specific close work always runs)
+// Assumes one trapped modal open at a time (each open adds a document
+// keydown listener; every full-screen .ov backdrop enforces this in
+// the UI today).
+function makeModalTrap(modalId, onEscape) {
+  let prevFocus = null;
+  let keyHandler = null;
+  return {
+    // initialFocus: optional () => element to focus after open (next
+    // tick, matching the implicit-default convention of the connect
+    // form). Defensive re-open without close tears the old listener
+    // down first so we don't leak it or stomp prevFocus.
+    open(initialFocus) {
+      if (keyHandler) this.close();
+      prevFocus = document.activeElement;
+      keyHandler = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); onEscape(); return; }
+        if (e.key !== 'Tab') return;
+        let m = $(modalId); if (!m) return;
+        let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
+        if (!focusables.length) return;
+        let first = focusables[0], last = focusables[focusables.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      };
+      document.addEventListener('keydown', keyHandler);
+      let modal = $(modalId);
+      if (modal) modal.classList.remove('h');
+      if (initialFocus) {
+        setTimeout(() => { try { let el = initialFocus(); el && el.focus(); } catch(e){} }, 0);
+      }
+    },
+    close() {
+      if (keyHandler) {
+        document.removeEventListener('keydown', keyHandler);
+        keyHandler = null;
+      }
+      let modal = $(modalId);
+      if (modal) modal.classList.add('h');
+      // Restore focus to whatever opened the modal — otherwise focus
+      // briefly lands on the page body and races any focusFirst logic.
+      if (prevFocus && typeof prevFocus.focus === 'function') {
+        try { prevFocus.focus(); } catch (e) {}
+      }
+      prevFocus = null;
+    },
   };
-  document.addEventListener('keydown', _legacyUpdateKeyHandler);
-  modal.classList.remove('h');
+}
+
+const _legacyUpdateTrap = makeModalTrap('legacyUpdateModal',
+                                        () => closeLegacyUpdateModal());
+function openLegacyUpdateModal() {
+  if (!$('legacyUpdateModal')) return;
   // Initial focus on the Got-it button so Enter dismisses; matches
   // the implicit-default convention used by the connect form.
-  setTimeout(() => { try { $('legacyUpdateOk').focus(); } catch(e){} }, 0);
+  _legacyUpdateTrap.open(() => $('legacyUpdateOk'));
 }
 
 function closeLegacyUpdateModal() {
-  let modal = $('legacyUpdateModal'); if (!modal) return;
-  if (_legacyUpdateKeyHandler) {
-    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
-    _legacyUpdateKeyHandler = null;
-  }
-  modal.classList.add('h');
-  // Restore focus to whatever opened the modal before draining the
-  // deferred autoconnect — otherwise focus would briefly land back
-  // on (e.g.) the page body and the connect form's focusFirst would
-  // race against it.
-  if (_legacyUpdatePrevFocus && typeof _legacyUpdatePrevFocus.focus === 'function') {
-    try { _legacyUpdatePrevFocus.focus(); } catch (e) {}
-  }
-  _legacyUpdatePrevFocus = null;
+  if (!$('legacyUpdateModal')) return;
+  // Trap close also restores focus to whatever opened the modal before
+  // draining the deferred autoconnect — otherwise focus would briefly
+  // land on the page body and the connect form's focusFirst would race
+  // against it.
+  _legacyUpdateTrap.close();
   // Drain the queued post-modal action (typically doAutoConnect).
   if (_deferredAfterLegacyModal) {
     let fn = _deferredAfterLegacyModal;
@@ -3730,17 +3759,20 @@ function cancelDownload(id) {
 // ── File browser ─────────────────────────────────────────────────────
 let _fbId = null;
 
+const _fbTrap = makeModalTrap('fbOv', () => closeFb());
 function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
   $('fbManual').value = '';
-  $('fbOv').classList.remove('h');
+  // Escape now closes the browser and Tab cycles inside it (previously
+  // neither worked); focus starts in the manual-path input.
+  _fbTrap.open(() => $('fbManual'));
   loadFbDir('~');
 }
 
 function closeFb() {
-  $('fbOv').classList.add('h');
+  _fbTrap.close();
   _fbId = null;
 }
 
@@ -4167,14 +4199,8 @@ function closeOptions(){ $('ovOpt').classList.add('h'); }
 // gate because the action is irreversible. WCAG: role=dialog +
 // aria-modal in the markup; focus trap + Escape + restore-focus
 // wired here. (Finding 9 in the PR-67 review.)
-let _signOutPrevFocus = null;
-let _signOutKeyHandler = null;
+const _signOutTrap = makeModalTrap('signOutModal', () => closeSignOutModal());
 function openSignOutModal() {
-  // Defensive: if a previous open left a keydown listener wired (no
-  // current call site does this, but a future programmatic open might),
-  // tear it down first so we don't leak listeners or stomp on
-  // _signOutPrevFocus.
-  if (_signOutKeyHandler) closeSignOutModal();
   let input = $('signOutInput');
   let confirm = $('signOutConfirm');
   let status = $('signOutStatus');
@@ -4208,40 +4234,13 @@ function openSignOutModal() {
         '. Live sessions opened from these cards will disconnect across all tabs.';
     }
   }
-  _signOutPrevFocus = document.activeElement;
-  // Tab focus trap + Escape handler. Bound to document so it fires
-  // regardless of which focusable inside the modal currently holds
-  // focus. Both are removed in closeSignOutModal.
-  _signOutKeyHandler = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeSignOutModal(); return; }
-    if (e.key !== 'Tab') return;
-    let modal = $('signOutModal'); if (!modal) return;
-    let focusables = modal.querySelectorAll('input:not([disabled]),button:not([disabled])');
-    if (!focusables.length) return;
-    let first = focusables[0], last = focusables[focusables.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-    } else {
-      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-    }
-  };
-  document.addEventListener('keydown', _signOutKeyHandler);
-  $('signOutModal').classList.remove('h');
-  setTimeout(() => { try { input && input.focus(); } catch(e){} }, 0);
+  _signOutTrap.open(() => input);
 }
 
 function closeSignOutModal() {
-  if (_signOutKeyHandler) {
-    document.removeEventListener('keydown', _signOutKeyHandler);
-    _signOutKeyHandler = null;
-  }
-  $('signOutModal').classList.add('h');
-  // Restore focus to whatever opened the modal (typically the
-  // "Sign out of this browser" button in the Options panel).
-  if (_signOutPrevFocus && typeof _signOutPrevFocus.focus === 'function') {
-    try { _signOutPrevFocus.focus(); } catch (e) {}
-  }
-  _signOutPrevFocus = null;
+  // Trap close restores focus to whatever opened the modal (typically
+  // the "Sign out of this browser" button in the Options panel).
+  _signOutTrap.close();
 }
 
 async function confirmSignOut() {

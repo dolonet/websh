@@ -2875,6 +2875,47 @@ test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
   cleanup(env);
 });
 
+test('terminate-confirm and file-browser dialogs: Esc closes via shared trap', async () => {
+  // makeModalTrap parity: the previously untrapped dialogs (confirmOv,
+  // fbOv) now get Escape-to-dismiss, initial focus, and focus restore.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-trap', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', response: {path: '/home/u', entries: []}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+  // confirmOv: Escape cancels (does NOT terminate).
+  let confirmed = 0;
+  win.showTerminateModal(p, () => { confirmed++; });
+  await sleep(10);
+  ok(!hidden($(win, 'confirmOv')), 'terminate confirm open');
+  ok(win.document.activeElement ===
+       $(win, 'confirmOv').querySelector('button'),
+     'initial focus on Cancel (safe default)');
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Escape', bubbles: true, cancelable: true}));
+  await sleep(10);
+  ok(hidden($(win, 'confirmOv')), 'Esc closes the terminate confirm');
+  ok(confirmed === 0, 'Esc cancels — terminate callback NOT fired');
+  // fbOv: Escape closes the file browser.
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(!hidden($(win, 'fbOv')), 'file browser open');
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Escape', bubbles: true, cancelable: true}));
+  await sleep(10);
+  ok(hidden($(win, 'fbOv')), 'Esc closes the file browser');
+  cleanup(env);
+});
+
 test('proto mismatch surfaces a reload toast; absent/equal stay silent', async () => {
   // Server upgraded across a breaking wire change while the tab stayed
   // open -> /api/config carries a different proto -> warn toast. An
