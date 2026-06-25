@@ -1479,6 +1479,11 @@ class SSHSession(object):
         # uses a selector — see _build_session_selector and the
         # interleaved-short-waits loop in wait_for_data.
         self._data_event = Event()
+        # Write ends of per-WAIT wake socketpairs (see wait_for_data):
+        # _signal() pokes one byte into each so a parked waiter wakes
+        # from a single blocking select instead of polling in slices.
+        self._waiters = set()
+        self._waiters_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
         # At most one /api/stream consumer per session. SSHSession.read()
@@ -1922,11 +1927,28 @@ class SSHSession(object):
     def _signal(self):
         """Wake any consumer thread blocked in wait_for_data(). Setting
         an already-set Event is a no-op, so wakeups coalesce naturally.
-        Event.set() does not raise."""
+        Event.set() does not raise. Parked waiters additionally get one
+        byte on their per-wait wake socket so they return from a single
+        blocking select; a full pipe / closed peer is irrelevant (any
+        readable byte means wake, and the waiter is tearing down)."""
         ev = self._data_event
         if ev is None:
             return
         ev.set()
+        waiters = getattr(self, "_waiters", None)
+        if not waiters:
+            return
+        # Send UNDER the lock: the waiter's finally discards its socket
+        # under the same lock before closing it, so a send can never
+        # overlap a close — without this, a send racing the close could
+        # in principle hit a recycled fd number (send is non-blocking,
+        # so the hold time is bounded).
+        with self._waiters_lock:
+            for w in list(waiters):
+                try:
+                    w.send(b"x")
+                except (OSError, ValueError):
+                    pass
 
     # Slice length for the interleaved short-wait loop in wait_for_data.
     # The Event itself wakes within microseconds of _signal(); the slice
@@ -1974,6 +1996,69 @@ class SSHSession(object):
         if ev.is_set():
             ev.clear()
             return
+        waiters = getattr(self, "_waiters", None)
+        if waiters is not None:
+            # Parked path: one blocking select on (wake socket, client
+            # socket) for the whole timeout — zero wakeups while idle,
+            # vs 50/second in the slice loop below. The socketpair is
+            # PER WAIT: registered under the lock, discarded under
+            # the same lock before closing (and _signal sends under it
+            # too), so nothing outlives the wait and a signal can never
+            # touch a closed/recycled fd. The Event stays as the state
+            # carrier.
+            try:
+                wake_r, wake_w = socket.socketpair()
+            except OSError:
+                wake_r = wake_w = None   # fd exhaustion: slice fallback
+            if wake_r is not None:
+                sel = None
+                try:
+                    wake_r.setblocking(False)
+                    wake_w.setblocking(False)
+                    with self._waiters_lock:
+                        waiters.add(wake_w)
+                    # A signal may have landed between the is_set()
+                    # check above and our registration — it would have
+                    # missed our wake socket. Re-check.
+                    if ev.is_set():
+                        ev.clear()
+                        return
+                    try:
+                        sel = selectors.DefaultSelector()
+                    except OSError:
+                        # epoll-fd exhaustion: fall through to the slice
+                        # loop below (the finally cleans the pair up).
+                        sel = None
+                    if sel is None:
+                        wake_r_failed = True
+                    else:
+                        wake_r_failed = False
+                        sel.register(wake_r, selectors.EVENT_READ)
+                    if not wake_r_failed:
+                        if client_socket is not None:
+                            try:
+                                sel.register(client_socket,
+                                             selectors.EVENT_READ)
+                            except (KeyError, ValueError, OSError):
+                                pass
+                        sel.select(timeout)
+                        if ev.is_set():
+                            ev.clear()
+                        return
+                finally:
+                    with self._waiters_lock:
+                        waiters.discard(wake_w)
+                    if sel is not None:
+                        try:
+                            sel.close()
+                        except Exception:
+                            pass
+                    for sock in (wake_r, wake_w):
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+
         deadline = time.time() + timeout
         while True:
             remaining = deadline - time.time()

@@ -46,6 +46,134 @@ class _FakeNotifyMixin(object):
         time.sleep(min(timeout, 0.01))
 
 
+class TestParkedWaiterWake(unittest.TestCase):
+    """The per-wait socketpair path: instant wake from _signal while
+    parked in ONE blocking select, FIN wake via the client socket, and
+    teardown while a waiter is parked."""
+
+    def _session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._data_event = threading.Event()
+        s._waiters = set()
+        s._waiters_lock = threading.Lock()
+        return s
+
+    def test_signal_wakes_parked_waiter_fast(self):
+        s = self._session()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)            # let it park
+        t0 = time.time()
+        s._signal()
+        th.join(2)
+        self.assertTrue(woke, "waiter never returned")
+        self.assertLess(time.time() - t0, 0.5,
+                        "signal wake took too long")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0, "wake socket leaked")
+
+    def test_client_fin_wakes_parked_waiter(self):
+        import socket as _socket
+        s = self._session()
+        a, b = _socket.socketpair()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(a, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        b.close()                  # FIN
+        th.join(2)
+        a.close()
+        self.assertTrue(woke and woke[0] < 1.0,
+                        "FIN did not wake the parked waiter; %r" % woke)
+
+    def test_close_while_parked_does_not_hang_or_crash(self):
+        s = self._session()
+        s.alive = True
+        s.master_fd = -1
+        s.pid = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = True
+        s._exit_status = 0
+        s._key_file = None
+        s._control_path = None
+        s.persistent = False
+        s.slot_id = None
+        done = []
+        def waiter():
+            s.wait_for_data(None, timeout=5)
+            done.append(1)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        s.close()                  # signals via _signal()
+        th.join(2)
+        self.assertTrue(done, "waiter did not return after close()")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0)
+
+    def test_signal_in_registration_window_is_not_lost(self):
+        # The lost-wakeup window: a signal that lands AFTER the first
+        # is_set() check but BEFORE the wake socket is registered gets
+        # no byte — the post-registration re-check must catch it.
+        # Deterministic: fire the signal from inside socketpair(),
+        # which runs exactly inside that window.
+        s = self._session()
+        import socket as _socket
+        real_pair = _socket.socketpair
+        def evil_pair(*a, **kw):
+            s._data_event.set()      # the signal, mid-window
+            return real_pair(*a, **kw)
+        orig = server.socket.socketpair
+        server.socket.socketpair = evil_pair
+        try:
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            self.assertLess(time.time() - t0, 0.5,
+                            "mid-window signal was lost")
+            self.assertFalse(s._data_event.is_set())
+        finally:
+            server.socket.socketpair = orig
+
+    def test_socketpair_exhaustion_falls_back_to_slice_loop(self):
+        s = self._session()
+        orig = server.socket.socketpair
+        server.socket.socketpair = unittest.mock.Mock(
+            side_effect=OSError("EMFILE"))
+        try:
+            woke = []
+            def waiter():
+                t0 = time.time()
+                s.wait_for_data(None, timeout=5)
+                woke.append(time.time() - t0)
+            th = threading.Thread(target=waiter, daemon=True)
+            th.start()
+            time.sleep(0.1)
+            s._signal()
+            th.join(2)
+            self.assertTrue(woke, "fallback waiter never returned")
+            self.assertLess(woke[0], 1.0,
+                            "slice-loop fallback did not wake on signal")
+        finally:
+            server.socket.socketpair = orig
+
+    def test_pre_set_event_returns_immediately_without_socketpair(self):
+        s = self._session()
+        s._data_event.set()
+        t0 = time.time()
+        s.wait_for_data(None, timeout=5)
+        self.assertLess(time.time() - t0, 0.1)
+        self.assertFalse(s._data_event.is_set(), "event consumed")
+
+
 class TestClamp(unittest.TestCase):
 
     def test_valid(self):
