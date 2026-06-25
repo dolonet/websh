@@ -143,15 +143,60 @@ const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_INPUT_BODY = 8 * 1024 * 1024;
 let authMode = 'pw';
 
-const darkTheme = {
-  background:'#0d1117',foreground:'#e6edf3',cursor:'#58a6ff',cursorAccent:'#0d1117',
-  selectionBackground:'rgba(88,166,255,0.3)',
-  black:'#484f58',red:'#ff7b72',green:'#3fb950',yellow:'#d29922',
-  blue:'#58a6ff',magenta:'#bc8cff',cyan:'#39d353',white:'#b1bac4',
-  brightBlack:'#6e7681',brightRed:'#ffa198',brightGreen:'#56d364',
-  brightYellow:'#e3b341',brightBlue:'#79c0ff',brightMagenta:'#d2a8ff',
-  brightCyan:'#56d364',brightWhite:'#f0f6fc'
+// ── Themes ──────────────────────────────────────────────────────────
+// One table drives every color surface: the CSS custom properties on
+// :root (the same literals ship in index.html so there is no unstyled
+// flash before this script runs), xterm's per-pane theme object, and
+// the scrollback-search decoration colors. A new theme is one more
+// entry here; applyTheme() repaints live panes in place.
+const THEMES = {
+  dark: {
+    css: {
+      bg:'#0d1117', sf:'#161b22', bd:'#30363d', tx:'#e6edf3',
+      dim:'#8b949e', ac:'#58a6ff', ach:'#79c0ff', dg:'#f85149',
+      ok:'#3fb950', wn:'#d29922',
+      // Options-panel preview swatches, derived from the terminal
+      // palette (red / brightYellow / a dimmed foreground).
+      'preview-red':'#ff7b72', 'preview-yel':'#e3b341',
+      'preview-dim':'#7d8590',
+    },
+    xterm: {
+      background:'#0d1117',foreground:'#e6edf3',cursor:'#58a6ff',cursorAccent:'#0d1117',
+      selectionBackground:'rgba(88,166,255,0.3)',
+      black:'#484f58',red:'#ff7b72',green:'#3fb950',yellow:'#d29922',
+      blue:'#58a6ff',magenta:'#bc8cff',cyan:'#39d353',white:'#b1bac4',
+      brightBlack:'#6e7681',brightRed:'#ffa198',brightGreen:'#56d364',
+      brightYellow:'#e3b341',brightBlue:'#79c0ff',brightMagenta:'#d2a8ff',
+      brightCyan:'#56d364',brightWhite:'#f0f6fc'
+    },
+    search: {
+      matchBackground: '#264f78',
+      matchBorder: '#3a6fa5',
+      matchOverviewRuler: '#58a6ff',
+      activeMatchBackground: '#a07b00',
+      activeMatchBorder: '#d29922',
+      activeMatchColorOverviewRuler: '#d29922',
+    },
+  },
 };
+let currentTheme = 'dark';
+
+function themeXterm() {
+  return (THEMES[currentTheme] || THEMES.dark).xterm;
+}
+
+function applyTheme(name) {
+  let t = THEMES[name] || THEMES.dark;
+  currentTheme = THEMES[name] ? name : 'dark';
+  let root = document.documentElement.style;
+  Object.keys(t.css).forEach(k => root.setProperty('--' + k, t.css[k]));
+  // Live panes: xterm repaints when options.theme is reassigned.
+  Object.keys(panes).forEach(id => {
+    let term = panes[id].term;
+    if (term && term.options) term.options.theme = t.xterm;
+  });
+  SEARCH_OPTS.decorations = Object.assign({}, t.search);
+}
 
 function createPane(container) {
   let id = 'p' + (++paneCounter);
@@ -203,7 +248,7 @@ function createPane(container) {
     fontWeight: settings.fontWeight,
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
-    theme: darkTheme,
+    theme: themeXterm(),
     allowProposedApi:true, scrollback:50000
   });
   term.loadAddon(fit);
@@ -3867,14 +3912,7 @@ function fbDownloadManual() {
 // gets painted, not just the current one). Without it, only the active
 // match is rendered — and the PR-description perf note about
 // highlightLimit defends a code path the addon never takes.
-const SEARCH_OPTS = {decorations: {
-  matchBackground: '#264f78',
-  matchBorder: '#3a6fa5',
-  matchOverviewRuler: '#58a6ff',
-  activeMatchBackground: '#a07b00',
-  activeMatchBorder: '#d29922',
-  activeMatchColorOverviewRuler: '#d29922',
-}};
+const SEARCH_OPTS = {decorations: Object.assign({}, THEMES.dark.search)};
 function activeSearch() { let p=panes[activeId]; return p?p.searchAddon:null }
 function toggleSearch() {
   let p=panes[activeId]; if(!p) return;
@@ -4642,6 +4680,7 @@ function tryRestoreSessions() {
 // before the change is an orphan. Remove it once so a fresh devtools
 // pass on a returning user's browser doesn't show stray entries.
 try { localStorage.removeItem('websh_theme'); } catch(e){}
+applyTheme(currentTheme);
 
 // Open the vault BroadcastChannel early so a sign-out fired in another
 // tab during loadServerConfig still gets observed by this tab.

@@ -3004,6 +3004,34 @@ test('form_defaults never overwrite user-typed values or apply under restrict_ho
   cleanup(env2);
 });
 
+test('applyTheme repaints live panes and sets CSS vars; unknown falls back', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-theme', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+  // The default fake Terminal has no options bag; applyTheme writes
+  // options.theme only when the bag exists (real xterm always has it).
+  if (!p.term.options) p.term.options = {};
+  win.applyTheme('dark');
+  ok(p.term.options.theme && p.term.options.theme.background === '#0d1117',
+     'live pane repainted from the THEMES table');
+  ok(win.document.documentElement.style.getPropertyValue('--bg') === '#0d1117',
+     'CSS var set from the table');
+  win.applyTheme('no-such-theme');
+  ok(p.term.options.theme.background === '#0d1117',
+     'unknown theme falls back to dark');
+  cleanup(env);
+});
+
 // =====================================================================
 // Vault: manual-pane plaintext lives in sessionStorage
 // =====================================================================
