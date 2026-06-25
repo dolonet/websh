@@ -7,6 +7,7 @@ import json
 import os
 import re
 import selectors
+import shutil
 import signal
 import socket
 import subprocess
@@ -44,6 +45,173 @@ class _FakeNotifyMixin(object):
         # Mirror Session.wait_for_data's _data_event=None fallback so
         # the protocol-level loop progresses without busy-spinning.
         time.sleep(min(timeout, 0.01))
+
+
+class LiveServerCase(unittest.TestCase):
+    """Shared fixture for integration tests that hit a live HTTP server.
+
+    Subclasses declare what they need instead of hand-rolling
+    setUpClass/tearDownClass:
+
+      CONFIG       dict written to <tmpdir>/websh.json and exported via
+                   WEBSH_CONFIG (config caches reset around the class).
+                   None = the config machinery is left untouched, which
+                   matches the old bare-server fixtures: with WEBSH_CONFIG
+                   unset, load_config() returns _CONFIG_EMPTY regardless
+                   of any cache state.
+      ENV          extra os.environ entries for the class duration.
+      GLOBALS      server-module globals to set for the class duration;
+                   snapshotted in setUpClass, restored in tearDownClass.
+      CREDS        optional dict written to <tmpdir>/websh.creds.json
+                   (implies CREDS_PATH).
+      CREDS_PATH   True = allocate cls.creds_path inside the tempdir,
+                   export it via WEBSH_CREDS_PATH and reset the creds
+                   caches (no file written unless CREDS is set).
+      START_SERVER False = fixture only (tempdir/env/globals), no server.
+
+    The server listens on an ephemeral port; readiness is confirmed by
+    polling /api/ping (up to ~5 s in 10 ms steps) instead of the flat
+    0.2 s sleep the old per-class fixtures used.
+    """
+
+    CONFIG = None
+    ENV = {}
+    GLOBALS = {}
+    CREDS = None
+    CREDS_PATH = False
+    START_SERVER = True
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp()
+        cls._env_keys = []
+        cls._globals_snapshot = {}
+        cls.httpd = None
+
+        if cls.CONFIG is not None:
+            cfg_path = os.path.join(cls.tmpdir, "websh.json")
+            with open(cfg_path, "w") as f:
+                json.dump(cls.CONFIG, f)
+            cls._setenv("WEBSH_CONFIG", cfg_path)
+            server._config_cache = None
+            server._config_mtime = 0
+
+        for key, value in cls.ENV.items():
+            cls._setenv(key, value)
+
+        if cls.CREDS is not None or cls.CREDS_PATH:
+            cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
+            cls._setenv("WEBSH_CREDS_PATH", cls.creds_path)
+            if cls.CREDS is not None:
+                with open(cls.creds_path, "w") as f:
+                    json.dump(cls.CREDS, f)
+            server._creds_cache = None
+            server._creds_cache_key = (0, 0)
+
+        for name, value in cls.GLOBALS.items():
+            cls._globals_snapshot[name] = getattr(server, name)
+            setattr(server, name, value)
+
+        if cls.START_SERVER:
+            server.HOST = "127.0.0.1"
+            cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+            cls.port = cls.httpd.server_address[1]
+            server.PORT = cls.port
+            cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                          daemon=True)
+            cls.thread.start()
+            cls._wait_ready()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.httpd is not None:
+            cls.httpd.shutdown()
+            cls.httpd.server_close()
+        for name, value in cls._globals_snapshot.items():
+            setattr(server, name, value)
+        for key in cls._env_keys:
+            os.environ.pop(key, None)
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+        if cls.CONFIG is not None:
+            server._config_cache = None
+            server._config_mtime = 0
+        if cls.CREDS is not None or cls.CREDS_PATH:
+            server._creds_cache = None
+            server._creds_cache_key = (0, 0)
+
+    @classmethod
+    def _setenv(cls, key, value):
+        os.environ[key] = value
+        cls._env_keys.append(key)
+
+    @classmethod
+    def _wait_ready(cls):
+        from urllib.request import urlopen
+        url = "http://127.0.0.1:{}/api/ping".format(cls.port)
+        deadline = time.time() + 5
+        while True:
+            try:
+                with urlopen(url, timeout=1) as resp:
+                    resp.read()
+                return
+            except Exception as e:
+                if hasattr(e, "code"):
+                    return  # any HTTP response means the server is up
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.01)
+
+    # ── shared HTTP helpers ───────────────────────────────────────────
+
+    def _server_url(self, path):
+        return "http://127.0.0.1:{}{}".format(self.port, path)
+
+    def _request_raw(self, path, data=None, method=None, headers=None,
+                     timeout=5):
+        """Raw request → (status, body bytes). HTTP error responses are
+        returned, not raised; transport errors propagate."""
+        from urllib.request import urlopen, Request
+        req = Request(self._server_url(path), data=data, method=method,
+                      headers=headers or {})
+        try:
+            resp = urlopen(req, timeout=timeout)
+            return resp.getcode(), resp.read()
+        except Exception as e:
+            if hasattr(e, "code"):
+                payload = e.read() if hasattr(e, "read") else b""
+                return e.code, payload
+            raise
+
+    # Classes that historically tolerated non-JSON bodies (the vault API
+    # tests asserted on a {"_raw": ...} shape) opt in; everyone else
+    # keeps the strict implicit contract that every API response —
+    # including errors — is JSON, so a stdlib HTML send_error leaking
+    # out fails the test instead of slipping through.
+    TOLERANT_JSON = False
+
+    def _request_json(self, path, data=None, method=None, headers=None,
+                      timeout=5):
+        """JSON request → (parsed body, status). Non-JSON payloads
+        raise (TOLERANT_JSON=False) or come back as {"_raw": <text>}."""
+        code, payload = self._request_raw(path, data=data, method=method,
+                                          headers=headers, timeout=timeout)
+        try:
+            return json.loads(payload.decode("utf-8")), code
+        except ValueError:
+            if self.TOLERANT_JSON:
+                return {"_raw": payload.decode("utf-8", "replace")}, code
+            raise
+
+    def _get(self, path):
+        return self._request_json(path)
+
+    def _post(self, path, body, timeout=5):
+        return self._request_json(
+            path, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, timeout=timeout)
+
+    def _delete(self, path):
+        return self._request_raw(path, method="DELETE")
 
 
 class TestParkedWaiterWake(unittest.TestCase):
@@ -939,7 +1107,7 @@ class TestIsHostAllowed(unittest.TestCase):
 
 @unittest.skipUnless(server.HAS_CRYPTOGRAPHY,
                      "cryptography not installed; saved-card HTTP path needs AES-GCM")
-class TestSavedCardConnectAuthz(unittest.TestCase):
+class TestSavedCardConnectAuthz(LiveServerCase):
     """Integration: a saved vault card POSTed to /api/connect is gated by
     authorize_target even when it carries a `connection` hint — the hint must
     not let it skip the gate (call-site wiring). Covers the is_saved
@@ -954,29 +1122,26 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
     CARD_HOST = "192.0.2.10"   # TEST-NET-1 (RFC 5737) — never routable
     SCAN_HOSTS = ("198.51.100.1", "198.51.100.2", "198.51.100.3")  # TEST-NET-2
 
+    CONFIG = {
+        "restrict_hosts": True,
+        # Two prompt connections share the card's host:port — 'gate'
+        # (first) denies 'root', 'alt' allows it. A connection-name
+        # hint must be able to select 'alt' over the file-order first
+        # match.
+        "connections": [
+            {"name": "gate", "host": CARD_HOST, "port": 22,
+             "username": "", "denied_users": ["root"]},
+            {"name": "alt", "host": CARD_HOST, "port": 22,
+             "username": "", "allowed_users": ["root"]},
+        ],
+    }
+    CREDS_PATH = True
+    GLOBALS = {"WEBSH_VAULT_ENABLE": True, "_vault_disabled": False}
+
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        cls.tmpdir = tempfile.mkdtemp()
-        cfg_path = os.path.join(cls.tmpdir, "websh.json")
-        with open(cfg_path, "w") as f:
-            json.dump({
-                "restrict_hosts": True,
-                # Two prompt connections share the card's host:port — 'gate'
-                # (first) denies 'root', 'alt' allows it. A connection-name
-                # hint must be able to select 'alt' over the file-order first
-                # match.
-                "connections": [
-                    {"name": "gate", "host": cls.CARD_HOST, "port": 22,
-                     "username": "", "denied_users": ["root"]},
-                    {"name": "alt", "host": cls.CARD_HOST, "port": 22,
-                     "username": "", "allowed_users": ["root"]},
-                ],
-            }, f)
-        os.environ["WEBSH_CONFIG"] = cfg_path
-        server._config_cache = None
-        server._config_mtime = 0
-
         # Credential blobs AAD-bound to (VAULT, conn_id), each decryptable with
         # the one vault key. host/username here are what authorize_target sees.
         cls.key = AESGCM.generate_key(bit_length=256)
@@ -995,37 +1160,11 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
         for conn, host in zip((cls.SCAN1, cls.SCAN2, cls.SCAN3),
                               cls.SCAN_HOSTS):
             slot[conn] = _rec(conn, host, "root")
-        creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
-        with open(creds_path, "w") as f:
+        with open(cls.creds_path, "w") as f:
             json.dump({"version": server._CREDS_SCHEMA_VERSION,
                        "vaults": {cls.VAULT: slot}}, f)
-        os.environ["WEBSH_CREDS_PATH"] = creds_path
         server._creds_cache = None
         server._creds_cache_key = (0, 0)
-
-        cls._vault_enable = server.WEBSH_VAULT_ENABLE
-        cls._vault_disabled = server._vault_disabled
-        server.WEBSH_VAULT_ENABLE = True
-        server._vault_disabled = False
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        server.WEBSH_VAULT_ENABLE = cls._vault_enable
-        server._vault_disabled = cls._vault_disabled
-        os.environ.pop("WEBSH_CONFIG", None)
-        os.environ.pop("WEBSH_CREDS_PATH", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
 
     def setUp(self):
         server._rate_limits.clear()
@@ -1033,18 +1172,7 @@ class TestSavedCardConnectAuthz(unittest.TestCase):
             server.sessions.clear()
 
     def _connect(self, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}/api/connect".format(self.port)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
+        return self._post("/api/connect", body)
 
     def test_saved_card_with_connection_hint_still_enforces_denied_users(self):
         """The card (server-resolved user 'root') targets a host whose only
@@ -1641,70 +1769,16 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertNotIn("form_defaults", pub)
 
 
-class TestHTTPApi(unittest.TestCase):
+class TestHTTPApi(LiveServerCase):
     """Integration tests: start the server and hit the API with HTTP."""
 
-    @classmethod
-    def setUpClass(cls):
-        # Use a random port to avoid conflicts
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({
-                "restrict_hosts": True,
-                "connections": [
-                    {"name": "allowed", "host": "localhost", "port": 22,
-                     "username": "testuser", "password": "testpass"}
-                ]
-            }, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
-
-    def _get(self, path):
-        if sys.version_info >= (3, 0):
-            from urllib.request import urlopen
-            from urllib.error import HTTPError
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        try:
-            resp = urlopen(url, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, 'read'):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
-
-    def _post(self, path, body):
-        if sys.version_info >= (3, 0):
-            from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, 'read'):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
+    CONFIG = {
+        "restrict_hosts": True,
+        "connections": [
+            {"name": "allowed", "host": "localhost", "port": 22,
+             "username": "testuser", "password": "testpass"}
+        ]
+    }
 
     def test_ping(self):
         body, code = self._get("/api/ping")
@@ -2289,69 +2363,24 @@ class TestHTTPApi(unittest.TestCase):
         self.assertEqual(code, 400)
 
 
-class TestPromptConnectHTTP(unittest.TestCase):
+class TestPromptConnectHTTP(LiveServerCase):
     """Named /api/connect for Prompt entries — body carries creds, server
     enforces allowed_users / denied_users when no fixed username."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({
-                "connections": [
-                    {"name": "free", "host": "free.example.com"},
-                    {"name": "wl", "host": "wl.example.com",
-                     "allowed_users": ["alice", "bob"]},
-                    {"name": "bl", "host": "bl.example.com",
-                     "denied_users": ["root"]},
-                    {"name": "fixed", "host": "fx.example.com",
-                     "username": "ops", "allowed_users": ["neverchecked"]},
-                ]
-            }, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {
+        "connections": [
+            {"name": "free", "host": "free.example.com"},
+            {"name": "wl", "host": "wl.example.com",
+             "allowed_users": ["alice", "bob"]},
+            {"name": "bl", "host": "bl.example.com",
+             "denied_users": ["root"]},
+            {"name": "fixed", "host": "fx.example.com",
+             "username": "ops", "allowed_users": ["neverchecked"]},
+        ]
+    }
 
     def setUp(self):
         server._rate_limits.clear()
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}{}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            return json.loads(e.read().decode("utf-8")), e.code
-
-    def _get(self, path):
-        from urllib.request import urlopen
-        url = "http://127.0.0.1:{}{}".format(self.port, path)
-        try:
-            resp = urlopen(url, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            return json.loads(e.read().decode("utf-8")), e.code
 
     def test_config_lists_kinds(self):
         body, code = self._get("/api/config")
@@ -2957,7 +2986,7 @@ def _make_stub_session_cls(spawn_delay=0.0):
     return _StubSession
 
 
-class TestPerIpSessionCapHTTP(unittest.TestCase):
+class TestPerIpSessionCapHTTP(LiveServerCase):
     """Integration: per-IP cap returns 429 before reaching the SSH spawn.
 
     Plants fake session objects in the live registry and posts to
@@ -2969,31 +2998,7 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
     test servers).
     """
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
 
     def setUp(self):
         server._rate_limits.clear()
@@ -3027,18 +3032,7 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
         return s
 
     def _post(self, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}/api/connect".format(self.port)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
+        return LiveServerCase._post(self, "/api/connect", body)
 
     _PAYLOAD = {"host": "ignored.example", "username": "u",
                 "password": "p", "cols": 80, "rows": 24}
@@ -3110,7 +3104,7 @@ class TestPerIpSessionCapHTTP(unittest.TestCase):
         self.assertIn("from your IP", body2.get("error", ""))
 
 
-class TestPerIpSessionCapConcurrency(unittest.TestCase):
+class TestPerIpSessionCapConcurrency(LiveServerCase):
     """Regression: per-IP cap must not be racy under concurrent connects.
 
     The original implementation released sessions_lock between the gate
@@ -3126,31 +3120,7 @@ class TestPerIpSessionCapConcurrency(unittest.TestCase):
     fire cap+5 concurrent POSTs and assert exactly `cap` succeed.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
 
     def setUp(self):
         server._rate_limits.clear()
@@ -3180,22 +3150,14 @@ class TestPerIpSessionCapConcurrency(unittest.TestCase):
         server.SSHSession = self._orig_session_cls
 
     def _post(self):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}/api/connect".format(self.port)
-        body = json.dumps({"host": "ignored.example", "username": "u",
-                           "password": "p", "cols": 80, "rows": 24}).encode("utf-8")
-        req = Request(url, data=body,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=10)
-            return resp.getcode(), json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            if hasattr(e, "read") and hasattr(e, "code"):
-                try:
-                    return e.code, json.loads(e.read().decode("utf-8"))
-                except Exception:
-                    return e.code, {}
-            raise
+        # timeout=10: cap+5 concurrent connects with spawn_delay can
+        # queue behind each other on a loaded box; the old fixture
+        # deliberately doubled the default.
+        body, code = LiveServerCase._post(
+            self, "/api/connect",
+            {"host": "ignored.example", "username": "u",
+             "password": "p", "cols": 80, "rows": 24}, timeout=10)
+        return code, body
 
     def test_concurrent_connects_respect_cap(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -4028,55 +3990,16 @@ class TestSessionNotify(unittest.TestCase):
 # slot_id/tmux_cmd validation happens before any host/connection check,
 # so responses are deterministic 400s.
 
-class TestConnectValidation(unittest.TestCase):
+class TestConnectValidation(LiveServerCase):
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        # No restrict_hosts, no connections — tests only exercise the
-        # early-validation codepath.
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    # No restrict_hosts, no connections — tests only exercise the
+    # early-validation codepath.
+    CONFIG = {"connections": []}
 
     def setUp(self):
         # Rate limiter is process-global; clear it between tests so a
         # handful of POSTs don't exhaust the budget.
         server._rate_limits.clear()
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, 'read'):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
 
     def test_persistent_without_slot_id_rejected(self):
         body, code = self._post("/api/connect", {
@@ -5062,40 +4985,10 @@ class TestPushTmuxOptions(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
+class TestTmuxOptionsHTTPDispatch(LiveServerCase):
     """HTTP-level dispatch for POST /api/tmux_options — checks routing,
     body validation, and unknown-session handling. Live ssh is mocked
     via push_tmux_options."""
-
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(
-            target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}{}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
 
     def test_unknown_session_404(self):
         body, code = self._post("/api/tmux_options",
@@ -5456,40 +5349,10 @@ class TestRemoveRemoteTmp(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-class TestUploadFinalizeHTTPDispatch(unittest.TestCase):
+class TestUploadFinalizeHTTPDispatch(LiveServerCase):
     """HTTP-level dispatch for /api/upload_finalize and /api/upload_cancel.
     The session methods are mocked; we're testing routing, body
     validation, and the non_persistent-vs-error response shape."""
-
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(
-            target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}{}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
 
     # ── /api/upload_finalize ──
     def test_finalize_unknown_session_404(self):
@@ -5649,26 +5512,10 @@ class TestUploadFinalizeHTTPDispatch(unittest.TestCase):
                 server.sessions.pop(sid, None)
 
 
-class TestUploadPathNULRejection(unittest.TestCase):
+class TestUploadPathNULRejection(LiveServerCase):
     """The /api/upload validator rejects \\x00 in rel_path because bash
     silently truncates NUL bytes in variable values, which would land
     a file at a different name than the client asked for."""
-
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(
-            target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
 
     def test_nul_byte_in_path_400(self):
         from urllib.request import urlopen, Request
@@ -5748,34 +5595,10 @@ class TestSlotIdSecurity(unittest.TestCase):
                 self.assertNotIn(bad_char, name)
 
 
-class TestDisconnectTerminateFlag(unittest.TestCase):
+class TestDisconnectTerminateFlag(LiveServerCase):
     """HTTP-level: /api/disconnect routes the terminate flag correctly."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
 
     def setUp(self):
         with server.sessions_lock:
@@ -5784,20 +5607,6 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
     def tearDown(self):
         with server.sessions_lock:
             server.sessions.clear()
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
 
     def _seed_fake(self, sid, persistent=True):
         s = server.SSHSession.__new__(server.SSHSession)
@@ -5869,7 +5678,7 @@ class TestDisconnectTerminateFlag(unittest.TestCase):
         self.assertEqual(code, 200)
 
 
-class TestEndToEndPersistent(unittest.TestCase):
+class TestEndToEndPersistent(LiveServerCase):
     """End-to-end: spawn a real SSHSession against localhost, verify
     the remote tmux session materializes, then verify
     terminate_remote_tmux actually kills it via the ControlMaster
@@ -5884,10 +5693,12 @@ class TestEndToEndPersistent(unittest.TestCase):
     in CI environments where the fixture is guaranteed.
     """
 
+    START_SERVER = False  # talks straight to SSHSession, no HTTP server
     _skip_reason = None
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls._skip_reason = cls._probe()
         if cls._skip_reason and os.environ.get("WEBSH_E2E") == "1":
             raise RuntimeError(
@@ -6185,35 +5996,12 @@ class TestDownloadFile(unittest.TestCase):
         self.assertEqual(captured.get("stderr"), subprocess.DEVNULL)
 
 
-class TestLsHTTPDispatch(unittest.TestCase):
+class TestLsHTTPDispatch(LiveServerCase):
     """HTTP-level tests for GET /api/ls."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(
-            target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
     def _get(self, qs):
-        from urllib.request import urlopen
-        url = "http://127.0.0.1:{}/api/ls?{}".format(self.port, qs)
-        try:
-            with urlopen(url) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            if hasattr(e, 'read'):
-                return json.loads(e.read())
-            raise
+        body, _code = LiveServerCase._get(self, "/api/ls?" + qs)
+        return body
 
     def test_invalid_session_404(self):
         r = self._get("session_id=not-a-uuid")
@@ -6252,37 +6040,17 @@ class TestLsHTTPDispatch(unittest.TestCase):
         self.assertIn("error", r)
 
 
-class TestDownloadHTTPDispatch(unittest.TestCase):
+class TestDownloadHTTPDispatch(LiveServerCase):
     """HTTP-level tests for GET /api/download."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(
-            target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
     def _url(self, qs):
-        return "http://127.0.0.1:{}/api/download?{}".format(self.port, qs)
+        # NB: query-string semantics, unlike LiveServerCase._server_url —
+        # several tests open this URL directly with urlopen.
+        return self._server_url("/api/download?" + qs)
 
     def _get_json(self, qs):
-        from urllib.request import urlopen
-        try:
-            with urlopen(self._url(qs)) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            if hasattr(e, 'read'):
-                return json.loads(e.read())
-            raise
+        body, _code = self._get("/api/download?" + qs)
+        return body
 
     def test_invalid_session_404(self):
         r = self._get_json("session_id=not-a-uuid&path=/etc/hosts")
@@ -6654,39 +6422,14 @@ class TestSanitizeForLog(unittest.TestCase):
         self.assertEqual(server._sanitize_for_log(None, 64), "None")
 
 
-class TestAccessLogConnectEvents(unittest.TestCase):
+class TestAccessLogConnectEvents(LiveServerCase):
     """Integration: each /api/connect rejection path emits the right event."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({
-                "restrict_hosts": False,
-                "denied_hosts": ["10.0.0.0/8", "blocked.example"],
-                "connections": [],
-            }, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {
+        "restrict_hosts": False,
+        "denied_hosts": ["10.0.0.0/8", "blocked.example"],
+        "connections": [],
+    }
 
     def setUp(self):
         server._rate_limits.clear()
@@ -6705,18 +6448,7 @@ class TestAccessLogConnectEvents(unittest.TestCase):
             return [json.loads(line) for line in f if line.strip()]
 
     def _post_connect(self, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}/api/connect".format(self.port)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
+        return self._post("/api/connect", body)
 
     def test_deny_blocked_emits_event(self):
         _, code = self._post_connect({
@@ -6850,7 +6582,7 @@ class TestAccessLogConnectEvents(unittest.TestCase):
             server.SSHSession = orig
 
 
-class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
+class TestRestrictHostsDoesNotFeedScanPattern(LiveServerCase):
     """Integration: under restrict_hosts: true, a manual /api/connect
     is rejected because the policy disallows free-form connects (use a
     named connection), NOT because the target was on the deny-list. So
@@ -6858,36 +6590,11 @@ class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
     buggy or stale UI POSTing `host` instead of `connection` from one
     legitimate IP could otherwise rapidly accumulate to a ban."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({
-                "restrict_hosts": True,
-                "denied_hosts": [],
-                "connections": [],
-            }, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {
+        "restrict_hosts": True,
+        "denied_hosts": [],
+        "connections": [],
+    }
 
     def setUp(self):
         # Generous rate-limit budget so 100 POSTs all reach the
@@ -6926,18 +6633,7 @@ class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
             return [json.loads(line) for line in f if line.strip()]
 
     def _post_connect(self, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{}/api/connect".format(self.port)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
+        return self._post("/api/connect", body)
 
     def test_restrict_hosts_does_not_feed_scan_pattern(self):
         """100 raw manual /api/connect POSTs from one IP, each to a
@@ -6964,35 +6660,11 @@ class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
                          .format(scan))
 
 
-class TestAccessLogDisconnectEvents(unittest.TestCase):
+class TestAccessLogDisconnectEvents(LiveServerCase):
     """Integration: /api/disconnect emits an access-log record with the
     right `result` value (and surfaces close failures via close_error)."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.tmpdir = tempfile.mkdtemp()
-        path = os.path.join(cls.tmpdir, "websh.json")
-        with open(path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = path
-        server._config_cache = None
-        server._config_mtime = 0
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
 
     def setUp(self):
         with server.sessions_lock:
@@ -7012,20 +6684,6 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
     def _read_records(self):
         with open(self.logfile.name, "r", encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, "read"):
-                return json.loads(e.read().decode("utf-8")), e.code
-            raise
 
     def _seed(self, sid, host="host.example", close_raises=None):
         class _Stub(object):
@@ -7104,44 +6762,17 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
         self.assertEqual(self._read_records(), [])
 
 
-class TestApiSave(unittest.TestCase):
+class TestApiSave(LiveServerCase):
+    TOLERANT_JSON = True
     """POST /api/save validation, upsert, gate."""
 
     VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
     CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
-        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
-        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
-        cls._old_enable = server.WEBSH_VAULT_ENABLE
-        server.WEBSH_VAULT_ENABLE = True
-        # Empty config so /api/save doesn't conflict with anything
-        cfg_path = os.path.join(cls.tmpdir, "websh.json")
-        with open(cfg_path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = cfg_path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        server.WEBSH_VAULT_ENABLE = cls._old_enable
-        os.environ.pop("WEBSH_CREDS_PATH", None)
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    # Empty config so /api/save doesn't conflict with anything
+    CONFIG = {"connections": []}
+    CREDS_PATH = True
+    GLOBALS = {"WEBSH_VAULT_ENABLE": True}
 
     def setUp(self):
         # Reset the creds cache so each test sees a fresh file
@@ -7150,24 +6781,6 @@ class TestApiSave(unittest.TestCase):
         server._rate_limits.clear()
         if os.path.exists(self.creds_path):
             os.unlink(self.creds_path)
-
-    def _post(self, path, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, 'read'):
-                payload = e.read().decode("utf-8")
-                try:
-                    return json.loads(payload), e.code
-                except ValueError:
-                    return {"_raw": payload}, e.code
-            raise
 
     def _valid_body(self, **overrides):
         body = {
@@ -7357,43 +6970,15 @@ class TestApiSave(unittest.TestCase):
         self.assertIn("StrictHostKeyChecking", stored)
 
 
-class TestApiSaveDelete(unittest.TestCase):
+class TestApiSaveDelete(LiveServerCase):
     """DELETE /api/save validation, reap-empty-vault, gate."""
 
     VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
     CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
-        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
-        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
-        cls._old_enable = server.WEBSH_VAULT_ENABLE
-        server.WEBSH_VAULT_ENABLE = True
-        cfg_path = os.path.join(cls.tmpdir, "websh.json")
-        with open(cfg_path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = cfg_path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        server.WEBSH_VAULT_ENABLE = cls._old_enable
-        os.environ.pop("WEBSH_CREDS_PATH", None)
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
+    CREDS_PATH = True
+    GLOBALS = {"WEBSH_VAULT_ENABLE": True}
 
     def setUp(self):
         server._creds_cache = None
@@ -7408,38 +6993,11 @@ class TestApiSaveDelete(unittest.TestCase):
             }}},
         })
 
-    def _delete(self, path):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}{1}".format(self.port, path)
-        req = Request(url, method="DELETE")
-        try:
-            resp = urlopen(req, timeout=5)
-            return resp.getcode(), resp.read()
-        except Exception as e:
-            if hasattr(e, 'code'):
-                payload = b""
-                if hasattr(e, 'read'):
-                    payload = e.read()
-                return e.code, payload
-            raise
-
     def _post_save_delete(self, vault_id, conn_id):
-        from urllib.request import urlopen, Request
         qs = "vault_id={}&conn_id={}".format(vault_id, conn_id)
-        url = "http://127.0.0.1:{}/api.php?action=save_delete&{}".format(
-            self.port, qs)
-        req = Request(url, data=b"{}", method="POST",
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return resp.getcode(), resp.read()
-        except Exception as e:
-            if hasattr(e, 'code'):
-                payload = b""
-                if hasattr(e, 'read'):
-                    payload = e.read()
-                return e.code, payload
-            raise
+        return self._request_raw(
+            "/api.php?action=save_delete&" + qs, data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"})
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_existing_entry_returns_204_and_reaps_empty_vault(self):
@@ -7506,43 +7064,16 @@ class TestApiSaveDelete(unittest.TestCase):
         self.assertNotIn(self.CONN, data["vaults"][self.VAULT])
 
 
-class TestApiConnectSaved(unittest.TestCase):
+class TestApiConnectSaved(LiveServerCase):
+    TOLERANT_JSON = True
     """Saved-variant POST /api/connect: decrypt → spawn ssh."""
 
     VAULT = "AAAAAAAAAAAAAAAAAAAAAAAAAA"
     CONN  = "BBBBBBBBBBBBBBBBBBBBBBBBBB"
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp()
-        cls.creds_path = os.path.join(cls.tmpdir, "websh.creds.json")
-        os.environ["WEBSH_CREDS_PATH"] = cls.creds_path
-        cls._old_enable = server.WEBSH_VAULT_ENABLE
-        server.WEBSH_VAULT_ENABLE = True
-        cfg_path = os.path.join(cls.tmpdir, "websh.json")
-        with open(cfg_path, "w") as f:
-            json.dump({"connections": []}, f)
-        os.environ["WEBSH_CONFIG"] = cfg_path
-        server._config_cache = None
-        server._config_mtime = 0
-
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        server.WEBSH_VAULT_ENABLE = cls._old_enable
-        os.environ.pop("WEBSH_CREDS_PATH", None)
-        os.environ.pop("WEBSH_CONFIG", None)
-        import shutil
-        shutil.rmtree(cls.tmpdir)
+    CONFIG = {"connections": []}
+    CREDS_PATH = True
+    GLOBALS = {"WEBSH_VAULT_ENABLE": True}
 
     def setUp(self):
         server._creds_cache = None
@@ -7568,22 +7099,7 @@ class TestApiConnectSaved(unittest.TestCase):
             })
 
     def _post(self, body):
-        from urllib.request import urlopen, Request
-        url = "http://127.0.0.1:{0}/api/connect".format(self.port)
-        data = json.dumps(body).encode("utf-8")
-        req = Request(url, data=data,
-                      headers={"Content-Type": "application/json"})
-        try:
-            resp = urlopen(req, timeout=5)
-            return json.loads(resp.read().decode("utf-8")), resp.getcode()
-        except Exception as e:
-            if hasattr(e, 'read'):
-                payload = e.read().decode("utf-8")
-                try:
-                    return json.loads(payload), e.code
-                except ValueError:
-                    return {"_raw": payload}, e.code
-            raise
+        return LiveServerCase._post(self, "/api/connect", body)
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_saved_variant_decrypts_and_spawns(self):
@@ -8241,29 +7757,13 @@ class TestReapChild(unittest.TestCase):
         self.assertFalse(s._reap_lock.locked())
 
 
-class TestSecurityHeaders(unittest.TestCase):
+class TestSecurityHeaders(LiveServerCase):
     """The credential-handling page must ship CSP + companion hardening
     headers, and the CSP must still permit what the app actually loads."""
 
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-
     def _headers(self, path):
         from urllib.request import urlopen
-        with urlopen("http://127.0.0.1:{}{}".format(self.port, path)) as r:
+        with urlopen(self._server_url(path)) as r:
             return r.headers
 
     def test_index_emits_hardening_headers(self):
@@ -8522,26 +8022,10 @@ class TestMainSigtermSubprocess(unittest.TestCase):
                 proc.stderr.decode("utf-8", "replace")))
 
 
-class TestTransferAccessLog(unittest.TestCase):
+class TestTransferAccessLog(LiveServerCase):
     """Download and upload must emit access-log records so bulk data
     transfer through a logged-in session is auditable (fail2ban /
     forensics), with a byte count and the (sanitized) path."""
-
-    @classmethod
-    def setUpClass(cls):
-        server.HOST = "127.0.0.1"
-        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
-        cls.port = cls.httpd.server_address[1]
-        server.PORT = cls.port
-        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
-                                      daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
 
     def setUp(self):
         self._orig_log = server.ACCESS_LOG_PATH
