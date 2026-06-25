@@ -5310,6 +5310,65 @@ test('paneRecord: vault pane carries the connection hint (#74)', async () => {
   cleanup(env);
 });
 
+test('badge/tag DOM is not rebuilt when pane state is unchanged', async () => {
+  // updatePaneBadge runs on EVERY output frame; before the _badgeState
+  // early-return, updatePaneTag removed and recreated the .pane-tag span
+  // per frame — hundreds of element allocations/sec during noisy output.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sidT', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.1'; $(win, 'iU').value = 'alex';
+  $(win, 'iPw').value = 'pw'; $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane exists');
+  win.updatePaneBadge(p);
+  const tag1 = p.el.querySelector('.pane-tag');
+  ok(!!tag1, 'tag rendered for a host-bearing pane');
+  const badgeText1 = p.el.querySelector('[data-pane-badge]').textContent;
+  win.updatePaneBadge(p);
+  win.updatePaneBadge(p);
+  const tag2 = p.el.querySelector('.pane-tag');
+  ok(tag1 === tag2, 'same-state updates must not recreate the tag element');
+  ok(p.el.querySelector('[data-pane-badge]').textContent === badgeText1,
+     'badge text unchanged');
+  // A real state change must still re-render:
+  p.persistent = true;
+  win.updatePaneBadge(p);
+  const tag3 = p.el.querySelector('.pane-tag');
+  ok(!!tag3 && tag3 !== tag1, 'state change recreates the tag');
+  ok(tag3.textContent === 'persistent',
+     'tag reflects new state; got ' + (tag3 && tag3.textContent));
+  cleanup(env);
+});
+
+test('document title follows the active pane across switches', async () => {
+  // Regression for the _badgeState memo: title upkeep must live OUTSIDE
+  // the memo, because activeId changes without the pane's own state
+  // changing. A memoized skip left the previous pane's title behind.
+  const env = await mkEnv(SEARCH_PANE_PLAN()); const win = env.win;
+  const [a, b] = await _twoPanes(win);
+  ok(!!a && !!b, 'two panes up');
+  // B was connected last and is active; prime both memos.
+  win.updatePaneBadge(a); win.updatePaneBadge(b);
+  win.activatePane(a.id);
+  ok(win.document.title.indexOf(a.label) === 0,
+     'A active -> title is A; got ' + win.document.title);
+  win.activatePane(b.id);
+  ok(win.document.title.indexOf(b.label) === 0,
+     'switch to B updates title; got ' + win.document.title);
+  win.activatePane(a.id);
+  ok(win.document.title.indexOf(a.label) === 0,
+     'switch BACK to A updates title (stale-memo regression); got '
+     + win.document.title);
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

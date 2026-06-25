@@ -407,10 +407,25 @@ function updatePaneBadge(p) {
   let badge = p.el.querySelector('[data-pane-badge]');
   if (!badge) return;
   let s = p.sid ? 'connected' : (p.connecting ? 'connecting' : 'disconnected');
+  let busy = !!p.upload || !!p.download;
+  // Title upkeep stays OUTSIDE the memo below: it depends on activeId,
+  // which changes without this pane's own state changing (pane switch),
+  // so a memoized skip here could leave a stale document title. setTitle
+  // is itself memoized, so per-frame upkeep is one string compare.
+  if (activeId === p.id) setTitle(p.label || '');
+  // Early-return when nothing rendered below can have changed. This runs
+  // on EVERY output frame (handleOutputPayload): during noisy output
+  // (cat, build logs) the remove/recreate dance in updatePaneTag
+  // allocated a fresh element and invalidated layout hundreds of times a
+  // second, racing xterm's own renderer. The key covers every input the
+  // remaining DOM writes depend on, so a skipped call is a true no-op.
+  let state = [s, busy ? 1 : 0,
+               p.label || '', p.host || '', p.connection || '',
+               p.persistent ? 1 : 0].join('');
+  if (p._badgeState === state) return;
+  p._badgeState = state;
   badge.className = 'pane-badge ' + (s==='connected'?'s-on':s==='connecting'?'s-wait':'s-off');
   badge.textContent = s.charAt(0).toUpperCase() + s.slice(1);
-  if (activeId === p.id) setTitle(p.label || '');
-  let busy = !!p.upload || !!p.download;
   let ub = p.el.querySelector('[data-upload-btn]');
   if (ub) ub.disabled = !p.sid || busy;
   let db = p.el.querySelector('[data-download-btn]');
@@ -1643,7 +1658,9 @@ async function connectPane(p, opts) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   let rec = paneRecord(p);
@@ -2054,7 +2071,9 @@ function finalizeSuccess(opts, result, run) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   // Close the status popup and login form as a single success step.
@@ -2191,8 +2210,15 @@ function dismissConnectStatus() {
 }
 
 // ── UI ──────────────────────────────────────────────────────────────
+let _lastTitle = null;
 function setTitle(label) {
-  document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  // Memoized: updatePaneBadge re-asserts the title on every output frame
+  // (cheap upkeep that also heals stray writes); skip the DOM write when
+  // nothing changed. document.title is written nowhere else.
+  let t = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  if (t === _lastTitle) return;
+  _lastTitle = t;
+  document.title = t;
 }
 
 
