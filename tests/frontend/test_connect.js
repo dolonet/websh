@@ -2875,6 +2875,46 @@ test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
   cleanup(env);
 });
 
+test('proto mismatch surfaces a reload toast; absent/equal stay silent', async () => {
+  // Server upgraded across a breaking wire change while the tab stayed
+  // open -> /api/config carries a different proto -> warn toast. An
+  // older server (no proto field) or a matching one must stay silent.
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   proto: 999}},
+  ]);
+  const win = env.win;
+  await sleep(30);
+  const toasts = win.document.querySelectorAll('.toast');
+  let found = false;
+  toasts.forEach(t => { if (/reload the page/i.test(t.textContent)) found = true; });
+  ok(found, 'mismatch toast shown; got ' + toasts.length + ' toasts');
+  cleanup(env);
+
+  const env2 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+  ]);
+  await sleep(30);
+  let silent = true;
+  env2.win.document.querySelectorAll('.toast').forEach(t => {
+    if (/reload the page/i.test(t.textContent)) silent = false;
+  });
+  ok(silent, 'no toast when the server does not send proto');
+  cleanup(env2);
+
+  const env3 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   proto: 1}},  // == CLIENT_PROTO today
+  ]);
+  await sleep(30);
+  let silent3 = true;
+  env3.win.document.querySelectorAll('.toast').forEach(t => {
+    if (/reload the page/i.test(t.textContent)) silent3 = false;
+  });
+  ok(silent3, 'no toast when proto matches');
+  cleanup(env3);
+});
+
 test('form_defaults from /api/config prefill the manual form', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: [],

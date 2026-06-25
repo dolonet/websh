@@ -1711,6 +1711,9 @@ class TestHTTPApi(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
         self.assertIn("version", body)
+        # Wire-protocol version: the client decides "reload the page"
+        # from this field; both meta endpoints must carry it.
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
 
     def test_config_returns_no_secrets(self):
         body, code = self._get("/api/config")
@@ -1718,6 +1721,7 @@ class TestHTTPApi(unittest.TestCase):
         self.assertTrue(body["restrict_hosts"])
         self.assertIn("session_timeout", body)
         self.assertIn("version", body)
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
         self.assertEqual(len(body["connections"]), 1)
         conn = body["connections"][0]
         self.assertEqual(conn["name"], "allowed")

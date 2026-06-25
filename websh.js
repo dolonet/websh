@@ -3075,6 +3075,20 @@ function doConnect() {
 }
 
 // ── Server config ───────────────────────────────────────────────────
+// Wire-protocol version this client speaks; the server ships its own in
+// /api/config ("proto"). A mismatch at page load means the browser is
+// running a stale CACHED websh.js against an upgraded server - surface
+// a reload prompt instead of letting requests fail obscurely. An absent
+// field (older server) stays silent.
+const CLIENT_PROTO = 1;
+
+function checkProtoVersion(cfg) {
+  if (cfg && cfg.proto !== undefined && cfg.proto !== CLIENT_PROTO) {
+    showToast('websh was updated on the server \u2014 reload the page ' +
+              '(Ctrl+Shift+R) to get the matching client.', 'warn');
+  }
+}
+
 // Prefill the manual connect form from websh.json "form_defaults"
 // (shipped via /api/config). Only fields the user hasn't already typed
 // into are touched, and the port only when it still shows the markup
@@ -3093,6 +3107,7 @@ function applyFormDefaults(cfg) {
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
+    checkProtoVersion(cfg);
     applyFormDefaults(cfg);
     if(cfg.isolate_storage) {
       storagePrefix = location.pathname.replace(/[^/]*$/, '');
