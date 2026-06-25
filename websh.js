@@ -2093,66 +2093,79 @@ function mapConnectError(err, opts) {
 }
 
 // One popup, many states. Only [OK]/[Cancel] (dismissConnectStatus).
+// Connect-status popup content, keyed by outcome kind. `sub` is a
+// function of {host, user} (host pre-defaulted to 'target'). `status`:
+// the literal 'msg' shows ctx.msg (when present) as an error line; any
+// other string is fixed error text; absent = no status line. `btn`
+// defaults to 'OK'. Unknown kinds fall back to the generic error entry.
+// Adding an outcome is one table row.
+const CONNECT_STATUS = {
+  connecting: {
+    title: 'Connecting',
+    sub: c => 'Connecting to ' + c.host + '\u2026',
+    btn: 'Cancel',
+  },
+  auth_failed: {
+    title: 'Authentication failed',
+    sub: c => 'Could not log in to ' + c.host + '.',
+    status: 'Check your password or key and try again.',
+  },
+  policy_deny: {
+    title: 'Connection not allowed',
+    sub: c => "The username '" + (c.user || '?') +
+              "' is not authorized to connect to " + c.host + '.',
+    status: 'msg',
+  },
+  host_down: {
+    title: 'Host unreachable',
+    sub: c => 'Could not reach ' + c.host + '.',
+    status: 'msg',
+  },
+  timeout: {
+    title: 'Connection timed out',
+    sub: c => 'The connection to ' + c.host + ' timed out.',
+  },
+  rate_limited: {
+    title: 'Too many connection attempts',
+    sub: () => 'Please wait and try again shortly.',
+    status: 'msg',
+  },
+  vault_not_found: {
+    title: 'Saved entry missing on server',
+    sub: () => 'This card was deleted or the server vault was cleared.',
+    status: 'Delete this card from the saved list, then re-enter to re-save.',
+  },
+  vault_decrypt: {
+    title: 'Cannot decrypt this card',
+    sub: () => 'The vault key in this browser does not match the stored blob.',
+    status: 'Re-enter the credentials to re-save this connection.',
+  },
+  vault_off: {
+    title: 'Vault is disabled on the server',
+    sub: () => 'The server is not accepting saved credentials right now.',
+    status: 'msg',
+  },
+  error: {
+    title: 'Connection error',
+    sub: c => 'Could not connect to ' + c.host + '.',
+    status: 'msg',
+  },
+};
+
 function showConnectStatus(kind, ctx) {
   let title = $('tmTitle'), sub = $('tmSub'), status = $('tmStatus'), btn = $('tmCancel');
-  let host = ctx.host || 'target';
   status.textContent = ''; status.className = 'tm-status';
   btn.classList.remove('h');
-
-  if (kind === 'connecting') {
-    title.textContent = 'Connecting';
-    sub.textContent = 'Connecting to ' + host + '…';
-    btn.textContent = 'Cancel';
-  } else if (kind === 'auth_failed') {
-    title.textContent = 'Authentication failed';
-    sub.textContent = 'Could not log in to ' + host + '.';
-    status.textContent = 'Check your password or key and try again.';
+  let e = CONNECT_STATUS[kind] || CONNECT_STATUS.error;
+  title.textContent = e.title;
+  sub.textContent = e.sub({host: ctx.host || 'target', user: ctx.user});
+  if (e.status === 'msg') {
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+  } else if (e.status) {
+    status.textContent = e.status;
     status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'policy_deny') {
-    title.textContent = 'Connection not allowed';
-    sub.textContent =
-      "The username '" + (ctx.user || '?') +
-      "' is not authorized to connect to " + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'host_down') {
-    title.textContent = 'Host unreachable';
-    sub.textContent = 'Could not reach ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'timeout') {
-    title.textContent = 'Connection timed out';
-    sub.textContent = 'The connection to ' + host + ' timed out.';
-    btn.textContent = 'OK';
-  } else if (kind === 'rate_limited') {
-    title.textContent = 'Too many connection attempts';
-    sub.textContent = 'Please wait and try again shortly.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_not_found') {
-    title.textContent = 'Saved entry missing on server';
-    sub.textContent = 'This card was deleted or the server vault was cleared.';
-    status.textContent = 'Delete this card from the saved list, then re-enter to re-save.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_decrypt') {
-    title.textContent = 'Cannot decrypt this card';
-    sub.textContent = 'The vault key in this browser does not match the stored blob.';
-    status.textContent = 'Re-enter the credentials to re-save this connection.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_off') {
-    title.textContent = 'Vault is disabled on the server';
-    sub.textContent = 'The server is not accepting saved credentials right now.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else {
-    title.textContent = 'Connection error';
-    sub.textContent = 'Could not connect to ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
   }
+  btn.textContent = e.btn || 'OK';
   $('tmuxOv').classList.remove('h');
 }
 
