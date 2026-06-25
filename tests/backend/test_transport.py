@@ -771,7 +771,6 @@ class TestSessionNotify(unittest.TestCase):
         deadline. We simulate FIN by half-closing one end of a
         socketpair and passing the other to wait_for_data via a
         caller-owned selector."""
-        import socket
         a, b = socket.socketpair()
         s = self._fake()
         try:
@@ -883,7 +882,6 @@ class TestSessionNotify(unittest.TestCase):
         wait_for_data calls. This avoids per-call epoll_create1+ctl+
         close overhead. Verify the wakeup contract still holds when
         this path is exercised."""
-        import socket
         a, b = socket.socketpair()
         s = self._fake()
         try:
@@ -991,7 +989,6 @@ class TestWatchdogRuntime(unittest.TestCase):
             os.kill(pid, signal.SIGTERM)
         except (OSError, ValueError):
             pass
-        import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _run(self, cmd, timeout=5):

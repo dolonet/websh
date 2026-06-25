@@ -87,7 +87,6 @@ class TestVaultLoad(unittest.TestCase):
             os.environ.pop("WEBSH_CREDS_PATH", None)
         else:
             os.environ["WEBSH_CREDS_PATH"] = self._old_env
-        import shutil
         shutil.rmtree(self.tmpdir)
 
     def _write(self, data):
@@ -189,7 +188,6 @@ class TestVaultWrite(unittest.TestCase):
             os.environ.pop("WEBSH_CREDS_PATH", None)
         else:
             os.environ["WEBSH_CREDS_PATH"] = self._old_env
-        import shutil
         shutil.rmtree(self.tmpdir)
 
     def test_writer_creates_file_with_mode_600(self):

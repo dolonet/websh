@@ -37,7 +37,6 @@ class TestAccessLogEmit(unittest.TestCase):
 
     def tearDown(self):
         server.ACCESS_LOG_PATH = self._orig
-        import shutil
         shutil.rmtree(self.tmpdir)
 
     def _read_lines(self):

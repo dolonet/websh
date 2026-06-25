@@ -35,7 +35,6 @@ class TestConfigLoading(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
 
     def _write_config(self, data):
@@ -202,7 +201,6 @@ class TestFindConfigConnection(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -223,7 +221,6 @@ class TestIsHostAllowed(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -651,7 +648,6 @@ class TestDeniedHosts(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -826,7 +822,6 @@ class TestConnectionKinds(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -906,7 +901,6 @@ class TestConfigPublicKind(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
