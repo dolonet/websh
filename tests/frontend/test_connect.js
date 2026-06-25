@@ -2875,6 +2875,135 @@ test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
   cleanup(env);
 });
 
+test('terminate-confirm and file-browser dialogs: Esc closes via shared trap', async () => {
+  // makeModalTrap parity: the previously untrapped dialogs (confirmOv,
+  // fbOv) now get Escape-to-dismiss, initial focus, and focus restore.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-trap', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', response: {path: '/home/u', entries: []}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+  // confirmOv: Escape cancels (does NOT terminate).
+  let confirmed = 0;
+  win.showTerminateModal(p, () => { confirmed++; });
+  await sleep(10);
+  ok(!hidden($(win, 'confirmOv')), 'terminate confirm open');
+  ok(win.document.activeElement ===
+       $(win, 'confirmOv').querySelector('button'),
+     'initial focus on Cancel (safe default)');
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Escape', bubbles: true, cancelable: true}));
+  await sleep(10);
+  ok(hidden($(win, 'confirmOv')), 'Esc closes the terminate confirm');
+  ok(confirmed === 0, 'Esc cancels — terminate callback NOT fired');
+  // fbOv: Escape closes the file browser.
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(!hidden($(win, 'fbOv')), 'file browser open');
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Escape', bubbles: true, cancelable: true}));
+  await sleep(10);
+  ok(hidden($(win, 'fbOv')), 'Esc closes the file browser');
+  cleanup(env);
+});
+
+test('proto mismatch surfaces a reload toast; absent/equal stay silent', async () => {
+  // Server upgraded across a breaking wire change while the tab stayed
+  // open -> /api/config carries a different proto -> warn toast. An
+  // older server (no proto field) or a matching one must stay silent.
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   proto: 999}},
+  ]);
+  const win = env.win;
+  await sleep(30);
+  const toasts = win.document.querySelectorAll('.toast');
+  let found = false;
+  toasts.forEach(t => { if (/reload the page/i.test(t.textContent)) found = true; });
+  ok(found, 'mismatch toast shown; got ' + toasts.length + ' toasts');
+  cleanup(env);
+
+  const env2 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+  ]);
+  await sleep(30);
+  let silent = true;
+  env2.win.document.querySelectorAll('.toast').forEach(t => {
+    if (/reload the page/i.test(t.textContent)) silent = false;
+  });
+  ok(silent, 'no toast when the server does not send proto');
+  cleanup(env2);
+
+  const env3 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   proto: 1}},  // == CLIENT_PROTO today
+  ]);
+  await sleep(30);
+  let silent3 = true;
+  env3.win.document.querySelectorAll('.toast').forEach(t => {
+    if (/reload the page/i.test(t.textContent)) silent3 = false;
+  });
+  ok(silent3, 'no toast when proto matches');
+  cleanup(env3);
+});
+
+test('form_defaults from /api/config prefill the manual form', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+      form_defaults: {host: '192.0.2.10', port: 2222, username: 'deploy'}}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  ok($(win, 'iH').value === '192.0.2.10',
+     'host prefilled; got ' + $(win, 'iH').value);
+  ok(String($(win, 'iP').value) === '2222',
+     'port prefilled over the markup default; got ' + $(win, 'iP').value);
+  ok($(win, 'iU').value === 'deploy',
+     'username prefilled; got ' + $(win, 'iU').value);
+  cleanup(env);
+});
+
+test('form_defaults never overwrite user-typed values or apply under restrict_hosts', async () => {
+  // applyFormDefaults runs when /api/config lands; anything the user
+  // already typed must win, and under restrict_hosts with configured
+  // connections the section is ignored outright.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: true,
+      connections: [{name: 'only', kind: 'ready', host: 'h', port: 22,
+                     username: 'u', persistent: false}],
+      form_defaults: {host: 'ignored.example', username: 'ignored'}}},
+    // restrict_hosts+single ready connection auto-connects on boot:
+    {action: 'connect', response: {auth_failed: true, alive: false}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  ok($(win, 'iH').value !== 'ignored.example',
+     'restrict_hosts: defaults ignored; got ' + $(win, 'iH').value);
+  cleanup(env);
+
+  // Pre-typed value wins over the default.
+  const env2 = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+      form_defaults: {host: 'default.example'}}},
+  ]);
+  // Simulate the user-typed case by calling applyFormDefaults again on
+  // a filled form — it must not overwrite.
+  const win2 = env2.win;
+  $(win2, 'iH').value = 'typed.example';
+  win2.applyFormDefaults({restrict_hosts: false, connections: [],
+                          form_defaults: {host: 'default.example'}});
+  ok($(win2, 'iH').value === 'typed.example',
+     'user-typed host not overwritten; got ' + $(win2, 'iH').value);
+  cleanup(env2);
+});
+
 test('applyTheme repaints live panes and sets CSS vars; unknown falls back', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: []}},
@@ -5247,6 +5376,65 @@ test('paneRecord: vault pane carries the connection hint (#74)', async () => {
   });
   ok(recNone.connection === null,
      'null when pane has none; got ' + JSON.stringify(recNone.connection));
+  cleanup(env);
+});
+
+test('badge/tag DOM is not rebuilt when pane state is unchanged', async () => {
+  // updatePaneBadge runs on EVERY output frame; before the _badgeState
+  // early-return, updatePaneTag removed and recreated the .pane-tag span
+  // per frame — hundreds of element allocations/sec during noisy output.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sidT', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.1'; $(win, 'iU').value = 'alex';
+  $(win, 'iPw').value = 'pw'; $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane exists');
+  win.updatePaneBadge(p);
+  const tag1 = p.el.querySelector('.pane-tag');
+  ok(!!tag1, 'tag rendered for a host-bearing pane');
+  const badgeText1 = p.el.querySelector('[data-pane-badge]').textContent;
+  win.updatePaneBadge(p);
+  win.updatePaneBadge(p);
+  const tag2 = p.el.querySelector('.pane-tag');
+  ok(tag1 === tag2, 'same-state updates must not recreate the tag element');
+  ok(p.el.querySelector('[data-pane-badge]').textContent === badgeText1,
+     'badge text unchanged');
+  // A real state change must still re-render:
+  p.persistent = true;
+  win.updatePaneBadge(p);
+  const tag3 = p.el.querySelector('.pane-tag');
+  ok(!!tag3 && tag3 !== tag1, 'state change recreates the tag');
+  ok(tag3.textContent === 'persistent',
+     'tag reflects new state; got ' + (tag3 && tag3.textContent));
+  cleanup(env);
+});
+
+test('document title follows the active pane across switches', async () => {
+  // Regression for the _badgeState memo: title upkeep must live OUTSIDE
+  // the memo, because activeId changes without the pane's own state
+  // changing. A memoized skip left the previous pane's title behind.
+  const env = await mkEnv(SEARCH_PANE_PLAN()); const win = env.win;
+  const [a, b] = await _twoPanes(win);
+  ok(!!a && !!b, 'two panes up');
+  // B was connected last and is active; prime both memos.
+  win.updatePaneBadge(a); win.updatePaneBadge(b);
+  win.activatePane(a.id);
+  ok(win.document.title.indexOf(a.label) === 0,
+     'A active -> title is A; got ' + win.document.title);
+  win.activatePane(b.id);
+  ok(win.document.title.indexOf(b.label) === 0,
+     'switch to B updates title; got ' + win.document.title);
+  win.activatePane(a.id);
+  ok(win.document.title.indexOf(a.label) === 0,
+     'switch BACK to A updates title (stale-memo regression); got '
+     + win.document.title);
   cleanup(env);
 });
 

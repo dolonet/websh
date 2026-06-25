@@ -157,3 +157,28 @@ https://your-host/console/#connect=Production
 ```
 
 This auto-connects on page load — useful for bookmarks and support links.
+
+## Form defaults
+
+Prefill the manual connect form (host, port, username) without
+configuring a full connection entry:
+
+```json
+{
+  "form_defaults": {
+    "host": "192.0.2.10",
+    "port": 22,
+    "username": "deploy"
+  }
+}
+```
+
+All three fields are optional and validated server-side (bad types or
+ranges are dropped silently). The client only fills fields the user
+hasn't typed into (the port only while it still shows the markup
+default `22`), so a half-completed form is not overwritten. The section
+is ignored when `restrict_hosts` is on and connections are configured —
+the manual form is locked to those connections there.
+
+This replaces front-proxy HTML rewriting (e.g. an nginx `sub_filter` on
+the host input), which breaks whenever the form markup changes.
