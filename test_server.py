@@ -1625,6 +1625,34 @@ class TestHTTPApi(unittest.TestCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def test_placeholder_session_404s_on_plain_endpoints(self):
+        """_require_session must reject _SessionPlaceholder slots on every
+        endpoint, not just /api/stream. Before the helper, hitting input/
+        output/resize inside the connect window dereferenced attributes the
+        placeholder's __slots__ omit — an AttributeError surfacing as a 500
+        from /api/input (its write is wrapped in try/except) and as a
+        dropped connection with no response from the other endpoints. /api/ls
+        rides along to pin one side-channel-throttled endpoint too."""
+        sid = str(uuid.uuid4())
+        placeholder = server._SessionPlaceholder("1.2.3.4", False)
+        with server.sessions_lock:
+            server.sessions[sid] = placeholder
+        try:
+            for fetch in (
+                lambda: self._get("/api/output?session_id=" + sid),
+                lambda: self._post("/api/input",
+                                   {"session_id": sid, "data": "x"}),
+                lambda: self._post("/api/resize",
+                                   {"session_id": sid, "cols": 80, "rows": 24}),
+                lambda: self._get("/api/ls?session_id=" + sid),
+            ):
+                body, code = fetch()
+                self.assertEqual(code, 404)
+                self.assertIn("error", body)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_stream_happy_path(self):
         """Plant a fake session that emits one chunk then dies.
         Verify SSE headers, the initial ': ok' comment, the encoded
