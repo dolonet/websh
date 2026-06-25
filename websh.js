@@ -1585,6 +1585,32 @@ function queueInput(p, data) {
 // Vault-backed panes (opts.conn_id or p.conn_id set) re-derive vault_key
 // from IDB at every connect — caching it on the pane would let a
 // sign-out in another tab leave a stale key in memory.
+// Shared tail of BOTH connect pipelines (the form flow's
+// finalizeSuccess and the reconnect/restore flow in connectPane): the
+// session is confirmed, the pane fields are set — close the login
+// surfaces and start I/O. The two pipelines genuinely differ in
+// everything BEFORE this point (materialize-vs-reuse, opts copying,
+// deferred-save arming, slot semantics), so only this verbatim-
+// identical tail is shared; do not try to merge more of them without
+// re-reading both flows end to end.
+function beginSessionIO(p) {
+  hideOverlay();
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+  p.term.focus();
+  p.polling = true;
+  p.pollRetries = 0;
+  // Force a resize so resumed tmux sessions redraw at the real size.
+  // flushPaneResize uses p.term.cols/rows post-fit and updates
+  // p.lastSent* so subsequent refit triggers can dedup.
+  p.fitAddon.fit();
+  flushPaneResize(p);
+  startKeepalive(p);
+  saveSessions();
+  startOutput(p);
+}
+
 async function connectPane(p, opts) {
   // In-flight guard: a connect is already running for this pane. A second
   // entrant (double Reconnect click, a manual reconnect racing the
@@ -1742,21 +1768,7 @@ async function connectPane(p, opts) {
         if (dirty) saveSaved(list);
       }
       hideTmuxBar(p);
-      hideOverlay();
-      connectingFor = null;
-      overlayMode = null;
-      pendingSplit = null;
-      p.term.focus();
-      p.polling = true;
-      p.pollRetries = 0;
-      // Force a resize so resumed tmux sessions redraw at the real size.
-      // flushPaneResize uses p.term.cols/rows post-fit and updates
-      // p.lastSent* so subsequent refit triggers can dedup.
-      p.fitAddon.fit();
-      flushPaneResize(p);
-      startKeepalive(p);
-      saveSessions();
-      startOutput(p);
+      beginSessionIO(p);
     })
     .catch(e => {
       // Mirror the .then guard above: if the pane was destroyed while the
@@ -2047,20 +2059,8 @@ function finalizeSuccess(opts, result, run) {
 
   // Close the status popup and login form as a single success step.
   $('tmuxOv').classList.add('h');
-  hideOverlay();
-  connectingFor = null;
-  overlayMode = null;
-  pendingSplit = null;
   currentConnectRun = null;
-
-  p.term.focus();
-  p.polling = true;
-  p.pollRetries = 0;
-  p.fitAddon.fit();
-  flushPaneResize(p);
-  startKeepalive(p);
-  saveSessions();
-  startOutput(p);
+  beginSessionIO(p);
 }
 
 function cleanupRun(run) {
