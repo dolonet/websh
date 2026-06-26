@@ -70,20 +70,47 @@ const DEFAULT_SETTINGS = {
   // without ever needing to toggle in /options.
   tmuxClipboard: true, tmuxHistory: 100000
 };
-// id → [label, webfont-name-or-null, fallback-stack]
-// webfont-name is the family loaded via Google Fonts; null = system only.
+// id → [label, webfont-name-or-null, fallback-stack, google-weights]
+// webfont-name is the family loaded via Google Fonts; null = system
+// only. google-weights mirrors what the old static <link> requested
+// per family (they differ — Fira Code has no 100/200, Inconsolata no
+// 100/500) so every weight the options panel offers stays a real face.
 const FONTS = {
-  'jetbrains-mono': ['JetBrains Mono', 'JetBrains Mono', "'Menlo','Monaco','Consolas',monospace"],
-  'fira-code':      ['Fira Code',      'Fira Code',      "'Menlo','Monaco','Consolas',monospace"],
-  'ibm-plex-mono':  ['IBM Plex Mono',  'IBM Plex Mono',  "'Menlo','Monaco','Consolas',monospace"],
-  'roboto-mono':    ['Roboto Mono',    'Roboto Mono',    "'Menlo','Monaco','Consolas',monospace"],
-  'source-code-pro':['Source Code Pro','Source Code Pro',"'Menlo','Monaco','Consolas',monospace"],
-  'inconsolata':    ['Inconsolata',    'Inconsolata',    "'Menlo','Monaco','Consolas',monospace"],
-  'system':         ['System default', null,             "ui-monospace,'Menlo','Monaco','SF Mono','Cascadia Code','Consolas',monospace"]
+  'jetbrains-mono': ['JetBrains Mono', 'JetBrains Mono', "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'fira-code':      ['Fira Code',      'Fira Code',      "'Menlo','Monaco','Consolas',monospace", '300;400;500;700'],
+  'ibm-plex-mono':  ['IBM Plex Mono',  'IBM Plex Mono',  "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'roboto-mono':    ['Roboto Mono',    'Roboto Mono',    "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'source-code-pro':['Source Code Pro','Source Code Pro',"'Menlo','Monaco','Consolas',monospace", '200;300;400;500;700'],
+  'inconsolata':    ['Inconsolata',    'Inconsolata',    "'Menlo','Monaco','Consolas',monospace", '200;300;400;700'],
+  'system':         ['System default', null,             "ui-monospace,'Menlo','Monaco','SF Mono','Cascadia Code','Consolas',monospace", null]
 };
 function fontStack(id) {
   let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
   return (f[1] ? `'${f[1]}',` : '') + f[2];
+}
+
+// Load the ACTIVE font family only. The old static <link> pulled the
+// css2 descriptors for all six families on every page load; now one
+// <link id="dynFontCss"> tracks settings.font (boot + options change).
+// While the css loads, the fallback stack renders and the fit-settle
+// loop (fitPaneWhenStable) absorbs the swap — same flow as before.
+function ensureFontLink(id) {
+  let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
+  let link = $('dynFontCss');
+  if (!f[1]) {                 // system font: nothing to fetch
+    if (link) link.remove();
+    return;
+  }
+  let href = 'https://fonts.googleapis.com/css2?family=' +
+             f[1].replace(/ /g, '+') + ':wght@' + f[3] + '&display=swap';
+  if (link && link.getAttribute('href') === href) return;
+  if (!link) {
+    link = document.createElement('link');
+    link.id = 'dynFontCss';
+    link.rel = 'stylesheet';
+    document.head.appendChild(link);
+  }
+  link.setAttribute('href', href);
 }
 
 // Copy `text` to the system clipboard. Yandex Browser silently rejects
@@ -143,15 +170,60 @@ const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_INPUT_BODY = 8 * 1024 * 1024;
 let authMode = 'pw';
 
-const darkTheme = {
-  background:'#0d1117',foreground:'#e6edf3',cursor:'#58a6ff',cursorAccent:'#0d1117',
-  selectionBackground:'rgba(88,166,255,0.3)',
-  black:'#484f58',red:'#ff7b72',green:'#3fb950',yellow:'#d29922',
-  blue:'#58a6ff',magenta:'#bc8cff',cyan:'#39d353',white:'#b1bac4',
-  brightBlack:'#6e7681',brightRed:'#ffa198',brightGreen:'#56d364',
-  brightYellow:'#e3b341',brightBlue:'#79c0ff',brightMagenta:'#d2a8ff',
-  brightCyan:'#56d364',brightWhite:'#f0f6fc'
+// ── Themes ──────────────────────────────────────────────────────────
+// One table drives every color surface: the CSS custom properties on
+// :root (the same literals ship in index.html so there is no unstyled
+// flash before this script runs), xterm's per-pane theme object, and
+// the scrollback-search decoration colors. A new theme is one more
+// entry here; applyTheme() repaints live panes in place.
+const THEMES = {
+  dark: {
+    css: {
+      bg:'#0d1117', sf:'#161b22', bd:'#30363d', tx:'#e6edf3',
+      dim:'#8b949e', ac:'#58a6ff', ach:'#79c0ff', dg:'#f85149',
+      ok:'#3fb950', wn:'#d29922',
+      // Options-panel preview swatches, derived from the terminal
+      // palette (red / brightYellow / a dimmed foreground).
+      'preview-red':'#ff7b72', 'preview-yel':'#e3b341',
+      'preview-dim':'#7d8590',
+    },
+    xterm: {
+      background:'#0d1117',foreground:'#e6edf3',cursor:'#58a6ff',cursorAccent:'#0d1117',
+      selectionBackground:'rgba(88,166,255,0.3)',
+      black:'#484f58',red:'#ff7b72',green:'#3fb950',yellow:'#d29922',
+      blue:'#58a6ff',magenta:'#bc8cff',cyan:'#39d353',white:'#b1bac4',
+      brightBlack:'#6e7681',brightRed:'#ffa198',brightGreen:'#56d364',
+      brightYellow:'#e3b341',brightBlue:'#79c0ff',brightMagenta:'#d2a8ff',
+      brightCyan:'#56d364',brightWhite:'#f0f6fc'
+    },
+    search: {
+      matchBackground: '#264f78',
+      matchBorder: '#3a6fa5',
+      matchOverviewRuler: '#58a6ff',
+      activeMatchBackground: '#a07b00',
+      activeMatchBorder: '#d29922',
+      activeMatchColorOverviewRuler: '#d29922',
+    },
+  },
 };
+let currentTheme = 'dark';
+
+function themeXterm() {
+  return (THEMES[currentTheme] || THEMES.dark).xterm;
+}
+
+function applyTheme(name) {
+  let t = THEMES[name] || THEMES.dark;
+  currentTheme = THEMES[name] ? name : 'dark';
+  let root = document.documentElement.style;
+  Object.keys(t.css).forEach(k => root.setProperty('--' + k, t.css[k]));
+  // Live panes: xterm repaints when options.theme is reassigned.
+  Object.keys(panes).forEach(id => {
+    let term = panes[id].term;
+    if (term && term.options) term.options.theme = t.xterm;
+  });
+  SEARCH_OPTS.decorations = Object.assign({}, t.search);
+}
 
 function createPane(container) {
   let id = 'p' + (++paneCounter);
@@ -203,7 +275,7 @@ function createPane(container) {
     fontWeight: settings.fontWeight,
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
-    theme: darkTheme,
+    theme: themeXterm(),
     allowProposedApi:true, scrollback:50000
   });
   term.loadAddon(fit);
@@ -407,10 +479,25 @@ function updatePaneBadge(p) {
   let badge = p.el.querySelector('[data-pane-badge]');
   if (!badge) return;
   let s = p.sid ? 'connected' : (p.connecting ? 'connecting' : 'disconnected');
+  let busy = !!p.upload || !!p.download;
+  // Title upkeep stays OUTSIDE the memo below: it depends on activeId,
+  // which changes without this pane's own state changing (pane switch),
+  // so a memoized skip here could leave a stale document title. setTitle
+  // is itself memoized, so per-frame upkeep is one string compare.
+  if (activeId === p.id) setTitle(p.label || '');
+  // Early-return when nothing rendered below can have changed. This runs
+  // on EVERY output frame (handleOutputPayload): during noisy output
+  // (cat, build logs) the remove/recreate dance in updatePaneTag
+  // allocated a fresh element and invalidated layout hundreds of times a
+  // second, racing xterm's own renderer. The key covers every input the
+  // remaining DOM writes depend on, so a skipped call is a true no-op.
+  let state = [s, busy ? 1 : 0,
+               p.label || '', p.host || '', p.connection || '',
+               p.persistent ? 1 : 0].join('');
+  if (p._badgeState === state) return;
+  p._badgeState = state;
   badge.className = 'pane-badge ' + (s==='connected'?'s-on':s==='connecting'?'s-wait':'s-off');
   badge.textContent = s.charAt(0).toUpperCase() + s.slice(1);
-  if (activeId === p.id) setTitle(p.label || '');
-  let busy = !!p.upload || !!p.download;
   let ub = p.el.querySelector('[data-upload-btn]');
   if (ub) ub.disabled = !p.sid || busy;
   let db = p.el.querySelector('[data-download-btn]');
@@ -1220,6 +1307,31 @@ function closeStream(p) {
   }
 }
 
+// Shared transport teardown for a pane whose session is over. Closes the
+// stream, stops keepalive, drops the polling/connecting flags, clears the
+// deferred-save timer (its commit guard needs p.sid, which we null here;
+// clearing also drops the closure's pane ref), and nulls p.sid. The bits
+// call sites genuinely differ on are opt-in:
+//   o.disconnect — POST /api/disconnect for the old sid (fire-and-forget)
+//   o.save       — persist the session manifest (saveSessions)
+//   o.badge      — refresh the pane badge now
+function endSession(p, o) {
+  o = o || {};
+  let sid = p.sid;
+  closeStream(p);
+  stopKeepalive(p);
+  p.polling = false;
+  p.connecting = false;
+  p.sid = null;
+  clearTimeout(p.saveCommitTimer);
+  p.saveCommitTimer = null;
+  if (o.disconnect && sid) {
+    api('disconnect', {body: {session_id: sid}}).catch(() => {});
+  }
+  if (o.save) saveSessions();
+  if (o.badge) updatePaneBadge(p);
+}
+
 // ── Recovery after a long absence ────────────────────────────────────
 // Background tabs get frozen by the browser (Chrome's memory saver /
 // page lifecycle freeze) after ~5 min hidden: timers stop, EventSource
@@ -1325,9 +1437,7 @@ function handleOutputPayload(p, r, sid) {
     // re-enter connectPane and stomp our own reconnect attempt.
     if (!p.sid) return true;
     console.log('output: session error:', r.error);
-    closeStream(p);
-    stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
-    updatePaneBadge(p);
+    endSession(p, {badge: true});
     if(p.host || p.connection) {
       connectPane(p, {label:p.label, resume:p.persistent});
     } else { doAutoConnect(); }
@@ -1369,14 +1479,8 @@ function handleOutputPayload(p, r, sid) {
   if (r.auth_failed) {
     p.pendingSave = null;
     p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
-    closeStream(p);
-    stopKeepalive(p); p.polling = false;
-    if (p.sid) {
-      api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
-      p.sid = null;
-    }
+    endSession(p, {disconnect: true, badge: true});
     p.recentOutput = '';
-    updatePaneBadge(p);
     if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
     saveSessions();
     return true;
@@ -1389,9 +1493,7 @@ function handleOutputPayload(p, r, sid) {
   }
   if(r.alive===false){
     p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
-    closeStream(p);
-    stopKeepalive(p); p.polling=false; p.sid=null;
-    saveSessions();
+    endSession(p, {save: true});
     // Smart tmux fallback: a persistent pane whose session dies quickly
     // with a "not found" shape in the output is almost certainly a
     // missing tmux binary on the target. Offer re-probe / short-lived.
@@ -1439,15 +1541,18 @@ function clearRetryClock(p) {
 }
 
 function transportFatal(p, e) {
+  // Stale-transport guard: a rejected fetch / SSE error from a transport
+  // that endSession already tore down (p.polling=false) must not banner
+  // the pane again — and must not reset p.connecting, which would defuse
+  // connectPane's in-flight duplicate guard during an auto-reconnect.
+  if (!p.polling) return;
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
     ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
     : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
   p.term.write(msg);
-  closeStream(p);
-  stopKeepalive(p); p.polling=false; p.sid=null;
-  saveSessions();
+  endSession(p, {save: true});
   if(p.host || p.connection) showReconnectBar(p);
   if(activeId===p.id) updatePaneBadge(p);
 }
@@ -1585,6 +1690,32 @@ function queueInput(p, data) {
 // Vault-backed panes (opts.conn_id or p.conn_id set) re-derive vault_key
 // from IDB at every connect — caching it on the pane would let a
 // sign-out in another tab leave a stale key in memory.
+// Shared tail of BOTH connect pipelines (the form flow's
+// finalizeSuccess and the reconnect/restore flow in connectPane): the
+// session is confirmed, the pane fields are set — close the login
+// surfaces and start I/O. The two pipelines genuinely differ in
+// everything BEFORE this point (materialize-vs-reuse, opts copying,
+// deferred-save arming, slot semantics), so only this verbatim-
+// identical tail is shared; do not try to merge more of them without
+// re-reading both flows end to end.
+function beginSessionIO(p) {
+  hideOverlay();
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+  p.term.focus();
+  p.polling = true;
+  p.pollRetries = 0;
+  // Force a resize so resumed tmux sessions redraw at the real size.
+  // flushPaneResize uses p.term.cols/rows post-fit and updates
+  // p.lastSent* so subsequent refit triggers can dedup.
+  p.fitAddon.fit();
+  flushPaneResize(p);
+  startKeepalive(p);
+  saveSessions();
+  startOutput(p);
+}
+
 async function connectPane(p, opts) {
   // In-flight guard: a connect is already running for this pane. A second
   // entrant (double Reconnect click, a manual reconnect racing the
@@ -1617,7 +1748,9 @@ async function connectPane(p, opts) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   let rec = paneRecord(p);
@@ -1728,6 +1861,12 @@ async function connectPane(p, opts) {
       if (r.tmux_cmd) p.tmuxCmd = r.tmux_cmd;
       p.connectedAt = Date.now();
       p.recentOutput = '';
+      // A deferred save may still be pending from the original connect
+      // (session error inside the 2.6s commit window -> auto-reconnect
+      // lands here). endSession cleared the old timer; re-arm it against
+      // the NEW sid, or an idle SSE session would never commit the save
+      // (the output-gated path needs a frame >=2.5s after connectedAt).
+      if (p.pendingSave) scheduleSaveCommit(p);
       // Persist a non-default tmux path on the matching saved entry so
       // future connects skip the probe and use the right binary path.
       if (p.persistent && p.tmuxCmd && p.tmuxCmd !== 'tmux') {
@@ -1742,21 +1881,7 @@ async function connectPane(p, opts) {
         if (dirty) saveSaved(list);
       }
       hideTmuxBar(p);
-      hideOverlay();
-      connectingFor = null;
-      overlayMode = null;
-      pendingSplit = null;
-      p.term.focus();
-      p.polling = true;
-      p.pollRetries = 0;
-      // Force a resize so resumed tmux sessions redraw at the real size.
-      // flushPaneResize uses p.term.cols/rows post-fit and updates
-      // p.lastSent* so subsequent refit triggers can dedup.
-      p.fitAddon.fit();
-      flushPaneResize(p);
-      startKeepalive(p);
-      saveSessions();
-      startOutput(p);
+      beginSessionIO(p);
     })
     .catch(e => {
       // Mirror the .then guard above: if the pane was destroyed while the
@@ -1843,20 +1968,24 @@ function tmuxSwitchToShortLived(id) {
 // for future closes (preference lives in localStorage).
 let pendingTerminate = null;
 
+const _confirmTrap = makeModalTrap('confirmOv', () => confirmCancel());
 function showTerminateModal(p, onConfirm) {
   pendingTerminate = onConfirm;
   // Prefer the human label (saved name or connection name) over the raw
   // host IP — matches what the user sees in the pane's title bar.
   let name = p.label || p.connection || p.host || 'server';
   $('cfTitle').textContent = 'Terminate session on ' + name + '?';
-  $('confirmOv').classList.remove('h');
+  // Initial focus on Cancel — the safe default for a destructive
+  // confirm; Escape cancels too (previously this dialog trapped
+  // neither focus nor Escape).
+  _confirmTrap.open(() => $('confirmOv').querySelector('button'));
 }
 function confirmCancel() {
-  $('confirmOv').classList.add('h');
+  _confirmTrap.close();
   pendingTerminate = null;
 }
 function confirmTerminate(neverAgain) {
-  $('confirmOv').classList.add('h');
+  _confirmTrap.close();
   let cb = pendingTerminate;
   pendingTerminate = null;
   if (cb) cb(!!neverAgain);
@@ -2042,25 +2171,15 @@ function finalizeSuccess(opts, result, run) {
   let labelEl = p.el.querySelector('[data-pane-label]');
   if (labelEl) labelEl.textContent = p.label;
   p.term.reset();
-  setTitle(p.label);
+  // Only the active pane owns the document title — a background pane
+  // (auto-reconnect while the user works elsewhere) must not clobber it.
+  if (activeId === p.id) setTitle(p.label);
   updatePaneBadge(p);
 
   // Close the status popup and login form as a single success step.
   $('tmuxOv').classList.add('h');
-  hideOverlay();
-  connectingFor = null;
-  overlayMode = null;
-  pendingSplit = null;
   currentConnectRun = null;
-
-  p.term.focus();
-  p.polling = true;
-  p.pollRetries = 0;
-  p.fitAddon.fit();
-  flushPaneResize(p);
-  startKeepalive(p);
-  saveSessions();
-  startOutput(p);
+  beginSessionIO(p);
 }
 
 function cleanupRun(run) {
@@ -2093,66 +2212,79 @@ function mapConnectError(err, opts) {
 }
 
 // One popup, many states. Only [OK]/[Cancel] (dismissConnectStatus).
+// Connect-status popup content, keyed by outcome kind. `sub` is a
+// function of {host, user} (host pre-defaulted to 'target'). `status`:
+// the literal 'msg' shows ctx.msg (when present) as an error line; any
+// other string is fixed error text; absent = no status line. `btn`
+// defaults to 'OK'. Unknown kinds fall back to the generic error entry.
+// Adding an outcome is one table row.
+const CONNECT_STATUS = {
+  connecting: {
+    title: 'Connecting',
+    sub: c => 'Connecting to ' + c.host + '\u2026',
+    btn: 'Cancel',
+  },
+  auth_failed: {
+    title: 'Authentication failed',
+    sub: c => 'Could not log in to ' + c.host + '.',
+    status: 'Check your password or key and try again.',
+  },
+  policy_deny: {
+    title: 'Connection not allowed',
+    sub: c => "The username '" + (c.user || '?') +
+              "' is not authorized to connect to " + c.host + '.',
+    status: 'msg',
+  },
+  host_down: {
+    title: 'Host unreachable',
+    sub: c => 'Could not reach ' + c.host + '.',
+    status: 'msg',
+  },
+  timeout: {
+    title: 'Connection timed out',
+    sub: c => 'The connection to ' + c.host + ' timed out.',
+  },
+  rate_limited: {
+    title: 'Too many connection attempts',
+    sub: () => 'Please wait and try again shortly.',
+    status: 'msg',
+  },
+  vault_not_found: {
+    title: 'Saved entry missing on server',
+    sub: () => 'This card was deleted or the server vault was cleared.',
+    status: 'Delete this card from the saved list, then re-enter to re-save.',
+  },
+  vault_decrypt: {
+    title: 'Cannot decrypt this card',
+    sub: () => 'The vault key in this browser does not match the stored blob.',
+    status: 'Re-enter the credentials to re-save this connection.',
+  },
+  vault_off: {
+    title: 'Vault is disabled on the server',
+    sub: () => 'The server is not accepting saved credentials right now.',
+    status: 'msg',
+  },
+  error: {
+    title: 'Connection error',
+    sub: c => 'Could not connect to ' + c.host + '.',
+    status: 'msg',
+  },
+};
+
 function showConnectStatus(kind, ctx) {
   let title = $('tmTitle'), sub = $('tmSub'), status = $('tmStatus'), btn = $('tmCancel');
-  let host = ctx.host || 'target';
   status.textContent = ''; status.className = 'tm-status';
   btn.classList.remove('h');
-
-  if (kind === 'connecting') {
-    title.textContent = 'Connecting';
-    sub.textContent = 'Connecting to ' + host + '…';
-    btn.textContent = 'Cancel';
-  } else if (kind === 'auth_failed') {
-    title.textContent = 'Authentication failed';
-    sub.textContent = 'Could not log in to ' + host + '.';
-    status.textContent = 'Check your password or key and try again.';
+  let e = CONNECT_STATUS[kind] || CONNECT_STATUS.error;
+  title.textContent = e.title;
+  sub.textContent = e.sub({host: ctx.host || 'target', user: ctx.user});
+  if (e.status === 'msg') {
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+  } else if (e.status) {
+    status.textContent = e.status;
     status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'policy_deny') {
-    title.textContent = 'Connection not allowed';
-    sub.textContent =
-      "The username '" + (ctx.user || '?') +
-      "' is not authorized to connect to " + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'host_down') {
-    title.textContent = 'Host unreachable';
-    sub.textContent = 'Could not reach ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'timeout') {
-    title.textContent = 'Connection timed out';
-    sub.textContent = 'The connection to ' + host + ' timed out.';
-    btn.textContent = 'OK';
-  } else if (kind === 'rate_limited') {
-    title.textContent = 'Too many connection attempts';
-    sub.textContent = 'Please wait and try again shortly.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_not_found') {
-    title.textContent = 'Saved entry missing on server';
-    sub.textContent = 'This card was deleted or the server vault was cleared.';
-    status.textContent = 'Delete this card from the saved list, then re-enter to re-save.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_decrypt') {
-    title.textContent = 'Cannot decrypt this card';
-    sub.textContent = 'The vault key in this browser does not match the stored blob.';
-    status.textContent = 'Re-enter the credentials to re-save this connection.';
-    status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'vault_off') {
-    title.textContent = 'Vault is disabled on the server';
-    sub.textContent = 'The server is not accepting saved credentials right now.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
-  } else {
-    title.textContent = 'Connection error';
-    sub.textContent = 'Could not connect to ' + host + '.';
-    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
-    btn.textContent = 'OK';
   }
+  btn.textContent = e.btn || 'OK';
   $('tmuxOv').classList.remove('h');
 }
 
@@ -2178,8 +2310,15 @@ function dismissConnectStatus() {
 }
 
 // ── UI ──────────────────────────────────────────────────────────────
+let _lastTitle = null;
 function setTitle(label) {
-  document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  // Memoized: updatePaneBadge re-asserts the title on every output frame
+  // (cheap upkeep that also heals stray writes); skip the DOM write when
+  // nothing changed. document.title is written nowhere else.
+  let t = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
+  if (t === _lastTitle) return;
+  _lastTitle = t;
+  document.title = t;
 }
 
 
@@ -2641,17 +2780,7 @@ function invalidateVaultCache() {
 // (intentional: the user has to sign in again to recover).
 function _disconnectVaultPaneForNoKey(p) {
   if (!p) return;
-  p.connecting = false;
-  if (p.sid) {
-    let sid = p.sid;
-    p.polling = false;
-    stopKeepalive(p);
-    closeStream(p);
-    clearTimeout(p.saveCommitTimer);   // drop the armed deferred-save timer
-    api('disconnect', {body: {session_id: sid}}).catch(() => {});
-    p.sid = null;
-  }
-  updatePaneBadge(p);
+  endSession(p, {disconnect: true, badge: true});
   showReconnectBar(p, 'no_vault_key');
 }
 
@@ -2733,57 +2862,82 @@ function _maybeAutoDropLegacy() {
 // user sees the connect overlay only AFTER they've acknowledged the
 // migration message.
 let _deferredAfterLegacyModal = null;
-// A11y plumbing mirrors signOutModal: Esc closes, Tab traps focus
-// inside the dialog, focus is restored on close. Without these the
-// modal had role=dialog/aria-modal but Tab leaked to the page behind
-// it and Esc did nothing.
-let _legacyUpdatePrevFocus = null;
-let _legacyUpdateKeyHandler = null;
-function openLegacyUpdateModal() {
-  let modal = $('legacyUpdateModal'); if (!modal) return;
-  // Defensive: if a previous open left a keydown listener wired
-  // (programmatic re-open without close), tear it down first so we
-  // don't leak listeners or stomp on _legacyUpdatePrevFocus.
-  if (_legacyUpdateKeyHandler) {
-    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
-    _legacyUpdateKeyHandler = null;
-  }
-  _legacyUpdatePrevFocus = document.activeElement;
-  _legacyUpdateKeyHandler = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeLegacyUpdateModal(); return; }
-    if (e.key !== 'Tab') return;
-    let m = $('legacyUpdateModal'); if (!m) return;
-    let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
-    if (!focusables.length) return;
-    let first = focusables[0], last = focusables[focusables.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-    } else {
-      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-    }
+
+// ── Shared modal a11y plumbing ──────────────────────────────────────
+// Tab focus trap + Escape-to-close + focus restore, shared by every
+// dialog. makeModalTrap returns {open, close}; per-modal setup (field
+// resets, scope text, deferred actions) stays in the modal's own
+// open/close functions, which call into the trap.
+//   modalId   — element id of the dialog container
+//   onEscape  — called on Escape (the modal's own close/cancel function,
+//               so modal-specific close work always runs)
+// Assumes one trapped modal open at a time (each open adds a document
+// keydown listener; every full-screen .ov backdrop enforces this in
+// the UI today).
+function makeModalTrap(modalId, onEscape) {
+  let prevFocus = null;
+  let keyHandler = null;
+  return {
+    // initialFocus: optional () => element to focus after open (next
+    // tick, matching the implicit-default convention of the connect
+    // form). Defensive re-open without close tears the old listener
+    // down first so we don't leak it or stomp prevFocus.
+    open(initialFocus) {
+      if (keyHandler) this.close();
+      prevFocus = document.activeElement;
+      keyHandler = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); onEscape(); return; }
+        if (e.key !== 'Tab') return;
+        let m = $(modalId); if (!m) return;
+        let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
+        if (!focusables.length) return;
+        let first = focusables[0], last = focusables[focusables.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      };
+      document.addEventListener('keydown', keyHandler);
+      let modal = $(modalId);
+      if (modal) modal.classList.remove('h');
+      if (initialFocus) {
+        setTimeout(() => { try { let el = initialFocus(); el && el.focus(); } catch(e){} }, 0);
+      }
+    },
+    close() {
+      if (keyHandler) {
+        document.removeEventListener('keydown', keyHandler);
+        keyHandler = null;
+      }
+      let modal = $(modalId);
+      if (modal) modal.classList.add('h');
+      // Restore focus to whatever opened the modal — otherwise focus
+      // briefly lands on the page body and races any focusFirst logic.
+      if (prevFocus && typeof prevFocus.focus === 'function') {
+        try { prevFocus.focus(); } catch (e) {}
+      }
+      prevFocus = null;
+    },
   };
-  document.addEventListener('keydown', _legacyUpdateKeyHandler);
-  modal.classList.remove('h');
+}
+
+const _legacyUpdateTrap = makeModalTrap('legacyUpdateModal',
+                                        () => closeLegacyUpdateModal());
+function openLegacyUpdateModal() {
+  if (!$('legacyUpdateModal')) return;
   // Initial focus on the Got-it button so Enter dismisses; matches
   // the implicit-default convention used by the connect form.
-  setTimeout(() => { try { $('legacyUpdateOk').focus(); } catch(e){} }, 0);
+  _legacyUpdateTrap.open(() => $('legacyUpdateOk'));
 }
 
 function closeLegacyUpdateModal() {
-  let modal = $('legacyUpdateModal'); if (!modal) return;
-  if (_legacyUpdateKeyHandler) {
-    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
-    _legacyUpdateKeyHandler = null;
-  }
-  modal.classList.add('h');
-  // Restore focus to whatever opened the modal before draining the
-  // deferred autoconnect — otherwise focus would briefly land back
-  // on (e.g.) the page body and the connect form's focusFirst would
-  // race against it.
-  if (_legacyUpdatePrevFocus && typeof _legacyUpdatePrevFocus.focus === 'function') {
-    try { _legacyUpdatePrevFocus.focus(); } catch (e) {}
-  }
-  _legacyUpdatePrevFocus = null;
+  if (!$('legacyUpdateModal')) return;
+  // Trap close also restores focus to whatever opened the modal before
+  // draining the deferred autoconnect — otherwise focus would briefly
+  // land on the page body and the connect form's focusFirst would race
+  // against it.
+  _legacyUpdateTrap.close();
   // Drain the queued post-modal action (typically doAutoConnect).
   if (_deferredAfterLegacyModal) {
     let fn = _deferredAfterLegacyModal;
@@ -3075,9 +3229,40 @@ function doConnect() {
 }
 
 // ── Server config ───────────────────────────────────────────────────
+// Wire-protocol version this client speaks; the server ships its own in
+// /api/config ("proto"). A mismatch at page load means the browser is
+// running a stale CACHED websh.js against an upgraded server - surface
+// a reload prompt instead of letting requests fail obscurely. An absent
+// field (older server) stays silent.
+const CLIENT_PROTO = 1;
+
+function checkProtoVersion(cfg) {
+  if (cfg && cfg.proto !== undefined && cfg.proto !== CLIENT_PROTO) {
+    showToast('websh was updated on the server \u2014 reload the page ' +
+              '(Ctrl+Shift+R) to get the matching client.', 'warn');
+  }
+}
+
+// Prefill the manual connect form from websh.json "form_defaults"
+// (shipped via /api/config). Only fields the user hasn't already typed
+// into are touched, and the port only when it still shows the markup
+// default — so a half-filled form or a restored session is never
+// overwritten. Skipped when restrict_hosts is on AND connections are
+// configured (the manual form is locked to those connections there).
+function applyFormDefaults(cfg) {
+  let fd = cfg && cfg.form_defaults;
+  if (!fd || (cfg.restrict_hosts && (cfg.connections || []).length)) return;
+  let h = $('iH'), po = $('iP'), u = $('iU');
+  if (fd.host && h && !h.value) h.value = fd.host;
+  if (fd.port && po && (!po.value || po.value === '22')) po.value = fd.port;
+  if (fd.username && u && !u.value) u.value = fd.username;
+}
+
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
+    checkProtoVersion(cfg);
+    applyFormDefaults(cfg);
     if(cfg.isolate_storage) {
       storagePrefix = location.pathname.replace(/[^/]*$/, '');
       // `settings`/`fontSize` were loaded at module init under the empty
@@ -3088,6 +3273,11 @@ function loadServerConfig() {
       // at boot. Re-read from the now-correct path-scoped key.
       settings = loadSettings();
       fontSize = settings.fontSize;
+      // The module-init ensureFontLink() above ran under the empty prefix,
+      // so it loaded the default family; refresh it to the path-scoped font
+      // before any pane materializes (fitPaneWhenStable's document.fonts.load
+      // gate then resolves against the correct face).
+      ensureFontLink(settings.font);
     }
     // Re-mint the vault BroadcastChannel with the now-known storagePrefix
     // so sign-out signals don't cross path-scoped namespaces. No-op if
@@ -3174,6 +3364,9 @@ function clearPromptSelection() {
   $('promptTarget').classList.add('h');
   $('iH').disabled = false; $('iP').disabled = false; $('iU').disabled = false;
   $('iH').value = ''; $('iP').value = '22'; $('iU').value = '';
+  // The reset wiped any server-provided prefill; bring it back so the
+  // post-card-dismiss form matches the first-load state.
+  applyFormDefaults(serverConfig);
   // Restore restrict_hosts kiosk mode if configured.
   if(serverConfig && serverConfig.restrict_hosts) {
     $('manualForm').classList.add('h');
@@ -3467,6 +3660,24 @@ function closeUploadSession(u) {
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
 }
 
+// Shared tail of every transfer outcome (upload/download x finish/cancel):
+// paint the progress bar + text for this outcome, then after `delay` clear
+// the transfer slot, hide the bar and refresh the badge. Painting differs
+// per outcome and stays at the call sites via `paint(bar, text)`.
+function settleTransfer(p, slot, delay, paint) {
+  let el = p.el && p.el.querySelector('[data-upload-progress]');
+  if (el && paint) {
+    paint(el.querySelector('.upload-progress-bar'),
+          el.querySelector('.upload-progress-text'));
+  }
+  setTimeout(() => {
+    p[slot] = null;
+    hideUploadProgress(p);
+    updatePaneBadge(p);
+    if (el) el.querySelector('.upload-progress-bar').style.background = '';
+  }, delay);
+}
+
 function finishUpload(p, success, reason) {
   if (!p.upload) return;
   let u = p.upload;
@@ -3474,10 +3685,12 @@ function finishUpload(p, success, reason) {
   closeUploadSession(u);
   let staged = u.staged || [];
   let placed = u.placed || [];
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  // Banner stays visible longer when there's something the user needs to
+  // read and act on — a destination path, or a specific failure reason —
+  // so it doesn't vanish before they can take it in.
+  let dismissAfter = (!success || staged.length || placed.length === 1)
+    ? 6000 : 2000;
+  settleTransfer(p, 'upload', dismissAfter, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       if (staged.length) {
@@ -3496,18 +3709,7 @@ function finishUpload(p, success, reason) {
       bar.style.background = 'var(--dg)';
       text.textContent = reason ? 'Upload failed: ' + reason : 'Upload failed';
     }
-  }
-  // Banner stays visible longer when there's something the user needs to
-  // read and act on — a destination path, or a specific failure reason —
-  // so it doesn't vanish before they can take it in.
-  let dismissAfter = (!success || staged.length || placed.length === 1)
-    ? 6000 : 2000;
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, dismissAfter);
+  });
 }
 
 function cancelUpload(id) {
@@ -3525,17 +3727,10 @@ function cancelUpload(id) {
       .catch(() => {});
   }
 
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'upload', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 function cancelTransfer(id) {
@@ -3630,10 +3825,7 @@ function finishDownload(p, success, msg) {
   let dl = p.download;
   if (!dl) return;
   dl.cancelled = true;
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  settleTransfer(p, 'download', 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -3641,13 +3833,7 @@ function finishDownload(p, success, msg) {
       bar.style.background = 'var(--dg)';
       text.textContent = msg || 'Download failed';
     }
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  });
 }
 
 function cancelDownload(id) {
@@ -3655,33 +3841,29 @@ function cancelDownload(id) {
   if (!p || !p.download) return;
   p.download.cancelled = true;
   if (p.download.abort) p.download.abort();
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'download', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 // ── File browser ─────────────────────────────────────────────────────
 let _fbId = null;
 
+const _fbTrap = makeModalTrap('fbOv', () => closeFb());
 function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
   $('fbManual').value = '';
-  $('fbOv').classList.remove('h');
+  // Escape now closes the browser and Tab cycles inside it (previously
+  // neither worked); focus starts in the manual-path input.
+  _fbTrap.open(() => $('fbManual'));
   loadFbDir('~');
 }
 
 function closeFb() {
-  $('fbOv').classList.add('h');
+  _fbTrap.close();
   _fbId = null;
 }
 
@@ -3776,14 +3958,7 @@ function fbDownloadManual() {
 // gets painted, not just the current one). Without it, only the active
 // match is rendered — and the PR-description perf note about
 // highlightLimit defends a code path the addon never takes.
-const SEARCH_OPTS = {decorations: {
-  matchBackground: '#264f78',
-  matchBorder: '#3a6fa5',
-  matchOverviewRuler: '#58a6ff',
-  activeMatchBackground: '#a07b00',
-  activeMatchBorder: '#d29922',
-  activeMatchColorOverviewRuler: '#d29922',
-}};
+const SEARCH_OPTS = {decorations: Object.assign({}, THEMES.dark.search)};
 function activeSearch() { let p=panes[activeId]; return p?p.searchAddon:null }
 function toggleSearch() {
   let p=panes[activeId]; if(!p) return;
@@ -3876,6 +4051,7 @@ function flushPaneResize(p) {
 function applySettings(opts){
   opts = opts || {};
   let forceFlush = opts.forceFlush !== false;
+  ensureFontLink(settings.font);
   let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
     let p = panes[k];
@@ -4108,14 +4284,8 @@ function closeOptions(){ $('ovOpt').classList.add('h'); }
 // gate because the action is irreversible. WCAG: role=dialog +
 // aria-modal in the markup; focus trap + Escape + restore-focus
 // wired here. (Finding 9 in the PR-67 review.)
-let _signOutPrevFocus = null;
-let _signOutKeyHandler = null;
+const _signOutTrap = makeModalTrap('signOutModal', () => closeSignOutModal());
 function openSignOutModal() {
-  // Defensive: if a previous open left a keydown listener wired (no
-  // current call site does this, but a future programmatic open might),
-  // tear it down first so we don't leak listeners or stomp on
-  // _signOutPrevFocus.
-  if (_signOutKeyHandler) closeSignOutModal();
   let input = $('signOutInput');
   let confirm = $('signOutConfirm');
   let status = $('signOutStatus');
@@ -4149,40 +4319,13 @@ function openSignOutModal() {
         '. Live sessions opened from these cards will disconnect across all tabs.';
     }
   }
-  _signOutPrevFocus = document.activeElement;
-  // Tab focus trap + Escape handler. Bound to document so it fires
-  // regardless of which focusable inside the modal currently holds
-  // focus. Both are removed in closeSignOutModal.
-  _signOutKeyHandler = (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); closeSignOutModal(); return; }
-    if (e.key !== 'Tab') return;
-    let modal = $('signOutModal'); if (!modal) return;
-    let focusables = modal.querySelectorAll('input:not([disabled]),button:not([disabled])');
-    if (!focusables.length) return;
-    let first = focusables[0], last = focusables[focusables.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-    } else {
-      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-    }
-  };
-  document.addEventListener('keydown', _signOutKeyHandler);
-  $('signOutModal').classList.remove('h');
-  setTimeout(() => { try { input && input.focus(); } catch(e){} }, 0);
+  _signOutTrap.open(() => input);
 }
 
 function closeSignOutModal() {
-  if (_signOutKeyHandler) {
-    document.removeEventListener('keydown', _signOutKeyHandler);
-    _signOutKeyHandler = null;
-  }
-  $('signOutModal').classList.add('h');
-  // Restore focus to whatever opened the modal (typically the
-  // "Sign out of this browser" button in the Options panel).
-  if (_signOutPrevFocus && typeof _signOutPrevFocus.focus === 'function') {
-    try { _signOutPrevFocus.focus(); } catch (e) {}
-  }
-  _signOutPrevFocus = null;
+  // Trap close restores focus to whatever opened the modal (typically
+  // the "Sign out of this browser" button in the Options panel).
+  _signOutTrap.close();
 }
 
 async function confirmSignOut() {
@@ -4584,6 +4727,8 @@ function tryRestoreSessions() {
 // before the change is an orphan. Remove it once so a fresh devtools
 // pass on a returning user's browser doesn't show stray entries.
 try { localStorage.removeItem('websh_theme'); } catch(e){}
+applyTheme(currentTheme);
+ensureFontLink(settings.font);
 
 // Open the vault BroadcastChannel early so a sign-out fired in another
 // tab during loadServerConfig still gets observed by this tab.
