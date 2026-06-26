@@ -1,6 +1,32 @@
 # Configuration
 
-Environment variables for `server.py`:
+Tunables for `server.py`. Each knob resolves in this order:
+
+1. `WEBSH_<NAME>` environment variable — the unambiguous alias wins,
+   so a bare generic name (`PORT`, `HOST`, `MAX_SESSIONS`, …) set by
+   unrelated software in a shared environment can't hijack websh;
+2. `<NAME>` environment variable (the names in the table below);
+3. the optional `"server"` object in `websh.json` — the only plane a
+   shared-hosting deployment can reliably write to (`api.php`'s
+   auto-start guarantees only `WEBSH_CONFIG` and `PORT`; whether
+   anything else survives into the environment depends on the host):
+
+   ```json
+   { "server": { "SESSION_TIMEOUT": 600, "MAX_SESSIONS": 20 } }
+   ```
+
+4. the built-in default.
+
+The `"server"` object is read once at startup (knobs are
+process-lifetime constants). Keys use the same names as the table
+below — including the `WEBSH_` prefix where the table has one, e.g.
+`{"server": {"WEBSH_VAULT_ENABLE": true}}`. Boolean knobs accept
+`1`/`true` (env string or JSON literal).
+
+Env-only exceptions: `WEBSH_CONFIG` (it locates the JSON), and
+`HOST` / `TRUSTED_PROXIES` — a writable `websh.json` must not be able
+to rebind the loopback-only server to a public interface or take over
+X-Forwarded-For trust.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -13,7 +39,8 @@ Environment variables for `server.py`:
 | `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`). The bundled `websh.service` and Docker image ship the dependency and a writable creds path, so enabling the vault there is a one-line opt-in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. See [`encryption.md`](encryption.md). |
-| `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
+| `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` (and `WEBSH_AUTH_HEADER`) from |
+| `WEBSH_AUTH_HEADER` | *(unset)* | Header-trust authentication: set to a header name (e.g. `Remote-User` from oauth2-proxy/Authelia) and every request except `/api/ping` requires it; sessions are stamped with their creator's identity and cross-user access is `403`. The header is only read from `TRUSTED_PROXIES` peers. See [`security.md`](security.md#header-trust-authentication). |
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
 | `MAX_UPLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/upload` (bytes) |
 | `MAX_DOWNLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/download` (bytes); the browser accumulates the stream into a Blob, so this also protects the tab |
@@ -34,4 +61,8 @@ Environment variables for `server.py`:
 | `WEBSH_RECORD_DIR` | *(unset)* | Opt-in session recording: directory for one [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) `.cast` file per session (created `0600`, named `<timestamp>-<sid>.cast`; replayable with `asciinema play`). Output-only by default. Best-effort: a write failure disables recording for that session, never the session itself. Mind retention/privacy — see [`security.md`](security.md#session-recording). |
 | `WEBSH_RECORD_INPUT` | `0` | With recording on, `1` also records keystrokes (`"i"` events). **Everything typed into the remote shell lands in the file — including passwords typed at prompts inside the session.** The browser-form ssh password is not recorded as input (the auto-type bypasses the tee); see the echo caveat in [`security.md`](security.md#session-recording). |
 
-The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
+The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend —
+and since the alias rule above makes `server.py` honor `WEBSH_PORT`
+too, in the shared-hosting flow (where the auto-started backend
+inherits PHP's environment) that one variable points both sides at the
+same port. Under systemd the unit's `PORT=` still pins the backend.

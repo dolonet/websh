@@ -142,6 +142,29 @@ same `systemctl edit` override; saved credentials then persist (encrypted)
 under `/var/lib/websh/websh.creds.json`. See
 [`encryption.md`](encryption.md).
 
+### Multiple instances
+
+Run several isolated websh instances on one box (per team, per
+environment) with the template unit — one env file per instance,
+no unit editing:
+
+```bash
+cp websh@.service /etc/systemd/system/
+install -d /etc/websh
+printf 'PORT=8766\n' > /etc/websh/staging.env
+printf 'PORT=8767\nWEBSH_CONFIG=/etc/websh/lab.json\n' > /etc/websh/lab.env
+systemctl enable --now websh@staging websh@lab
+```
+
+`PORT` is the one knob every instance must set (they collide on the
+default otherwise); anything from
+[`configuration.md`](configuration.md) can go in the env file. Each
+instance gets its own writable state under `/var/lib/websh-<name>`
+(`StateDirectory=websh-%i`) — point `WEBSH_CREDS_PATH` there when
+enabling the vault. A missing env file fails the unit loudly instead
+of booting a misconfigured instance. The single-instance
+`websh.service` remains the default path for one-box deployments.
+
 ## HTTPS via reverse proxy
 
 Put nginx or Caddy in front for TLS termination:

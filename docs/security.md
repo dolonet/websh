@@ -160,29 +160,83 @@ in one `write(2)` call and stays safe to view in a terminal.
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
 - `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots
 
+## Header-trust authentication
+
+websh itself has no user accounts — possession of a session id is the
+only key, and the documented model is "bind to loopback, put a reverse
+proxy in front". When that proxy authenticates users (oauth2-proxy,
+Authelia, authentik, Cloudflare Access), set:
+
+```
+WEBSH_AUTH_HEADER=Remote-User
+```
+
+and websh enforces what the proxy established:
+
+- every request **except `/api/ping`** (docker healthchecks, the PHP
+  shim's auto-start probe) requires the header → `401` otherwise —
+  including the static files;
+- the header is read **only from `TRUSTED_PROXIES` peers** — the same
+  trust rule as `X-Forwarded-For` — so a client that reaches the
+  backend directly cannot mint identities and is simply
+  unauthenticated;
+- sessions are stamped with their creator's identity at connect, and
+  every session endpoint (input/output/stream/resize/disconnect, tmux,
+  file transfer) enforces ownership → `403` across users;
+- `result=ok` connect records and disconnect records in the access log
+  carry the identity as `auth_user`.
+
+The proxy MUST strip/overwrite the configured header on incoming
+requests. Real auth proxies (oauth2-proxy, Authelia) do; a **bare
+nginx `proxy_pass` forwards client headers untouched** — if any
+non-auth hop sits in front, neutralize the header explicitly:
+
+```nginx
+proxy_set_header Remote-User "";
+```
+
+websh additionally refuses a request carrying the header **more than
+once** (an appending proxy would otherwise let a client-smuggled first
+value win), and reads it only from `TRUSTED_PROXIES` peers. Two
+operational notes: with the defaults (`HOST=127.0.0.1`,
+`TRUSTED_PROXIES=127.0.0.1`) any local process on a shared box can
+mint identities — inherent to loopback trust; and enable
+`WEBSH_AUTH_HEADER` at startup only — sessions are stamped at creation,
+so flipping it on over a live registry orphans existing sessions
+(deny-by-default, by design). Cross-user probes are recorded in the
+access log as `event=authz_denied` with `auth_user` and the probed
+`sid`. Note the vault endpoints are gated but not per-user scoped —
+header-trust auth gives per-session isolation, not per-user credential
+isolation.
+
+Known limitation: persistent tmux **slots** live on the target host
+keyed by slot id; ownership is enforced on websh sessions, while
+`resume_slot_id` re-attachment authenticates through ssh itself (the
+user must still hold valid credentials for the target).
+
 ## Session recording
 
-`WEBSH_RECORD_DIR` writes one asciicast v2 file per session (output
-events; `WEBSH_RECORD_INPUT=1` adds keystrokes). Treat the directory
-as sensitive:
+`WEBSH_RECORD_DIR` writes one asciicast v2 file per session. Recording is
+**output-only**: keystroke/input recording is hard-disabled (the input tee
+is compiled out), so passwords typed at a prompt *inside* the session are
+never written. `WEBSH_RECORD_INPUT` is ignored — if set, the server logs a
+warning at startup and records output only. Treat the directory as
+sensitive:
 
-- terminal output routinely contains secrets (cat'ed configs, env
-  dumps); with input recording on, every keystroke — including
-  passwords typed at prompts *inside* the session — is on disk;
-- files are created `0600` under the server user, but there is no
-  built-in rotation or retention — pair it with a tmpwatch/logrotate
-  policy and tell your users they are being recorded where the law
-  requires it;
-- the browser-form ssh password is not recorded as input: the
-  auto-type happens below the input tee. One caveat on the output
-  side: a malicious/non-OpenSSH target that prints a password-looking
-  prompt WITHOUT disabling terminal echo would cause the auto-typed
-  password to echo back into the output stream — and therefore into
-  the recording. A genuine OpenSSH prompt disables echo first, so the
-  standard flow never records it; the hostile-server case already
-  hands the password to the attacker, the recording merely adds local
-  persistence. Also add `WEBSH_RECORD_MAX_BYTES` (default 64 MiB) to
-  your sizing math — the cap stops a runaway recording, not the
-  session.
+- terminal output routinely contains secrets (cat'ed configs, env dumps),
+  so the recordings are sensitive even without keystrokes;
+- files are created `0600` under the server user, but there is no built-in
+  rotation or retention — pair it with a tmpwatch/logrotate policy and tell
+  your users they are being recorded where the law requires it;
+- the browser-form ssh password is never recorded as input (the auto-type
+  happened below the input tee, which is now removed). One caveat on the
+  output side: a malicious/non-OpenSSH target that prints a password-looking
+  prompt WITHOUT disabling terminal echo would cause the auto-typed password
+  to echo back into the output stream — and therefore into the recording. A
+  genuine OpenSSH prompt disables echo first, so the standard flow never
+  records it; the hostile-server case already hands the password to the
+  attacker, the recording merely adds local persistence. Also add
+  `WEBSH_RECORD_MAX_BYTES` (default 64 MiB) to your sizing math — the cap
+  stops a runaway recording, not the session.
 
 Replay with `asciinema play <file>` or any asciicast v2 player.

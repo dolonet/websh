@@ -1,7 +1,17 @@
-# NOTE: websh@.service (the multi-instance template) is derived from
-# this unit — apply hardening/option changes to BOTH files.
+# Template unit: one websh instance per /etc/websh/<name>.env.
+#
+#   install -d /etc/websh
+#   printf 'PORT=8766\n' > /etc/websh/staging.env
+#   systemctl enable --now websh@staging
+#
+# Instances are fully isolated: own port, own state directory
+# (/var/lib/websh-<name>), own env file. The single-instance
+# websh.service remains the default path for one-box deployments.
+#
+# NOTE: derived from websh.service — apply hardening/option changes
+# to BOTH files.
 [Unit]
-Description=websh — SSH terminal backend
+Description=websh — SSH terminal backend (instance %i)
 After=network.target
 
 [Service]
@@ -10,21 +20,30 @@ ExecStart=/usr/bin/python3 /opt/websh/server.py
 Restart=on-failure
 RestartSec=5
 
-Environment=PORT=8765
+# Per-instance configuration lives in /etc/websh/<instance>.env —
+# PORT is the one knob every instance MUST set (instances collide on
+# the default otherwise). Everything else (HOST, SESSION_TIMEOUT,
+# MAX_SESSIONS, WEBSH_CONFIG, WEBSH_VAULT_ENABLE, ...) is optional;
+# see docs/configuration.md for the full table.
 Environment=HOST=127.0.0.1
 Environment=SESSION_TIMEOUT=300
 Environment=MAX_SESSIONS=50
+EnvironmentFile=/etc/websh/%i.env
+
+# Per-instance writable state. StateDirectory pre-creates
+# /var/lib/websh-%i owned by the service user and keeps it writable
+# despite ProtectSystem=strict / ProtectHome=read-only, so the lazily
+# created websh.creds.json (mode 0600) has somewhere to live the moment
+# the vault is enabled. It is per-instance, so instances never share a
+# credential store.
+StateDirectory=websh-%i
 
 # The encrypted credential vault is available but OFF by default. To turn
-# it on, `systemctl edit websh` and add `Environment=WEBSH_VAULT_ENABLE=1`
-# (the cryptography wheel from requirements.txt must be installed; without
-# it the server still runs and the saved-credential UI just stays hidden).
-# StateDirectory pre-creates /var/lib/websh owned by the service user and
-# keeps it writable despite ProtectSystem=strict / ProtectHome=read-only,
-# so the lazily created websh.creds.json (mode 0600) has somewhere to live
-# the moment the vault is enabled.
-Environment=WEBSH_CREDS_PATH=/var/lib/websh/websh.creds.json
-StateDirectory=websh
+# it on, `systemctl edit websh@<instance>` and add
+# `Environment=WEBSH_VAULT_ENABLE=1` (the cryptography wheel from
+# requirements.txt must be installed; without it the server still runs and
+# the saved-credential UI just stays hidden).
+Environment=WEBSH_CREDS_PATH=/var/lib/websh-%i/websh.creds.json
 
 User=websh
 Group=websh

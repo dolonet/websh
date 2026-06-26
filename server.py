@@ -80,15 +80,83 @@ except ImportError:  # pragma: no cover - exercised by the no-deps CI job
     InvalidTag = Exception
     HAS_CRYPTOGRAPHY = False
 
+# ─── Knob resolution ─────────────────────────────────────────────────
+#
+# Every tunable resolves through _knob():
+#   1. env WEBSH_<NAME>  — the unambiguous alias wins: bare generic
+#      names (PORT, HOST, MAX_SESSIONS, ...) can be set by unrelated
+#      software in a shared environment, which is exactly the collision
+#      the prefix defends against;
+#   2. env <NAME>        — the historically documented name;
+#   3. websh.json "server" object — the only plane a shared-hosting
+#      deployment can reliably write to (api.php's auto-start
+#      guarantees only WEBSH_CONFIG and PORT in the environment);
+#      HOST and TRUSTED_PROXIES are env-only (_ENV_ONLY_KNOBS);
+#   4. the built-in default.
+#
+# The JSON plane is read ONCE at import: knobs are process-lifetime
+# constants and mid-flight changes to most of them would be unsound.
+# WEBSH_CONFIG itself is env-only — it locates the JSON.
+# Full table: docs/configuration.md.
+
+def _server_knobs():
+    """The websh.json "server" object, or {} when absent/broken."""
+    path = os.environ.get("WEBSH_CONFIG", "")
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as f:
+            section = json.load(f).get("server")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        # load_config() re-reads the file later and WARNs properly;
+        # knob resolution just falls back to env/defaults.
+        return {}
+
+
+_SERVER_KNOBS = _server_knobs()
+
+
+# Knobs that must NOT be settable from websh.json: a config-file write
+# primitive should not be able to rebind the loopback-only server to a
+# public interface or take over X-Forwarded-For trust (rate-limit /
+# per-IP-cap spoofing), nor redirect the filesystem paths the server
+# writes to — WEBSH_ACCESS_LOG (arbitrary-path O_APPEND|O_CREAT) and
+# WEBSH_CREDS_PATH (where the vault's _save_creds_atomic os.replace()
+# lands, i.e. arbitrary-path file overwrite). All env only.
+_ENV_ONLY_KNOBS = frozenset({
+    "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH"})
+
+
+def _knob(name, default):
+    """Resolve one tunable (raw value; callers cast). See the
+    precedence comment above."""
+    if not name.startswith("WEBSH_"):
+        v = os.environ.get("WEBSH_" + name)
+        if v is not None:
+            return v
+    v = os.environ.get(name)
+    if v is not None:
+        return v
+    if name in _SERVER_KNOBS and name not in _ENV_ONLY_KNOBS:
+        return _SERVER_KNOBS[name]
+    return default
+
+
+def _bool_knob(name):
+    """True for 1/true (any case, str or JSON literal)."""
+    return str(_knob(name, "")).lower() in ("1", "true")
+
+
 # Operator opt-in until the client-side PR (PR-C) lands. Default off
 # so a server upgrade does not advertise endpoints the bundled client
 # does not know how to call. Will become the default once PR-C ships.
-WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
+WEBSH_VAULT_ENABLE = _bool_knob("WEBSH_VAULT_ENABLE")
 
 # Operator opt-in to the future v1.0.0 default. With this set, any
 # plaintext credential in websh.json blocks startup with an actionable
 # message. Without it, plaintext still works and emits a WARN once.
-WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
+WEBSH_REQUIRE_VAULT = _bool_knob("WEBSH_REQUIRE_VAULT")
 
 # Runtime trap: flipped True when the on-disk creds file is unreadable
 # (unsupported schema version, etc) to refuse-to-write rather than
@@ -96,28 +164,49 @@ WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
 _vault_disabled = False
 
 __version__ = "0.2.0"
+# Wire-protocol version, shipped in /api/config and /api/ping and
+# checked by the bundled client at page load. Bump it on any breaking
+# change to an endpoint's request/response shape, semantics or status
+# codes (see docs/protocol.md) so a browser that boots with a STALE
+# CACHED websh.js after a server upgrade gets a "reload the page"
+# prompt instead of failing obscurely. Additive fields do NOT bump it.
+PROTO_VERSION = 1
 
 # ─── Configuration ───────────────────────────────────────────────────
 
 def _int_env(name, default):
     try:
-        return int(os.environ.get(name, default))
+        return int(_knob(name, default))
     except (TypeError, ValueError):
         return int(default)
 
 PORT = _int_env("PORT", "8765")
-HOST = os.environ.get("HOST", "127.0.0.1")
+HOST = str(_knob("HOST", "127.0.0.1"))
+# Optional header-trust authentication. When set to a header name (e.g.
+# "Remote-User" from oauth2-proxy / Authelia / authentik), every request
+# except /api/ping requires that header, its value becomes the request's
+# identity, sessions are stamped with their creator's identity at
+# connect, and every session endpoint enforces ownership (403 across
+# users). The header is only read when the TCP peer is in
+# TRUSTED_PROXIES — exactly the X-Forwarded-For trust rule — so a
+# client talking to the backend directly cannot mint identities; with
+# the feature on, an untrusted peer is simply unauthenticated (401).
+WEBSH_AUTH_HEADER = os.environ.get("WEBSH_AUTH_HEADER", "").strip()
 # Opt-in session recording (asciicast v2, one .cast file per session,
 # created 0600). OFF unless WEBSH_RECORD_DIR names a directory the
-# server user can write. Output-only by default: WEBSH_RECORD_INPUT=1
-# additionally records keystrokes — leave it off unless you understand
-# that EVERYTHING the user types into the remote shell (incl. any
-# password typed at a sudo/login prompt INSIDE the session) lands in
-# the file. The browser-form ssh password is never recorded either way
-# (it is auto-typed below the input tee). Recording is best-effort: a
-# write failure disables it for that session and never kills the PTY.
+# server user can write. Recording is OUTPUT-ONLY; keystroke/input
+# recording is hard-disabled (see WEBSH_RECORD_INPUT below). Recording is
+# best-effort: a write failure disables it for that session, never the PTY.
 WEBSH_RECORD_DIR = os.environ.get("WEBSH_RECORD_DIR", "").strip()
-WEBSH_RECORD_INPUT = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+# Input recording (keystrokes — which include any password typed at a
+# sudo/login prompt INSIDE the session) is HARD-DISABLED. Capturing
+# keystrokes to disk on a public-facing deployment is a liability we do
+# not accept, so recording is always output-only regardless of the
+# environment. The env var is read ONLY to warn an operator who sets it
+# (see main()). The browser-form ssh password was never recorded either
+# way (it is auto-typed below the input tee).
+_WEBSH_RECORD_INPUT_REQUESTED = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+WEBSH_RECORD_INPUT = False
 # Per-file ceiling. A `cat /dev/urandom` session would otherwise write
 # unbounded (and invalid UTF-8 inflates ~3-5x through replacement +
 # JSON escaping). Hitting the cap stops the recording with one WARN;
@@ -200,7 +289,7 @@ MAX_TMUX_CAPTURE_BYTES = max(1, _int_env("WEBSH_TMUX_CAPTURE_BYTES",
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
 _TRUSTED_PROXIES = set(
-    p.strip() for p in os.environ.get("TRUSTED_PROXIES", "127.0.0.1").split(",")
+    p.strip() for p in str(_knob("TRUSTED_PROXIES", "127.0.0.1")).split(",")
     if p.strip()
 )
 
@@ -577,7 +666,9 @@ def _resolve_log_path(raw):
     return os.path.abspath(os.path.expanduser(raw))
 
 
-ACCESS_LOG_PATH = _resolve_log_path(os.environ.get("WEBSH_ACCESS_LOG"))
+_v = _knob("WEBSH_ACCESS_LOG", None)
+ACCESS_LOG_PATH = _resolve_log_path(None if _v is None else str(_v))
+del _v
 
 # Per-field caps (in Unicode codepoints) for known fields. Anything not
 # listed here gets _DEFAULT_FIELD_CAP. Values are server- or attacker-
@@ -592,6 +683,7 @@ _LOG_FIELD_CAPS = {
     "result": 32,
     "event": 32,
     "classification": 32,
+    "auth_user": 64,       # header-trust identity (matches target_user)
 }
 _DEFAULT_FIELD_CAP = 256
 
@@ -698,6 +790,18 @@ def _check_side_channel_rate_limit(ip):
     side-channel limit."""
     return _rate_limit_take(_side_channel_rate_limits, _side_channel_rate_lock,
                             ip, SIDE_CHANNEL_RATE_MAX, SIDE_CHANNEL_RATE_WINDOW)
+
+
+def _prune_stale(store, lock, cutoff, ts_of=lambda e: e):
+    """Drop every IP from a per-IP event store whose newest event is older
+    than `cutoff`. `ts_of` extracts the timestamp from one stored entry
+    (the scan-pattern store keeps (ts, host) tuples). Shared by cleanup()
+    for the two rate-limit stores and the scan-pattern store."""
+    with lock:
+        stale = [ip for ip, entries in store.items()
+                 if not any(ts_of(e) > cutoff for e in entries)]
+        for ip in stale:
+            del store[ip]
 
 
 # ─── Scan-pattern detection ─────────────────────────────────────────
@@ -1025,6 +1129,8 @@ def load_config():
             "isolate_storage": bool(cfg.get("isolate_storage", False)),
             "denied_host_set": denied_host_set,
             "denied_net_list": denied_net_list,
+            # Raw passthrough; validated field-by-field in config_public.
+            "form_defaults": cfg.get("form_defaults"),
         }
         _config_cache = result
         _config_mtime = mtime
@@ -1079,7 +1185,7 @@ def _creds_path():
     Honors WEBSH_CREDS_PATH explicitly; otherwise sits next to
     WEBSH_CONFIG when set, else cwd.
     """
-    env = os.environ.get("WEBSH_CREDS_PATH", "").strip()
+    env = str(_knob("WEBSH_CREDS_PATH", "")).strip()
     if env:
         return env
     cfg = os.environ.get("WEBSH_CONFIG", "").strip()
@@ -1244,14 +1350,38 @@ def config_public():
             if c.get("denied_users") is not None:
                 item["denied_users"] = c["denied_users"]
         safe.append(item)
-    return {
+    out = {
         "connections": safe,
         "restrict_hosts": cfg["restrict_hosts"],
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
-        "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
+        "proto": PROTO_VERSION,
+        "vault_enabled": _vault_available(),
     }
+    # Optional connect-form prefill (websh.json "form_defaults"): lets a
+    # deployment seed host/port/username in the manual form without
+    # resorting to HTML rewriting in the front proxy (the nginx
+    # sub_filter hack this replaces). Validated field-by-field — a bad
+    # type or range drops that field, never the response. The client
+    # ignores the section when restrict_hosts is on and connections are
+    # configured (the manual form is locked to those connections).
+    fd = cfg.get("form_defaults")
+    if isinstance(fd, dict):
+        clean = {}
+        host = fd.get("host")
+        if isinstance(host, str) and 0 < len(host.strip()) <= 255:
+            clean["host"] = host.strip()
+        username = fd.get("username")
+        if isinstance(username, str) and 0 < len(username.strip()) <= 64:
+            clean["username"] = username.strip()
+        port = fd.get("port")
+        if isinstance(port, int) and not isinstance(port, bool) \
+                and MIN_PORT <= port <= MAX_PORT:
+            clean["port"] = port
+        if clean:
+            out["form_defaults"] = clean
+    return out
 
 
 def find_config_connection(name):
@@ -1407,6 +1537,34 @@ def clamp(value, lo, hi, default):
         return default
 
 
+def _bad_rel_path(p):
+    """True when `p` is unusable as a $HOME-relative remote path: empty,
+    oversized, absolute, NUL-bearing, or traversing (a `..` segment).
+    Shared by the upload family — keep the rules in one place so the
+    staging path and its cleanup path can never drift apart."""
+    return (not p or len(p) > 4096 or p.startswith("/")
+            or "\x00" in p or ".." in p.split("/"))
+
+
+def _kill_reap(proc):
+    """Best-effort kill + reap of a side-channel subprocess so it can't
+    linger as a zombie. Both steps are individually guarded: the process
+    may already be gone (kill) or stuck in the kernel (wait timeout)."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _vault_available():
+    """True when the encrypted credential vault can serve requests."""
+    return HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled
+
+
 # ─── Session management ─────────────────────────────────────────────
 
 sessions = OrderedDict()
@@ -1460,6 +1618,11 @@ class SSHSession(object):
         # uses a selector — see _build_session_selector and the
         # interleaved-short-waits loop in wait_for_data.
         self._data_event = Event()
+        # Write ends of per-WAIT wake socketpairs (see wait_for_data):
+        # _signal() pokes one byte into each so a parked waiter wakes
+        # from a single blocking select instead of polling in slices.
+        self._waiters = set()
+        self._waiters_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
         # At most one /api/stream consumer per session. SSHSession.read()
@@ -1770,8 +1933,17 @@ class SSHSession(object):
             return
         try:
             while self.alive:
+                # The timeout only bounds how fast we notice alive=False
+                # when the fd was NOT closed (close() resets master_fd to
+                # -1 first, so the next select raises ValueError and we
+                # break instantly; data / child-exit EOF-EIO wake select
+                # immediately). 0.25s cuts idle wakeups 5x vs the old
+                # 0.05s — 50 idle sessions burn 200 wakeups/s instead of
+                # 1000 — at the cost of ≤250ms extra on the rare
+                # alive-flag-only exits (e.g. write() hitting OSError).
+                # Output latency is unaffected.
                 try:
-                    r, _, _ = select.select([self.master_fd], [], [], 0.05)
+                    r, _, _ = select.select([self.master_fd], [], [], 0.25)
                 except (ValueError, OSError):
                     break
 
@@ -1997,11 +2169,28 @@ class SSHSession(object):
     def _signal(self):
         """Wake any consumer thread blocked in wait_for_data(). Setting
         an already-set Event is a no-op, so wakeups coalesce naturally.
-        Event.set() does not raise."""
+        Event.set() does not raise. Parked waiters additionally get one
+        byte on their per-wait wake socket so they return from a single
+        blocking select; a full pipe / closed peer is irrelevant (any
+        readable byte means wake, and the waiter is tearing down)."""
         ev = self._data_event
         if ev is None:
             return
         ev.set()
+        waiters = getattr(self, "_waiters", None)
+        if not waiters:
+            return
+        # Send UNDER the lock: the waiter's finally discards its socket
+        # under the same lock before closing it, so a send can never
+        # overlap a close — without this, a send racing the close could
+        # in principle hit a recycled fd number (send is non-blocking,
+        # so the hold time is bounded).
+        with self._waiters_lock:
+            for w in list(waiters):
+                try:
+                    w.send(b"x")
+                except (OSError, ValueError):
+                    pass
 
     # Slice length for the interleaved short-wait loop in wait_for_data.
     # The Event itself wakes within microseconds of _signal(); the slice
@@ -2049,6 +2238,69 @@ class SSHSession(object):
         if ev.is_set():
             ev.clear()
             return
+        waiters = getattr(self, "_waiters", None)
+        if waiters is not None:
+            # Parked path: one blocking select on (wake socket, client
+            # socket) for the whole timeout — zero wakeups while idle,
+            # vs 50/second in the slice loop below. The socketpair is
+            # PER WAIT: registered under the lock, discarded under
+            # the same lock before closing (and _signal sends under it
+            # too), so nothing outlives the wait and a signal can never
+            # touch a closed/recycled fd. The Event stays as the state
+            # carrier.
+            try:
+                wake_r, wake_w = socket.socketpair()
+            except OSError:
+                wake_r = wake_w = None   # fd exhaustion: slice fallback
+            if wake_r is not None:
+                sel = None
+                try:
+                    wake_r.setblocking(False)
+                    wake_w.setblocking(False)
+                    with self._waiters_lock:
+                        waiters.add(wake_w)
+                    # A signal may have landed between the is_set()
+                    # check above and our registration — it would have
+                    # missed our wake socket. Re-check.
+                    if ev.is_set():
+                        ev.clear()
+                        return
+                    try:
+                        sel = selectors.DefaultSelector()
+                    except OSError:
+                        # epoll-fd exhaustion: fall through to the slice
+                        # loop below (the finally cleans the pair up).
+                        sel = None
+                    if sel is None:
+                        wake_r_failed = True
+                    else:
+                        wake_r_failed = False
+                        sel.register(wake_r, selectors.EVENT_READ)
+                    if not wake_r_failed:
+                        if client_socket is not None:
+                            try:
+                                sel.register(client_socket,
+                                             selectors.EVENT_READ)
+                            except (KeyError, ValueError, OSError):
+                                pass
+                        sel.select(timeout)
+                        if ev.is_set():
+                            ev.clear()
+                        return
+                finally:
+                    with self._waiters_lock:
+                        waiters.discard(wake_w)
+                    if sel is not None:
+                        try:
+                            sel.close()
+                        except Exception:
+                            pass
+                    for sock in (wake_r, wake_w):
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+
         deadline = time.time() + timeout
         while True:
             remaining = deadline - time.time()
@@ -2112,8 +2364,9 @@ class SSHSession(object):
             self.alive = False
             return False
         self.last_activity = time.time()
-        if WEBSH_RECORD_INPUT:
-            self._record("i", data)
+        # Input recording (keystrokes — which include passwords typed at
+        # prompts inside the session) is hard-disabled; see WEBSH_RECORD_INPUT.
+        # The 'i' event is never written — recording is output-only.
         try:
             os.write(self.master_fd, data)
             return True
@@ -2190,6 +2443,47 @@ class SSHSession(object):
             # died, peer FIN, etc.) — best-effort, fall through.
             pass
 
+    # ── ControlMaster side-channel plumbing ─────────────────────────
+    #
+    # Every side-channel operation (tmux capture/options, file transfer,
+    # ls) runs a one-shot command over the existing ControlMaster socket
+    # with the same ssh argv. Build it in exactly one place so a future
+    # option change can't silently miss one of the seven call sites.
+    # terminate_remote_tmux is deliberately NOT on this helper: it
+    # re-dials with -p/-l/ConnectTimeout because its socket may belong
+    # to a master that is still authenticating.
+
+    def _mux_ready(self):
+        """True when the ControlMaster socket exists and can be dialed."""
+        return bool(self._control_path) and os.path.exists(self._control_path)
+
+    def _mux_argv(self, remote_cmd):
+        """argv for a one-shot remote command over the ControlMaster."""
+        return [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+
+    def _mux_run(self, remote_cmd, timeout, timeout_msg,
+                 err_prefix="ssh error: "):
+        """subprocess.run a remote command over the ControlMaster with
+        the shared timeout/exception handling. Returns (CompletedProcess,
+        None) on spawn success — the caller still interprets returncode/
+        stdout/stderr, which genuinely differ per operation — or
+        (None, error_string)."""
+        try:
+            proc = subprocess.run(self._mux_argv(remote_cmd),
+                                  capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, timeout_msg
+        except Exception as e:
+            # `or repr(e)` keeps the error truthy even for the rare
+            # exception with an empty str() — callers branch on `if err:`.
+            return None, err_prefix + (str(e) or repr(e))
+        return proc, None
+
     def tmux_capture(self):
         """Capture the full tmux pane buffer (scrollback + visible) over
         the ControlMaster channel. Only meaningful for persistent
@@ -2197,7 +2491,7 @@ class SSHSession(object):
         (bytes, error)."""
         if not self.persistent or not self.slot_id:
             return None, "not a persistent session"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, "control socket not ready"
         # `-S -<N>` reads the most recent N lines of history (was `-S -`,
         # the whole history, which on a 10M-line scrollback buffers
@@ -2208,19 +2502,9 @@ class SSHSession(object):
         tname = "websh-" + self.slot_id
         remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S -" +
                       str(MAX_TMUX_CAPTURE_LINES) + " -t " + tname)
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(
-                ssh_cmd, capture_output=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            return None, "tmux capture timeout"
-        except Exception as e:
-            return None, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 30, "tmux capture timeout")
+        if err:
+            return None, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return None, "tmux exit %d: %s" % (proc.returncode, err)
@@ -2243,7 +2527,7 @@ class SSHSession(object):
         used at connect time. Returns (ok, error)."""
         if not self.persistent or not self.slot_id:
             return False, "not a persistent session"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
         if not options:
             return True, ""
@@ -2254,19 +2538,9 @@ class SSHSession(object):
         # connect time.
         parts = ["set -g " + opt + " " + val for opt, val in options]
         remote_cmd = self.tmux_cmd + " " + " \\; ".join(parts)
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(
-                ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return False, "tmux set timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 10, "tmux set timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "tmux exit %d: %s" % (proc.returncode, err)
@@ -2281,7 +2555,7 @@ class SSHSession(object):
         re-auth and no PTY overhead. Returns (ok, error)."""
         if not self.alive:
             return False, "session is dead"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
 
         # rel_path is base64-encoded and decoded inside the remote shell so
@@ -2294,14 +2568,8 @@ class SSHSession(object):
             'cat > "$HOME/$n"'
         )
 
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
         proc = subprocess.Popen(
-            ssh_cmd,
+            self._mux_argv(remote_cmd),
             stdin=subprocess.PIPE,
             # `cat >` produces no stdout; discard it. stderr is kept (for the
             # "ssh exit N: <msg>" error below) but MUST be drained while we
@@ -2366,14 +2634,7 @@ class SSHSession(object):
                 proc.stdin.close()
             except Exception:
                 pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
             # remote `cat >` already died (e.g. "No space left on device")
@@ -2392,14 +2653,7 @@ class SSHSession(object):
         try:
             proc.wait(timeout=max(60, timeout))
         except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+            _kill_reap(proc)
             _drain.join(timeout=5)
             return False, "ssh side-channel timeout"
 
@@ -2426,7 +2680,7 @@ class SSHSession(object):
         guard for vim/less/htop)."""
         if not self.persistent or not self.slot_id:
             return False, "non-persistent"
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
 
         # Both names are base64-encoded in case the user picked a file
@@ -2467,18 +2721,9 @@ class SSHSession(object):
             'fi; '
             'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=15)
-        except subprocess.TimeoutExpired:
-            return False, "finalize timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 15, "finalize timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "finalize exit %d: %s" % (proc.returncode, err)
@@ -2490,7 +2735,7 @@ class SSHSession(object):
         the user cancelled — keystroke-free, so no risk of poking a
         running editor in the foreground PTY. Idempotent. rel_path
         must come from the caller's path validator."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return False, "control socket not ready"
         b = base64.b64encode(rel_path.encode("utf-8")).decode("ascii")
         # The `--` after rm protects against an attacker-supplied path
@@ -2500,18 +2745,9 @@ class SSHSession(object):
             'n=$(printf %s ' + b + ' | base64 -d) && '
             'rm -f -- "$HOME/$n"'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            proc = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return False, "rm timeout"
-        except Exception as e:
-            return False, "ssh error: " + str(e)
+        proc, err = self._mux_run(remote_cmd, 10, "rm timeout")
+        if err:
+            return False, err
         if proc.returncode != 0:
             return False, "rm exit %d" % proc.returncode
         return True, ""
@@ -2520,7 +2756,7 @@ class SSHSession(object):
         """List a directory via the ControlMaster side-channel.
         remote_path may be absolute, ~, ~/sub, or relative-to-$HOME.
         Returns (entries, abs_path, error_string)."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, None, "control socket not ready"
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
@@ -2555,18 +2791,10 @@ class SSHSession(object):
               'printf "%s\\t%s\\t%s\\t%s\\0" "$t" "$s" "$m" "$f"; '
             'done'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
-        try:
-            result = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            return None, None, "timeout"
-        except Exception as e:
-            return None, None, str(e)
+        # err_prefix="" keeps this method's historical bare str(e) message.
+        result, err = self._mux_run(remote_cmd, 10, "timeout", err_prefix="")
+        if err:
+            return None, None, err
         if result.returncode != 0:
             return None, None, "directory not found"
 
@@ -2602,7 +2830,7 @@ class SSHSession(object):
         Subprocess stdout starts with a header "OK\\t<size>\\n" or
         "ERR\\t<msg>\\n" so the caller can detect failure before
         sending HTTP response headers."""
-        if not self._control_path or not os.path.exists(self._control_path):
+        if not self._mux_ready():
             return None, "control socket not ready"
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
@@ -2620,12 +2848,6 @@ class SSHSession(object):
               'cat -- "$F"; '
             'else printf "ERR\\tFile not found\\n"; fi'
         )
-        ssh_cmd = [
-            "ssh", "-T",
-            "-o", "BatchMode=yes",
-            "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
-        ]
         try:
             # stderr→DEVNULL: the protocol header (OK/ERR on stdout) already
             # signals failure to the caller, and a PIPE that nobody drains
@@ -2633,7 +2855,7 @@ class SSHSession(object):
             # (host-key prompts, banners, debug). Same pattern as
             # terminate_remote_tmux.
             proc = subprocess.Popen(
-                ssh_cmd,
+                self._mux_argv(remote_cmd),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -2715,31 +2937,18 @@ def cleanup():
             s.close()
         except Exception as e:
             _log("WARN", "session {} close failed: {}".format(sid, e))
-    # Prune stale rate limit entries to prevent unbounded memory growth
+    # Prune stale per-IP entries to prevent unbounded memory growth.
+    # Without this the dicts grow proportionally to attacker activity and
+    # never shrink — the worst possible scaling profile for a long-running
+    # deploy. An IP whose newest event has aged out of the window
+    # disappears from RAM entirely.
     now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    with _rate_lock:
-        stale = [ip for ip, times in _rate_limits.items()
-                 if not any(t > cutoff for t in times)]
-        for ip in stale:
-            del _rate_limits[ip]
-    sc_cutoff = now - SIDE_CHANNEL_RATE_WINDOW
-    with _side_channel_rate_lock:
-        stale = [ip for ip, times in _side_channel_rate_limits.items()
-                 if not any(t > sc_cutoff for t in times)]
-        for ip in stale:
-            del _side_channel_rate_limits[ip]
-    # Prune stale scan-pattern entries the same way. Without this the
-    # dict grows proportionally to attacker activity and never shrinks
-    # — the worst possible scaling profile for a long-running deploy.
-    # Drop any IP whose newest event has aged out of the window (so an
-    # attacker that stops probing eventually disappears from RAM).
-    scan_cutoff = now - SCAN_PATTERN_WINDOW
-    with _scan_pattern_lock:
-        stale = [ip for ip, events in _scan_pattern.items()
-                 if not any(t > scan_cutoff for t, _ in events)]
-        for ip in stale:
-            del _scan_pattern[ip]
+    _prune_stale(_rate_limits, _rate_lock, now - RATE_LIMIT_WINDOW)
+    _prune_stale(_side_channel_rate_limits, _side_channel_rate_lock,
+                 now - SIDE_CHANNEL_RATE_WINDOW)
+    # Scan-pattern values are (ts, host) tuples, not bare timestamps.
+    _prune_stale(_scan_pattern, _scan_pattern_lock,
+                 now - SCAN_PATTERN_WINDOW, ts_of=lambda e: e[0])
 
 
 def _cleanup_loop():
@@ -2851,6 +3060,23 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
         return self.rfile.read(n) if n else b""
 
+    def _json_body(self):
+        """Parse the request body as a JSON object. Returns the dict, or
+        None after replying 400. Non-dict JSON (a bare list / string /
+        number) is rejected too: every caller immediately does
+        body.get(), which previously blew up with AttributeError — a
+        dropped connection — instead of the 400 the malformed-JSON case
+        gets."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return None
+        if not isinstance(body, dict):
+            self._json({"error": "invalid json"}, 400)
+            return None
+        return body
+
     def _path(self):
         p = self.path.split("?")[0].rstrip("/")
         return p or "/"
@@ -2910,66 +3136,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
 
     # ── Dispatch ────────────────────────────────────────────────────
+    #
+    # One table per HTTP method, action → handler-method name. Adding an
+    # endpoint is one table row (plus a row in the PHP proxy's switch for
+    # shared-hosting mode). Values are attribute names rather than bound
+    # methods so the tables can live on the class.
+
+    _POST_ROUTES = {
+        "connect":         "_connect",
+        "input":           "_input",
+        "resize":          "_resize",
+        "disconnect":      "_disconnect",
+        "upload":          "_upload",
+        "upload_finalize": "_upload_finalize",
+        "upload_cancel":   "_upload_cancel",
+        "tmux_options":    "_tmux_options",
+        "save":            "_save_credential",
+        # Compatibility with the bundled frontend in Python-only mode.
+        # The PHP shim translates POST ?action=save_delete into
+        # DELETE /api/save; when server.py serves api.php-style URLs
+        # directly, do the same dispatch here.
+        "save_delete":     "_delete_credential",
+    }
+
+    _GET_ROUTES = {
+        "output":       "_output",
+        "stream":       "_stream",
+        "config":       "_config",
+        "ping":         "_ping",
+        "tmux_capture": "_tmux_capture",
+        "ls":           "_ls",
+        "download":     "_download",
+    }
+
+    _DELETE_ROUTES = {
+        "save": "_delete_credential",
+    }
+
+    def _dispatch(self, routes):
+        name = routes.get(self._resolve_action())
+        if name is None:
+            self._json({"error": "not found"}, 404)
+            return
+        getattr(self, name)()
 
     def do_POST(self):
-        action = self._resolve_action()
-        if action == "connect":
-            self._connect()
-        elif action == "input":
-            self._input()
-        elif action == "resize":
-            self._resize()
-        elif action == "disconnect":
-            self._disconnect()
-        elif action == "upload":
-            self._upload()
-        elif action == "upload_finalize":
-            self._upload_finalize()
-        elif action == "upload_cancel":
-            self._upload_cancel()
-        elif action == "tmux_options":
-            self._tmux_options()
-        elif action == "save":
-            self._save_credential()
-        elif action == "save_delete":
-            # Compatibility with the bundled frontend in Python-only
-            # mode. The PHP shim translates POST ?action=save_delete
-            # into DELETE /api/save; when server.py serves api.php-style
-            # URLs directly, do the same dispatch here.
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        if self._auth_gate():
+            return
+        self._dispatch(self._POST_ROUTES)
 
     def do_GET(self):
-        p = self._path()
-        static = _STATIC_FILES.get(p)
+        # /api/ping stays open: docker healthchecks and the PHP shim's
+        # auto-start probe must work before any auth proxy is involved.
+        # It reveals only liveness + version, which the proxy-protected
+        # deployment model already exposes to the proxy itself.
+        if self._resolve_action() != "ping" and self._auth_gate():
+            return
+        static = _STATIC_FILES.get(self._path())
         if static:
             self._serve_static(*static)
             return
-        action = self._resolve_action()
-        if action == "output":
-            self._output()
-        elif action == "stream":
-            self._stream()
-        elif action == "config":
-            self._json(config_public())
-        elif action == "ping":
-            self._json({"ok": True, "version": __version__})
-        elif action == "tmux_capture":
-            self._tmux_capture()
-        elif action == "ls":
-            self._ls()
-        elif action == "download":
-            self._download()
-        else:
-            self._json({"error": "not found"}, 404)
+        self._dispatch(self._GET_ROUTES)
 
     def do_DELETE(self):
-        action = self._resolve_action()
-        if action == "save":
-            self._delete_credential()
-        else:
-            self._json({"error": "not found"}, 404)
+        if self._auth_gate():
+            return
+        self._dispatch(self._DELETE_ROUTES)
+
+    def _config(self):
+        self._json(config_public())
+
+    def _ping(self):
+        self._json({"ok": True, "version": __version__, "proto": PROTO_VERSION})
 
     # ── Source-IP / session-ID validation ───────────────────────────
 
@@ -3004,8 +3242,68 @@ class Handler(BaseHTTPRequestHandler):
                     return token
         return peer
 
+    def _client_identity(self):
+        """The authenticated identity, or "" when unauthenticated.
+        Only meaningful when WEBSH_AUTH_HEADER is configured; the header
+        is read exclusively from trusted proxies (same rule as
+        X-Forwarded-For) so a direct client cannot mint identities."""
+        if not WEBSH_AUTH_HEADER:
+            return ""
+        if self.client_address[0] not in _TRUSTED_PROXIES:
+            return ""
+        values = self.headers.get_all(WEBSH_AUTH_HEADER) or []
+        if len(values) > 1:
+            # A proxy that APPENDS its trusted header after a
+            # client-smuggled one would otherwise let the client's
+            # first value win (headers.get returns the first).
+            # Duplicates mean the proxy is not overwriting — refuse.
+            return ""
+        return (values[0] if values else "").strip()[:256]
+
+    def _auth_gate(self):
+        """401 unless the request carries an identity. True = blocked
+        (response already written). No-op when the feature is off."""
+        if not WEBSH_AUTH_HEADER:
+            return False
+        if self._client_identity():
+            return False
+        self._json({"error": "unauthorized"}, 401)
+        return True
+
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
+
+    def _require_session(self, sid):
+        """Validate `sid`, look it up, and reply 404 when it does not name
+        a live session. Returns the SSHSession, or None when a response
+        has already been written.
+
+        Rejects `_SessionPlaceholder` slots too: a placeholder only exists
+        for the duration of `_connect`'s ssh spawn, and no endpoint can do
+        anything useful with one — before this helper, hitting a non-stream
+        endpoint inside that window raised AttributeError (a 500 from
+        /api/input, whose write sits in a try/except; a dropped connection
+        with no response everywhere else) instead of the 404 the registry
+        miss gets a moment later."""
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return None
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session or isinstance(session, _SessionPlaceholder):
+            self._json({"error": "session not found"}, 404)
+            return None
+        if WEBSH_AUTH_HEADER and \
+                getattr(session, "owner", "") != self._client_identity():
+            # Another user's session: deny without confirming existence
+            # beyond the 403 (the sid itself was a 128-bit secret only
+            # its owner should hold; a cross-user probe is noteworthy —
+            # hence the audit record).
+            _access_log_emit("authz_denied", self._client_ip(),
+                             sid=sid, auth_user=self._client_identity())
+            self._json({"error": "forbidden"}, 403)
+            return None
+        return session
 
     def _side_channel_throttled(self):
         """Apply the per-IP side-channel rate limit. Returns True (and has
@@ -3019,18 +3317,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Vault save / delete ─────────────────────────────────────────
 
+    def _reply_vault_unavailable(self):
+        """The shared 501 for every vault-gated path; pairs with
+        _vault_available()."""
+        self._json({"error": "credential vault unavailable "
+                    "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                    "set / websh.creds.json schema unsupported — "
+                    "see server log)"}, 501)
+
     def _save_credential(self):
         ip = self._client_ip()
         if not _check_rate_limit(ip):
             _access_log_emit("save", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -3039,10 +3341,8 @@ class Handler(BaseHTTPRequestHandler):
         if content_length > _MAX_VAULT_REQUEST_BYTES:
             self._json({"error": "request body too large"}, 413)
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         vault_id = (body.get("vault_id") or "").strip()
         conn_id  = (body.get("conn_id") or "").strip()
@@ -3115,12 +3415,8 @@ class Handler(BaseHTTPRequestHandler):
             _access_log_emit("save_delete", ip, result="rate_limited")
             self._json({"error": "too many requests"}, 429)
             return
-        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                and not _vault_disabled):
-            self._json({"error": "credential vault unavailable "
-                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                        "set / websh.creds.json schema unsupported — "
-                        "see server log)"}, 501)
+        if not _vault_available():
+            self._reply_vault_unavailable()
             return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
@@ -3164,10 +3460,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "too many connection attempts"}, 429)
             return
 
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3203,12 +3497,8 @@ class Handler(BaseHTTPRequestHandler):
         ssh_options = {}
         if is_saved:
             # ── Saved-variant: resolve host/username/password from vault ──
-            if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
-                    and not _vault_disabled):
-                self._json({"error": "credential vault unavailable "
-                            "(cryptography missing / WEBSH_VAULT_ENABLE not "
-                            "set / websh.creds.json schema unsupported — "
-                            "see server log)"}, 501)
+            if not _vault_available():
+                self._reply_vault_unavailable()
                 return
             if not _VAULT_ID_RE.match(sv_vault) or not _CONN_ID_RE.match(sv_conn):
                 self._json({"error": "vault_input_invalid",
@@ -3447,6 +3737,10 @@ class Handler(BaseHTTPRequestHandler):
                 tmux_options=tmux_options,
                 client_ip=ip,
             )
+            # Identity stamp for header-trust auth: every session
+            # endpoint compares this against the request's identity.
+            # Empty when the feature is off (and never compared then).
+            session.owner = self._client_identity()
             with sessions_lock:
                 # Swap placeholder for the real Session. The slot was
                 # already counted under the gate lock, so this never
@@ -3460,6 +3754,7 @@ class Handler(BaseHTTPRequestHandler):
             # Successful connect forgives the IP — see _forgive_scan_for_ip.
             _forgive_scan_for_ip(ip)
             _access_log_emit("connect", ip, result="ok", sid=sid,
+                             auth_user=self._client_identity(),
                              target_host=host, target_user=username,
                              persistent=persistent,
                              latency_ms=int((time.time() - t0) * 1000))
@@ -3503,13 +3798,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         try:
@@ -3524,13 +3814,8 @@ class Handler(BaseHTTPRequestHandler):
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
 
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
@@ -3595,6 +3880,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
+        if WEBSH_AUTH_HEADER:
+            # Ownership BEFORE the slot-acquisition loop: a non-owner
+            # must not be able to (a) momentarily steal the stream slot
+            # or (b) learn streaming-vs-idle from a 409-vs-403 split.
+            with sessions_lock:
+                probe = sessions.get(sid)
+            if (probe is not None
+                    and not isinstance(probe, _SessionPlaceholder)
+                    and getattr(probe, "owner", "")
+                        != self._client_identity()):
+                _access_log_emit("authz_denied", self._client_ip(),
+                                 sid=sid, auth_user=self._client_identity())
+                self._json({"error": "forbidden"}, 403)
+                return
         # Acquire the per-session stream slot under sessions_lock. A second
         # /api/stream for the same session is mostly the *legitimate*
         # client reconnecting (visibility resume, network blip, EventSource
@@ -3785,20 +4084,13 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _resize(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3817,13 +4109,8 @@ class Handler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         data, err = session.tmux_capture()
         if err:
@@ -3843,19 +4130,12 @@ class Handler(BaseHTTPRequestHandler):
         same allow-list used at connect time."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         opts = _validate_tmux_options(body)
         ok, err = session.push_tmux_options(opts)
@@ -3879,13 +4159,13 @@ class Handler(BaseHTTPRequestHandler):
         sid = params.get("session_id", [""])[0]
         rel_path = params.get("path", [""])[0]
 
+        # Order matters (and is pinned by the dispatch tests): sid shape,
+        # then path/size validation, then registry existence — so a bad
+        # request is called out as bad even when the session is long gone.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not rel_path or len(rel_path) > 4096
-                or rel_path.startswith("/")
-                or "\x00" in rel_path
-                or ".." in rel_path.split("/")):
+        if _bad_rel_path(rel_path):
             # NUL would survive base64 encoding but bash strips it from
             # variable values, so the file would silently land at a
             # different name than the client asked for. Fail loud instead.
@@ -3903,10 +4183,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "file too large"}, 413)
             return
 
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         ok, err = session.upload_file(rel_path, self.rfile, length)
@@ -3940,33 +4218,29 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp, final }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
         final = body.get("final", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp/final
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
         # tmp uses the same rules as the upload path. final is a basename
         # — no slashes, no traversal, no NUL — because finalize_upload
         # cd's into the pane cwd and does `mv -- "$HOME/$t" "./$f"`.
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
         if (not final or len(final) > 4096
                 or "/" in final or "\x00" in final or final in ("..", ".")):
             self._json({"error": "invalid final"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, msg = session.finalize_upload(tmp, final)
         if not ok:
@@ -3990,25 +4264,21 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        if (not tmp or len(tmp) > 4096
-                or tmp.startswith("/") or "\x00" in tmp
-                or ".." in tmp.split("/")):
+        if _bad_rel_path(tmp):
             self._json({"error": "invalid tmp"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, err = session.remove_remote_tmp(tmp)
         if not ok:
@@ -4029,13 +4299,8 @@ class Handler(BaseHTTPRequestHandler):
         if "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         entries, abs_path, err = session.list_dir(path)
@@ -4058,27 +4323,14 @@ class Handler(BaseHTTPRequestHandler):
         if not path or "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         proc, err = session.download_file(path)
         if err:
             self._json({"error": err}, 502)
             return
-
-        def _reap():
-            # Reap the side-channel ssh after kill so it doesn't linger as
-            # a zombie. Mirrors the upload_file TimeoutExpired branch.
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
 
         # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
         header_line = b""
@@ -4089,15 +4341,13 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 header_line += c
         except Exception:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "download failed"}, 502)
             return
 
         parts = header_line.decode("utf-8", "replace").split("\t", 1)
         if not parts or parts[0] != "OK":
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             msg = parts[1].strip() if len(parts) > 1 else "download failed"
             self._json({"error": msg}, 404)
             return
@@ -4116,8 +4366,7 @@ class Handler(BaseHTTPRequestHandler):
         # any HTTP response headers, so the browser doesn't try to
         # accumulate a multi-GB Blob into memory.
         if content_length is not None and content_length > MAX_DOWNLOAD_SIZE:
-            proc.kill()
-            _reap()
+            _kill_reap(proc)
             self._json({"error": "file too large"}, 413)
             return
 
@@ -4166,8 +4415,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                _reap()
+                _kill_reap(proc)
         session.last_activity = time.time()
         # Audit the transfer so bulk exfiltration through a logged-in
         # session is visible to WEBSH_ACCESS_LOG / fail2ban. `bytes` is the
@@ -4180,16 +4428,27 @@ class Handler(BaseHTTPRequestHandler):
     # ── Disconnect ──────────────────────────────────────────────────
 
     def _disconnect(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
         terminate = bool(body.get("terminate", False))
         with sessions_lock:
-            session = sessions.pop(sid, None)
+            session = sessions.get(sid)
+            if (session is not None and WEBSH_AUTH_HEADER
+                    and getattr(session, "owner", "")
+                        != self._client_identity()):
+                session = None
+                forbidden = True
+            else:
+                forbidden = False
+                sessions.pop(sid, None)
+        if forbidden:
+            _access_log_emit("authz_denied", self._client_ip(),
+                             sid=sid, auth_user=self._client_identity())
+            self._json({"error": "forbidden"}, 403)
+            return
         if session:
             # Snapshot attacker-relevant state up front: if cleanup
             # raises we still want the access-log entry, with `error`
@@ -4208,6 +4467,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 fields = {"sid": sid, "terminate": terminate,
                           "target_host": host_for_log,
+                          "auth_user": self._client_identity(),
                           "result": "terminated" if terminate else "closed"}
                 if err is not None:
                     fields["error"] = err
@@ -4401,6 +4661,21 @@ def _close_all_sessions():
 
 
 def main():
+    # Header-trust auth and the credential vault are mutually exclusive for
+    # now. The vault is keyed by a client-supplied vault_id, NOT by the
+    # authenticated identity (see _save_credential / _delete_credential), so
+    # with WEBSH_AUTH_HEADER on any authenticated user could enumerate or
+    # delete another user's vault entries (host/user/port metadata; the
+    # secret itself stays passphrase-protected client-side). Until the vault
+    # is scoped per identity, refuse to start the unsafe combination loudly
+    # rather than ship a silent cross-user data path.
+    if WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE:
+        _log("ERROR",
+             "refusing to start: WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE are "
+             "both set, but the vault is keyed by client-supplied vault_id, "
+             "not by identity — an authenticated user could reach another "
+             "user's vault entries. Disable one until the vault is per-user.")
+        raise SystemExit(1)
     _warn_per_ip_misconfig()
     _warn_max_threads_misconfig()
     # Start background cleanup thread
@@ -4444,6 +4719,10 @@ def main():
         _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
     else:
         _log("INFO", "credential vault: enabled")
+    if _WEBSH_RECORD_INPUT_REQUESTED:
+        _log("WARN", "WEBSH_RECORD_INPUT is set but IGNORED: keystroke/input "
+                     "recording is hard-disabled (recording is output-only). "
+                     "Unset it to silence this warning.")
 
     stop_event.wait()
     _log("INFO", "shutting down")
