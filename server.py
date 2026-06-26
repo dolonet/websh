@@ -192,6 +192,27 @@ HOST = str(_knob("HOST", "127.0.0.1"))
 # client talking to the backend directly cannot mint identities; with
 # the feature on, an untrusted peer is simply unauthenticated (401).
 WEBSH_AUTH_HEADER = os.environ.get("WEBSH_AUTH_HEADER", "").strip()
+# Opt-in session recording (asciicast v2, one .cast file per session,
+# created 0600). OFF unless WEBSH_RECORD_DIR names a directory the
+# server user can write. Recording is OUTPUT-ONLY; keystroke/input
+# recording is hard-disabled (see WEBSH_RECORD_INPUT below). Recording is
+# best-effort: a write failure disables it for that session, never the PTY.
+WEBSH_RECORD_DIR = os.environ.get("WEBSH_RECORD_DIR", "").strip()
+# Input recording (keystrokes — which include any password typed at a
+# sudo/login prompt INSIDE the session) is HARD-DISABLED. Capturing
+# keystrokes to disk on a public-facing deployment is a liability we do
+# not accept, so recording is always output-only regardless of the
+# environment. The env var is read ONLY to warn an operator who sets it
+# (see main()). The browser-form ssh password was never recorded either
+# way (it is auto-typed below the input tee).
+_WEBSH_RECORD_INPUT_REQUESTED = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+WEBSH_RECORD_INPUT = False
+# Per-file ceiling. A `cat /dev/urandom` session would otherwise write
+# unbounded (and invalid UTF-8 inflates ~3-5x through replacement +
+# JSON escaping). Hitting the cap stops the recording with one WARN;
+# the session itself is never touched. 0 disables the cap.
+WEBSH_RECORD_MAX_BYTES = max(0, _int_env("WEBSH_RECORD_MAX_BYTES",
+                                         str(64 * 1024 * 1024)))
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
 # Per-source-IP active session cap. 0 disables the check (preserve legacy
@@ -1583,6 +1604,10 @@ class SSHSession(object):
         self.pid = None
         self.output_buf = b""
         self.buf_lock = Lock()
+        # Session recording (asciicast v2); None when disabled.
+        self._rec = None
+        self._rec_t0 = 0.0
+        self._rec_lock = Lock()
         # Cross-thread wake signal: the PTY read-loop calls _signal() (which
         # is _data_event.set()) after every output_buf update; consumers
         # (_stream / _output) park in wait_for_data() which waits on the
@@ -1769,6 +1794,10 @@ class SSHSession(object):
 
         ssh_cmd = self._build_ssh_cmd(host, port, username)
 
+        # Open the recording before the fork so even the earliest PTY
+        # bytes (banner, password prompt) land in the file.
+        self._rec_open(cols, rows)
+
         pid, fd = pty.fork()
         if pid == 0:
             # In the forked child: only call os._exit on execvpe failure.
@@ -1801,6 +1830,98 @@ class SSHSession(object):
             pass
 
     # ── Read loop / output buffer ───────────────────────────────────
+
+    # ── Session recording (asciicast v2) ────────────────────────────
+
+    def _rec_open(self, cols, rows):
+        """Start recording when WEBSH_RECORD_DIR is set. Best-effort."""
+        if not WEBSH_RECORD_DIR:
+            return
+        try:
+            # 0700 + explicit chmod (makedirs mode is ignored for an
+            # existing dir): the FILENAME carries the live session id —
+            # the API's only bearer credential — so a world-listable
+            # directory would let any local user hijack sessions.
+            os.makedirs(WEBSH_RECORD_DIR, mode=0o700, exist_ok=True)
+            os.chmod(WEBSH_RECORD_DIR, 0o700)
+            name = "%s-%s.cast" % (time.strftime("%Y%m%d-%H%M%S"), self.id)
+            path = os.path.join(WEBSH_RECORD_DIR, name)
+            # O_EXCL: the sid is unique, so a collision means something
+            # is impersonating the path — refuse rather than truncate.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # Line-buffered so a crash loses at most one event and the
+            # file can be live-tailed, matching asciinema's behavior.
+            self._rec = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+            self._rec_t0 = time.monotonic()
+            self._rec_bytes = 0
+            # Incremental decoders (one per direction): a multibyte
+            # UTF-8 sequence split across PTY reads must not become
+            # U+FFFD at every chunk boundary.
+            import codecs as _codecs
+            self._rec_dec = {}
+            self._rec_mkdec = lambda: _codecs.getincrementaldecoder(
+                "utf-8")("replace")
+            self._rec.write(json.dumps({
+                "version": 2,
+                "width": cols,
+                "height": rows,
+                "timestamp": int(time.time()),
+                "env": {"TERM": "xterm-256color"},
+            }) + "\n")
+        except Exception as e:
+            _log("WARN", "session {} recording disabled: {}".format(
+                self.id, e))
+            self._rec = None
+
+    def _record(self, kind, text):
+        """Append one event ([t, kind, text] JSONL). Never raises: a
+        broken recording must not kill the session — it logs once and
+        disables itself. getattr: tests (and the cleanup loop) touch
+        sessions built via __new__ that never ran __init__."""
+        if getattr(self, "_rec", None) is None:
+            return
+        try:
+            if isinstance(text, bytes):
+                dec = self._rec_dec.get(kind)
+                if dec is None:
+                    dec = self._rec_dec[kind] = self._rec_mkdec()
+                text = dec.decode(text)
+                if not text:
+                    return     # mid-sequence; flushed with the next chunk
+            with self._rec_lock:
+                f = self._rec
+                if f is None:
+                    return
+                # Timestamp under the lock so concurrent writers (the
+                # PTY reader vs input/resize handlers) cannot produce
+                # out-of-order events.
+                line = json.dumps(
+                    [round(time.monotonic() - self._rec_t0, 6), kind, text])
+                f.write(line + "\n")
+                self._rec_bytes += len(line) + 1
+                if (WEBSH_RECORD_MAX_BYTES
+                        and self._rec_bytes >= WEBSH_RECORD_MAX_BYTES):
+                    self._rec = None
+                    f.close()
+                    _log("WARN", "session {} recording capped at {} bytes"
+                         .format(self.id, WEBSH_RECORD_MAX_BYTES))
+        except Exception as e:
+            _log("WARN", "session {} recording stopped: {}".format(
+                self.id, e))
+            self._rec = None
+
+    def _rec_close(self):
+        if getattr(self, "_rec", None) is None:
+            self._rec = None
+            return
+        with self._rec_lock:
+            f = self._rec
+            self._rec = None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
 
     def _read_loop(self):
         """Background thread: reads PTY output into buffer."""
@@ -1836,6 +1957,7 @@ class SSHSession(object):
                         break
                     if not data:
                         break
+                    self._record("o", data)
 
                     # Auto-type password on prompt (accumulate to handle split reads)
                     if self._password and not self._password_sent:
@@ -1920,6 +2042,7 @@ class SSHSession(object):
                     if r:
                         leftover = os.read(self.master_fd, PTY_READ_SIZE)
                         if leftover:
+                            self._record("o", leftover)
                             with self.buf_lock:
                                 self.output_buf += leftover
                             self._signal()
@@ -1965,6 +2088,11 @@ class SSHSession(object):
             # Wake any consumer parked in wait_for_data so it observes
             # alive=False without waiting up to KEEPALIVE_INTERVAL.
             self._signal()
+            # The reader owns the recording tail: closing here (after
+            # the drain above) captures the session's final output.
+            # close()'s _rec_close stays as a backstop for sessions
+            # whose reader never ran.
+            self._rec_close()
 
     def _poll_child_exit(self):
         """Non-blocking WNOHANG check for the ssh child's self-exit, run from
@@ -2236,6 +2364,9 @@ class SSHSession(object):
             self.alive = False
             return False
         self.last_activity = time.time()
+        # Input recording (keystrokes — which include passwords typed at
+        # prompts inside the session) is hard-disabled; see WEBSH_RECORD_INPUT.
+        # The 'i' event is never written — recording is output-only.
         try:
             os.write(self.master_fd, data)
             return True
@@ -2245,6 +2376,7 @@ class SSHSession(object):
 
     def resize(self, cols, rows):
         self.last_activity = time.time()
+        self._record("r", "%dx%d" % (cols, rows))
         self._set_winsize(cols, rows)
 
     # ── Persistent tmux (terminate / capture / push options) ────────
@@ -2736,6 +2868,7 @@ class SSHSession(object):
 
     def close(self):
         self.alive = False
+        self._rec_close()
         # Wake any consumer parked in wait_for_data so it observes
         # alive=False and exits via the normal
         # `if not session.alive: break` path. Setting an Event whose
@@ -4586,6 +4719,10 @@ def main():
         _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
     else:
         _log("INFO", "credential vault: enabled")
+    if _WEBSH_RECORD_INPUT_REQUESTED:
+        _log("WARN", "WEBSH_RECORD_INPUT is set but IGNORED: keystroke/input "
+                     "recording is hard-disabled (recording is output-only). "
+                     "Unset it to silence this warning.")
 
     stop_event.wait()
     _log("INFO", "shutting down")

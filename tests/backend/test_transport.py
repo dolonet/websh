@@ -1949,5 +1949,201 @@ class TestParkedWaiterWake(unittest.TestCase):
         self.assertFalse(s._data_event.is_set(), "event consumed")
 
 
+class TestSessionRecording(unittest.TestCase):
+    """asciicast v2 recording: header shape, event framing, 0600 mode,
+    input off by default, best-effort failure, knob-off zero-cost."""
+
+    def _bare_session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = str(uuid.uuid4())
+        s._rec = None
+        s._rec_t0 = 0.0
+        s._rec_lock = threading.Lock()
+        s.alive = True
+        s.master_fd = -1
+        s.last_activity = 0
+        return s
+
+    def test_open_record_close_roundtrip(self):
+        d = tempfile.mkdtemp()
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            self.assertIsNotNone(s._rec)
+            s._record("o", b"hello \xff world")   # invalid utf-8 replaced
+            s._record("r", "100x30")
+            s._rec_close()
+            files = os.listdir(d)
+            self.assertEqual(len(files), 1)
+            path = os.path.join(d, files[0])
+            self.assertTrue(files[0].endswith("-" + s.id + ".cast"))
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            lines = open(path, encoding="utf-8").read().splitlines()
+            header = json.loads(lines[0])
+            self.assertEqual(header["version"], 2)
+            self.assertEqual(header["width"], 80)
+            self.assertEqual(header["height"], 24)
+            self.assertIsInstance(header["timestamp"], int)
+            ev1 = json.loads(lines[1])
+            self.assertEqual(ev1[1], "o")
+            self.assertIn("hello", ev1[2])
+            self.assertGreaterEqual(ev1[0], 0)
+            ev2 = json.loads(lines[2])
+            self.assertEqual(ev2[1:], ["r", "100x30"])
+            self.assertGreaterEqual(ev2[0], ev1[0])
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_knob_off_is_inert(self):
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = ""
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            self.assertIsNone(s._rec)
+            s._record("o", b"data")   # no-op, must not raise
+            s._rec_close()
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+
+    def test_input_is_never_recorded_even_when_flag_forced(self):
+        # Keystroke/input recording is hard-disabled (compiled out): the 'i'
+        # event is never written, so a password typed at an in-session prompt
+        # cannot reach disk. The env var can't enable it; this forces the
+        # in-process flag True to prove the input tee itself is gone. Output
+        # recording still works (the control assertion).
+        d = tempfile.mkdtemp()
+        orig_dir = server.WEBSH_RECORD_DIR
+        orig_in = server.WEBSH_RECORD_INPUT
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            r, w = os.pipe()
+            s.master_fd = w
+            server.WEBSH_RECORD_INPUT = True   # force-enable: must STILL not record
+            s.write(b"secret-keystrokes")
+            s._record("o", b"server-output")   # output IS recorded (control)
+            s._rec_close()
+            os.close(r); os.close(w)
+            body = open(os.path.join(d, os.listdir(d)[0]),
+                        encoding="utf-8").read()
+            self.assertNotIn("secret-keystrokes", body,
+                             "input must never be recorded (hard-disabled)")
+            self.assertIn("server-output", body,
+                          "output recording still works")
+        finally:
+            server.WEBSH_RECORD_DIR = orig_dir
+            server.WEBSH_RECORD_INPUT = orig_in
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_write_failure_disables_not_kills(self):
+        d = tempfile.mkdtemp()
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            s._rec.close()          # sabotage: closed file -> write raises
+            s._record("o", b"x")    # must swallow and disable
+            self.assertIsNone(s._rec)
+            s._record("o", b"y")    # still inert
+            s._rec_close()
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_split_utf8_survives_chunk_boundary(self):
+        d = tempfile.mkdtemp()
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            two = "Привет".encode("utf-8")   # 12 bytes, 2 per char
+            s._record("o", two[:3])           # splits the 2nd char
+            s._record("o", two[3:])
+            s._rec_close()
+            lines = open(os.path.join(d, os.listdir(d)[0]),
+                         encoding="utf-8").read().splitlines()
+            text = "".join(json.loads(ln)[2] for ln in lines[1:])
+            self.assertEqual(text, "Привет")    # reassembled across chunks
+            self.assertNotIn("\ufffd", text,
+                             "split sequence must not become U+FFFD")
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_resize_emits_r_event(self):
+        d = tempfile.mkdtemp()
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            s._set_winsize = lambda c, r: None
+            s.resize(132, 43)
+            s._rec_close()
+            lines = open(os.path.join(d, os.listdir(d)[0]),
+                         encoding="utf-8").read().splitlines()
+            ev = json.loads(lines[1])
+            self.assertEqual(ev[1:], ["r", "132x43"])
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_size_cap_stops_recording(self):
+        d = tempfile.mkdtemp()
+        orig = server.WEBSH_RECORD_DIR
+        orig_cap = server.WEBSH_RECORD_MAX_BYTES
+        server.WEBSH_RECORD_DIR = d
+        server.WEBSH_RECORD_MAX_BYTES = 64
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            s._record("o", b"x" * 200)
+            self.assertIsNone(s._rec, "cap must disable the recording")
+            s._record("o", b"more")   # inert
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            server.WEBSH_RECORD_MAX_BYTES = orig_cap
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_record_dir_is_0700(self):
+        base = tempfile.mkdtemp()
+        d = os.path.join(base, "rec")
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = d
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)
+            s._rec_close()
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700,
+                             "filenames carry live sids - dir must be 0700")
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+            import shutil
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_unwritable_dir_disables_recording(self):
+        orig = server.WEBSH_RECORD_DIR
+        server.WEBSH_RECORD_DIR = "/proc/no-such-dir/websh"
+        try:
+            s = self._bare_session()
+            s._rec_open(80, 24)     # must not raise
+            self.assertIsNone(s._rec)
+        finally:
+            server.WEBSH_RECORD_DIR = orig
+
+
 if __name__ == "__main__":
     unittest.main()

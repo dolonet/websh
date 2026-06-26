@@ -58,6 +58,8 @@ X-Forwarded-For trust.
 | `WEBSH_TMUX_CAPTURE_LINES` | `100000` | Max lines `/api/tmux_capture` reads from the tmux scrollback (`-S -N`); bounds capture RAM. |
 | `WEBSH_TMUX_CAPTURE_BYTES` | `16777216` (16 MiB) | Absolute byte ceiling on a tmux capture; output past it is truncated to the freshest tail with a marker. |
 | `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [`security.md`](security.md#access-log) for the record format. |
+| `WEBSH_RECORD_DIR` | *(unset)* | Opt-in session recording: directory for one [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) `.cast` file per session (created `0600`, named `<timestamp>-<sid>.cast`; replayable with `asciinema play`). Output-only by default. Best-effort: a write failure disables recording for that session, never the session itself. Mind retention/privacy — see [`security.md`](security.md#session-recording). |
+| `WEBSH_RECORD_INPUT` | `0` | With recording on, `1` also records keystrokes (`"i"` events). **Everything typed into the remote shell lands in the file — including passwords typed at prompts inside the session.** The browser-form ssh password is not recorded as input (the auto-type bypasses the tee); see the echo caveat in [`security.md`](security.md#session-recording). |
 
 The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend —
 and since the alias rule above makes `server.py` honor `WEBSH_PORT`
