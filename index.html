@@ -8,7 +8,10 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" integrity="sha384-tStR1zLfWgsiXCF3IgfB3lBa8KmBe/lG287CL9WCeKgQYcp1bjb4/+mwN6oti4Co" crossorigin="anonymous">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;700&family=Fira+Code:wght@300;400;500;700&family=IBM+Plex+Mono:wght@100;200;300;400;500;700&family=Roboto+Mono:wght@100;200;300;400;500;700&family=Source+Code+Pro:wght@200;300;400;500;700&family=Inconsolata:wght@200;300;400;700&display=swap">
+  <!-- Terminal fonts load dynamically (ensureFontLink in websh.js):
+       only the ACTIVE family's css2 descriptors are fetched, instead of
+       all six on every page load. The preconnects above stay so the
+       dynamic fetch starts warm. -->
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{

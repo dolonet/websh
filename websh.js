@@ -70,20 +70,47 @@ const DEFAULT_SETTINGS = {
   // without ever needing to toggle in /options.
   tmuxClipboard: true, tmuxHistory: 100000
 };
-// id → [label, webfont-name-or-null, fallback-stack]
-// webfont-name is the family loaded via Google Fonts; null = system only.
+// id → [label, webfont-name-or-null, fallback-stack, google-weights]
+// webfont-name is the family loaded via Google Fonts; null = system
+// only. google-weights mirrors what the old static <link> requested
+// per family (they differ — Fira Code has no 100/200, Inconsolata no
+// 100/500) so every weight the options panel offers stays a real face.
 const FONTS = {
-  'jetbrains-mono': ['JetBrains Mono', 'JetBrains Mono', "'Menlo','Monaco','Consolas',monospace"],
-  'fira-code':      ['Fira Code',      'Fira Code',      "'Menlo','Monaco','Consolas',monospace"],
-  'ibm-plex-mono':  ['IBM Plex Mono',  'IBM Plex Mono',  "'Menlo','Monaco','Consolas',monospace"],
-  'roboto-mono':    ['Roboto Mono',    'Roboto Mono',    "'Menlo','Monaco','Consolas',monospace"],
-  'source-code-pro':['Source Code Pro','Source Code Pro',"'Menlo','Monaco','Consolas',monospace"],
-  'inconsolata':    ['Inconsolata',    'Inconsolata',    "'Menlo','Monaco','Consolas',monospace"],
-  'system':         ['System default', null,             "ui-monospace,'Menlo','Monaco','SF Mono','Cascadia Code','Consolas',monospace"]
+  'jetbrains-mono': ['JetBrains Mono', 'JetBrains Mono', "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'fira-code':      ['Fira Code',      'Fira Code',      "'Menlo','Monaco','Consolas',monospace", '300;400;500;700'],
+  'ibm-plex-mono':  ['IBM Plex Mono',  'IBM Plex Mono',  "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'roboto-mono':    ['Roboto Mono',    'Roboto Mono',    "'Menlo','Monaco','Consolas',monospace", '100;200;300;400;500;700'],
+  'source-code-pro':['Source Code Pro','Source Code Pro',"'Menlo','Monaco','Consolas',monospace", '200;300;400;500;700'],
+  'inconsolata':    ['Inconsolata',    'Inconsolata',    "'Menlo','Monaco','Consolas',monospace", '200;300;400;700'],
+  'system':         ['System default', null,             "ui-monospace,'Menlo','Monaco','SF Mono','Cascadia Code','Consolas',monospace", null]
 };
 function fontStack(id) {
   let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
   return (f[1] ? `'${f[1]}',` : '') + f[2];
+}
+
+// Load the ACTIVE font family only. The old static <link> pulled the
+// css2 descriptors for all six families on every page load; now one
+// <link id="dynFontCss"> tracks settings.font (boot + options change).
+// While the css loads, the fallback stack renders and the fit-settle
+// loop (fitPaneWhenStable) absorbs the swap — same flow as before.
+function ensureFontLink(id) {
+  let f = FONTS[id] || FONTS[DEFAULT_SETTINGS.font];
+  let link = $('dynFontCss');
+  if (!f[1]) {                 // system font: nothing to fetch
+    if (link) link.remove();
+    return;
+  }
+  let href = 'https://fonts.googleapis.com/css2?family=' +
+             f[1].replace(/ /g, '+') + ':wght@' + f[3] + '&display=swap';
+  if (link && link.getAttribute('href') === href) return;
+  if (!link) {
+    link = document.createElement('link');
+    link.id = 'dynFontCss';
+    link.rel = 'stylesheet';
+    document.head.appendChild(link);
+  }
+  link.setAttribute('href', href);
 }
 
 // Copy `text` to the system clipboard. Yandex Browser silently rejects
@@ -3246,6 +3273,11 @@ function loadServerConfig() {
       // at boot. Re-read from the now-correct path-scoped key.
       settings = loadSettings();
       fontSize = settings.fontSize;
+      // The module-init ensureFontLink() above ran under the empty prefix,
+      // so it loaded the default family; refresh it to the path-scoped font
+      // before any pane materializes (fitPaneWhenStable's document.fonts.load
+      // gate then resolves against the correct face).
+      ensureFontLink(settings.font);
     }
     // Re-mint the vault BroadcastChannel with the now-known storagePrefix
     // so sign-out signals don't cross path-scoped namespaces. No-op if
@@ -4019,6 +4051,7 @@ function flushPaneResize(p) {
 function applySettings(opts){
   opts = opts || {};
   let forceFlush = opts.forceFlush !== false;
+  ensureFontLink(settings.font);
   let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
     let p = panes[k];
@@ -4695,6 +4728,7 @@ function tryRestoreSessions() {
 // pass on a returning user's browser doesn't show stray entries.
 try { localStorage.removeItem('websh_theme'); } catch(e){}
 applyTheme(currentTheme);
+ensureFontLink(settings.font);
 
 // Open the vault BroadcastChannel early so a sign-out fired in another
 // tab during loadServerConfig still gets observed by this tab.

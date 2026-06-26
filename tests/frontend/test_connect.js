@@ -5469,6 +5469,58 @@ test('document title follows the active pane across switches', async () => {
   cleanup(env);
 });
 
+test('font css link tracks the active family; system font removes it', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+  ]);
+  const win = env.win;
+  await sleep(30);
+  const link = win.document.getElementById('dynFontCss');
+  ok(!!link, 'boot created the dynamic font link');
+  ok(/JetBrains\+Mono/.test(link.getAttribute('href')),
+     'default family loaded; got ' + link.getAttribute('href'));
+  ok(!/Fira\+Code/.test(link.getAttribute('href')),
+     'inactive families NOT loaded');
+  win.ensureFontLink('fira-code');
+  ok(/Fira\+Code:wght@300;400;500;700/.test(
+       win.document.getElementById('dynFontCss').getAttribute('href')),
+     'family switch swaps the href with per-family weights');
+  win.ensureFontLink('system');
+  ok(!win.document.getElementById('dynFontCss'),
+     'system font removes the link entirely');
+  cleanup(env);
+});
+
+test('isolate_storage: font link refreshes to the path-scoped family at boot (#152)', async () => {
+  // Under isolate_storage the path-scoped settings (incl. font) are only
+  // known after /api/config returns. The module-init ensureFontLink ran
+  // under the empty prefix and loaded the DEFAULT family; loadServerConfig
+  // must refresh the link to the path-scoped font, or an isolate_storage
+  // user who picked a non-default font gets the default face every reload.
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                              connections: [], isolate_storage: true}}];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                               url: 'http://localhost/p/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.localStorage.clear();
+  // Seed the path-scoped settings (storagePrefix '/p/') with a non-default
+  // font BEFORE boot; the empty-prefix key is left at the default.
+  win.localStorage.setItem('/p/websh_settings', JSON.stringify({font: 'fira-code'}));
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  const link = win.document.getElementById('dynFontCss');
+  ok(!!link, 'font link present after boot');
+  ok(/Fira\+Code/.test(link.getAttribute('href')),
+     'link tracks the path-scoped fira-code, not the empty-prefix default; got '
+     + link.getAttribute('href'));
+  ok(!/JetBrains\+Mono/.test(link.getAttribute('href')),
+     'default family must not stay active under isolate_storage');
+  dom.window.close();
+});
+
 test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
   // After endSession tears a pane down (p.polling=false), an in-flight
   // auto-reconnect sets p.connecting=true. A late fetch/SSE rejection from
