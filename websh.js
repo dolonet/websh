@@ -1280,6 +1280,31 @@ function closeStream(p) {
   }
 }
 
+// Shared transport teardown for a pane whose session is over. Closes the
+// stream, stops keepalive, drops the polling/connecting flags, clears the
+// deferred-save timer (its commit guard needs p.sid, which we null here;
+// clearing also drops the closure's pane ref), and nulls p.sid. The bits
+// call sites genuinely differ on are opt-in:
+//   o.disconnect — POST /api/disconnect for the old sid (fire-and-forget)
+//   o.save       — persist the session manifest (saveSessions)
+//   o.badge      — refresh the pane badge now
+function endSession(p, o) {
+  o = o || {};
+  let sid = p.sid;
+  closeStream(p);
+  stopKeepalive(p);
+  p.polling = false;
+  p.connecting = false;
+  p.sid = null;
+  clearTimeout(p.saveCommitTimer);
+  p.saveCommitTimer = null;
+  if (o.disconnect && sid) {
+    api('disconnect', {body: {session_id: sid}}).catch(() => {});
+  }
+  if (o.save) saveSessions();
+  if (o.badge) updatePaneBadge(p);
+}
+
 // ── Recovery after a long absence ────────────────────────────────────
 // Background tabs get frozen by the browser (Chrome's memory saver /
 // page lifecycle freeze) after ~5 min hidden: timers stop, EventSource
@@ -1385,9 +1410,7 @@ function handleOutputPayload(p, r, sid) {
     // re-enter connectPane and stomp our own reconnect attempt.
     if (!p.sid) return true;
     console.log('output: session error:', r.error);
-    closeStream(p);
-    stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
-    updatePaneBadge(p);
+    endSession(p, {badge: true});
     if(p.host || p.connection) {
       connectPane(p, {label:p.label, resume:p.persistent});
     } else { doAutoConnect(); }
@@ -1429,14 +1452,8 @@ function handleOutputPayload(p, r, sid) {
   if (r.auth_failed) {
     p.pendingSave = null;
     p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
-    closeStream(p);
-    stopKeepalive(p); p.polling = false;
-    if (p.sid) {
-      api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
-      p.sid = null;
-    }
+    endSession(p, {disconnect: true, badge: true});
     p.recentOutput = '';
-    updatePaneBadge(p);
     if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
     saveSessions();
     return true;
@@ -1449,9 +1466,7 @@ function handleOutputPayload(p, r, sid) {
   }
   if(r.alive===false){
     p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
-    closeStream(p);
-    stopKeepalive(p); p.polling=false; p.sid=null;
-    saveSessions();
+    endSession(p, {save: true});
     // Smart tmux fallback: a persistent pane whose session dies quickly
     // with a "not found" shape in the output is almost certainly a
     // missing tmux binary on the target. Offer re-probe / short-lived.
@@ -1499,15 +1514,18 @@ function clearRetryClock(p) {
 }
 
 function transportFatal(p, e) {
+  // Stale-transport guard: a rejected fetch / SSE error from a transport
+  // that endSession already tore down (p.polling=false) must not banner
+  // the pane again — and must not reset p.connecting, which would defuse
+  // connectPane's in-flight duplicate guard during an auto-reconnect.
+  if (!p.polling) return;
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
     ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
     : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
   p.term.write(msg);
-  closeStream(p);
-  stopKeepalive(p); p.polling=false; p.sid=null;
-  saveSessions();
+  endSession(p, {save: true});
   if(p.host || p.connection) showReconnectBar(p);
   if(activeId===p.id) updatePaneBadge(p);
 }
@@ -1816,6 +1834,12 @@ async function connectPane(p, opts) {
       if (r.tmux_cmd) p.tmuxCmd = r.tmux_cmd;
       p.connectedAt = Date.now();
       p.recentOutput = '';
+      // A deferred save may still be pending from the original connect
+      // (session error inside the 2.6s commit window -> auto-reconnect
+      // lands here). endSession cleared the old timer; re-arm it against
+      // the NEW sid, or an idle SSE session would never commit the save
+      // (the output-gated path needs a frame >=2.5s after connectedAt).
+      if (p.pendingSave) scheduleSaveCommit(p);
       // Persist a non-default tmux path on the matching saved entry so
       // future connects skip the probe and use the right binary path.
       if (p.persistent && p.tmuxCmd && p.tmuxCmd !== 'tmux') {
@@ -2729,17 +2753,7 @@ function invalidateVaultCache() {
 // (intentional: the user has to sign in again to recover).
 function _disconnectVaultPaneForNoKey(p) {
   if (!p) return;
-  p.connecting = false;
-  if (p.sid) {
-    let sid = p.sid;
-    p.polling = false;
-    stopKeepalive(p);
-    closeStream(p);
-    clearTimeout(p.saveCommitTimer);   // drop the armed deferred-save timer
-    api('disconnect', {body: {session_id: sid}}).catch(() => {});
-    p.sid = null;
-  }
-  updatePaneBadge(p);
+  endSession(p, {disconnect: true, badge: true});
   showReconnectBar(p, 'no_vault_key');
 }
 
