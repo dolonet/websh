@@ -978,5 +978,109 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertNotIn("form_defaults", pub)
 
 
+class TestKnobResolution(unittest.TestCase):
+    """_knob precedence: WEBSH_<NAME> alias > bare env > websh.json
+    "server" object > default. The JSON plane is import-time static
+    (_SERVER_KNOBS); tests drive it by patching the dict."""
+
+    KNOB = "KNOB_TEST_VALUE"   # never a real knob
+
+    def setUp(self):
+        self._snap = dict(server._SERVER_KNOBS)
+        os.environ.pop(self.KNOB, None)
+        os.environ.pop("WEBSH_" + self.KNOB, None)
+
+    def tearDown(self):
+        server._SERVER_KNOBS.clear()
+        server._SERVER_KNOBS.update(self._snap)
+        os.environ.pop(self.KNOB, None)
+        os.environ.pop("WEBSH_" + self.KNOB, None)
+
+    def test_default_when_nothing_set(self):
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "dflt")
+
+    def test_json_section_beats_default(self):
+        server._SERVER_KNOBS[self.KNOB] = 123
+        self.assertEqual(server._knob(self.KNOB, "dflt"), 123)
+
+    def test_bare_env_beats_json(self):
+        server._SERVER_KNOBS[self.KNOB] = 123
+        os.environ[self.KNOB] = "456"
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "456")
+
+    def test_prefixed_alias_beats_bare_env(self):
+        # The unambiguous form wins: a bare generic name may belong to
+        # unrelated software in a shared environment.
+        os.environ[self.KNOB] = "456"
+        os.environ["WEBSH_" + self.KNOB] = "789"
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "789")
+
+    def test_already_prefixed_name_skips_double_prefix(self):
+        os.environ.pop("WEBSH_KNOB_X", None)
+        try:
+            os.environ["WEBSH_KNOB_X"] = "1"
+            self.assertEqual(server._knob("WEBSH_KNOB_X", "d"), "1")
+        finally:
+            os.environ.pop("WEBSH_KNOB_X", None)
+
+    def test_int_env_casts_and_falls_back(self):
+        server._SERVER_KNOBS[self.KNOB] = 42
+        self.assertEqual(server._int_env(self.KNOB, "7"), 42)
+        server._SERVER_KNOBS[self.KNOB] = "not-an-int"
+        self.assertEqual(server._int_env(self.KNOB, "7"), 7)
+
+    def test_bool_knob_accepts_json_true_and_env_1(self):
+        server._SERVER_KNOBS[self.KNOB] = True
+        self.assertTrue(server._bool_knob(self.KNOB))
+        server._SERVER_KNOBS[self.KNOB] = False
+        self.assertFalse(server._bool_knob(self.KNOB))
+        os.environ[self.KNOB] = "1"
+        self.assertTrue(server._bool_knob(self.KNOB))
+        os.environ[self.KNOB] = "0"
+        self.assertFalse(server._bool_knob(self.KNOB))
+
+    def test_env_only_knobs_ignore_json_plane(self):
+        # A websh.json write primitive must not rebind HOST or take
+        # over X-Forwarded-For trust.
+        server._SERVER_KNOBS["HOST"] = "0.0.0.0"
+        server._SERVER_KNOBS["TRUSTED_PROXIES"] = "6.6.6.6"
+        self.assertEqual(server._knob("HOST", "127.0.0.1"), "127.0.0.1")
+        self.assertEqual(server._knob("TRUSTED_PROXIES", "127.0.0.1"),
+                         "127.0.0.1")
+
+    def test_filesystem_path_knobs_are_env_only(self):
+        # A websh.json write must not redirect where the server appends its
+        # access log (arbitrary-path O_APPEND|O_CREAT) or writes the vault
+        # (WEBSH_CREDS_PATH -> _save_creds_atomic os.replace, an arbitrary-
+        # path file overwrite). Both stay env-only.
+        server._SERVER_KNOBS["WEBSH_ACCESS_LOG"] = "/tmp/evil.log"
+        server._SERVER_KNOBS["WEBSH_CREDS_PATH"] = "/tmp/evil.creds.json"
+        self.assertIsNone(server._knob("WEBSH_ACCESS_LOG", None))
+        self.assertIsNone(server._knob("WEBSH_CREDS_PATH", None))
+
+    def test_server_knobs_reader(self):
+        d = tempfile.mkdtemp()
+        prior = os.environ.get("WEBSH_CONFIG")
+        try:
+            p = os.path.join(d, "websh.json")
+            with open(p, "w") as f:
+                json.dump({"server": {"SESSION_TIMEOUT": 60}}, f)
+            os.environ["WEBSH_CONFIG"] = p
+            self.assertEqual(server._server_knobs(),
+                             {"SESSION_TIMEOUT": 60})
+            with open(p, "w") as f:
+                f.write("{broken json")
+            self.assertEqual(server._server_knobs(), {})
+            with open(p, "w") as f:
+                json.dump({"server": ["not", "a", "dict"]}, f)
+            self.assertEqual(server._server_knobs(), {})
+        finally:
+            if prior is None:
+                os.environ.pop("WEBSH_CONFIG", None)
+            else:
+                os.environ["WEBSH_CONFIG"] = prior
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

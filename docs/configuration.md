@@ -1,6 +1,32 @@
 # Configuration
 
-Environment variables for `server.py`:
+Tunables for `server.py`. Each knob resolves in this order:
+
+1. `WEBSH_<NAME>` environment variable — the unambiguous alias wins,
+   so a bare generic name (`PORT`, `HOST`, `MAX_SESSIONS`, …) set by
+   unrelated software in a shared environment can't hijack websh;
+2. `<NAME>` environment variable (the names in the table below);
+3. the optional `"server"` object in `websh.json` — the only plane a
+   shared-hosting deployment can reliably write to (`api.php`'s
+   auto-start guarantees only `WEBSH_CONFIG` and `PORT`; whether
+   anything else survives into the environment depends on the host):
+
+   ```json
+   { "server": { "SESSION_TIMEOUT": 600, "MAX_SESSIONS": 20 } }
+   ```
+
+4. the built-in default.
+
+The `"server"` object is read once at startup (knobs are
+process-lifetime constants). Keys use the same names as the table
+below — including the `WEBSH_` prefix where the table has one, e.g.
+`{"server": {"WEBSH_VAULT_ENABLE": true}}`. Boolean knobs accept
+`1`/`true` (env string or JSON literal).
+
+Env-only exceptions: `WEBSH_CONFIG` (it locates the JSON), and
+`HOST` / `TRUSTED_PROXIES` — a writable `websh.json` must not be able
+to rebind the loopback-only server to a public interface or take over
+X-Forwarded-For trust.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -32,4 +58,8 @@ Environment variables for `server.py`:
 | `WEBSH_TMUX_CAPTURE_BYTES` | `16777216` (16 MiB) | Absolute byte ceiling on a tmux capture; output past it is truncated to the freshest tail with a marker. |
 | `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [`security.md`](security.md#access-log) for the record format. |
 
-The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
+The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend —
+and since the alias rule above makes `server.py` honor `WEBSH_PORT`
+too, in the shared-hosting flow (where the auto-started backend
+inherits PHP's environment) that one variable points both sides at the
+same port. Under systemd the unit's `PORT=` still pins the backend.

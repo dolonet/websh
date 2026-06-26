@@ -80,15 +80,83 @@ except ImportError:  # pragma: no cover - exercised by the no-deps CI job
     InvalidTag = Exception
     HAS_CRYPTOGRAPHY = False
 
+# ─── Knob resolution ─────────────────────────────────────────────────
+#
+# Every tunable resolves through _knob():
+#   1. env WEBSH_<NAME>  — the unambiguous alias wins: bare generic
+#      names (PORT, HOST, MAX_SESSIONS, ...) can be set by unrelated
+#      software in a shared environment, which is exactly the collision
+#      the prefix defends against;
+#   2. env <NAME>        — the historically documented name;
+#   3. websh.json "server" object — the only plane a shared-hosting
+#      deployment can reliably write to (api.php's auto-start
+#      guarantees only WEBSH_CONFIG and PORT in the environment);
+#      HOST and TRUSTED_PROXIES are env-only (_ENV_ONLY_KNOBS);
+#   4. the built-in default.
+#
+# The JSON plane is read ONCE at import: knobs are process-lifetime
+# constants and mid-flight changes to most of them would be unsound.
+# WEBSH_CONFIG itself is env-only — it locates the JSON.
+# Full table: docs/configuration.md.
+
+def _server_knobs():
+    """The websh.json "server" object, or {} when absent/broken."""
+    path = os.environ.get("WEBSH_CONFIG", "")
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as f:
+            section = json.load(f).get("server")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        # load_config() re-reads the file later and WARNs properly;
+        # knob resolution just falls back to env/defaults.
+        return {}
+
+
+_SERVER_KNOBS = _server_knobs()
+
+
+# Knobs that must NOT be settable from websh.json: a config-file write
+# primitive should not be able to rebind the loopback-only server to a
+# public interface or take over X-Forwarded-For trust (rate-limit /
+# per-IP-cap spoofing), nor redirect the filesystem paths the server
+# writes to — WEBSH_ACCESS_LOG (arbitrary-path O_APPEND|O_CREAT) and
+# WEBSH_CREDS_PATH (where the vault's _save_creds_atomic os.replace()
+# lands, i.e. arbitrary-path file overwrite). All env only.
+_ENV_ONLY_KNOBS = frozenset({
+    "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH"})
+
+
+def _knob(name, default):
+    """Resolve one tunable (raw value; callers cast). See the
+    precedence comment above."""
+    if not name.startswith("WEBSH_"):
+        v = os.environ.get("WEBSH_" + name)
+        if v is not None:
+            return v
+    v = os.environ.get(name)
+    if v is not None:
+        return v
+    if name in _SERVER_KNOBS and name not in _ENV_ONLY_KNOBS:
+        return _SERVER_KNOBS[name]
+    return default
+
+
+def _bool_knob(name):
+    """True for 1/true (any case, str or JSON literal)."""
+    return str(_knob(name, "")).lower() in ("1", "true")
+
+
 # Operator opt-in until the client-side PR (PR-C) lands. Default off
 # so a server upgrade does not advertise endpoints the bundled client
 # does not know how to call. Will become the default once PR-C ships.
-WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
+WEBSH_VAULT_ENABLE = _bool_knob("WEBSH_VAULT_ENABLE")
 
 # Operator opt-in to the future v1.0.0 default. With this set, any
 # plaintext credential in websh.json blocks startup with an actionable
 # message. Without it, plaintext still works and emits a WARN once.
-WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
+WEBSH_REQUIRE_VAULT = _bool_knob("WEBSH_REQUIRE_VAULT")
 
 # Runtime trap: flipped True when the on-disk creds file is unreadable
 # (unsupported schema version, etc) to refuse-to-write rather than
@@ -108,12 +176,12 @@ PROTO_VERSION = 1
 
 def _int_env(name, default):
     try:
-        return int(os.environ.get(name, default))
+        return int(_knob(name, default))
     except (TypeError, ValueError):
         return int(default)
 
 PORT = _int_env("PORT", "8765")
-HOST = os.environ.get("HOST", "127.0.0.1")
+HOST = str(_knob("HOST", "127.0.0.1"))
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
 # Per-source-IP active session cap. 0 disables the check (preserve legacy
@@ -190,7 +258,7 @@ MAX_TMUX_CAPTURE_BYTES = max(1, _int_env("WEBSH_TMUX_CAPTURE_BYTES",
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
 _TRUSTED_PROXIES = set(
-    p.strip() for p in os.environ.get("TRUSTED_PROXIES", "127.0.0.1").split(",")
+    p.strip() for p in str(_knob("TRUSTED_PROXIES", "127.0.0.1")).split(",")
     if p.strip()
 )
 
@@ -567,7 +635,9 @@ def _resolve_log_path(raw):
     return os.path.abspath(os.path.expanduser(raw))
 
 
-ACCESS_LOG_PATH = _resolve_log_path(os.environ.get("WEBSH_ACCESS_LOG"))
+_v = _knob("WEBSH_ACCESS_LOG", None)
+ACCESS_LOG_PATH = _resolve_log_path(None if _v is None else str(_v))
+del _v
 
 # Per-field caps (in Unicode codepoints) for known fields. Anything not
 # listed here gets _DEFAULT_FIELD_CAP. Values are server- or attacker-
@@ -1083,7 +1153,7 @@ def _creds_path():
     Honors WEBSH_CREDS_PATH explicitly; otherwise sits next to
     WEBSH_CONFIG when set, else cwd.
     """
-    env = os.environ.get("WEBSH_CREDS_PATH", "").strip()
+    env = str(_knob("WEBSH_CREDS_PATH", "")).strip()
     if env:
         return env
     cfg = os.environ.get("WEBSH_CONFIG", "").strip()
