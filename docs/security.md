@@ -159,3 +159,57 @@ in one `write(2)` call and stays safe to view in a terminal.
 - Terminal dimensions are clamped to safe ranges
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
 - `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots
+
+## Header-trust authentication
+
+websh itself has no user accounts — possession of a session id is the
+only key, and the documented model is "bind to loopback, put a reverse
+proxy in front". When that proxy authenticates users (oauth2-proxy,
+Authelia, authentik, Cloudflare Access), set:
+
+```
+WEBSH_AUTH_HEADER=Remote-User
+```
+
+and websh enforces what the proxy established:
+
+- every request **except `/api/ping`** (docker healthchecks, the PHP
+  shim's auto-start probe) requires the header → `401` otherwise —
+  including the static files;
+- the header is read **only from `TRUSTED_PROXIES` peers** — the same
+  trust rule as `X-Forwarded-For` — so a client that reaches the
+  backend directly cannot mint identities and is simply
+  unauthenticated;
+- sessions are stamped with their creator's identity at connect, and
+  every session endpoint (input/output/stream/resize/disconnect, tmux,
+  file transfer) enforces ownership → `403` across users;
+- `result=ok` connect records and disconnect records in the access log
+  carry the identity as `auth_user`.
+
+The proxy MUST strip/overwrite the configured header on incoming
+requests. Real auth proxies (oauth2-proxy, Authelia) do; a **bare
+nginx `proxy_pass` forwards client headers untouched** — if any
+non-auth hop sits in front, neutralize the header explicitly:
+
+```nginx
+proxy_set_header Remote-User "";
+```
+
+websh additionally refuses a request carrying the header **more than
+once** (an appending proxy would otherwise let a client-smuggled first
+value win), and reads it only from `TRUSTED_PROXIES` peers. Two
+operational notes: with the defaults (`HOST=127.0.0.1`,
+`TRUSTED_PROXIES=127.0.0.1`) any local process on a shared box can
+mint identities — inherent to loopback trust; and enable
+`WEBSH_AUTH_HEADER` at startup only — sessions are stamped at creation,
+so flipping it on over a live registry orphans existing sessions
+(deny-by-default, by design). Cross-user probes are recorded in the
+access log as `event=authz_denied` with `auth_user` and the probed
+`sid`. Note the vault endpoints are gated but not per-user scoped —
+header-trust auth gives per-session isolation, not per-user credential
+isolation.
+
+Known limitation: persistent tmux **slots** live on the target host
+keyed by slot id; ownership is enforced on websh sessions, while
+`resume_slot_id` re-attachment authenticates through ssh itself (the
+user must still hold valid credentials for the target).

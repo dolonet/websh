@@ -1374,5 +1374,185 @@ class TestRestrictHostsDoesNotFeedScanPattern(LiveServerCase):
                          .format(scan))
 
 
+class TestHeaderTrustAuth(unittest.TestCase):
+    """WEBSH_AUTH_HEADER: 401 without the header, identity stamping at
+    connect, 403 across users, ping exempt, untrusted peer ignored."""
+
+    @classmethod
+    def setUpClass(cls):
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self._orig = server.WEBSH_AUTH_HEADER
+        server.WEBSH_AUTH_HEADER = "Remote-User"
+
+    def tearDown(self):
+        server.WEBSH_AUTH_HEADER = self._orig
+        with server.sessions_lock:
+            for sid in [k for k in server.sessions
+                        if getattr(server.sessions[k], "_fake", False)]:
+                server.sessions.pop(sid, None)
+
+    def _req(self, path, method="GET", body=None, user=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {}
+        if body is not None:
+            body = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        if user is not None:
+            headers["Remote-User"] = user
+        c.request(method, path, body=body, headers=headers)
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        try:
+            return r.status, json.loads(data.decode())
+        except ValueError:
+            return r.status, {"_raw": data.decode("utf-8", "replace")}
+
+    def _plant_session(self, owner):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.alive = True
+        fake.owner = owner
+        fake._fake = True
+        fake.write.return_value = True
+        with server.sessions_lock:
+            server.sessions[sid] = fake
+        return sid
+
+    def test_missing_header_is_401_everywhere_but_ping(self):
+        code, body = self._req("/api/config")
+        self.assertEqual(code, 401)
+        self.assertEqual(body.get("error"), "unauthorized")
+        code, _ = self._req("/", method="GET")
+        self.assertEqual(code, 401)
+        code, _ = self._req("/api/input", method="POST",
+                            body={"session_id": "x", "data": "y"})
+        self.assertEqual(code, 401)
+        code, body = self._req("/api/ping")
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"))
+
+    def test_header_present_passes_the_gate(self):
+        code, body = self._req("/api/config", user="alice")
+        self.assertEqual(code, 200)
+        self.assertIn("restrict_hosts", body)
+
+    def test_cross_user_session_access_is_403(self):
+        sid = self._plant_session(owner="alice")
+        code, body = self._req("/api/input", method="POST",
+                               body={"session_id": sid, "data": "x"},
+                               user="mallory")
+        self.assertEqual(code, 403)
+        self.assertEqual(body.get("error"), "forbidden")
+        # The owner still gets through.
+        code, body = self._req("/api/input", method="POST",
+                               body={"session_id": sid, "data": "x"},
+                               user="alice")
+        self.assertEqual(code, 200)
+
+    def test_cross_user_disconnect_is_403_and_session_survives(self):
+        sid = self._plant_session(owner="alice")
+        code, body = self._req("/api/disconnect", method="POST",
+                               body={"session_id": sid}, user="mallory")
+        self.assertEqual(code, 403)
+        with server.sessions_lock:
+            self.assertIn(sid, server.sessions)
+
+    def test_untrusted_peer_cannot_mint_identity(self):
+        # With no trusted proxies, the header is ignored entirely ->
+        # unauthenticated -> 401 even though the header is present.
+        orig = server._TRUSTED_PROXIES
+        server._TRUSTED_PROXIES = set()
+        try:
+            code, body = self._req("/api/config", user="alice")
+            self.assertEqual(code, 401)
+        finally:
+            server._TRUSTED_PROXIES = orig
+
+    def test_feature_off_is_passthrough(self):
+        server.WEBSH_AUTH_HEADER = ""
+        code, body = self._req("/api/config")
+        self.assertEqual(code, 200)
+
+    def test_whitespace_identity_is_unauthenticated(self):
+        code, body = self._req("/api/config", user="   ")
+        self.assertEqual(code, 401)
+
+    def test_duplicate_header_is_refused(self):
+        # An appending proxy would let a client-smuggled FIRST value
+        # win; two occurrences mean the proxy is not overwriting.
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest("GET", "/api/config")
+        c.putheader("Remote-User", "mallory")
+        c.putheader("Remote-User", "alice")
+        c.endheaders()
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 401)
+
+    def test_cross_user_stream_403_before_slot_state_leaks(self):
+        # Even while the OWNER holds the stream slot, a non-owner must
+        # get the ownership 403 — not a 409 that leaks streaming-vs-
+        # idle across the user boundary (and must not perturb the slot).
+        sid = self._plant_session(owner="alice")
+        with server.sessions_lock:
+            server.sessions[sid]._stream_active = True
+        code, body = self._req("/api/stream?session_id=" + sid,
+                               user="mallory")
+        self.assertEqual(code, 403)
+        with server.sessions_lock:
+            self.assertTrue(server.sessions[sid]._stream_active,
+                            "non-owner must not touch the stream slot")
+
+    def test_cross_user_probe_is_audit_logged(self):
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        log = os.path.join(d, "access.log")
+        orig = server.ACCESS_LOG_PATH
+        server.ACCESS_LOG_PATH = log
+        try:
+            sid = self._plant_session(owner="alice")
+            self._req("/api/input", method="POST",
+                      body={"session_id": sid, "data": "x"},
+                      user="mallory")
+            deadline = time.time() + 2
+            rec = None
+            while time.time() < deadline:
+                if os.path.exists(log):
+                    lines = open(log).read().splitlines()
+                    for ln in lines:
+                        r = json.loads(ln)
+                        if r.get("event") == "authz_denied":
+                            rec = r
+                            break
+                if rec:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(rec, "no authz_denied record")
+            self.assertEqual(rec["auth_user"], "mallory")
+            self.assertEqual(rec["sid"], sid)
+        finally:
+            server.ACCESS_LOG_PATH = orig
+            import shutil as _sh
+            _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

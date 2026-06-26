@@ -504,5 +504,29 @@ class TestInstanceTemplateUnit(unittest.TestCase):
         self.assertEqual(d.get("StateDirectory"), ["websh"])
 
 
+class TestAuthVaultStartupGuard(unittest.TestCase):
+    """main() refuses to start when WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE
+    are both set: the vault is keyed by client-supplied vault_id, not by the
+    authenticated identity, so the combination would let an authenticated
+    user reach another user's vault entries. The guard exits 1 before binding
+    (a clean start would instead serve forever)."""
+
+    def test_auth_plus_vault_refuses_to_start(self):
+        env = dict(os.environ)
+        env["PORT"] = "0"
+        env["WEBSH_AUTH_HEADER"] = "Remote-User"
+        env["WEBSH_VAULT_ENABLE"] = "1"
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [sys.executable, "-c", "import server; server.main()"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        self.assertEqual(
+            proc.returncode, 1,
+            "guard must exit 1 (a clean start would block/serve); stderr=%r"
+            % proc.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"refusing to start", proc.stderr)
+        self.assertIn(b"WEBSH_AUTH_HEADER", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

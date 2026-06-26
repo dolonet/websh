@@ -39,7 +39,8 @@ X-Forwarded-For trust.
 | `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`). The bundled `websh.service` and Docker image ship the dependency and a writable creds path, so enabling the vault there is a one-line opt-in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. See [`encryption.md`](encryption.md). |
-| `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
+| `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` (and `WEBSH_AUTH_HEADER`) from |
+| `WEBSH_AUTH_HEADER` | *(unset)* | Header-trust authentication: set to a header name (e.g. `Remote-User` from oauth2-proxy/Authelia) and every request except `/api/ping` requires it; sessions are stamped with their creator's identity and cross-user access is `403`. The header is only read from `TRUSTED_PROXIES` peers. See [`security.md`](security.md#header-trust-authentication). |
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
 | `MAX_UPLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/upload` (bytes) |
 | `MAX_DOWNLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/download` (bytes); the browser accumulates the stream into a Blob, so this also protects the tab |
