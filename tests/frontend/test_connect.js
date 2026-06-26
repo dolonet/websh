@@ -657,6 +657,37 @@ test('finalizeSuccess arms the deferred-save timer when Save is ticked', async (
   cleanup(env);
 });
 
+test('pendingSave survives a session-error auto-reconnect (timer re-armed)', async () => {
+  // Session dies inside the 2.6s commit window → handleOutputPayload's
+  // error branch runs endSession (which clears the deferred-save timer)
+  // and auto-reconnects via connectPane. The success path must re-arm
+  // scheduleSaveCommit against the NEW sid — otherwise an idle SSE
+  // session never commits the save the user asked for.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-first', alive: true}, once: true},
+    {action: 'connect', response: {session_id: 's-second', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'save', response: {}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Reconn';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(!!(p && p.pendingSave), 'pendingSave armed after first connect');
+  win.handleOutputPayload(p, {error: 'session not found'}, p.sid);
+  await sleep(150);
+  ok(p.sid === 's-second', 'auto-reconnect landed; got ' + p.sid);
+  ok(!!p.pendingSave, 'pendingSave survived the reconnect');
+  ok(!!p.saveCommitTimer, 'deferred-save timer re-armed for the new sid');
+  cleanup(env);
+});
+
 test('deferred save timer: cleared when the pane is closed within the window', async () => {
   // Closing the pane within SAVE_COMMIT_DELAY_MS must NOT save a session the
   // user just tore down. _destroyPane leaves p.sid set (it only reads it for
@@ -5488,6 +5519,50 @@ test('isolate_storage: font link refreshes to the path-scoped family at boot (#1
   ok(!/JetBrains\+Mono/.test(link.getAttribute('href')),
      'default family must not stay active under isolate_storage');
   dom.window.close();
+});
+
+test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
+  // After endSession tears a pane down (p.polling=false), an in-flight
+  // auto-reconnect sets p.connecting=true. A late fetch/SSE rejection from
+  // the OLD transport must NOT re-banner the pane and must NOT reset
+  // p.connecting — that would defuse connectPane's duplicate-connect guard
+  // and re-open the double-/api/connect + leaked-PTY race. This pins the
+  // endSession refactor's `if (!p.polling) return` guard.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-tf', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+
+  // Reconnect window: endSession dropped polling; connectPane set connecting.
+  p.polling = false;
+  p.connecting = true;
+  p.sid = 's-stale';
+  const writes = [];
+  p.term.write = (s) => { writes.push(String(s)); };
+
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.length === 0,
+     'guarded: no banner on a torn-down transport; got ' + JSON.stringify(writes));
+  ok(p.connecting === true,
+     'guarded: p.connecting preserved (in-flight reconnect guard intact)');
+  ok(p.sid === 's-stale', 'guarded: p.sid not nulled');
+
+  // Positive control: a LIVE transport (polling=true) must still surface.
+  p.polling = true;
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.some(s => /backend restarted|connection lost/.test(s)),
+     'live transport still banners; got ' + JSON.stringify(writes));
+  ok(p.polling === false, 'live transportFatal tore the pane down via endSession');
+  cleanup(env);
 });
 
 // =====================================================================
