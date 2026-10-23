@@ -5,7 +5,8 @@ Answers every request with a JSON description of what it received —
 method, path, query, body, and the headers the proxy is contractually
 required to set (X-Forwarded-For, Content-Type). /api/ping returns the
 shape ensure_backend() expects so api.php never tries to auto-start a
-real server.py.
+real server.py. session_id=gone answers 404, so the smoke can check
+that the proxy forwards backend status codes.
 """
 import json
 import sys
@@ -14,8 +15,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Echo(BaseHTTPRequestHandler):
     def _reply(self):
+        status = 200
         if self.path.split("?")[0] == "/api/ping":
             body = json.dumps({"ok": True, "version": "stub"}).encode()
+        elif "session_id=gone" in self.path:
+            status = 404
+            body = json.dumps({"error": "session not found"}).encode()
         else:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.dumps({
@@ -26,7 +31,7 @@ class Echo(BaseHTTPRequestHandler):
                 "xff": self.headers.get("X-Forwarded-For", ""),
                 "ctype": self.headers.get("Content-Type", ""),
             }).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
