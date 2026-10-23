@@ -24,14 +24,16 @@ below — including the `WEBSH_` prefix where the table has one, e.g.
 `1`/`true` (env string or JSON literal).
 
 Env-only exceptions: `WEBSH_CONFIG` (it locates the JSON), and
-`HOST` / `TRUSTED_PROXIES` — a writable `websh.json` must not be able
-to rebind the loopback-only server to a public interface or take over
-X-Forwarded-For trust.
+`HOST` / `TRUSTED_PROXIES` / `WEBSH_SOCKET` — a writable `websh.json`
+must not be able to rebind the loopback-only server to a public
+interface or a path of its choosing, or take over X-Forwarded-For
+trust.
 
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8765` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address |
+| `WEBSH_SOCKET` | *(unset)* | Listen on this Unix socket path instead of `HOST`:`PORT`. The socket is created `0600`, so only the websh user can connect; clients on it are trusted like `TRUSTED_PROXIES`. Its directory must belong to the websh user and not be writable by others (no `/tmp`). The PHP proxy always uses one (default `websh.sock` next to `websh.json`) — see [`deployment.md`](deployment.md#shared-hosting-php--python). |
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
@@ -61,8 +63,7 @@ X-Forwarded-For trust.
 | `WEBSH_RECORD_DIR` | *(unset)* | Opt-in session recording: directory for one [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) `.cast` file per session (created `0600`, named `<timestamp>-<sid>.cast`; replayable with `asciinema play`). Output-only by default. Best-effort: a write failure disables recording for that session, never the session itself. Mind retention/privacy — see [`security.md`](security.md#session-recording). |
 | `WEBSH_RECORD_INPUT` | `0` | With recording on, `1` also records keystrokes (`"i"` events). **Everything typed into the remote shell lands in the file — including passwords typed at prompts inside the session.** The browser-form ssh password is not recorded as input (the auto-type bypasses the tee); see the echo caveat in [`security.md`](security.md#session-recording). |
 
-The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend —
-and since the alias rule above makes `server.py` honor `WEBSH_PORT`
-too, in the shared-hosting flow (where the auto-started backend
-inherits PHP's environment) that one variable points both sides at the
-same port. Under systemd the unit's `PORT=` still pins the backend.
+The PHP proxy talks to the backend over `WEBSH_SOCKET` (default
+`websh.sock` next to `websh.json`) and starts `server.py` with that
+same value, so `PORT` and `HOST` play no part in the shared-hosting
+flow. Under systemd the unit's `PORT=` still pins the backend.

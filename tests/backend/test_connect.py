@@ -147,6 +147,9 @@ class TestClientIp(unittest.TestCase):
         def get(self, name, default=""):
             return self._m.get(name, default)
 
+        def get_all(self, name, default=None):
+            return [self._m[name]] if name in self._m else default
+
     def _make_handler(self, peer, headers=None):
         h = server.Handler.__new__(server.Handler)
         h.client_address = (peer, 12345)
@@ -224,6 +227,39 @@ class TestClientIp(unittest.TestCase):
         h = self._make_handler("127.0.0.1",
                                {"X-Forwarded-For": "1.2.3.4abc"})
         self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def _make_unix_handler(self, headers=None):
+        # socketserver hands a Unix-socket connection client_address ''.
+        h = server.Handler.__new__(server.Handler)
+        h.client_address = ""
+        h.headers = self._FakeHeaders(headers or {})
+        return h
+
+    def test_unix_socket_peer_trusts_xff(self):
+        # The socket is 0600: its only clients are the websh account's
+        # own processes (api.php), whatever TRUSTED_PROXIES says.
+        server._TRUSTED_PROXIES = {"10.0.0.5"}
+        h = self._make_unix_handler({"X-Forwarded-For": "1.2.3.4"})
+        self.assertEqual(h._client_ip(), "1.2.3.4")
+
+    def test_bound_unix_client_is_trusted_not_used_as_ip(self):
+        # A client that bound its own path shows up as that path.
+        h = self._make_unix_handler()
+        h.client_address = "client.sock"
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_unix_socket_peer_without_xff_is_loopback(self):
+        h = self._make_unix_handler()
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_unix_socket_peer_carries_auth_identity(self):
+        orig = server.WEBSH_AUTH_HEADER
+        server.WEBSH_AUTH_HEADER = "Remote-User"
+        try:
+            h = self._make_unix_handler({"Remote-User": "alice"})
+            self.assertEqual(h._client_identity(), "alice")
+        finally:
+            server.WEBSH_AUTH_HEADER = orig
 
 
 class TestRateLimit(unittest.TestCase):

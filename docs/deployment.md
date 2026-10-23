@@ -10,6 +10,7 @@ A typical shared-hosting directory layout:
 /home/user/
   example.com/              <- site root
     websh.json              <- config (OUTSIDE www — not accessible via HTTP)
+    websh.sock              <- backend socket (created by server.py)
     www/                    <- web root (public)
       console/
         index.html          <- frontend
@@ -27,15 +28,27 @@ A typical shared-hosting directory layout:
 
 That's it. `api.php` starts `server.py` automatically on the first request.
 
+The backend listens on a Unix socket, `websh.sock`, next to `websh.json`,
+not on a TCP port. On shared hosting `127.0.0.1` is shared by every account
+on the server, so a port would let other customers reach the backend
+around your web server's authentication. The socket is created with
+owner-only permissions, so only your account can connect to it — provided
+PHP runs as your account (suPHP, per-user PHP-FPM pools, LSAPI: the usual
+shared-hosting setup). Override the path with `WEBSH_SOCKET`: under 108
+bytes, in a directory that belongs to your account and that no one else
+can write to — never `/tmp`. Both `api.php` and `server.py` refuse a
+directory other users could plant a socket in.
+
 > **Path details:** `api.php` looks for `websh.json` two directories up from itself
 > (i.e. the site root, above `www/`). This works for most hosting providers.
 > If your layout is different, set the `WEBSH_CONFIG` environment variable
 > or edit the `$WEBSH_CONFIG` default near the top of `api.php`.
 
-For manual control (e.g. custom config path):
+For manual control (e.g. custom config path), start it on the socket
+`api.php` connects to:
 
 ```bash
-WEBSH_CONFIG=/path/to/websh.json nohup python3 server.py &
+WEBSH_CONFIG=/path/to/websh.json WEBSH_SOCKET=/path/to/websh.sock nohup python3 server.py &
 ```
 
 ### Troubleshooting
@@ -50,9 +63,19 @@ WEBSH_CONFIG=/path/to/websh.json nohup python3 server.py &
 - Set `WEBSH_CONFIG=/full/path/to/websh.json` environment variable if your layout differs
 - Check JSON syntax: `python3 -c "import json; json.load(open('websh.json'))"`
 
-**Port already in use:**
-- Another instance of `server.py` may be running: `ps aux | grep server.py`
-- Change the port: `PORT=8766 python3 server.py`
+**Upgrading from a version that listened on a TCP port:**
+- The old backend keeps running on `127.0.0.1:8765` (or your
+  `WEBSH_PORT`), reachable by anyone on the server, until it is stopped:
+  `pkill -f server.py` (the next request starts the new one), or ask your
+  host to restart your processes.
+
+**An error about the backend socket or its directory:**
+- The directory holding `websh.sock` (by default the one with `websh.json`)
+  must belong to your account and be writable by it alone; with
+  `open_basedir`, it must also be inside the allowed paths. Otherwise point
+  `WEBSH_SOCKET` at such a directory.
+- A stale `websh.sock` left by a crashed backend is replaced automatically;
+  a regular file at that path is not — remove it.
 
 ## Python only (no PHP)
 

@@ -5,6 +5,7 @@ Split from the original test_server.py; class bodies are verbatim.
 """
 
 import base64
+import http.client
 import io
 import json
 import os
@@ -2143,6 +2144,116 @@ class TestSessionRecording(unittest.TestCase):
             self.assertIsNone(s._rec)
         finally:
             server.WEBSH_RECORD_DIR = orig
+
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        http.client.HTTPConnection.__init__(self, "localhost", timeout=5)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+class TestUnixSocketServer(unittest.TestCase):
+    """WEBSH_SOCKET: the backend listens on a 0600 Unix socket instead
+    of loopback TCP, which every account on a shared host can reach."""
+
+    def setUp(self):
+        # Short dir: sun_path caps the socket path at ~107 bytes.
+        self.tmpdir = tempfile.mkdtemp(dir="/tmp")
+        self.path = os.path.join(self.tmpdir, "websh.sock")
+        self.httpd = None
+
+    def tearDown(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _start(self):
+        self.httpd = server.UnixServer(self.path, server.Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def _get(self, path):
+        c = _UnixHTTPConnection(self.path)
+        try:
+            c.request("GET", path)
+            r = c.getresponse()
+            return r.status, json.loads(r.read())
+        finally:
+            c.close()
+
+    def test_serves_api_over_owner_only_socket(self):
+        umask = os.umask(0o022)
+        os.umask(umask)
+        self._start()
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.umask(umask), umask, "bind leaked its umask")
+        status, body = self._get("/api/ping")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+    def test_close_removes_socket_file(self):
+        self._start()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = None
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_stale_socket_is_replaced(self):
+        # A backend killed with SIGKILL leaves its socket file behind.
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(self.path)
+        dead.close()
+        self._start()
+        self.assertEqual(self._get("/api/ping")[0], 200)
+
+    def test_live_socket_is_not_taken_over(self):
+        self._start()
+        with self.assertRaises(OSError):
+            server.UnixServer(self.path, server.Handler)
+        self.assertEqual(self._get("/api/ping")[0], 200)
+
+    def test_dir_writable_by_others_is_refused(self):
+        # A co-tenant could plant a socket there before the backend binds.
+        os.chmod(self.tmpdir, 0o777)
+        with self.assertRaises(OSError):
+            server.UnixServer(self.path, server.Handler)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_non_socket_file_is_left_alone(self):
+        with open(self.path, "w") as f:
+            f.write("keep me")
+        with self.assertRaises(OSError):
+            server.UnixServer(self.path, server.Handler)
+        with open(self.path) as f:
+            self.assertEqual(f.read(), "keep me")
+
+    def test_main_listens_on_socket_from_env(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        env["WEBSH_SOCKET"] = self.path
+        env["WEBSH_VAULT_ENABLE"] = "0"
+        env.pop("WEBSH_CONFIG", None)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import server; server.main()"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            for _ in range(500):
+                if os.path.exists(self.path):
+                    break
+                time.sleep(0.01)
+            self.assertEqual(self._get("/api/ping")[0], 200)
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            _, err = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn(b"listening on unix:" + self.path.encode(), err)
+        self.assertFalse(os.path.exists(self.path))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
  * websh — PHP proxy.
  *
  * Forwards AJAX requests from the browser to the Python REST API
- * running on 127.0.0.1. This allows all traffic to flow through
+ * over a Unix socket. This allows all traffic to flow through
  * the hosting provider's HTTPS — no exposed ports, no WebSocket.
  *
  * Compatible with PHP 5.3+ and requires only the curl extension.
@@ -28,9 +28,10 @@ if ($action === 'stream') {
 }
 
 if (!extension_loaded('curl')) {
-    header('HTTP/1.1 500 Internal Server Error');
-    echo '{"error":"PHP curl extension is required"}';
-    exit;
+    config_error('PHP curl extension is required');
+}
+if (!defined('CURLOPT_UNIX_SOCKET_PATH')) {
+    config_error('PHP curl lacks Unix socket support (needs PHP 7.0.7+ and libcurl 7.40+)');
 }
 
 if ($action !== 'stream') {
@@ -38,13 +39,32 @@ if ($action !== 'stream') {
     header('Cache-Control: no-cache, no-store, must-revalidate');
 }
 
-$BACKEND = 'http://127.0.0.1:' . (getenv('WEBSH_PORT') ?: '8765');
-
 // Path to config file (must be OUTSIDE the web root for security).
 $WEBSH_CONFIG = getenv('WEBSH_CONFIG') ?: dirname(__FILE__) . '/../../websh.json';
 
+// The backend listens on a Unix socket, not a TCP port: on shared
+// hosting 127.0.0.1 is common to every account, so any co-tenant could
+// reach a TCP backend past the web server's auth (and use the
+// server-side connections in websh.json), or take the port while the
+// backend is down and receive what users type. server.py creates the
+// socket 0600 next to websh.json, outside the web root, so only this
+// account can connect to it or create it there.
+$config_dir = @realpath(dirname($WEBSH_CONFIG)) ?: dirname($WEBSH_CONFIG);
+$WEBSH_SOCKET = trim((string) getenv('WEBSH_SOCKET')) ?: $config_dir . '/websh.sock';
+// sun_path holds 107 bytes; past that bind() and connect() just fail.
+if (strlen($WEBSH_SOCKET) > 107) {
+    config_error('backend socket path is too long; set WEBSH_SOCKET to a '
+        . 'shorter path in a directory only this account can write');
+}
+$problem = socket_path_problem($WEBSH_SOCKET);
+if ($problem !== '') {
+    config_error($problem);
+}
+// Only the Host header sees this; the connection goes to the socket.
+$BACKEND = 'http://localhost';
+
 // Auto-start: launch server.py if it's not running.
-ensure_backend($BACKEND, $WEBSH_CONFIG);
+ensure_backend($BACKEND, $WEBSH_CONFIG, $WEBSH_SOCKET);
 
 switch ($action) {
     case 'config':     proxy_get($BACKEND . '/api/config');     break;
@@ -112,15 +132,48 @@ switch ($action) {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+// A deployment problem only the operator can fix: 500 with the reason.
+function config_error($msg) {
+    http_response_code(500);
+    header('Content-Type: application/json');
+    echo json_encode(array('error' => $msg));
+    exit;
+}
+
+// A socket path other accounts can create files at is a trap: a
+// co-tenant plants a socket there first and receives what users type.
+// So the directory must belong to this account and be closed to other
+// users' writes, and an existing socket must be ours. Returns the
+// problem, or '' when the path is safe.
+function socket_path_problem($socket) {
+    $uid = function_exists('posix_geteuid') ? posix_geteuid() : getmyuid();
+    $gid = function_exists('posix_getegid') ? posix_getegid() : getmygid();
+    $dir = @stat(dirname($socket));
+    if (!$dir) {
+        return 'cannot access the backend socket directory (open_basedir?); '
+            . 'set WEBSH_SOCKET to a path in a directory this account owns';
+    }
+    if ($dir['uid'] !== $uid || ($dir['mode'] & 0002)
+            || (($dir['mode'] & 0020) && $dir['gid'] !== $gid)) {
+        return 'the backend socket directory must belong to this account '
+            . 'and be writable only by it; set WEBSH_SOCKET';
+    }
+    $owner = @fileowner($socket);
+    if ($owner !== false && $owner !== $uid) {
+        return 'the backend socket belongs to another user';
+    }
+    return '';
+}
+
 // Headers every proxied backend request must carry. The X-Forwarded-For
-// is the load-bearing one: all backend calls originate from 127.0.0.1
-// (this PHP process), so without it the server sees every browser client
+// is the load-bearing one: all backend calls come from this PHP process
+// over the socket, so without it the server sees every browser client
 // as the loopback address and the entire per-IP defense layer collapses
 // to a single shared bucket — one client exhausts RATE_LIMIT_MAX for
 // everyone, MAX_SESSIONS_PER_IP caps all users combined, and the access
 // log records 127.0.0.1 for every connect. The backend trusts only the
-// FIRST token of X-Forwarded-For from a trusted proxy (loopback by
-// default), so we send exactly one token and OVERWRITE rather than
+// FIRST token of X-Forwarded-For from a trusted proxy (any client of
+// its socket), so we send exactly one token and OVERWRITE rather than
 // append. REMOTE_ADDR is the real client on the typical shared-hosting
 // layout where PHP faces the browser directly; if PHP itself sits behind
 // another proxy, configure that proxy to populate REMOTE_ADDR.
@@ -130,6 +183,17 @@ function backend_headers($extra = array()) {
         $h[] = 'X-Forwarded-For: ' . $_SERVER['REMOTE_ADDR'];
     }
     return $h;
+}
+
+// Every backend request goes over the socket.
+function backend_curl($url) {
+    global $WEBSH_SOCKET;
+    $ch = curl_init($url);
+    if (!curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $WEBSH_SOCKET)) {
+        // libcurl built without Unix sockets: never fall back to TCP.
+        config_error('PHP curl cannot connect to Unix sockets');
+    }
+    return $ch;
 }
 
 // curl_close() only frees the handle before PHP 8.0; since then handles
@@ -142,7 +206,7 @@ function release_curl($ch) {
 }
 
 function ping_backend($backend) {
-    $ch = curl_init($backend . '/api/ping');
+    $ch = backend_curl($backend . '/api/ping');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 2);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 1);
@@ -153,7 +217,7 @@ function ping_backend($backend) {
 
 function proxy_post($url) {
     $body = file_get_contents('php://input');
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -174,7 +238,7 @@ function proxy_post($url) {
 }
 
 function proxy_get($url) {
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
     curl_setopt($ch, CURLOPT_TIMEOUT, 50);
@@ -201,7 +265,7 @@ function proxy_upload($url) {
         return;
     }
 
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
     curl_setopt($ch, CURLOPT_UPLOAD, true);
     curl_setopt($ch, CURLOPT_INFILE, $in);
@@ -232,7 +296,7 @@ function proxy_download($url) {
     @ob_implicit_flush(true);
 
     $sent_headers = false;
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
@@ -277,7 +341,7 @@ function proxy_download($url) {
 // DELETE helper for /api/save. Mirrors proxy_post/proxy_get by
 // forwarding the backend's status code, including 204 No Content.
 function proxy_delete($url) {
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
@@ -316,7 +380,7 @@ function proxy_stream($url) {
     @ob_implicit_flush(true);
 
     $sent_headers = false;
-    $ch = curl_init($url);
+    $ch = backend_curl($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
     curl_setopt($ch, CURLOPT_HEADER, false);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
@@ -369,13 +433,19 @@ function proxy_stream($url) {
     }
 }
 
-function ensure_backend($backend, $config_path) {
+function ensure_backend($backend, $config_path, $socket) {
     if (ping_backend($backend)) return;
 
-    // Lock to prevent double-start.
-    $lock = fopen(sys_get_temp_dir() . '/websh_start.lock', 'c');
-    if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-        if ($lock) fclose($lock);
+    // Lock to prevent double-start. It sits next to the socket, not in
+    // the system temp dir: with a shared /tmp every account on the host
+    // would contend for one lock file owned by whoever created it.
+    $lock = @fopen($socket . '.lock', 'c');
+    if (!$lock) {
+        config_error('cannot create the auto-start lock next to the backend '
+            . 'socket; its directory must be writable by this account');
+    }
+    if (!flock($lock, LOCK_EX | LOCK_NB)) {
+        fclose($lock);
         usleep(1500000);
         ping_backend($backend);
         return;
@@ -386,15 +456,12 @@ function ensure_backend($backend, $config_path) {
 
     $script = dirname(__FILE__) . '/server.py';
     if (file_exists($script)) {
-        // Pass PORT so the spawned server.py binds the SAME port this proxy
-        // pings ($BACKEND uses WEBSH_PORT). Without it the backend always
-        // binds its own default 8765, so on a non-default WEBSH_PORT the
-        // ping never succeeds, every request re-execs python3, and the
-        // browser sees permanent 502s.
+        // WEBSH_SOCKET makes the spawned server.py listen on the socket
+        // this proxy connects to instead of a loopback TCP port.
         $cmd = sprintf(
-            'WEBSH_CONFIG=%s PORT=%s nohup python3 %s </dev/null >/dev/null 2>&1 &',
+            'WEBSH_CONFIG=%s WEBSH_SOCKET=%s nohup python3 %s </dev/null >/dev/null 2>&1 &',
             escapeshellarg($config_path),
-            escapeshellarg(getenv('WEBSH_PORT') ?: '8765'),
+            escapeshellarg($socket),
             escapeshellarg($script)
         );
         exec($cmd);
