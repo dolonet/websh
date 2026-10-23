@@ -38,6 +38,29 @@ For manual control (e.g. custom config path):
 WEBSH_CONFIG=/path/to/websh.json nohup python3 server.py &
 ```
 
+### Keep PHP patched
+
+In this layout PHP is part of websh's attack surface: every API call —
+connect credentials, keystrokes, terminal output — passes through it, and
+`server.py` runs as the same OS user PHP does (on most shared hosts, the
+account that also owns `websh.json` and the frontend files). Code execution
+in PHP can read server-side connection secrets and replace the backend or
+the frontend to capture the passwords users type.
+
+Interpreter bugs can fire while PHP is still parsing the request — before
+`api.php` runs a single line — so nothing in the proxy, `ini_set()` or
+`.user.ini` can defend against them. The fix is the interpreter itself:
+
+- Run a branch listed on [php.net/supported-versions](https://www.php.net/supported-versions.php),
+  kept on its latest patch release, or a hosting/distribution package that
+  backports security fixes to an older branch.
+- On distribution packages the version number alone doesn't tell you —
+  fixes are backported without changing it — so ask your host.
+- If you can't get a patched PHP, take websh off that account (remove
+  `api.php`, `server.py` and `websh.json`) and run the
+  [Python only](#python-only-no-php) layout on a machine you control, behind
+  a [reverse proxy](#https-via-reverse-proxy).
+
 ### Troubleshooting
 
 **"Backend unavailable" or blank page:**
