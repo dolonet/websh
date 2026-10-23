@@ -6,11 +6,23 @@ method, path, query, body, and the headers the proxy is contractually
 required to set (X-Forwarded-For, Content-Type). /api/ping returns the
 shape ensure_backend() expects so api.php never tries to auto-start a
 real server.py. session_id=gone answers 404, so the smoke can check
-that the proxy forwards backend status codes.
+that the proxy forwards backend status codes. Listens on the Unix
+socket given as argv[1], as server.py does under the PHP proxy.
 """
 import json
+import socket
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class UnixHTTPServer(HTTPServer):
+    address_family = socket.AF_UNIX
+
+    def server_bind(self):
+        # HTTPServer.server_bind would getfqdn() a (host, port) pair.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", 0
 
 
 class Echo(BaseHTTPRequestHandler):
@@ -44,7 +56,6 @@ class Echo(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    # Port 0 = kernel-assigned; print the real port for the caller.
-    srv = HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 0), Echo)
-    print(srv.server_address[1], flush=True)
+    srv = UnixHTTPServer(sys.argv[1], Echo)
+    print("ready", flush=True)
     srv.serve_forever()

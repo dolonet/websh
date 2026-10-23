@@ -9,6 +9,8 @@ Listens on 127.0.0.1 only — meant to be proxied through Apache/nginx via PHP.
 Environment variables:
     PORT                  — listen port (default: 8765)
     HOST                  — bind address (default: 127.0.0.1)
+    WEBSH_SOCKET          — listen on this Unix socket path instead of
+                            HOST:PORT (the PHP proxy always sets it)
     SESSION_TIMEOUT       — seconds of inactivity before cleanup (default: 300)
     MAX_SESSIONS          — max concurrent SSH sessions (default: 50)
     WEBSH_CONFIG          — path to websh.json config file (optional)
@@ -49,6 +51,7 @@ API endpoints:
 import base64
 import binascii
 import datetime
+import errno
 import fcntl
 import ipaddress
 import json
@@ -59,6 +62,8 @@ import select
 import selectors
 import signal
 import socket
+import socketserver
+import stat
 import struct
 import subprocess
 import sys
@@ -182,6 +187,12 @@ def _int_env(name, default):
 
 PORT = _int_env("PORT", "8765")
 HOST = str(_knob("HOST", "127.0.0.1"))
+# Listen on a Unix socket at this path instead of HOST:PORT. The PHP
+# proxy always sets it: on shared hosting 127.0.0.1 is common to every
+# account, so a TCP port is reachable by any co-tenant. Env-only (read
+# directly, not via _knob): a websh.json write must not pick a path the
+# server unlinks and binds.
+WEBSH_SOCKET = os.environ.get("WEBSH_SOCKET", "").strip()
 # Optional header-trust authentication. When set to a header name (e.g.
 # "Remote-User" from oauth2-proxy / Authelia / authentik), every request
 # except /api/ping requires that header, its value becomes the request's
@@ -3211,14 +3222,25 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Source-IP / session-ID validation ───────────────────────────
 
+    def _peer(self):
+        """(address, trusted) for the connection's peer. A Unix-socket
+        peer has no IP (client_address is a path, usually ''); only
+        processes of the websh account can open the 0600 socket — in
+        practice api.php — so it is trusted and reported as loopback."""
+        if not isinstance(self.client_address, tuple):
+            return "127.0.0.1", True
+        peer = self.client_address[0]
+        return peer, peer in _TRUSTED_PROXIES
+
     def _client_ip(self):
         """Return the IP we treat as the request's source for rate-limit
         and per-IP-cap purposes.
 
         Uses the TCP peer by default. When the peer is in TRUSTED_PROXIES
-        we read the FIRST X-Forwarded-For token — but only if it parses
-        as a valid IP literal. Anything else (typo, intentional garbage,
-        an injected oversized blob) falls back to the peer.
+        (or on the Unix socket) we read the FIRST X-Forwarded-For token —
+        but only if it parses as a valid IP literal. Anything else (typo,
+        intentional garbage, an injected oversized blob) falls back to
+        the peer.
 
         Important: when running behind a reverse proxy, the proxy MUST
         OVERWRITE this header (`proxy_set_header X-Forwarded-For $remote_addr;`
@@ -3229,8 +3251,8 @@ class Handler(BaseHTTPRequestHandler):
         attacker-controlled non-IP bytes from ending up as the registry
         comparison key — it does NOT compensate for an appending proxy.
         """
-        peer = self.client_address[0]
-        if peer in _TRUSTED_PROXIES:
+        peer, trusted = self._peer()
+        if trusted:
             xff = self.headers.get("X-Forwarded-For", "")
             if xff:
                 token = xff.split(",", 1)[0].strip()
@@ -3249,7 +3271,7 @@ class Handler(BaseHTTPRequestHandler):
         X-Forwarded-For) so a direct client cannot mint identities."""
         if not WEBSH_AUTH_HEADER:
             return ""
-        if self.client_address[0] not in _TRUSTED_PROXIES:
+        if not self._peer()[1]:
             return ""
         values = self.headers.get_all(WEBSH_AUTH_HEADER) or []
         if len(values) > 1:
@@ -4587,6 +4609,89 @@ class Server(HTTPServer):
             self._req_sem.release()
 
 
+class UnixServer(Server):
+    """Server on a Unix socket (WEBSH_SOCKET) instead of loopback TCP.
+
+    On shared hosting every account shares 127.0.0.1: any co-tenant
+    could reach a TCP backend directly, past the web server's auth, and
+    use the server-side connections in websh.json — or take the port
+    while the backend is down and receive the credentials api.php
+    forwards. The socket file is created 0600, so only the websh
+    account can connect to it; living in that account's directory, only
+    that account can create it.
+    """
+
+    address_family = socket.AF_UNIX
+    # SO_REUSE* mean nothing for a path; stale files are handled below.
+    allow_reuse_address = False
+    allow_reuse_port = False
+    # Set once bind() succeeds; socketserver calls server_close() on a
+    # failed bind too, and that must not unlink someone else's file.
+    _sock_ino = None
+
+    def server_bind(self):
+        _check_socket_dir(self.server_address)
+        _clear_stale_socket(self.server_address)
+        # umask instead of a chmod after bind(): no window where the
+        # socket exists with looser permissions.
+        old = os.umask(0o177)
+        try:
+            # HTTPServer.server_bind would getfqdn() a (host, port) pair.
+            socketserver.TCPServer.server_bind(self)
+        finally:
+            os.umask(old)
+        self._sock_ino = os.lstat(self.server_address).st_ino
+        self.server_name = "localhost"
+        self.server_port = 0
+
+    def server_close(self):
+        Server.server_close(self)
+        try:
+            # Only our own file — never a socket a newer backend bound.
+            if os.lstat(self.server_address).st_ino == self._sock_ino:
+                os.unlink(self.server_address)
+        except OSError:
+            pass
+
+
+def _check_socket_dir(path):
+    """Refuse a socket directory other users can create files in: a
+    co-tenant could plant a socket there before we bind, and api.php
+    would hand it what users type."""
+    d = os.path.dirname(os.path.abspath(path))
+    st = os.stat(d)
+    if (st.st_uid != os.geteuid() or st.st_mode & stat.S_IWOTH
+            or (st.st_mode & stat.S_IWGRP and st.st_gid != os.getegid())):
+        raise OSError(errno.EPERM, "WEBSH_SOCKET directory {} must belong to "
+                      "this user and be writable only by it".format(d))
+
+
+def _clear_stale_socket(path):
+    """Unlink a socket file left by a backend that died without cleaning
+    up, so bind() does not fail with EADDRINUSE. Anything that is not a
+    socket, or a socket that still accepts connections, is left alone."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISSOCK(st.st_mode):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # A full backlog (wedged backend) blocks connect(); count it as
+        # in use rather than hang every auto-start attempt.
+        probe.settimeout(1)
+        try:
+            probe.connect(path)
+        except ConnectionRefusedError:
+            os.unlink(path)
+            return
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    raise OSError(errno.EADDRINUSE,
+                  "WEBSH_SOCKET {} is in use or not a socket".format(path))
+
+
 def _warn_per_ip_misconfig():
     """Emit a WARN when MAX_SESSIONS_PER_IP cannot ever trip.
 
@@ -4682,7 +4787,12 @@ def main():
     t = Thread(target=_cleanup_loop, daemon=True)
     t.start()
 
-    server = Server((HOST, PORT), Handler)
+    if WEBSH_SOCKET:
+        server = UnixServer(WEBSH_SOCKET, Handler)
+        where = "unix:" + WEBSH_SOCKET
+    else:
+        server = Server((HOST, PORT), Handler)
+        where = "http://{}:{}".format(HOST, PORT)
 
     stop_event = Event()
 
@@ -4709,8 +4819,7 @@ def main():
     serve_thread = Thread(target=server.serve_forever, daemon=True)
     serve_thread.start()
 
-    _log("INFO", "websh v{} listening on http://{}:{}".format(
-        __version__, HOST, PORT))
+    _log("INFO", "websh v{} listening on {}".format(__version__, where))
     if ACCESS_LOG_PATH:
         _log("INFO", "access log: {}".format(ACCESS_LOG_PATH))
     if not HAS_CRYPTOGRAPHY:

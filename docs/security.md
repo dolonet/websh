@@ -8,6 +8,12 @@ It is meant to be lightweight — add access control at the web server level:
 - **Cloudflare Access**, **Tailscale Funnel**, or similar zero-trust tools
 - IP allowlisting via firewall rules
 
+That only holds if nothing reaches the backend around the web server.
+On shared hosting `127.0.0.1` is common to every account on the server,
+so the PHP proxy runs the backend on an owner-only Unix socket
+(`WEBSH_SOCKET`) instead of a loopback port. With the default TCP bind,
+run websh on a machine you don't share.
+
 ## SSH host keys
 
 The backend connects with `StrictHostKeyChecking=no` by default to avoid
@@ -200,7 +206,8 @@ once** (an appending proxy would otherwise let a client-smuggled first
 value win), and reads it only from `TRUSTED_PROXIES` peers. Two
 operational notes: with the defaults (`HOST=127.0.0.1`,
 `TRUSTED_PROXIES=127.0.0.1`) any local process on a shared box can
-mint identities — inherent to loopback trust; and enable
+mint identities — inherent to loopback trust, which `WEBSH_SOCKET`
+avoids; and enable
 `WEBSH_AUTH_HEADER` at startup only — sessions are stamped at creation,
 so flipping it on over a live registry orphans existing sessions
 (deny-by-default, by design). Cross-user probes are recorded in the
