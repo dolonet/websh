@@ -42,7 +42,10 @@ Shared-хостинг не даёт держать долгоживущий пр
 - **Постоянные сессии (опционально).** `tmux` на удалённом хосте —
   любая более-менее свежая версия. См.
   [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
-- **Опциональный proxy на shared-хостинге.** PHP 5.3+ с расширением `curl`.
+- **Опциональный proxy на shared-хостинге.** PHP с расширением `curl`:
+  [поддерживаемая ветка](https://www.php.net/supported-versions.php) или
+  пакет хостера/дистрибутива, который ещё получает обновления
+  безопасности. См. [`docs/deployment.md`](docs/deployment.md#keep-php-patched).
 - **Опциональный reverse-proxy.** nginx, Caddy или Apache.
 
 ## Особенности
@@ -116,6 +119,10 @@ python3 server.py
 **SSH-доступ не требуется.** Залей `index.html`, `websh.js`, `api.php`,
 `server.py` и папку `assets/` в папку в веб-корне. Открой в браузере.
 `api.php` сам запускает `server.py` при первом запросе.
+
+Выбери версию PHP, которая ещё получает обновления безопасности, —
+в большинстве панелей хостинга она задаётся для каждого сайта; см.
+[`docs/deployment.md`](docs/deployment.md#keep-php-patched).
 
 `websh.json` (опционально, для серверных подключений) лежит **вне**
 веб-корня — `api.php` по умолчанию ищет на два каталога выше себя.
