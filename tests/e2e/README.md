@@ -15,6 +15,7 @@ and on the network, and unit tests passed while they were live.
 |---|---|
 | `smoke` | the page boots, no script errors |
 | `typing` | keys arrive in the order typed; echo costs one round trip |
+| `connections` | eight panes through private HTTP/1.1 nginx echo promptly, including hidden panes and after output recovery; a seventh and eighth connection cannot exhaust browser sockets. Run plain and `E2E_SEALED=1`; `E2E_CONNECTIONS_NO_SSE=1` also checks the browser without EventSource |
 | `offline` | 8 s without network during output: nothing lost or doubled |
 | `drop` | the stream's connection is reset three times |
 | `silent` | the connection dies without FIN/RST (Wi-Fi switch): output returns by itself |

@@ -1926,6 +1926,9 @@ def config_public():
         # An upload piece may also come as {"b64": ...} JSON (the client's
         # fallback when binary POSTs are blocked on the user's machine).
         "upload_text": True,
+        # A page can share one waiting output request across any number
+        # of panes instead of exhausting HTTP/1.x's per-origin sockets.
+        "output_batch": True,
         # Sealed channel: whether this server can open one, and the
         # fingerprint of its identity key (the browser pins it on first
         # use and shows it next to the setting).
@@ -2858,7 +2861,7 @@ class SSHSession(object):
         if len(self._replay) > OUTPUT_REPLAY_BYTES + OUTPUT_REPLAY_BYTES // 2:
             self._replay = self._replay[-OUTPUT_REPLAY_BYTES:]
 
-    def read_since(self, cursor):
+    def read_since(self, cursor, max_bytes=None):
         """Cursor read for lossless reconnect: the output from absolute
         offset `cursor` on, WITHOUT consuming it. Returns (data, end,
         lost, reset): `end` is the next cursor; `lost` counts bytes that
@@ -2866,6 +2869,10 @@ class SSHSession(object):
         `reset` means the cursor was not one this session ever issued
         (ahead of its output) and the reader must start over from the
         retained window.
+
+        `max_bytes` optionally bounds one reader's chunk. Its returned
+        cursor advances only across those bytes, so a batched reader
+        can give each pane a fair share without losing the remainder.
 
         Cursor readers also clear the legacy drain buffer: it only exists
         for readers without a cursor (older clients), and would otherwise
@@ -2877,7 +2884,12 @@ class SSHSession(object):
             if reset:
                 cursor = start
             lost = max(0, start - cursor)
-            data = self._replay[max(cursor, start) - start:]
+            offset = max(cursor, start) - start
+            if max_bytes is None:
+                data = self._replay[offset:]
+            else:
+                data = self._replay[offset:offset + max_bytes]
+                end = max(cursor, start) + len(data)
             self.output_buf = b""
         if data:
             self.last_activity = time.time()
@@ -4696,6 +4708,7 @@ class Handler(BaseHTTPRequestHandler):
     _POST_ROUTES = {
         "connect":         "_connect",
         "input":           "_input",
+        "output_many":     "_output_many",
         "resize":          "_resize",
         "disconnect":      "_disconnect",
         "upload":          "_upload",
@@ -5722,6 +5735,131 @@ class Handler(BaseHTTPRequestHandler):
         if cursor is not None:
             body["cursor"] = cursor
         self._json(body)
+
+    def _output_many(self):
+        """One cursor long-poll shared by every pane without an SSE slot.
+
+        Register one private wake socket in ALL sessions before reading
+        any of them. Every signal then either precedes its cursor read,
+        or leaves a byte for the following select: no lost-wake window,
+        and no shared Event to clear under another page's waiting poll.
+        Replies are in request order, with a status per session so one
+        missing or forbidden pane cannot disconnect its neighbours.
+        """
+        body = self._json_body()
+        if body is None:
+            return
+        entries = body.get("sessions")
+        if not isinstance(entries, list) or not entries:
+            self._json({"error": "sessions must be a nonempty list"}, 400)
+            return
+        # Fit every possible live session without adding a pane limit,
+        # but bound error envelopes and repeated replay allocations.
+        if len(entries) > max(128, MAX_SESSIONS + MAX_BG_SESSIONS):
+            self._json({"error": "too many output sessions"}, 400)
+            return
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or \
+                    not isinstance(entry.get("session_id"), str) or \
+                    not isinstance(entry.get("since"), int) or \
+                    isinstance(entry["since"], bool) or entry["since"] < 0:
+                self._json({"error": "each session needs session_id and since"}, 400)
+                return
+            if entry["session_id"] in seen:
+                self._json({"error": "duplicate output session"}, 400)
+                return
+            seen.add(entry["session_id"])
+
+        # Validate ownership for every entry before the first read.
+        # _require_session writes its reply immediately, so its checks
+        # are repeated here to return errors inside the batch instead.
+        identity = self._client_identity()
+        selected = []
+        with sessions_lock:
+            for entry in entries:
+                sid = entry["session_id"]
+                session = sessions.get(sid) if self._valid_sid(sid) else None
+                if session is None or isinstance(session, _SessionPlaceholder):
+                    selected.append((None, 404, {"error": "session not found"}))
+                elif WEBSH_AUTH_HEADER and getattr(session, "owner", "") != identity:
+                    selected.append((None, 403, {"error": "forbidden"}))
+                    _access_log_emit("authz_denied", self._client_ip(),
+                                     sid=sid, auth_user=identity)
+                else:
+                    selected.append((session, 200, None))
+
+        wake_r = wake_w = sel = None
+        registered = []
+        try:
+            wake_r, wake_w = socket.socketpair()
+            wake_r.setblocking(False)
+            wake_w.setblocking(False)
+            sel = self._build_session_selector(None)
+            sel.register(wake_r, selectors.EVENT_READ)
+            for session, _, _ in selected:
+                if session is not None and session not in registered:
+                    with session._waiters_lock:
+                        session._waiters.add(wake_w)
+                    registered.append(session)
+            deadline = time.monotonic() + POLL_TIMEOUT
+            while True:
+                if self._client_gone():
+                    return
+                if _shutting_down:
+                    self._json({"error": "server restarting",
+                                "code": "restarting"}, 503)
+                    return
+                # Drain BEFORE reading the sessions: data signalled
+                # during/after those reads must remain selectable.
+                try:
+                    while wake_r.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                outputs = []
+                ready = False
+                for entry, (session, status, error) in zip(entries, selected):
+                    if session is None:
+                        outputs.append({"status": status, "payload": error})
+                        ready = True
+                        continue
+                    # At most 1 MiB of raw output across the batch,
+                    # instead of N full replay windows in one JSON body.
+                    # All panes get a share on every reply; their next
+                    # cursor resumes anything left in the replay log.
+                    data, cursor, lost, reset = session.read_since(
+                        entry["since"], max_bytes=max(1, 1048576 // len(entries)))
+                    # A stopped child may still have more than its
+                    # share buffered. Terminal flags end the client's
+                    # loop, so defer them until its cursor drains the
+                    # final retained bytes (including auth-failure text).
+                    alive, auth_failed = session.alive, session.auth_failed
+                    pending = cursor < session._replay_end
+                    payload = {"data": base64.b64encode(data).decode("ascii"),
+                               "cursor": cursor, "alive": alive or pending,
+                               "auth_failed": auth_failed and not pending}
+                    if lost or reset:
+                        payload.update({"lost": lost, "reset": reset})
+                    outputs.append({"status": 200, "payload": payload})
+                    ready = ready or bool(data) or bool(lost) or reset or \
+                        not session.alive or session.auth_failed
+                remaining = deadline - time.monotonic()
+                if ready or remaining <= 0:
+                    self._json({"outputs": outputs})
+                    return
+                sel.select(remaining)
+        finally:
+            # _signal sends under this same lock. Remove every reference
+            # before closing, so it can never send to a recycled fd.
+            for session in registered:
+                with session._waiters_lock:
+                    session._waiters.discard(wake_w)
+            if sel is not None:
+                sel.close()
+            for sock in (wake_r, wake_w):
+                if sock is not None:
+                    sock.close()
 
     def _stream(self):
         """SSE: stream output as 'data' events until session dies or client

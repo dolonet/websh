@@ -220,6 +220,26 @@ its last line, 3 rounds; on the code before the fix the pane froze at
 the throw and nothing typed appeared in 15 s; and a 15 s spinner
 triggers no `paint:` recovery).
 
+**O10. One page leaves connections available for input.**
+Six independent SSE streams on HTTP/1.1 used every Chromium connection:
+input did not leave the browser and a seventh pane could not connect.
+At most three page-owned SSE streams are kept open. Remaining panes
+share one cursor-based `output_many` long-poll; hidden panes are alive,
+and a quiet pane wakes the shared poll as soon as it prints. A missing
+or forbidden session affects only its own result; cancelling one batch
+cannot cancel another reader. A batch reply has a bounded raw output
+budget shared fairly by its panes; cursors advance only over delivered
+bytes. An ended or auth-failed session remains nonterminal until its
+last retained byte is delivered, including a final append racing the
+response. Starting the next shared poll uses a microtask, never a
+browser timer that a hidden page can throttle to one second per reply.
+The capability `output_batch` lets new
+clients keep speaking to old servers, and the old single-session
+endpoints remain available. Guard: backend `test_output_many.py`;
+frontend `test_output_batch.js` (browser timers frozen);
+e2e `connections` on HTTP/1.1, plain and sealed, with EventSource
+available and unavailable.
+
 ## Layout and tabs
 
 **U1. A pane in a hidden tab is never fitted to its hidden box.**
