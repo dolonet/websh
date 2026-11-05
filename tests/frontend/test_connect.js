@@ -6675,7 +6675,8 @@ function inputServer(win, opts) {
       if (r === 'neterr') { reject(new TypeError('Failed to fetch')); return; }
       if (r === 'hang') { st.inflight++; return; }
       if (r && r.status) {
-        resolve({status: r.status, statusText: '', json: () => Promise.resolve({error: 'busy'})});
+        if (r.applied) { st.applied += body.data; st.bodies.push(body.data); }
+        resolve({status: r.status, statusText: '', json: () => Promise.resolve(r.body || {error: 'busy'})});
         return;
       }
       st.applied += body.data; st.bodies.push(body.data);
@@ -6713,6 +6714,44 @@ test('input: a busy (503) reply resends the same batch ahead of later keys', asy
   ok(st.applied === 'abcd', 'resent batch first, nothing lost or doubled; got ' + JSON.stringify(st.applied));
   cleanup(env);
 });
+
+for (const status of [502, 503, 429]) {
+  test('input: a generic HTTP ' + status + ' after execution never repeats a command', async () => {
+    const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+    const win = env.win;
+    const p = win.createPane(win.document.getElementById('panes'));
+    p.sid = 'sid-ambiguous-' + status;
+    const st = inputServer(win, {delay: () => 5,
+      reply: n => n === 1 ? {status, applied: true, body: {error: 'upstream reply unavailable'}} : null});
+    win.queueInput(p, 'echo once\r');
+    for (let i = 0; i < 100 && !st.applied; i++) await sleep(10);
+    win.queueInput(p, 'later');
+    for (let i = 0; i < 150 && !st.applied.endsWith('later'); i++) await sleep(10);
+    ok(st.applied === 'echo once\rlater', 'each command once, later keys flow; got ' + JSON.stringify(st.applied));
+    ok(st.calls === 2, 'no resend based on HTTP status alone; got ' + st.calls + ' requests');
+    cleanup(env);
+  });
+}
+
+for (const refusal of [
+  {status: 503, body: {error: 'busy'}},
+  {status: 503, body: {error: 'server restarting', code: 'restarting'}},
+  {status: 429, body: {error: 'too many requests', code: 'rate_limited'}},
+]) {
+  test('input: an explicit before-write refusal ' + JSON.stringify(refusal.body) + ' safely retries in order', async () => {
+    const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+    const win = env.win;
+    const p = win.createPane(win.document.getElementById('panes'));
+    p.sid = 'sid-explicit-refusal';
+    const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? refusal : null});
+    win.queueInput(p, 'ab');
+    for (let i = 0; i < 100 && st.calls < 1; i++) await sleep(10);
+    win.queueInput(p, 'cd');
+    for (let i = 0; i < 150 && st.applied.length < 4; i++) await sleep(10);
+    ok(st.applied === 'abcd', 'refused batch precedes later keys, exactly once; got ' + JSON.stringify(st.applied));
+    cleanup(env);
+  });
+}
 
 test('input: a network error is not retried (the write may have landed)', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);

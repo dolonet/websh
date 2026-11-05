@@ -5171,13 +5171,15 @@ function sendInputBatch(p, sid, d, attempt, parts) {
       if (!p.flushTimer) p.flushTimer = setTimeout(() => flushInput(p), Math.max(250, _sealWaitMs()));
       return;
     }
-    // Replies that prove the bytes never reached the PTY (the worker
-    // pool was full, a rate limit, the proxy could not reach the
-    // backend): resend the same batch, ahead of anything typed since.
-    // A network error is NOT retried - the write may have happened and
-    // only the reply was lost, and a doubled keystroke is worse.
+    // Only websh's explicit before-write refusals prove that resending
+    // is safe. A proxy's generic 502/503/429 can follow a successful
+    // PTY write whose reply was lost, so status alone cannot authorize
+    // a resend. Keep the exact legacy busy reply for cached servers.
     let st = r && r.error && r._status;
-    if (!settled && (st === 503 || st === 429 || st === 502) &&
+    let safeRetry = (st === 503 && (r.code === 'busy' || r.code === 'restarting' ||
+                                  r.error === 'busy')) ||
+                    (st === 429 && r.code === 'rate_limited');
+    if (!settled && safeRetry &&
         attempt < INPUT_RETRIES && p.sid === sid) {
       settled = true; clearTimeout(stall);
       setTimeout(() => sendInputBatch(p, sid, d, attempt + 1, parts), 200 * (attempt + 1));

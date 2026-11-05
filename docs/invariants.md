@@ -19,11 +19,15 @@ Guard: frontend `input: keystrokes reach the PTY in the order typed`;
 e2e `typing`.
 
 **I2. A failed input is resent only when the reply proves it never
-reached the PTY** (503, 429, 502). A network error is not retried: the
-write may have landed and only the reply was lost, and a doubled key
-(`rm` then Enter, twice) is worse than a lost one.
-Guard: frontend `input: a busy (503) reply…`, `input: a network error is
-not retried`.
+reached the PTY.** An explicit websh `busy`, `restarting` or
+`rate_limited` refusal is before the write and permits a retry. A
+502/503/429 status by itself proves nothing: a proxy can lose the
+reply after the command executed. Such a reply and a network error
+must never resend the batch; later keys still flow in order. A doubled
+command (`rm` then Enter, twice) is worse than a lost key.
+Guard: frontend `input: a generic HTTP ... after execution never
+repeats a command`, `input: an explicit before-write refusal ...`,
+`input: a network error is not retried`.
 
 **I3. Keys are never replayed into a different shell, and never stale.**
 Held keys go out only when a *persistent* pane re-attaches to its tmux

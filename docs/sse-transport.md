@@ -109,9 +109,11 @@ One `/api/input` per pane is in flight at a time; keys typed meanwhile
 form the next batch. Requests fired without waiting overtook each
 other (HTTP/2 multiplexing, then one backend thread per request) and
 text arrived scrambled. A reply that proves the bytes never reached
-the PTY (503, 429, 502) resends the same batch first; a network error
-is not retried - the write may have landed, and a doubled key is worse
-than a lost one. `404` means the session is gone: the pane reconnects,
+the PTY resends the same batch first: a 503 with `code: busy` or
+`code: restarting` (also the exact legacy `error: busy` reply), or a
+429 with `code: rate_limited`. A generic 502, 503 or 429 and a network
+error are not retried: the write may have landed, and a doubled key is
+worse than a lost one. `404` means the session is gone: the pane reconnects,
 and for a persistent pane the batch is held for the re-attach (see
 `docs/persistent-sessions.md`, "Coming back after an absence").
 
