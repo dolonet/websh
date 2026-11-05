@@ -78,6 +78,12 @@ export async function run({ b, t, port }) {
   const outLine = word.slice(5);
   await until(async () => (await b.lines(i)).includes(outLine), 3000, 20);
   await until(async () => /[$#]\s*$/.test((await b.screen(i)).trimEnd() + ' '), 3000, 20);
+  // SSE can echo the last Enter before its input POST reply arrives.
+  // Wait for that reply before navigating: navigation can abort it and
+  // remove its unfinished measurement before pagehide takes the report.
+  const settled = await until(() => b.ev(`(() => { const p = Object.values(panes)[${i}];
+    return !p.inputInFlight && !p.inputQueue.length; })()`), 3000, 5);
+  t.ok(settled >= 0, 'the last input reply settled before pagehide');
   await b.network({});
   t.ok(echoed === word.length, `every key echoed (${echoed}/${word.length})`);
 

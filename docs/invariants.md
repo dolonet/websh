@@ -551,6 +551,12 @@ swallows a click within 400 ms of a drag's release
 (`_blockClickAfterDrag`): a scenario waits that out (`tabbreak`'s
 `calm`), it does not race it.
 
+The `latency` pagehide scenario waits for the final input POST reply,
+not just its echo. SSE can echo Enter before an emulated 100 ms HTTP
+reply arrives; navigating then aborts the measurement and made a report
+contain 11 batches for 12 requests. The input is not lost. Waiting for
+`inputInFlight` and the queue to clear makes the scenario deterministic.
+
 **T3. A fix comes with a test that fails without it.** Check it: put
 the old code back and watch the test go red.
 
