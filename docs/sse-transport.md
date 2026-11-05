@@ -117,6 +117,11 @@ worse than a lost one. `404` means the session is gone: the pane reconnects,
 and for a persistent pane the batch is held for the re-attach (see
 `docs/persistent-sessions.md`, "Coming back after an absence").
 
+In sealed mode, when a held command prefix expires, all keys queued
+behind it are dropped together. Sending only the fresh suffix could
+execute a different command. Input typed after this drop is accepted
+normally.
+
 ### Paint guard
 
 Output that reached the page must be on screen. Users (Chrome on macOS,

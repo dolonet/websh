@@ -5063,6 +5063,10 @@ function queueInput(p, data) {
     // Disconnected and nobody is reconnecting: nothing will read this.
     if (!p.connecting || !p.persistent) return;
   }
+  // Expiry is a boundary BEFORE this new keystroke. Otherwise a stale
+  // held batch waiting for backoff could later discard fresh input
+  // typed after the channel recovered along with its old backlog.
+  discardExpiredSealedInput(p);
   p.inputQueuedAt = Date.now();     // freshness of the NEWEST key
   if (!p.inputQueue.length || !p.latKeyAt) p.latKeyAt = latNow();   // ── Input latency
   p.inputQueue.push(data);
@@ -5076,19 +5080,35 @@ function queueInput(p, data) {
 // tried again. Never late (I3): if the oldest of them is older than
 // INPUT_HOLD_MS, all of them are dropped, with a notice - never a
 // suffix of a command without its start.
+function discardExpiredSealedInput(p) {
+  let held = p.sealHeld || [];
+  if (held.length &&
+      (Date.now() - held[0].at > INPUT_HOLD_MS || held[0].sid !== p.sid)) {
+    p.sealHeld = [];
+    // A suffix queued for the SAME session belongs to its blocked
+    // prefix: dropping only the prefix could execute another command.
+    // After a session change, queued fresh keys belong to the new
+    // session and must survive disposal of the old held batch.
+    if (held[0].sid === p.sid) {
+      p.inputQueue = [];
+      p.latKeyAt = 0;
+    }
+    showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
+  }
+}
+
 function takeSealedHeld(p) {
+  discardExpiredSealedInput(p);
   let held = p.sealHeld || [];
   p.sealHeld = [];
-  if (!held.length) return [];
-  if (Date.now() - held[0].at > INPUT_HOLD_MS || held[0].sid !== p.sid) {
-    showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
-    return [];
-  }
   return held;
 }
 
 function flushInput(p) {
   p.flushTimer = null;
+  // Drop an already queued suffix with its expired prefix even while
+  // the channel is still in backoff; it must never become a request.
+  discardExpiredSealedInput(p);
   let held = p.sealHeld && p.sealHeld.length;
   if(p.inputInFlight || !p.sid || p.inputGate || (!p.inputQueue.length && !held)) return;
   let parts = [];

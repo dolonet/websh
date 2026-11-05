@@ -436,6 +436,41 @@ test('sealed I3: keys typed during a 410 backoff longer than 20 s are not delive
   cleanup(env);
 });
 
+test('sealed I3: an expired held prefix drops the whole outage command including its recent suffix', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.restart(); srv.sealOpenFail = 500;
+  typeKeys(win, p, 'echo ');
+  ok(await until(() => p.sealHeld && p.sealHeld.length > 0, 3000), 'prefix held after the channel refused to open');
+  // The channel stays in backoff while the user finishes the same command.
+  env.skew += 19000;
+  typeKeys(win, p, 'OUTAGE_SUFFIX\r');
+  ok(await until(() => p.inputQueue.join('').includes('OUTAGE_SUFFIX'), 1000), 'recent suffix queued before its prefix expires');
+  // Expiry now happens with the suffix already queued, not at a new
+  // keypress. A new keypress after expiry starts a fresh input epoch.
+  env.skew += 6000;
+  srv.sealOpenFail = null;
+  ok(await until(() => (!p.sealHeld || !p.sealHeld.length) && !p.inputQueue.length && !p.inputInFlight, 4000), 'outage backlog settled');
+  ok(shellInput(srv, p) === '', 'neither the expired prefix nor its recent suffix executes; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(/not sent/i.test(win.document.body.textContent), 'user told the command was not sent');
+  typeKeys(win, p, 'fresh\r');
+  ok(await until(() => shellInput(srv, p).endsWith('fresh\r'), 3000), 'a newly typed command works after recovery');
+  ok(shellInput(srv, p) === 'fresh\r', 'only the new command reaches the shell; got ' + JSON.stringify(shellInput(srv, p)));
+  cleanup(env);
+});
+
+test('sealed I3: held input from a different session never discards the new shell command', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const oldSid = srv.newSession();
+  p.sealHeld = [{sid: oldSid, d: 'OLD_SHELL\r', at: win.Date.now() - HOLD_PAST}];
+  typeKeys(win, p, 'fresh-shell\r');
+  ok(await until(() => shellInput(srv, p) === 'fresh-shell\r', 3000), 'new shell input survives an obsolete held batch; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(srv.sessions[oldSid].input === '', 'old input never goes to its former shell either');
+  ok(!shellInput(srv, p).includes('OLD_SHELL'), 'no replay into the new shell');
+  cleanup(env);
+});
+
 test('sealed I3: a short outage (channel down for 0.3 s) delivers the keys typed during it, once, in order', async () => {
   const {env, win, srv, p} = await sealedPane();
   if (!p) { ok(false, 'setup'); cleanup(env); return; }

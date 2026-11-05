@@ -33,6 +33,17 @@ repeats a command`, `input: an explicit before-write refusal ...`,
 Held keys go out only when a *persistent* pane re-attaches to its tmux
 session, within `INPUT_HOLD_MS` (20 s). A non-persistent reconnect is a
 new shell. A pane nobody is reconnecting drops what is typed at it.
+If a sealed outage expires the held prefix of a command, discard the
+whole accumulated outage input, including a recent suffix still in the
+normal queue for that same session. Expiry is checked before accepting
+a new keypress and before waiting on channel backoff: input already
+queued at expiry is discarded, then the new keypress starts fresh
+input. A held batch belonging to an old session is discarded without
+dropping new input for the current one.
+Executing the suffix alone can turn `echo filename` into
+a different command. The user sees that the input was not sent, and
+new typing after recovery works. Guard: frontend `sealed I3: an expired
+held prefix drops the whole outage command including its recent suffix`.
 Guard: frontend `input: keys for an expired NON-persistent session…`,
 `input: typing on a disconnected pane…`, `input: held keys older than…`.
 
@@ -495,8 +506,10 @@ call whose caller gave up while it waited for the channel (the input
 stall timer) is not sent, and an `input` that waited for the channel
 longer than `INPUT_HOLD_MS` (the "key changed" dialog left open) is
 dropped with a toast, never sent; held batches whose oldest key is older
-than `INPUT_HOLD_MS` are all dropped with that toast (never the end of
-a command without its start). Closing a sealed stream cancels its
+than `INPUT_HOLD_MS` are dropped together with the normal input queue
+for the same session, with that toast (never the end of a command
+without its start). A held batch for an old session is discarded
+without dropping new typing for the current session. Closing a sealed stream cancels its
 body quietly - no unhandled rejection in the page. The server runs the inner request through
 the same `_dispatch` with only path, headers, body and `wfile` swapped
 (`Handler._sealed`), so I1-I4 and O1-O9 hold through it unchanged.
