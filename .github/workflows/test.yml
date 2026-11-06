@@ -68,6 +68,20 @@ jobs:
       - name: Behavioral smoke (php -S vs echo backend)
         run: bash tests/php/smoke.sh
 
+  scripts:
+    # The helper scripts are what contributors and agents run first; a
+    # syntax error in one must not wait for someone to trip over it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: for f in scripts/*.sh tests/e2e/*.sh; do bash -n "$f"; done
+      - run: for f in tests/e2e/*.mjs tests/e2e/scenarios/*.mjs; do node --check "$f"; done
+      - run: python3 scripts/codemap.py && python3 scripts/codemap.py tests >/dev/null
+      - run: node tests/e2e/run.mjs --list
+
   ruff:
     # Correctness-only families (F/E9/B/PLE — see ruff.toml); style
     # rules are deliberately off so real findings aren't buried in

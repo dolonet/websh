@@ -12,13 +12,11 @@ Thanks for your interest in websh.
 ## Code
 
 - No build step. The frontend (`websh.js`, `index.html`) is plain JS/HTML; the backend (`server.py`) is stdlib-only Python.
-- Run tests before opening a PR (CI runs the same set):
-  - Backend: `python3 -m unittest discover -s tests/backend -t .`
-  - Frontend: `node --check websh.js` and `cd tests/frontend && npm install && npm test` — it must end with `failed: 0`
-  - PHP proxy: `php -l api.php && bash tests/php/smoke.sh`
-  - Lint: `ruff check .`
+- Start with [`AGENTS.md`](AGENTS.md): where things are, the constraints, how a change is done. `scripts/codemap.py` shows where things are in the two big files.
+- Before opening a PR run `scripts/check.sh` - it must end with `ALL GREEN`. For changes to the transport, input, reconnects or the session lifecycle also run the browser scenarios, `scripts/e2e.sh` ([`tests/e2e/README.md`](tests/e2e/README.md)).
 - Every bug fix comes with a regression test that fails without the fix.
-- Tests must not depend on timing luck: wait for a real signal (an event, a promise, a scripted fake) rather than a fixed sleep, and never touch shared state such as the user's tmux server — use a private socket (`tmux -L <unique name>`).
+- Tests must not depend on timing luck: wait for a real signal (an event, a promise, a scripted fake) rather than a fixed sleep, and never touch shared state such as the user's tmux server - use a private socket (`tmux -L <unique name>`).
+- [`docs/invariants.md`](docs/invariants.md) lists behaviour that was broken once and must not break again.
 
 ## Reporting bugs
 
