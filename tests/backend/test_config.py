@@ -33,9 +33,14 @@ class TestConfigLoading(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         server._config_cache = None
         server._config_mtime = 0
+        server._config_unusable = None
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
+        os.environ.pop("WEBSH_CONFIG", None)
+        server._config_cache = None
+        server._config_mtime = 0
+        server._config_unusable = None
 
     def _write_config(self, data):
         path = os.path.join(self.tmpdir, "websh.json")
@@ -58,10 +63,47 @@ class TestConfigLoading(unittest.TestCase):
         self.assertFalse(cfg["restrict_hosts"])
 
     def test_missing_file(self):
+        # Never created (api.php always passes a default path): no config,
+        # exactly as before - not a broken one.
         os.environ["WEBSH_CONFIG"] = "/nonexistent/websh.json"
         cfg = server.load_config()
         self.assertEqual(cfg["connections"], [])
         self.assertFalse(cfg["restrict_hosts"])
+
+    def test_broken_config_keeps_the_last_good_policy(self):
+        """A running server with restrict_hosts and a deny-list used to
+        drop both the moment websh.json stopped parsing (a trailing comma
+        in an edit, a half-written save, a rename): every connect was
+        then allowed, with a WARN per request as the only sign."""
+        path = self._write_config({"restrict_hosts": True,
+                                   "denied_hosts": ["10.0.0.0/8"],
+                                   "connections": [{"name": "a", "host": "a.example"}]})
+        good = server.load_config()
+        self.assertTrue(good["restrict_hosts"])
+        for broken in ('{"restrict_hosts": true,}', "", "[1]"):
+            with open(path, "w") as f:
+                f.write(broken)
+            os.utime(path, (time.time() + 5, time.time() + 5))   # new mtime
+            cfg = server.load_config()
+            self.assertTrue(cfg["restrict_hosts"], repr(broken))
+            self.assertEqual(len(cfg["denied_net_list"]), 1, repr(broken))
+            self.assertEqual([c["name"] for c in cfg["connections"]], ["a"])
+            self.assertTrue(server._config_unusable)
+        os.rename(path, path + ".bak")                            # renamed away
+        self.assertTrue(server.load_config()["restrict_hosts"])
+        # Fixed: the new version is used and the flag clears.
+        self._write_config({"restrict_hosts": False, "connections": []})
+        self.assertFalse(server.load_config()["restrict_hosts"])
+        self.assertIsNone(server._config_unusable)
+
+    def test_broken_config_without_a_good_version_locks_everything(self):
+        path = os.path.join(self.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            f.write('{"restrict_hosts": false,}')
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        self.assertFalse(server.is_host_allowed("198.51.100.7", 22, "u"))
 
     def test_valid_config(self):
         self._write_config({
@@ -726,6 +768,36 @@ class TestDeniedHosts(unittest.TestCase):
         self.assertTrue(server._valid_host("[::1]"))
         self.assertFalse(server._valid_host("[]"))
         self.assertFalse(server._valid_host(""))
+
+    def test_ipv6_scope_id_cannot_smuggle_a_target(self):
+        """ipaddress accepts almost anything as a %scope-id. '::%@10.1.2.3'
+        was a valid 'IPv6 literal', failed DNS (deny-list fell open), and
+        ssh read it as user '::%' at host 10.1.2.3 (confirmed with ssh -G).
+        Real scope ids (interface names/indexes) stay allowed."""
+        for bad in ("::%@10.1.2.3", "::%@127.0.0.1", "[::%@10.1.2.3]",
+                    "fe80::1%eth0 x", "fe80::1%a\nb", "::%"):
+            self.assertFalse(server._valid_host(bad), repr(bad))
+        for good in ("fe80::1%eth0", "fe80::1%2", "[fe80::1%en0]"):
+            self.assertTrue(server._valid_host(good), repr(good))
+
+    def test_trailing_root_dot_cannot_bypass_hostname_entry(self):
+        self._write_config({"restrict_hosts": False,
+                            "denied_hosts": ["bastion.corp", "Other.Corp."]})
+        with self._patched_resolve("8.8.8.8"):
+            for h in ("bastion.corp.", "BASTION.CORP.", "other.corp", "other.corp."):
+                self.assertFalse(server.is_host_allowed(h, 22, "u"), h)
+
+    def test_unspecified_and_v6_loopback_count_as_loopback(self):
+        """A deny-list that names 127.0.0.0/8 (the documented example)
+        must also stop 0, 0.0.0.0, :: and ::1 - the kernel delivers all
+        of them to the websh host itself. Real resolver, no patching."""
+        self._write_config({"restrict_hosts": False,
+                            "denied_hosts": ["127.0.0.0/8"]})
+        for h in ("127.0.0.1", "0", "0.0.0.0", "::", "::1", "[::1]",
+                  "::ffff:127.0.0.1"):
+            self.assertFalse(server.is_host_allowed(h, 22, "u"), h)
+        # ...and an unrelated address is still fine.
+        self.assertTrue(server.is_host_allowed("192.0.2.10", 22, "u"))
 
     def test_dns_resolves_to_denied_range_blocked(self):
         """The whole point: hostname looks innocent, but A record points

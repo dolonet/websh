@@ -609,6 +609,33 @@ class TestTransferAccessLog(LiveServerCase):
         self.assertEqual((mv["path"], mv["name"], mv["result"]),
                          ("/srv/a", "b", "ok"))
 
+    def test_upload_placement_emits_access_log(self):
+        """/api/upload logs where the bytes were staged ($HOME/<tmp>);
+        the finalize logs where they actually came to rest. With the
+        destination now chosen by the client, the second record is the
+        only one that says which directory received the file."""
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake._host = "h.example"
+        fake.finalize_upload.return_value = (True, "/srv/www/a.txt")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-z",
+                "final": "a.txt", "dir": "/srv/www"})
+        rec = self._records("upload_place")[0]
+        self.assertEqual((rec["result"], rec["path"], rec["target_host"]),
+                         ("ok", "/srv/www/a.txt", "h.example"))
+
+        fake.finalize_upload.return_value = (False, "Permission denied")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-z",
+                "final": "a.txt", "dir": "/srv/locked"})
+        bad = [r for r in self._records("upload_place", want=2)
+               if r["result"] == "error"][0]
+        self.assertEqual(bad["path"], "/srv/locked")
+        self.assertIn("Permission", bad["error"])
+
     def test_download_emits_access_log(self):
         from urllib.request import urlopen
         sid = str(uuid.uuid4())

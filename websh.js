@@ -8,6 +8,19 @@ function storageKey(name) { return storagePrefix + name; }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function $(id){ return document.getElementById(id) }
+// Markup for one icon from the sprite in index.html. Kept in one place
+// so dynamically built buttons (pane bar, search bar, file rows) use the
+// same set as the static markup instead of ad-hoc emoji/glyphs.
+function ic(name){ return '<svg class="ic"><use href="#i-' + name + '"></use></svg>' }
+function icEl(name){
+  const SVG = 'http://www.w3.org/2000/svg';
+  let svg = document.createElementNS(SVG, 'svg');
+  svg.setAttribute('class', 'ic');
+  let use = document.createElementNS(SVG, 'use');
+  use.setAttribute('href', '#i-' + name);
+  svg.appendChild(use);
+  return svg;
+}
 // HTML-escape for BOTH text and attribute context. The old
 // textContent->innerHTML trick only covered & < > - a remote filename
 // containing a double quote could then close an attribute and add its
@@ -26,9 +39,32 @@ function api(action, opts) {
   // A non-JSON reply (a reverse proxy's own HTML error page for a 5xx,
   // a captive portal) used to surface as "Unexpected token <" in the
   // toast. Turn it into an {error} the callers already handle.
+  // The status rides along as a non-enumerable `_status`, so callers
+  // that must tell "the session is gone" (404) from "the server or a
+  // proxy hiccuped" (503 busy, 502/504, 429) can - an {error} alone
+  // can't say which.
   return fetch(url, init).then(r => r.json().catch(() => ({
     error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
-           ' (unexpected reply from the server or a proxy)'})));
+           ' (unexpected reply from the server or a proxy)'}))
+    .then(j => {
+      if (j && typeof j === 'object') {
+        try { Object.defineProperty(j, '_status', {value: r.status}); } catch (e) {}
+      }
+      return j;
+    }));
+}
+
+// An /api/output reply that says nothing about the session itself: the
+// worker pool was full (503 busy), a proxy failed (502/504, often an
+// HTML page), a rate limit, a conflict with a stream still being torn
+// down (409). Retry those on the SAME session. Only a real answer about
+// the session (404 "session not found", or a normal frame) may end it -
+// treating a transient 503 as "gone" opened a fresh shell and orphaned
+// the old one with whatever was running in it.
+function isTransientOutputReply(r) {
+  let st = r && r._status;
+  if (!r || !r.error || !st) return false;
+  return st === 408 || st === 409 || st === 425 || st === 429 || st >= 500;
 }
 
 // Capacity/rate errors are identified by a machine-readable `code`
@@ -96,7 +132,9 @@ const DEFAULT_SETTINGS = {
   // order buries it. 'name' | 'size' | 'mtime'; dir -1 = descending.
   fbSort: 'mtime', fbSortDir: -1,
   // Dotfiles hidden by default, as in every file manager and `ls`.
-  fbShowHidden: false
+  fbShowHidden: false,
+  // Ctrl+V pastes instead of sending ^V. See _ctrlVShouldPaste().
+  ctrlVPaste: true
 };
 // id → [label, webfont-name-or-null, fallback-stack, google-weights]
 // webfont-name is the family loaded via Google Fonts; null = system
@@ -139,6 +177,30 @@ function ensureFontLink(id) {
     document.head.appendChild(link);
   }
   link.setAttribute('href', href);
+}
+
+// True when this key event is a Ctrl+V that should paste rather than
+// send ^V. Deliberately narrow: only a plain Ctrl+V keydown, and only
+// where ^V is not already the better binding.
+function _ctrlVShouldPaste(e) {
+  if (!settings.ctrlVPaste) return false;
+  if (e.type !== 'keydown') return false;
+  // Ctrl alone. Ctrl+Shift+V already pastes natively (xterm ignores it),
+  // and Ctrl+Alt+V / AltGr must keep their own meaning.
+  if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return false;
+  // macOS pastes with Cmd+V, which needs nothing from us; there Ctrl+V
+  // stays what it is on every Mac terminal - quoted-insert.
+  if (_isMacLike()) return false;
+  // e.code is layout-independent (a Cyrillic or Dvorak layout still
+  // reports KeyV for the physical V); e.key covers browsers without it.
+  return e.code === 'KeyV' || e.key === 'v' || e.key === 'V';
+}
+
+function _isMacLike() {
+  let n = typeof navigator === 'object' && navigator ? navigator : {};
+  let s = (n.userAgentData && n.userAgentData.platform) || n.platform ||
+          n.userAgent || '';
+  return /Mac|iPhone|iPad|iPod/i.test(s);
 }
 
 // Copy `text` to the system clipboard. Yandex Browser silently rejects
@@ -265,26 +327,29 @@ function createPane(container) {
       `<div class="upload-progress h" data-upload-progress="${id}">` +
         `<div class="upload-progress-track"><div class="upload-progress-bar"></div>` +
         `<div class="upload-progress-text"></div></div>` +
-        `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">&#x2715;</button>` +
+        `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">${ic('close')}</button>` +
       `</div>` +
-      `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>&#x2B06;</button>` +
+      `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
-      `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>&#x2B07;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">&#x2194;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">&#x2195;</button>` +
-      `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">&#x2715;</button>` +
+      `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
+      `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
     `</div>` +
-    `<div class="reconnect-bar h" data-reconnect="${id}">` +
-      `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
-      `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
-      `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+    `<div class="pane-term">` +
+      `<div class="pane-overlays" data-overlays="${id}">` +
+        `<div class="reconnect-bar h" data-reconnect="${id}">` +
+          `<span style="font-size:12px;color:var(--dim)"></span>` +
+          `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
+          `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+        `</div>` +
+      `</div>` +
     `</div>` +
-    `<div class="pane-term"></div>` +
     `<div class="search-bar h" data-search="${id}">` +
       `<input type="text" placeholder="Search...">` +
-      `<button onclick="searchPrev()">&#x25B2;</button>` +
-      `<button onclick="searchNext()">&#x25BC;</button>` +
-      `<button onclick="closeSearch()">&#x2715;</button>` +
+      `<button onclick="searchPrev()" title="Previous match" aria-label="Previous match">${ic('chevron-up')}</button>` +
+      `<button onclick="searchNext()" title="Next match" aria-label="Next match">${ic('chevron-down')}</button>` +
+      `<button onclick="closeSearch()" title="Close search" aria-label="Close search">${ic('close')}</button>` +
     `</div>`;
   container.appendChild(el);
 
@@ -412,6 +477,17 @@ function createPane(container) {
   // the sync execCommand runs inside the activation window left by
   // the recent mouseup. Format: "<kind>;<base64>"; "?" means a read
   // request, which we don't service.
+  // A clipboard write from the remote is honoured only when the user
+  // asked for copying (Auto-copy) AND just did something in this pane -
+  // a copy is always the tail of a mouse selection or a copy-mode key.
+  // Otherwise ANY output could replace the clipboard: `tail -f` of a log
+  // with an injected ESC]52 sequence silently put an attacker's command
+  // line there, to be pasted into a local terminal later.
+  const OSC52_GESTURE_MS = 3000;
+  let lastGesture = 0;
+  let markGesture = () => { lastGesture = Date.now(); };
+  termEl.addEventListener('mouseup', markGesture, true);
+  termEl.addEventListener('keydown', markGesture, true);
   if (term.parser && term.parser.registerOscHandler) {
     term.parser.registerOscHandler(52, data => {
       let semi = data.indexOf(';');
@@ -435,6 +511,10 @@ function createPane(container) {
         text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(
           Uint8Array.from(text, c => c.charCodeAt(0)));
       } catch (e) {}
+      // Returning true consumes the sequence, so xterm's own handler
+      // doesn't write it either.
+      if (!settings.tmuxClipboard) return true;
+      if (Date.now() - lastGesture > OSC52_GESTURE_MS) return true;
       copyText(text);
       return true;
     });
@@ -485,6 +565,19 @@ function createPane(container) {
   term.onBell(() => {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
   });
+
+  // Ctrl+V. In a terminal Ctrl+letter is a control code: xterm sends
+  // ^V (0x16) and cancels the browser's own paste, so Ctrl+V looked
+  // broken - the shell sat waiting for readline's quoted-insert to
+  // swallow the next key. With the setting on we decline the event
+  // instead of handling it: xterm leaves it alone, the browser performs
+  // its native paste into xterm's hidden textarea, and xterm's own
+  // paste handler wraps the text in bracketed-paste markers (so a
+  // multi-line paste is not executed line by line).
+  //
+  // Returning false here is the ONLY way to get that: any handling at
+  // all ends in preventDefault, which kills the native paste.
+  term.attachCustomKeyEventHandler(e => !_ctrlVShouldPaste(e));
 
   // Right-click paste. Also swallow button-2 mousedown at capture phase
   // so xterm.js never forwards it to the remote — otherwise tmux (with
@@ -865,10 +958,13 @@ function showReconnectBar(p, reason) {
   let msg = bar.querySelector('span');
   let pwInput = bar.querySelector('input[type=password]');
   let showInput = _needsReconnectPwInput(p, reason);
+  // Severity drives the card's coloured edge; a plain drop gets none.
+  bar.classList.remove('sev-err', 'sev-warn');
   if (msg) {
     if (reason === 'auth_failed') {
       msg.textContent = showInput ? 'Authentication failed — type password' : 'Authentication failed';
       msg.style.color = 'var(--dg)';
+      bar.classList.add('sev-err');
     } else if (reason === 'no_vault_key') {
       // Distinct from auth-fail (creds rejected): the encryption key
       // that wraps this pane's saved creds is missing in this browser.
@@ -877,8 +973,12 @@ function showReconnectBar(p, reason) {
       // the user needs to sign in again on this browser to recover.
       msg.textContent = 'Vault key missing — sign in again to recover';
       msg.style.color = 'var(--wn)';
+      bar.classList.add('sev-warn');
     } else {
-      msg.textContent = showInput ? 'Disconnected — type password to reconnect' : 'Disconnected';
+      // The pane badge already says "Disconnected"; repeating it here in
+      // red just doubled the alarm. Say only what the card adds - what to
+      // do next - and let the lone Reconnect button speak for itself.
+      msg.textContent = showInput ? 'Type the password to reconnect' : '';
       msg.style.color = 'var(--dim)';
     }
   }
@@ -891,6 +991,12 @@ function showReconnectBar(p, reason) {
       setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
+  // Nothing but the button left? Then the card is a box drawn around a
+  // button that already has its own edges - drop the chrome and show
+  // the button alone. The card comes back as soon as it has to carry
+  // text or the password input.
+  bar.classList.toggle('bare',
+    !(msg && msg.textContent) && !(pwInput && !pwInput.classList.contains('h')));
   bar.classList.remove('h');
 }
 function hideReconnectBar(p) {
@@ -923,10 +1029,18 @@ const PANES_VERSION = 2;
 
 function slotIdFor(user, host, port) {
   // Human-readable + unique. Sanitize to backend's [A-Za-z0-9_-]{1,64}.
-  let base = (user || 'u') + '_' + (host || 'h') + '_' + (port || 22);
-  let rand = Math.random().toString(36).slice(2, 8);
-  let raw = base + '_' + rand;
-  return raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+  // The random suffix is what makes two panes to the same target two
+  // tmux sessions, so it is never the part that gets cut: truncating the
+  // whole string to 64 chars dropped the suffix (and the port) for a
+  // long user@host, every persistent pane for it got the same slot, and
+  // opening a second one attached to - and detached - the first one's
+  // shell. Shorten the readable part instead.
+  let base = ((user || 'u') + '_' + (host || 'h') + '_' + (port || 22))
+    .replace(/[^A-Za-z0-9_-]/g, '_');
+  let rand = '';
+  while (rand.length < 8) rand += Math.random().toString(36).slice(2);
+  rand = rand.slice(0, 8);
+  return base.slice(0, 64 - 1 - rand.length) + '_' + rand;
 }
 
 function paneRecord(p) {
@@ -1410,8 +1524,15 @@ function endSession(p, o) {
   // reconnect starts somewhere else and must re-learn it.
   p.cwd = '';
   p.osc7Host = null;     // a new session pins its own OSC 7 host
+  p.outCursor = 0;       // cursors are per session
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
+  // Nothing accepts keystrokes any more (queueInput is guarded on
+  // p.sid), so a blinking cursor is a lie - and, on a pane whose output
+  // starts at the top, it sat right under the pane bar looking welded to
+  // it. Blurring hides it outright: cursorInactiveStyle is 'none'.
+  // Reconnecting focuses the terminal again (activatePane/connectPane).
+  try { p.term.blur(); } catch (e) {}
   if (o.disconnect && sid) {
     api('disconnect', {body: {session_id: sid}}).catch(() => {});
   }
@@ -1531,7 +1652,24 @@ function handleOutputPayload(p, r, sid) {
     return true;
   }
   p.connecting=false;
-  if(r.data){
+  // Output cursor (servers with lossless reconnect). A frame covers the
+  // bytes [cursor - len, cursor). Anything below our own cursor was
+  // already written to this terminal - a replay after a reconnect, or
+  // EventSource re-sending its original URL - so it is trimmed rather
+  // than printed twice. `reset`: the server did not know our cursor and
+  // started over from what it still has.
+  let chunk = r.data ? atob(r.data) : '';
+  if (typeof r.cursor === 'number') {
+    let start = r.cursor - chunk.length;
+    let have = p.outCursor || 0;
+    if (!r.reset && start < have) chunk = chunk.slice(Math.min(chunk.length, have - start));
+    if (r.lost) {
+      p.term.write('\r\n\x1b[2m[websh: ' + r.lost + ' bytes of output were produced while ' +
+                   'disconnected and no longer available]\x1b[0m\r\n');
+    }
+    p.outCursor = r.reset ? r.cursor : Math.max(have, r.cursor);
+  }
+  if(chunk.length){
     // Always render incoming bytes — even on a tail-drain frame that
     // arrives after the disconnect banner, the bytes may be the last
     // thing the shell wrote (final command output, exit message). We
@@ -1539,7 +1677,7 @@ function handleOutputPayload(p, r, sid) {
     // them where the cursor is. Skipping them on p.sid=null would
     // silently drop end-of-session output.
     updatePaneBadge(p);
-    let chunk = atob(r.data);
+
     // Tight loop instead of Uint8Array.from(chunk, c => c.charCodeAt(0)):
     // this runs per output chunk on the hottest path (noisy output like
     // `cat`/build logs), and the per-element callback in .from() is a
@@ -1565,7 +1703,7 @@ function handleOutputPayload(p, r, sid) {
   // (reconnect placeholder). The login form never reopens on its own.
   if (r.auth_failed) {
     p.pendingSave = null;
-    p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+    p.term.write('\r\n\x1b[31m[websh: authentication failed]\x1b[0m\r\n');
     endSession(p, {disconnect: true, badge: true});
     p.recentOutput = '';
     if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
@@ -1579,7 +1717,7 @@ function handleOutputPayload(p, r, sid) {
     commitPendingSave(p);
   }
   if(r.alive===false){
-    p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
+    p.term.write('\r\n\x1b[2m[websh: connection closed]\x1b[0m\r\n');
     endSession(p, {save: true});
     // Smart tmux fallback: a persistent pane whose session dies quickly
     // with a "not found" shape in the output is almost certainly a
@@ -1648,8 +1786,7 @@ function setReconnecting(p, on) {
     el = document.createElement('div');
     el.className = 'pane-reconnect';
     el.setAttribute('role', 'status');
-    let body = p.el;                      // .pane is position:relative
-    body.appendChild(el);
+    p.el.querySelector('.pane-overlays').appendChild(el);
   }
   let paint = () => {
     let left = Math.max(0, Math.ceil(
@@ -1671,9 +1808,13 @@ function transportFatal(p, e) {
   setReconnecting(p, false);
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
+  // All websh-injected lines share one form - dim "[websh: …]" for the
+  // expected outcomes, red for a real error - so the terminal doesn't
+  // shout in bright red about a link that simply dropped, and our lines
+  // are never mistaken for the remote's own output.
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
-    ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
-    : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
+    ? '\r\n\x1b[2m[websh: backend restarted, session lost]\x1b[0m\r\n'
+    : '\r\n\x1b[2m[websh: connection lost]\x1b[0m\r\n';
   p.term.write(msg);
   endSession(p, {save: true});
   if(p.host || p.connection) showReconnectBar(p);
@@ -1695,7 +1836,12 @@ function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
   let mySid = p.sid;
-  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}`;
+  // since= our output cursor: a reconnect resumes exactly where this
+  // pane's terminal stopped, instead of losing whatever the server had
+  // already sent into the dead connection. EventSource's own automatic
+  // reconnects send Last-Event-ID (the id: of the last event it got).
+  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}` +
+            `&since=${p.outCursor || 0}`;
   let es;
   try { es = new EventSource(url); }
   catch (e) {
@@ -1769,23 +1915,55 @@ function streamOutput(p) {
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
     setReconnecting(p, true);
-    // EventSource will retry on its own ~3s; we just enforce the
-    // total-elapsed budget. No need to schedule an explicit retry.
+    if (es.readyState === 2 /* EventSource.CLOSED */) {
+      // It will never retry on its own: previously the pane then showed
+      // "reconnecting… (0 s)" forever and dropped every keystroke.
+      closeStream(p);
+      setTimeout(() => recoverClosedStream(p, mySid), d);
+    }
+    // Otherwise EventSource retries by itself (~3 s); we only enforce
+    // the total-elapsed budget.
   };
 }
 
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
   let mySid = p.sid;
-  api('output',{query:'&session_id='+mySid}).then(r => {
+  api('output',{query:'&session_id='+mySid+'&since='+(p.outCursor || 0)}).then(r => {
+    if (isTransientOutputReply(r)) throw new Error(r.error);
     clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
     if(p.polling) pollOutput(p);
   }).catch(e => {
+    if (p.sid !== mySid) return;        // replaced meanwhile: not our loop
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
     setTimeout(() => { if(p.polling) pollOutput(p) }, d);
+  });
+}
+
+// EventSource gave up for good (readyState CLOSED): it does that on ANY
+// non-200 reconnect reply - 404 after a backend restart, 409 while the
+// old stream still holds the slot, 502 from a proxy, 503 busy - and
+// never retries again. Ask once over plain HTTP, which returns a status:
+// a real answer (a frame, or "session not found") goes through the
+// normal path - including resume/reconnect for a session that is gone -
+// and a transient failure waits and asks again, inside the same budget.
+function recoverClosedStream(p, mySid) {
+  if (!p.polling || p.sid !== mySid) return;
+  api('output', {query: '&session_id=' + mySid + '&since=' + (p.outCursor || 0)}).then(r => {
+    if (isTransientOutputReply(r)) throw new Error(r.error);
+    if (p.sid !== mySid) return;
+    clearRetryClock(p);
+    if (handleOutputPayload(p, r, mySid)) return;
+    if (p.polling) streamOutput(p);     // healthy again: back to SSE
+  }).catch(e => {
+    if (!p.polling || p.sid !== mySid) return;
+    let d = nextRetryDelay(p);
+    if (d < 0) { transportFatal(p, e); return; }
+    setReconnecting(p, true);
+    setTimeout(() => recoverClosedStream(p, mySid), d);
   });
 }
 
@@ -1823,12 +2001,23 @@ function queueInput(p, data) {
 // deferred-save arming, slot semantics), so only this verbatim-
 // identical tail is shared; do not try to merge more of them without
 // re-reading both flows end to end.
-function beginSessionIO(p) {
-  hideOverlay();
-  connectingFor = null;
-  overlayMode = null;
-  pendingSplit = null;
-  p.term.focus();
+// o.fromForm: this session is the one the login form was opened for (the
+// form's own success path). Only then does it close the form and clear
+// the form's state. A BACKGROUND pane finishing a reconnect or an F5
+// restore used to do it too: it hid a form the user was typing in (the
+// next keystrokes went to that pane's shell) and nulled pendingSplit, so
+// the user's split connect then landed in the active pane - overwriting
+// its session, which was never disconnected - instead of a new split.
+function beginSessionIO(p, o) {
+  if ((o && o.fromForm) || connectingFor === p.id) {
+    hideOverlay();
+    connectingFor = null;
+    overlayMode = null;
+    pendingSplit = null;
+    p.term.focus();
+  } else if (activeId === p.id && $('ov').classList.contains('h')) {
+    p.term.focus();            // the pane in front, nothing else open
+  }
   p.polling = true;
   p.pollRetries = 0;
   // Force a resize so resumed tmux sessions redraw at the real size.
@@ -1966,7 +2155,7 @@ async function connectPane(p, opts) {
         if (formOpen) {
           showErr('Authentication failed — check password or key.');
         } else {
-          p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+          p.term.write('\r\n\x1b[31m[websh: authentication failed]\x1b[0m\r\n');
           if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
           connectingFor = null;
           overlayMode = null;
@@ -1982,6 +2171,7 @@ async function connectPane(p, opts) {
         return;
       }
       p.sid = r.session_id;
+      p.outCursor = 0;          // a new session's output starts at offset 0
       if (r.slot_id) p.slotId = r.slot_id;
       if (r.tmux_cmd) p.tmuxCmd = r.tmux_cmd;
       p.connectedAt = Date.now();
@@ -2064,8 +2254,9 @@ function showTmuxBar(p, note) {
     shortBtn.textContent = 'Connect short-lived';
     shortBtn.onclick = () => { tmuxSwitchToShortLived(p.id); };
     bar.appendChild(shortBtn);
-    let panebar = p.el.querySelector('.pane-bar');
-    panebar.after(bar);
+    // Into the overlay stack, not the pane's flex column: a bar that
+    // takes layout space resizes the terminal (and the remote PTY).
+    p.el.querySelector('.pane-overlays').appendChild(bar);
   }
   bar.querySelector('[data-tmux-msg]').textContent = note || 'tmux failed on this target';
   bar.classList.remove('h');
@@ -2274,6 +2465,7 @@ function finalizeSuccess(opts, result, run) {
   p.slotId = result.slot_id || opts.slotId || null;
   p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
   p.sid = result.session_id;
+  p.outCursor = 0;              // a new session's output starts at offset 0
   p.connectedAt = Date.now();
   p.recentOutput = '';
   p.connecting = false;
@@ -2304,7 +2496,7 @@ function finalizeSuccess(opts, result, run) {
   // Close the status popup and login form as a single success step.
   $('tmuxOv').classList.add('h');
   currentConnectRun = null;
-  beginSessionIO(p);
+  beginSessionIO(p, {fromForm: true});
 }
 
 function cleanupRun(run) {
@@ -2489,7 +2681,7 @@ function hideErr(){ $('err').classList.remove('on') }
 // toast, so even a target-less pane never loses the text.)
 function surfaceConnectError(p, msg, reason) {
   if (!$('ov').classList.contains('h')) { showErr(msg); return; }
-  try { p.term.write('\r\n\x1b[91m--- ' + msg + ' ---\x1b[0m\r\n'); } catch (e) {}
+  try { p.term.write('\r\n\x1b[31m[websh: ' + msg + ']\x1b[0m\r\n'); } catch (e) {}
   if (p.host || p.connection) showReconnectBar(p, reason || 'error');
   connectingFor = null;
   overlayMode = null;
@@ -3113,10 +3305,18 @@ function renderSaved() {
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
       `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${Number(c.port) || 22}${suffix}${nokeyTag}</div></div>`+
-      `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
+      `<div class="sv-actions">` +
+        `<button class="sv-btn edit" data-edit="${i}" title="Edit" aria-label="Edit ${esc(c.name)}">${ic('pencil')}</button>` +
+        `<button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {
+    let editBtn = e.target.closest('[data-edit]');
+    if (editBtn) {
+      e.stopPropagation();
+      editSaved(parseInt(editBtn.getAttribute('data-edit'), 10));
+      return;
+    }
     if(e.target.classList.contains('del')){
       let idx = parseInt(e.target.getAttribute('data-idx'));
       let c = list[idx];
@@ -3134,12 +3334,98 @@ function renderSaved() {
     let c = list[idx];
     if (c && c.conn_id && !_idbHasKeyCache) {
       // No-key state: the row's click target is delete, not connect.
-      _bulkDeleteVaultEntry(c).catch(() => {});
-      list.splice(idx, 1); saveSaved(list); renderSaved();
+      // Deleting is irreversible, so ask IndexedDB itself rather than
+      // trust the cached flag: a render from a stale cache (config fetch
+      // failed at boot, a missed broadcast) must never cost a user a
+      // credential whose key is in fact present.
+      _refreshIdbHasKey().catch(() => false).then(has => {
+        if (has) { renderSaved(); connectSaved(c); return; }
+        let cur = loadSaved();
+        let at = cur.findIndex(x => x && x.conn_id === c.conn_id);
+        if (at < 0) return;
+        _bulkDeleteVaultEntry(c).catch(() => {});
+        cur.splice(at, 1); saveSaved(cur); renderSaved();
+      });
       return;
     }
     connectSaved(c);
   };
+}
+
+// Inline editor on a saved card. Without it the only way to fix a typo
+// in a name, port or username was Delete + create again - and for a
+// vault-backed entry that means re-entering the password.
+//
+// What can change depends on where the secret lives. A vault entry's
+// destination is inside the encrypted blob's AAD and in the server-side
+// record, and the client cannot rewrite either without the secret, so
+// only the display name is editable there; changing the destination
+// means saving the credentials again. Entries without a stored secret
+// carry all their metadata locally, so everything is editable.
+function editSaved(idx) {
+  let list = loadSaved(), c = list[idx];
+  if (!c) return;
+  let row = $('savedList').querySelector(`.sv[data-idx="${idx}"]`);
+  if (!row || row.classList.contains('editing')) return;
+  let locked = !!c.conn_id;             // secret lives in the vault
+  row.classList.add('editing');
+  row.innerHTML =
+    '<div class="sv-edit">' +
+      '<input class="e-name" maxlength="64" aria-label="Name" placeholder="Name">' +
+      '<input class="e-user" maxlength="64" aria-label="User" placeholder="user"' + (locked ? ' disabled' : '') + '>' +
+      '<input class="e-host" maxlength="253" aria-label="Host" placeholder="host"' + (locked ? ' disabled' : '') + '>' +
+      '<input class="e-port" type="number" min="1" max="65535" aria-label="Port" placeholder="22"' + (locked ? ' disabled' : '') + '>' +
+    '</div>' +
+    '<span class="sv-edit-note"></span>' +
+    '<div class="sv-edit-row">' +
+      '<button type="button" class="btn sv-cancel">Cancel</button>' +
+      '<button type="button" class="btn btn-p sv-save">Save</button>' +
+    '</div>';
+  let q = sel => row.querySelector(sel);
+  q('.e-name').value = c.name || '';
+  q('.e-user').value = c.user || '';
+  q('.e-host').value = c.host || '';
+  q('.e-port').value = Number(c.port) || 22;
+  let note = q('.sv-edit-note');
+  if (locked) {
+    note.textContent = 'Saved in the vault — re-save the credentials to change the destination.';
+  }
+  let close = () => renderSaved();
+  q('.sv-cancel').addEventListener('click', ev => { ev.stopPropagation(); close(); });
+  q('.sv-save').addEventListener('click', ev => { ev.stopPropagation(); commit(); });
+  row.addEventListener('keydown', ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+  });
+  row.addEventListener('click', ev => ev.stopPropagation());   // not a connect click
+  function fail(msg, sel) {
+    note.textContent = msg;
+    note.classList.add('sv-edit-err');
+    let el = q(sel); if (el) el.focus();
+  }
+  function commit() {
+    let name = q('.e-name').value.trim();
+    if (!name) return fail('Name cannot be empty.', '.e-name');
+    let next = Object.assign({}, c, {name: name});
+    if (!locked) {
+      let user = q('.e-user').value.trim(), host = q('.e-host').value.trim();
+      let port = parseInt(q('.e-port').value, 10);
+      // The same shapes the server accepts at /api/connect, so a saved
+      // entry can't be edited into one that is refused on use.
+      if (!/^[A-Za-z0-9._@-]{1,64}$/.test(user)) return fail('User: letters, digits and . _ - @ only.', '.e-user');
+      if (!/^[A-Za-z0-9._:\[\]-]{1,253}$/.test(host)) return fail('Host: a hostname or an IP address.', '.e-host');
+      if (!(port >= 1 && port <= 65535)) return fail('Port must be between 1 and 65535.', '.e-port');
+      Object.assign(next, {user: user, host: host, port: port});
+    }
+    let all = loadSaved();
+    all[idx] = next;
+    saveSaved(all);
+    renderSaved();
+    showToast('Saved “' + name + '”', 'ok');
+  }
+  q('.e-name').focus();
+  q('.e-name').select();
 }
 
 // Fire-and-forget DELETE /api/save for a vault-backed entry. The PHP
@@ -3408,7 +3694,7 @@ function checkProtoVersion(cfg) {
 }
 
 function loadServerConfig() {
-  api('config').then(async cfg => {
+  return api('config').then(async cfg => {
     serverConfig=cfg;
     applyFormDefaults(cfg);
     checkProtoVersion(cfg);
@@ -3469,8 +3755,13 @@ function loadServerConfig() {
     showOverlay();
     // Config unreachable: the prefix can't be known, so show what the
     // unscoped namespace holds (the pre-isolation behaviour) rather
-    // than an empty list.
-    try { renderSaved(); } catch (e) {}
+    // than an empty list. Ask IndexedDB whether the vault key is there
+    // FIRST: the cache still holds its declaration-time false, and
+    // painting with it marked every vault card "no key" - whose click
+    // is delete.
+    _refreshIdbHasKey().catch(() => {}).then(() => {
+      try { renderSaved(); } catch (e) {}
+    });
   });
 }
 
@@ -3576,13 +3867,17 @@ function uploadBlocker(p) {
   return '';
 }
 
-function startUploadFiles(id, files) {
+// o.destDir: an absolute remote directory to drop the files into -
+// what the file browser is showing. Without it the destination is the
+// pane's own working directory, as before.
+function startUploadFiles(id, files, o) {
   let p = panes[id];
   if (!files.length || uploadBlocker(p)) return;
   let totalSize = 0;
   files.forEach(f => { totalSize += f.size });
   p.upload = {
     files:files, fileIndex:0, cancelled:false,
+    destDir: (o && o.destDir) || null,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
     currentFile:null, currentTmp:null, xhr:null,
     // Persistent sessions: server-side finalize landed each file at
@@ -3616,15 +3911,17 @@ function _dragHasFiles(ev) {
 const DROP_HEARTBEAT_MS = 1200;
 let _dropHighlighted = false;
 
-function showDropTarget(p) {
-  let el = p.el;
-  let why = uploadBlocker(p);
+function showDropTargetOn(el, why, msg) {
   el.classList.add('drop-target');
   el.classList.toggle('drop-refused', !!why);
-  el.setAttribute('data-drop-msg', why || 'Drop to upload');
+  el.setAttribute('data-drop-msg', why || msg);
   _dropHighlighted = true;
   clearTimeout(el._dropTimer);
   el._dropTimer = setTimeout(() => hideDropTarget(el), DROP_HEARTBEAT_MS);
+}
+
+function showDropTarget(p) {
+  showDropTargetOn(p.el, uploadBlocker(p), 'Drop to upload');
 }
 
 function hideDropTarget(el) {
@@ -3636,7 +3933,8 @@ function hideDropTarget(el) {
 function clearAllDropTargets() {
   if (!_dropHighlighted) return;
   _dropHighlighted = false;
-  document.querySelectorAll('.pane.drop-target').forEach(hideDropTarget);
+  document.querySelectorAll('.pane.drop-target,.fb-panel.drop-target')
+    .forEach(hideDropTarget);
 }
 
 function wirePaneDrop(p) {
@@ -3673,22 +3971,29 @@ function wirePaneDrop(p) {
     clearAllDropTargets();
     let why = uploadBlocker(p);
     if (why) { showToast(why, 'warn'); return; }
-    let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
-    let files = [], folders = 0;
-    if (items.length) {
-      for (let it of items) {
-        if (it.kind !== 'file') continue;
-        let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
-        if (entry && entry.isDirectory) { folders++; continue; }
-        let f = it.getAsFile();
-        if (f) files.push(f);
-      }
-    } else {
-      files = Array.from(ev.dataTransfer.files || []);
-    }
-    if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+    let files = droppedFiles(ev);
     if (files.length) { activatePane(p.id); startUploadFiles(p.id, files); }
   });
+}
+
+// The files in a drop, minus folders (the upload pipeline streams single
+// files), warning once if any were skipped.
+function droppedFiles(ev) {
+  let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
+  let files = [], folders = 0;
+  if (items.length) {
+    for (let it of items) {
+      if (it.kind !== 'file') continue;
+      let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (entry && entry.isDirectory) { folders++; continue; }
+      let f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  } else {
+    files = Array.from(ev.dataTransfer.files || []);
+  }
+  if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+  return files;
 }
 
 // A file dropped anywhere else would make the browser navigate to it -
@@ -3751,9 +4056,13 @@ function makeUploadMvCmd(finalName, tmpName) {
 function finalizeUploadedFile(p, file) {
   let u = p.upload;
   let tmp = u.currentTmp, fname = u.currentFile;
-  if (p.persistent) {
-    return api('upload_finalize', { body: { session_id: p.sid,
-                                             tmp: tmp, final: fname } })
+  // A named destination needs no tmux and no keystrokes, so it is the
+  // server path for every pane - the foreground mv below exists only
+  // because a non-persistent shell's cwd is unknowable from here.
+  if (p.persistent || u.destDir) {
+    let body = { session_id: p.sid, tmp: tmp, final: fname };
+    if (u.destDir) body.dir = u.destDir;
+    return api('upload_finalize', { body: body })
       .then(r => {
         if (r && r.ok && r.path) {
           u.placed.push({ name: fname, path: r.path });
@@ -3763,7 +4072,7 @@ function finalizeUploadedFile(p, file) {
         // pane, but is the documented graceful-fallback shape) — fall
         // through to the keystroke path. Any other error is a hard
         // failure.
-        if (r && r.non_persistent) return foregroundMv(p, fname, tmp);
+        if (r && r.non_persistent && !u.destDir) return foregroundMv(p, fname, tmp);
         return Promise.reject(r && r.error ? r.error : 'finalize failed');
       });
   }
@@ -3783,6 +4092,29 @@ function foregroundMv(p, fname, tmp) {
   }
   return api('input', { body: { session_id: p.sid,
                                 data: makeUploadMvCmd(fname, tmp) } });
+}
+
+// The bytes are safe in $HOME/<tmp>; only the move failed. Say where
+// they are and WHY the move failed - the server's reason (a folder that
+// vanished, a read-only one) is what the user needs to act on, and the
+// destination is the one they chose, not "the current directory".
+function describeFinalizeError(err, u) {
+  let where = u && u.destDir ? u.destDir : 'the current directory';
+  let tmp = u && u.currentTmp ? ' as ' + u.currentTmp : '';
+  let reason = typeof err === 'string' ? err : (err && err.message) || '';
+  let why;
+  if (/no such file/i.test(reason)) {
+    why = where + ' no longer exists';
+  } else if (/permission|not permitted|read-only/i.test(reason)) {
+    why = 'no permission to write to ' + where;
+  } else if (/control socket not ready/i.test(reason)) {
+    why = 'the connection to the host is not ready yet';
+  } else if (/not a directory/i.test(reason)) {
+    why = where + ' is not a folder';
+  } else {
+    why = 'it could not be moved to ' + where + (reason ? ' (' + reason + ')' : '');
+  }
+  return 'saved to your home folder' + tmp + ', but ' + why;
 }
 
 // Turn a failed upload into a reason that names the actual problem.
@@ -3890,9 +4222,7 @@ function uploadNextFile(p) {
     .catch((err) => {
       if (!u || u.cancelled) return;
       if (err) console.warn('websh: upload finalize failed:', err);
-      finishUpload(p, false,
-        'the file was uploaded to your home folder but could not be moved' +
-        ' into the current directory');
+      finishUpload(p, false, describeFinalizeError(err, u));
     });
   };
   xhr.onerror = () => {
@@ -3912,6 +4242,7 @@ function showUploadProgress(p) {
     prog.querySelector('.upload-progress-text').textContent = '';
     prog.classList.remove('h');
   }
+  paintFbXfer(p);
 }
 
 function hideUploadProgress(p) {
@@ -3919,6 +4250,7 @@ function hideUploadProgress(p) {
   let prog = p.el.querySelector('[data-upload-progress]');
   if (label) label.classList.remove('h');
   if (prog) prog.classList.add('h');
+  paintFbXfer(p);
 }
 
 function updateUploadProgress(p) {
@@ -3934,6 +4266,7 @@ function updateUploadProgress(p) {
   el.querySelector('.upload-progress-bar').style.width = pct + '%';
   let prefix = total > 1 ? `(${Math.min(done + 1, total)}/${total}) ` : '';
   el.querySelector('.upload-progress-text').textContent = prefix + name + ' ' + pct + '%';
+  paintFbXfer(p);
 }
 
 function closeUploadSession(u) {
@@ -3945,18 +4278,39 @@ function closeUploadSession(u) {
 // paint the progress bar + text for this outcome, then after `delay` clear
 // the transfer slot, hide the bar and refresh the badge. Painting differs
 // per outcome and stays at the call sites via `paint(bar, text)`.
+// Resolves once the slot is released - the moment another transfer may
+// start. A queue (fbBulkDownload) must wait for THAT, not for the bytes:
+// the finished transfer keeps p[slot] set while its banner is showing,
+// and startFastDownload refuses to start while it is.
 function settleTransfer(p, slot, delay, paint) {
   let el = p.el && p.el.querySelector('[data-upload-progress]');
   if (el && paint) {
     paint(el.querySelector('.upload-progress-bar'),
           el.querySelector('.upload-progress-text'));
+    paintFbXfer(p);          // the outcome, not just the progress
   }
-  setTimeout(() => {
-    p[slot] = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, delay);
+  let mine = p[slot];
+  return new Promise(resolve => setTimeout(() => {
+    // Only release the transfer this call settled: if the banner was
+    // dismissed early and a new transfer has started since, this late
+    // timer must not null (and hide) the new one.
+    if (p[slot] === mine) {
+      p[slot] = null;
+      hideUploadProgress(p);
+      updatePaneBadge(p);
+      if (el) el.querySelector('.upload-progress-bar').style.background = '';
+    }
+    resolve();
+  }, delay));
+}
+
+// The X on a transfer that has already ENDED only dismisses its banner.
+function dismissTransfer(p, slot) {
+  p[slot] = null;
+  hideUploadProgress(p);
+  updatePaneBadge(p);
+  let el = p.el && p.el.querySelector('[data-upload-progress] .upload-progress-bar');
+  if (el) el.style.background = '';
 }
 
 function finishUpload(p, success, reason) {
@@ -3966,6 +4320,12 @@ function finishUpload(p, success, reason) {
   closeUploadSession(u);
   let staged = u.staged || [];
   let placed = u.placed || [];
+  // The browser is showing the directory the file just landed in: list
+  // it again so the user sees the file instead of having to refresh.
+  if (success && u.destDir && _fbId === p.id && _fbCurPath === u.destDir
+      && !$('fbOv').classList.contains('h')) {
+    reloadFbDir();
+  }
   // Banner stays visible longer when there's something the user needs to
   // read and act on — a destination path, or a specific failure reason —
   // so it doesn't vanish before they can take it in.
@@ -3983,6 +4343,8 @@ function finishUpload(p, success, reason) {
       } else if (placed.length === 1) {
         // Persistent finalize gave us the absolute path — show it.
         text.textContent = 'Saved to ' + placed[0].path;
+      } else if (placed.length > 1 && u.destDir) {
+        text.textContent = 'Saved ' + placed.length + ' files to ' + u.destDir;
       } else {
         text.textContent = 'Upload complete';
       }
@@ -3997,6 +4359,12 @@ function cancelUpload(id) {
   let p = panes[id];
   if (!p || !p.upload) return;
   let u = p.upload;
+  // Finished already (success or failure; finishUpload sets cancelled):
+  // the X is dismissing the result banner. Cancelling here used to POST
+  // upload_cancel for the staged file - after a failed move that is the
+  // ONLY copy, which the banner had just said was safe in $HOME - and
+  // relabel a "Saved to ..." banner as "Cancelled".
+  if (u.cancelled) { dismissTransfer(p, 'upload'); return; }
   let tmpName = u.currentTmp;
   u.cancelled = true;
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
@@ -4027,9 +4395,14 @@ function triggerDownload(id) {
   showFileBrowser(id);
 }
 
-function startFastDownload(id, path) {
+// Resolves true when the file has been saved, false on any failure or
+// cancellation - fbBulkDownload chains the queue on it. o.settleDelay
+// shortens how long the finished transfer stays on the pane bar so the
+// next file in a queue isn't blocked behind it.
+function startFastDownload(id, path, o) {
   let p = panes[id];
-  if (!p || !p.sid || p.upload || p.download) return;
+  if (!p || !p.sid || p.upload || p.download) return Promise.resolve(false);
+  let settleDelay = (o && o.settleDelay) || 2000;
   let filename = path.split('/').pop() || 'download';
   let ctrl = new AbortController();
   p.download = {cancelled: false, filename: filename, abort: () => ctrl.abort()};
@@ -4038,7 +4411,7 @@ function startFastDownload(id, path) {
 
   let url = API + '?action=download&session_id=' + encodeURIComponent(p.sid) +
             '&path=' + encodeURIComponent(path);
-  fetch(url, {signal: ctrl.signal})
+  return fetch(url, {signal: ctrl.signal})
     .then(resp => {
       if (!resp.ok) {
         return resp.json().then(e => { throw new Error(e.error || 'failed'); });
@@ -4085,7 +4458,7 @@ function startFastDownload(id, path) {
         // the promise. Without this guard we'd still build a partial
         // Blob and trigger a save dialog with success UI. The .catch
         // branch below has the same guard.
-        if (!p.download || p.download.cancelled) return;
+        if (!p.download || p.download.cancelled) return false;
         let blob = new Blob(chunks, {type: 'application/octet-stream'});
         let a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -4093,20 +4466,23 @@ function startFastDownload(id, path) {
         document.body.appendChild(a); a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(a.href);
-        finishDownload(p, true);
+        return finishDownload(p, true, null, settleDelay).then(() => true);
       });
     })
     .catch(e => {
       if (p.download && !p.download.cancelled)
-        finishDownload(p, false, e.message || 'download failed');
+        return finishDownload(p, false, e.message || 'download failed', settleDelay)
+          .then(() => false);
+      return false;
     });
 }
 
-function finishDownload(p, success, msg) {
+// Resolves when the pane can take another transfer (see settleTransfer).
+function finishDownload(p, success, msg, settleDelay) {
   let dl = p.download;
-  if (!dl) return;
+  if (!dl) return Promise.resolve();
   dl.cancelled = true;
-  settleTransfer(p, 'download', 2000, (bar, text) => {
+  return settleTransfer(p, 'download', settleDelay || 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -4120,6 +4496,7 @@ function finishDownload(p, success, msg) {
 function cancelDownload(id) {
   let p = panes[id];
   if (!p || !p.download) return;
+  if (p.download.cancelled) { dismissTransfer(p, 'download'); return; }
   p.download.cancelled = true;
   if (p.download.abort) p.download.abort();
   settleTransfer(p, 'download', 2000, (bar, text) => {
@@ -4195,6 +4572,7 @@ function showFileBrowser(id) {
   _fbTrap.open(() => $('fbManual'));
   syncFbSortUi();
   syncFbHiddenUi();
+  paintFbXfer(p);            // a transfer may already be running
   let f = $('fbFilter'); if (f) f.value = '';
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
@@ -4249,6 +4627,7 @@ function closeFb() {
   // list is about to be discarded, and a stale closure would otherwise
   // keep a detached row alive.
   _fbConfirm = null;
+  fbClearSel();
   _fbTrap.close();
   _fbId = null;
   _fbSeq++;              // a reply still in flight must not paint a closed browser
@@ -4360,6 +4739,10 @@ function renderFbEntries(entries, absPath) {
   // from the previous listing no longer refers to anything on screen.
   _fbConfirm = null;
   _fbEntries = entries;
+  // Names are only meaningful within one listing: keeping them across a
+  // navigation (or a delete) would aim an action at a different file.
+  _fbSel.clear();
+  _fbSelAnchor = null;
   list.innerHTML = '';
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
@@ -4435,7 +4818,7 @@ function makeFbRowKeyboardable(row) {
 function makeFbRow(type, name, size, mtime, o) {
   let row = document.createElement('div');
   row.className = 'fb-row';
-  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
   let sizeStr = '';
   if (size !== null && size !== undefined) {
     if (size < 1024) sizeStr = size + ' B';
@@ -4446,7 +4829,10 @@ function makeFbRow(type, name, size, mtime, o) {
   // Rename + delete live in a fixed-width group at the far right, after
   // the metadata columns. The ".." row gets no buttons, but the empty
   // group keeps its width so the size/date columns stay aligned.
+  row.dataset.type = type;
   row.innerHTML =
+    (o && o.noActions ? '<span class="fb-ck-sp" style="width:14px;flex-shrink:0"></span>'
+                      : '<input type="checkbox" class="fb-ck" tabindex="-1">') +
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
@@ -4458,17 +4844,19 @@ function makeFbRow(type, name, size, mtime, o) {
   if (!(o && o.noActions)) {
     let acts = row.querySelector('.fb-act');
     for (let [cls, attr, title, glyph] of [
-        ['fb-ren', 'data-fb-ren', 'Rename', '\u270E'],
-        ['fb-del', 'data-fb-del', 'Delete', '\u00D7']]) {
+        ['fb-ren', 'data-fb-ren', 'Rename', 'pencil'],
+        ['fb-del', 'data-fb-del', 'Delete', 'close']]) {
       let b = document.createElement('button');
       b.type = 'button'; b.className = cls;
       b.setAttribute(attr, '');
       b.title = title;
       b.setAttribute('aria-label', title + ' ' + name);
-      b.textContent = glyph;
+      b.appendChild(icEl(glyph));
       acts.appendChild(b);
     }
   }
+  let ck = row.querySelector('.fb-ck');
+  if (ck) ck.setAttribute('aria-label', 'Select ' + name);
   // The visibility pass (dotfile toggle + name filter) reads the name here.
   row.dataset.name = name;
   return row;
@@ -4576,9 +4964,14 @@ function syncFbSortUi() {
 // restore must re-wire BOTH. One helper, so neither `done()` can forget
 // one: the delete editor used to re-wire only its own button, and the
 // orphaned Rename click then bubbled to the row and downloaded the file.
+// Everything a row's markup needs to work - called on first render AND
+// after an editor (delete confirm, rename) restores the row's innerHTML,
+// which recreates every element inside it without its listeners. A
+// handler wired anywhere else is lost on the first Cancel.
 function wireFbRow(row, fullPath, name, type) {
   wireFbDelete(row, fullPath, name, type);
   wireFbRename(row, fullPath, name, type);
+  wireFbSelect(row);
 }
 
 function wireFbDelete(row, fullPath, name, type) {
@@ -4699,6 +5092,9 @@ function applyFbVisibility() {
   } else if (note) {
     note.remove();
   }
+  // Rows just hidden by the filter drop out of the selection: the strip
+  // must never count something the user can no longer see.
+  syncFbSel();
 }
 function applyFbFilter() { applyFbVisibility(); }
 
@@ -4730,7 +5126,7 @@ function askFbRename(row, fullPath, name, type) {
   if (row.classList.contains('fb-edit')) return;
   cancelFbConfirm();                    // close any other open editor
   let restore = row.innerHTML;
-  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
   row.classList.add('fb-edit');
   row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
@@ -4794,6 +5190,337 @@ function doFbRename(row, fullPath, newName, undo, type) {
     });
 }
 
+// ── File browser: selecting several entries ─────────────────────────
+// Names (not paths) of the picked entries in the directory on screen.
+// A fresh listing always starts empty: a name that survived a navigation
+// or a delete would point at a different file.
+let _fbSel = new Set();
+let _fbSelAnchor = null;        // last row toggled, for shift-range picks
+
+function fbClearSel() {
+  _fbSel.clear();
+  _fbSelAnchor = null;
+  syncFbSel();
+}
+
+function fbVisibleRows() {
+  let list = $('fbList');
+  if (!list) return [];
+  return Array.from(list.querySelectorAll('.fb-row'))
+    .filter(r => r.dataset.parent !== '1' && !r.classList.contains('fb-hide'));
+}
+
+// One place decides what the checkboxes, the row tint and the action
+// strip say, so they cannot drift apart.
+function syncFbSel() {
+  let list = $('fbList'), bar = $('fbSel');
+  if (!list || !bar) return;
+  // Drop names that are no longer on screen (filtered out, or gone from
+  // the listing) - acting on them would act on something unseen.
+  let onScreen = new Set(fbVisibleRows().map(r => r.dataset.name));
+  for (let n of Array.from(_fbSel)) if (!onScreen.has(n)) _fbSel.delete(n);
+  for (let row of list.querySelectorAll('.fb-row')) {
+    let picked = _fbSel.has(row.dataset.name) && row.dataset.parent !== '1';
+    row.classList.toggle('fb-picked', picked);
+    let ck = row.querySelector('.fb-ck');
+    if (ck) ck.checked = picked;
+  }
+  list.classList.toggle('has-sel', _fbSel.size > 0);
+  bar.classList.toggle('h', _fbSel.size === 0);
+  if (!_fbSel.size) return;
+  let files = 0, dirs = 0;
+  for (let row of fbVisibleRows()) {
+    if (!_fbSel.has(row.dataset.name)) continue;
+    if (row.dataset.type === 'd') dirs++; else files++;
+  }
+  let parts = [];
+  if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
+  if (dirs) parts.push(dirs + (dirs === 1 ? ' folder' : ' folders'));
+  $('fbSelN').textContent = parts.join(', ') + ' selected';
+  let acts = $('fbSelActs');
+  acts.innerHTML = '';
+  // Folders are not downloadable (the transfer streams one file), so the
+  // button is offered only when there is something it can act on.
+  if (files) fbSelButton(acts, 'fb-sel-go', 'Download', fbBulkDownload);
+  fbSelButton(acts, 'fb-sel-del', 'Delete', fbAskBulkDelete);
+  fbSelButton(acts, '', 'Clear', fbClearSel);
+}
+
+function fbSelButton(acts, cls, label, fn) {
+  let b = document.createElement('button');
+  b.type = 'button'; b.className = cls; b.textContent = label;
+  b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
+  acts.appendChild(b);
+  return b;
+}
+
+// Shift-click picks the run between the last toggled row and this one -
+// the behaviour every file manager has, and the only bearable way to
+// pick forty files.
+function fbToggleRow(row, shiftKey) {
+  let rows = fbVisibleRows();
+  let name = row.dataset.name;
+  if (shiftKey && _fbSelAnchor !== null) {
+    let a = rows.findIndex(r => r.dataset.name === _fbSelAnchor);
+    let b = rows.indexOf(row);
+    if (a >= 0 && b >= 0) {
+      let [lo, hi] = a <= b ? [a, b] : [b, a];
+      let want = !_fbSel.has(name);
+      for (let i = lo; i <= hi; i++) {
+        if (want) _fbSel.add(rows[i].dataset.name);
+        else _fbSel.delete(rows[i].dataset.name);
+      }
+      _fbSelAnchor = name;
+      syncFbSel();
+      return;
+    }
+  }
+  if (_fbSel.has(name)) _fbSel.delete(name); else _fbSel.add(name);
+  _fbSelAnchor = name;
+  syncFbSel();
+}
+
+function wireFbSelect(row) {
+  let ck = row.querySelector('.fb-ck');
+  if (!ck) return;
+  // The row's own click navigates or downloads; the checkbox must not.
+  // No preventDefault here: a checkbox is toggled BEFORE its click event,
+  // and preventing the default reverts it after the handler has run - so
+  // the box that syncFbSel had just ticked went blank again (visible on a
+  // shift-range pick). Let the native toggle stand; syncFbSel then writes
+  // the authoritative state onto every box.
+  ck.addEventListener('click', ev => {
+    ev.stopPropagation();
+    fbToggleRow(row, ev.shiftKey);
+  });
+  ck.addEventListener('keydown', ev => {
+    if (ev.key !== ' ' && ev.key !== 'Enter') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    fbToggleRow(row, ev.shiftKey);
+  });
+}
+
+// The absolute paths of the selected rows, in the order they appear.
+function fbSelected(kind) {
+  let dir = _fbCurPath;
+  return fbVisibleRows()
+    .filter(r => _fbSel.has(r.dataset.name))
+    .filter(r => !kind || (kind === 'f' ? r.dataset.type !== 'd'
+                                        : r.dataset.type === 'd'))
+    .map(r => ({name: r.dataset.name, type: r.dataset.type, row: r,
+                path: (dir === '/' ? '' : dir) + '/' + r.dataset.name}));
+}
+
+// ── Bulk delete ─────────────────────────────────────────────────────
+// One question for the whole batch, then one rm per entry: each delete
+// stays a separate, individually audited side-channel call, and a
+// failure in the middle names the entry that failed.
+function fbAskBulkDelete() {
+  let items = fbSelected();
+  if (!items.length) return;
+  let dirs = items.filter(i => i.type === 'd').length;
+  let bar = $('fbSel');
+  $('fbSelN').textContent = 'Delete ' + items.length +
+    (items.length === 1 ? ' item' : ' items') + '?' +
+    (dirs ? ' (folders only if empty)' : '');
+  let acts = $('fbSelActs');
+  acts.innerHTML = '';
+  fbSelButton(acts, '', 'Cancel', syncFbSel);
+  let go = fbSelButton(acts, 'fb-sel-del armed', 'Delete ' + items.length,
+                       () => fbBulkDelete(items));
+  try { go.focus(); } catch (e) {}
+  bar.classList.remove('h');
+}
+
+function fbBulkDelete(items) {
+  let p = fbSessionForAction();
+  if (!p) return;
+  let sid = p.sid;
+  $('fbSelActs').innerHTML = '';
+  let done = 0, failed = [];
+  let step = () => {
+    if (done >= items.length) return Promise.resolve();
+    let it = items[done];
+    $('fbSelN').textContent = 'Deleting ' + (done + 1) + '/' + items.length +
+                              ' — ' + it.name;
+    return api('rm', {body: {session_id: sid, path: it.path}})
+      .then(r => {
+        if (r && r.error) {
+          // The side-channel rate limit is the one failure that makes
+          // continuing pointless: stop and say so.
+          if (r.code === 'rate_limited' || /rate.?limit/i.test(r.error)) {
+            throw new Error('rate_limited');
+          }
+          failed.push(it.name + ': ' + r.error);
+        }
+        done++;
+        return step();
+      });
+  };
+  step()
+    .catch(e => {
+      if (e && e.message === 'rate_limited') {
+        showToast('Too many requests — deleted ' + done + ' of ' + items.length +
+                  ', try the rest in a moment.', 'warn');
+      } else {
+        failed.push(e && e.message ? e.message : 'error');
+      }
+    })
+    .then(() => {
+      let ok = done - failed.length;
+      if (failed.length) {
+        showToast('Deleted ' + ok + ' of ' + items.length + ' — ' + failed[0] +
+                  (failed.length > 1 ? ' (+' + (failed.length - 1) + ' more)' : ''), 'err');
+      } else if (ok) {
+        showToast('Deleted ' + ok + (ok === 1 ? ' item' : ' items'), 'ok');
+      }
+      fbClearSel();
+      reloadFbDir();
+    });
+}
+
+// ── Bulk download ───────────────────────────────────────────────────
+// Strictly one at a time: a pane carries one transfer, and the browser
+// stays open so the queue's progress is visible.
+function fbBulkDownload() {
+  let items = fbSelected('f');
+  if (!items.length) return;
+  let p = fbSessionForAction();
+  if (!p) return;
+  let why = uploadBlocker(p);
+  if (why && /already running/.test(why)) { showToast(why, 'warn'); return; }
+  let skipped = fbSelected().length - items.length;
+  if (skipped) showToast('Folders can’t be downloaded — skipping ' + skipped + '.', 'warn');
+  let id = p.id, done = 0, stopped = null;
+  let step = () => {
+    if (done >= items.length || stopped) return Promise.resolve();
+    let it = items[done];
+    $('fbSelN').textContent = 'Downloading ' + (done + 1) + '/' + items.length +
+                              ' — ' + it.name;
+    // startFastDownload resolves once the pane's slot is free again; a
+    // short settle keeps the queue moving instead of showing each
+    // "Download complete" for two seconds.
+    return startFastDownload(id, it.path, {settleDelay: 250})
+      .then(ok => {
+        if (!ok) { stopped = it.name; return; }
+        done++;
+        return step();
+      });
+  };
+  step().then(() => {
+    if (stopped) {
+      showToast('Stopped at ' + stopped + ' — downloaded ' + done +
+                ' of ' + items.length + '.', 'err');
+    } else {
+      showToast('Downloaded ' + done + (done === 1 ? ' file' : ' files'), 'ok');
+    }
+    fbClearSel();
+  });
+}
+
+// ── File browser: upload into the directory on screen ───────────────
+// Until the server learned to take a destination, an upload always
+// landed wherever the shell happened to be standing - so the folder the
+// user had just navigated to in the browser was the one place they
+// could not send a file to.
+
+// Why this browser can't take an upload right now, or '' when it can.
+function fbUploadBlocker() {
+  let p = _fbId && panes[_fbId];
+  if (!p || !p.sid) return 'This pane is not connected.';
+  // Never upload into a path we are not sure of: the rows (and _fbCurPath)
+  // must belong to the session we are about to send the file through.
+  if (!_fbCurPath || p.sid !== _fbListedSid) return 'The listing is still loading.';
+  return uploadBlocker(p);
+}
+
+function fbUploadHere() {
+  let why = fbUploadBlocker();
+  if (why) { showToast(why, 'warn'); return; }
+  let inp = $('fbUploadInput');
+  if (inp) inp.click();
+}
+
+function fbHandleUpload(input) {
+  let files = Array.prototype.slice.call(input.files || []);
+  input.value = '';
+  fbStartUpload(files);
+}
+
+function fbStartUpload(files) {
+  if (!files.length) return;
+  let why = fbUploadBlocker();
+  if (why) { showToast(why, 'warn'); return; }
+  // showUploadProgress (inside startUploadFiles) paints the strip.
+  startUploadFiles(_fbId, files, {destDir: _fbCurPath});
+}
+
+function fbCancelXfer() {
+  if (_fbId) cancelTransfer(_fbId);
+}
+
+// The pane's own progress bar is behind this modal, so mirror it into
+// the browser's footer while the browser is the thing the user is
+// looking at. Reads the pane's bar rather than keeping a second copy of
+// the state, so the two can't disagree.
+function paintFbXfer(p) {
+  let el = $('fbXfer');
+  if (!el) return;
+  let open = _fbId && p && p.id === _fbId && !$('fbOv').classList.contains('h');
+  let src = open && p.el && p.el.querySelector('[data-upload-progress]');
+  if (!src || src.classList.contains('h')) { el.classList.add('h'); return; }
+  let bar = src.querySelector('.upload-progress-bar');
+  let mine = el.querySelector('.fb-xfer-bar');
+  mine.style.width = bar.style.width;
+  mine.style.background = bar.style.background || '';
+  el.querySelector('.fb-xfer-text').textContent =
+    src.querySelector('.upload-progress-text').textContent;
+  el.classList.remove('h');
+}
+
+function wireFbDrop() {
+  let el = document.querySelector('#fbOv .fb-panel');
+  if (!el) return;
+  let msg = () => 'Drop to upload to ' + (_fbCurPath || 'this folder');
+  el.addEventListener('dragenter', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    showDropTargetOn(el, fbUploadBlocker(), msg());
+  });
+  el.addEventListener('dragover', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = fbUploadBlocker() ? 'none' : 'copy';
+    showDropTargetOn(el, fbUploadBlocker(), msg());
+  });
+  el.addEventListener('dragleave', ev => {
+    if (!_dragHasFiles(ev)) return;
+    if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+    hideDropTarget(el);
+  });
+  el.addEventListener('drop', ev => {
+    if (!_dragHasFiles(ev)) return;
+    // Stop here: the document-level handler would otherwise tell the user
+    // to drop onto a pane, about a drop that just worked.
+    ev.preventDefault();
+    ev.stopPropagation();
+    clearAllDropTargets();
+    let why = fbUploadBlocker();
+    if (why) { showToast(why, 'warn'); return; }
+    fbStartUpload(droppedFiles(ev));
+  });
+}
+
+// The panel exists before this script runs (scripts are at the end of
+// the body), but guard anyway so load-order changes can't silently drop
+// the browser's drop zone.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireFbDrop);
+} else {
+  wireFbDrop();
+}
+
 // ── File browser: new folder (mkdir) ────────────────────────────────
 // An editor row inserted at the top of the list, above the entries.
 function fbNewFolder() {
@@ -4803,7 +5530,7 @@ function fbNewFolder() {
   let row = document.createElement('div');
   row.className = 'fb-row fb-edit';
   row.innerHTML =
-    '<span class="fb-ic">📁</span>' +
+    '<span class="fb-ic">' + ic('folder') + '</span>' +
     '<input type="text" class="fb-ed-inp" placeholder="Folder name" aria-label="Folder name">' +
     '<button type="button" class="fb-ed-no">Cancel</button>' +
     '<button type="button" class="fb-ed-ok">Create</button>';
@@ -4848,7 +5575,8 @@ function doFbMkdir(row, name, undo) {
   // Join onto the current directory; avoid a double slash at the root.
   let base = _fbCurPath === '/' ? '' : _fbCurPath;
   let full = base + '/' + name;
-  row.innerHTML = '<span class="fb-ic">📁</span><span class="fb-cf-q">Creating…</span>';
+  row.innerHTML = '<span class="fb-ic">' + ic('folder') + '</span>' +
+                  '<span class="fb-cf-q">Creating…</span>';
   api('mkdir', {body: {session_id: p.sid, path: full}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
@@ -5214,6 +5942,7 @@ function openOptions(){
   $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
   $('optWeight').value = settings.fontWeight;
   $('optWeightVal').textContent = settings.fontWeight;
+  let cv = $('optCtrlVPaste'); if (cv) cv.checked = !!settings.ctrlVPaste;
   let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
   let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
   renderOptPreview();
@@ -5375,6 +6104,12 @@ document.addEventListener('DOMContentLoaded', () => {
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
   f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
+  let cv = $('optCtrlVPaste');
+  // Read live by _ctrlVShouldPaste, so the change takes effect in every
+  // open pane immediately - no re-attaching of key handlers.
+  if (cv) cv.addEventListener('change', () => {
+    settings.ctrlVPaste = cv.checked; saveSettings();
+  });
   let cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
   if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
   if (ch) ch.addEventListener('change', () => {
@@ -5534,8 +6269,19 @@ $('ov').addEventListener('click', e => {
 });
 
 // ── Enter to connect ────────────────────────────────────────────────
-document.querySelector('.panel').addEventListener('keydown', e => {
-  if(e.key==='Enter'&&e.target.matches('input:not([type=checkbox])')) doConnect();
+// Enter in the login form's fields connects. Bound to THE LOGIN panel:
+// `document.querySelector('.panel')` found the first .panel in the page,
+// which is the Options panel - so Enter in the form did nothing, and
+// Enter in an Options field (Scrollback) fired doConnect() and toasted
+// "Host and username are required". The form's own fields only: the
+// inline editor of a saved card handles its own Enter.
+document.querySelector('#ov .panel').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || e.isComposing) return;
+  let t = e.target;
+  if (!t.matches || !t.matches('input:not([type=checkbox]):not([type=hidden])')) return;
+  if (t.closest('.sv-edit, .sv, #savedList')) return;
+  e.preventDefault();
+  doConnect();
 });
 
 // ── Auto-connect logic ──────────────────────────────────────────────
@@ -5604,6 +6350,27 @@ function tryRestoreSessions() {
   if (!ids.length) return false;
   activatePane(restored[ids[0]].id);
 
+  // Re-key every pane's sessionStorage secret from its old id to the id
+  // build() just minted (ids restart at p1 on every page load, and the
+  // next saveSessions() writes the manifest under the new ids; secrets
+  // left under the old ones would be unreachable on the next F5). Do it
+  // eagerly, so it survives a failed connect, and in TWO passes. build() mints ids in layout
+  // order, the manifest is walked in creation order, so old->new is a
+  // permutation (after splits, old p3 can become new p2 and old p2 new
+  // p3). Moving in place overwrote a secret that a later step had not
+  // read yet, and a pane reconnected with ANOTHER host's password - and
+  // every later F5 repeated it. Read them all first, then write.
+  let secretsByOld = {};
+  Object.keys(m.panes).forEach(oldId => { secretsByOld[oldId] = _getPaneSecret(oldId); });
+  Object.keys(m.panes).forEach(oldId => {
+    let p = restored[oldId];
+    if (p && secretsByOld[oldId] && oldId !== p.id) _deletePaneSecret(oldId);
+  });
+  Object.keys(m.panes).forEach(oldId => {
+    let p = restored[oldId];
+    if (p && secretsByOld[oldId] && oldId !== p.id) _setPaneSecret(p.id, secretsByOld[oldId]);
+  });
+
   let missingCreds = 0;
   Object.keys(m.panes).forEach(oldId => {
     let rec = m.panes[oldId];
@@ -5618,21 +6385,7 @@ function tryRestoreSessions() {
     // prefer sessionStorage when present, fall back to legacy fields,
     // and finally surface a toast if both are empty for a non-vault
     // pane that needs creds at connect time.
-    let secrets = _getPaneSecret(oldId);
-    // Pane ids (`p' + ++paneCounter`) reset on every module load, so a
-    // manifest with gaps (e.g. {p1, p3} because p2 was closed earlier)
-    // remints panes as {p1, p2} on restore. If we don't re-key
-    // sessionStorage right now, the next saveSessions() (fired after
-    // the connect lands) will write a manifest with the new ids while
-    // the secrets stay under the OLD ids — and the next F5 cannot find
-    // them. Do the rewrite eagerly so it survives even if this connect
-    // itself fails. _setPaneSecret(p.id, null) is a no-op delete, so
-    // pass-through cases (vault panes, panes with no stored secrets)
-    // don't accidentally create empty rows.
-    if (secrets && oldId !== p.id) {
-      _setPaneSecret(p.id, secrets);
-      _deletePaneSecret(oldId);
-    }
+    let secrets = secretsByOld[oldId];
     let password = (secrets && secrets.password) || rec.password || '';
     let key      = (secrets && secrets.key)      || rec.key      || '';
     let keyPass  = (secrets && secrets.key_pass) || rec.key_pass || '';
@@ -5680,7 +6433,9 @@ _initVaultBroadcast();
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
-loadServerConfig();
+// Settles once boot has finished acting on /api/config (restore or the
+// login form) - the frontend tests wait on it instead of guessing a delay.
+const bootReady = loadServerConfig();
 // No renderSaved() here: under isolate_storage the storage prefix is
 // only known once /api/config answers, and a render now read the
 // SHARED namespace - the login screen showed another deployment's

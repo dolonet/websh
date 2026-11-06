@@ -81,6 +81,32 @@ as `output`, `: keepalive` comment heartbeats, and a final
 `event: end` + `data: {"alive": false, ...}`. Note the events are
 named — a bare `EventSource.onmessage` consumer sees nothing.
 
+#### Output cursor (lossless reconnect)
+Both endpoints accept `&since=<n>`: the absolute byte offset of the
+output this client has already rendered (0 for a new session). With
+it, output is read **without being consumed**, from a replay window of
+the session's last `OUTPUT_REPLAY_BYTES` (default 512 KiB), and every
+reply / `data` event carries:
+
+- `cursor` — the offset after this chunk (the client's next `since`);
+- `lost` (only when non-zero) — bytes that were produced but fell out
+  of the replay window before this reader asked; the client should say
+  so rather than silently skip;
+- `reset: true` (only when set) — the `since` was ahead of anything
+  this session produced (a cursor from another session); the reply
+  starts over from the retained window.
+
+On SSE each `data` event also has `id: <cursor>`, so a browser's
+automatic EventSource reconnect resends it as `Last-Event-ID`, which
+takes precedence over the `since` in the (unchanged) reconnect URL. A
+chunk may overlap what the client already has - it covers
+`[cursor - len(data), cursor)` - and the client trims bytes below its
+own cursor. The PHP shim forwards `Last-Event-ID`.
+
+Without `since` (and without `Last-Event-ID`) the original semantics
+apply: reads drain the buffer, no `cursor` field. Older cached clients
+keep working.
+
 ### POST /api/resize
 Body: `session_id`, `cols`, `rows`. Reply `{"ok": true}`.
 
@@ -113,10 +139,26 @@ Streams into `$HOME/<path>` over the ControlMaster. Reply
 `{"ok": true, "bytes": n, "path": "$HOME/<path>"}` / `{"error": ...}`.
 
 ### POST /api/upload_finalize
-Body: `session_id`, `tmp`, `final`. Moves `$HOME/<tmp>` into the
-foreground tmux pane's cwd with collision auto-increment. Reply
-`{"ok": true, "path": abs}` or `{"ok": false, "non_persistent": true}`
-(client falls back to a foreground `mv`).
+Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
+to its destination with collision auto-increment (`a.txt` → `a(1).txt`).
+
+`dir` is an absolute remote path — the directory the client wants the
+file in, normally the one its file browser is showing. Same validation
+as `rm`/`mkdir`/`mv`: absolute, no NUL, ≤ 4096 bytes, not bare `/`s →
+`400 {"error": "invalid dir"}`. It confers no access the session does
+not already have; the same user could `mv` there from their shell. A
+placement is audited as an `upload_place` access-log event carrying the
+final path (the `upload` event only sees the staging name in `$HOME`).
+
+Without `dir` the destination is the foreground tmux pane's cwd, which
+only a tmux-backed session can resolve: others get
+`{"ok": false, "non_persistent": true}` and the client falls back to a
+foreground `mv`. With `dir` no tmux is involved, so the move is
+keystroke-free for every session.
+
+Reply `{"ok": true, "path": abs}`. Failures carry the remote's own
+reason with a matching status: `404` for a missing directory, `403` for
+a permission or read-only failure, `409` for a conflict, `502` otherwise.
 
 ### POST /api/upload_cancel
 Body: `session_id`, `tmp`. Best-effort `rm` of the staged file.

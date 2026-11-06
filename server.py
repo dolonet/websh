@@ -62,6 +62,7 @@ import pty
 import re
 import select
 import selectors
+import shlex
 import signal
 import socket
 import socketserver
@@ -179,6 +180,12 @@ WEBSH_REQUIRE_VAULT = _bool_knob("WEBSH_REQUIRE_VAULT")
 # (unsupported schema version, etc) to refuse-to-write rather than
 # silently overwrite. Cleared only by process restart.
 _vault_disabled = False
+# Why the creds file on disk cannot be used right now, or None. Unlike
+# _vault_disabled (an unsupported schema: latched until restart) this is
+# re-evaluated on every load, so fixing the file needs no restart. While
+# it is set every WRITE is refused: rewriting "the store" from an empty
+# stand-in would permanently delete every other user's vault.
+_creds_unreadable = None
 
 __version__ = "0.2.0"
 # Wire-protocol version, shipped in /api/config and /api/ping and
@@ -348,6 +355,12 @@ PTY_DRAIN_INTERVAL = 0.01    # seconds per drain round
 PTY_READ_SIZE = 65536         # bytes per read
 OUTPUT_BUF_MAX = 1048576      # 1 MB — truncate if exceeded
 OUTPUT_BUF_KEEP = 524288      # keep last 512 KB on truncation
+# Replay window for cursor readers (lossless reconnect). Every byte the
+# PTY produced gets an absolute offset; the last OUTPUT_REPLAY_BYTES are
+# retained, so a client that reconnects with ?since=<its cursor> (or the
+# SSE Last-Event-ID) gets exactly what it missed - including bytes the
+# server had already "written" into a socket that never delivered them.
+OUTPUT_REPLAY_BYTES = max(4096, _int_env("OUTPUT_REPLAY_BYTES", str(512 * 1024)))
 
 # Terminal reset sequence: exit alt screen, show cursor, reset attrs, full reset
 TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
@@ -365,6 +378,28 @@ PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 # history, in the recording.
 PASSWORD_ARM_MAX_BYTES = 16 * 1024
 PASSWORD_ARM_MAX_SECONDS = 60.0
+# How long after the auto-typed password a "permission denied" or a
+# second prompt still means "ssh rejected it". Past this - or as soon as
+# the user types anything - output belongs to the logged-in shell, where
+# `sudo -i` or `ls /root` saying the same words is ordinary life.
+AUTH_FAIL_WINDOW_SECONDS = 10.0
+# A real login prompt is the LAST thing on the terminal and then nothing
+# comes: ssh is waiting for input. This long a silence after a prompt-
+# shaped line is what makes it one (a banner line keeps printing).
+PASSWORD_PROMPT_QUIET_SECONDS = 0.15
+
+
+def _is_login_prompt(text):
+    """True when `text` (lowercased recent PTY output) ENDS in a
+    password prompt: its last non-blank line contains a prompt word and
+    ends with a colon. A match anywhere in the output is not enough - an
+    sshd banner saying "Forgot your password: call IT" used to get the
+    password typed into it, echoed on screen, before the real prompt."""
+    tail = text.rstrip(" \t\r\n")
+    if not tail.endswith(":"):
+        return False
+    last = tail.rsplit("\n", 1)[-1].rsplit("\r", 1)[-1]
+    return any(p.rstrip(":") in last for p in PASSWORD_PROMPTS)
 
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
@@ -490,17 +525,20 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     # `\;` chains the options in the same tmux invocation, applying
     # them regardless of whether the session was newly created or
     # re-attached via -A.
-    attach = (tmux_cmd + " new-session -A -D -s " + tname
+    # Per-connect tmux options go BEFORE new-session. Tuples are
+    # pre-validated against an allow-list (see _validate_tmux_options) so
+    # direct interpolation is shell- and tmux-injection-safe. The order
+    # matters for history-limit: tmux reads it only when a pane is
+    # CREATED, so `new-session ... \; set -g history-limit N` left the new
+    # pane with the old limit and the Scrollback setting did nothing
+    # (verified on tmux 3.4). `start-server` first, because `set -g`
+    # needs a server and on first use there is none yet.
+    pre = ""
+    for opt, val in (tmux_options or ()):
+        pre += " \\; set -g " + opt + " " + val
+    attach = (tmux_cmd + " start-server" + pre + " \\; new-session -A -D -s " + tname
               + ' -- "$SHELL" -l \\; set -g mouse on'
               + ' \\; set -g status off')
-    # Per-connect tmux options. Tuples are pre-validated against an
-    # allow-list (see _validate_tmux_options) so direct interpolation
-    # below is shell- and tmux-injection-safe. `\;` chains commands in
-    # the same tmux invocation so options apply to the global server
-    # state regardless of whether the session was newly created or
-    # re-attached via -A.
-    for opt, val in (tmux_options or ()):
-        attach += " \\; set -g " + opt + " " + val
     if ttl_seconds <= 0:
         return "exec " + attach
 
@@ -1040,10 +1078,37 @@ class _PlaintextCredsRejected(Exception):
     pass
 
 
+_proxy_host_warned = False
+
+
+def _warn_proxy_host_once(host_hdr, origin_host):
+    """The one misconfiguration that looks exactly like CSRF: a reverse
+    proxy that does not forward Host, so every browser request arrives as
+    "Host: 127.0.0.1:8765" with the public Origin. Say so once, with the
+    fix, instead of leaving the operator with a wall of 403s."""
+    global _proxy_host_warned
+    h = host_hdr.strip().lower().split(":")[0].strip("[]")
+    if _proxy_host_warned or h not in ("127.0.0.1", "localhost", "::1"):
+        return
+    _proxy_host_warned = True
+    _log("WARN", "browser requests from {} arrive with Host: {} - the "
+         "reverse proxy is not forwarding the Host header, so they are "
+         "refused as cross-site. nginx: add `proxy_set_header Host $host;` "
+         "(see docs/deployment.md).".format(origin_host, host_hdr))
+
+
 _CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
                  "isolate_storage": False,
                  "denied_host_set": frozenset(),
                  "denied_net_list": ()}
+# What an unusable websh.json means when there is no earlier good version
+# to keep: nothing may be reached. restrict_hosts with no connections
+# refuses every connect. The file the operator named carries their
+# policy (restrict_hosts, denied_hosts); losing it must not quietly mean
+# "anyone may go anywhere".
+_CONFIG_LOCKED = dict(_CONFIG_EMPTY, restrict_hosts=True)
+# Why the named websh.json can't be used right now, or None.
+_config_unusable = None
 
 
 def _normalize_user_list(value):
@@ -1075,8 +1140,15 @@ def _parse_denied_hosts(entries):
         try:
             net_list.append(ipaddress.ip_network(s, strict=False))
         except ValueError:
-            host_set.add(s.lower())
+            host_set.add(_host_key(s))
     return frozenset(host_set), tuple(net_list)
+
+
+def _host_key(host):
+    """The form a hostname is compared in: lowercase, without the
+    trailing root dot. "bastion.corp." is the same host as "bastion.corp"
+    to ssh and to DNS; compared raw, it walked past a deny-list entry."""
+    return host.strip().lower().rstrip(".")
 
 
 # What a client may name as an ssh destination / login. The deny-list
@@ -1089,6 +1161,7 @@ def _parse_denied_hosts(entries):
 # whitespace anywhere - those are exactly the characters that turn a
 # hostname into something ssh parses differently than we validated.
 _HOSTNAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,253}$')
+_SCOPE_ID_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
 _USERNAME_RE = re.compile(r'^[A-Za-z0-9._@-]{1,64}$')
 
 
@@ -1100,10 +1173,16 @@ def _valid_host(host):
                        and len(host) > 2) else host
     try:
         ipaddress.ip_address(h)
-        return True
     except ValueError:
-        pass
-    return bool(_HOSTNAME_RE.match(host))
+        return bool(_HOSTNAME_RE.match(host))
+    # Python accepts nearly anything as an IPv6 %scope-id - "@", spaces,
+    # newlines. "::%@10.1.2.3" parsed as an address, failed resolution
+    # (so the deny-list fell open), and ssh read it as user "::%" at
+    # host 10.1.2.3. A scope id is an interface name or index; allow
+    # exactly that.
+    if "%" in h:
+        return bool(_SCOPE_ID_RE.match(h.split("%", 1)[1]))
+    return True
 
 
 def _valid_username(username):
@@ -1193,19 +1272,34 @@ def _is_denied_host(host):
     if not host_set and not net_list:
         return False, None
     h = _normalize_host(host)
-    hl = h.strip().lower()
-    if hl in host_set:
+    if _host_key(h) in host_set:
         return True, "hostname on deny-list"
     if not net_list:
         return False, None
     # h already stripped of [...]; _resolve_host_ips re-normalises but is
     # idempotent so this is fine.
     for ip in _resolve_host_ips(h):
-        for net in net_list:
-            if ip in net:
-                return True, "{} resolves to {} which is in denied range {}".format(
-                    host, ip, net)
+        for probe in _deny_probes(ip):
+            for net in net_list:
+                if probe in net:
+                    return True, "{} resolves to {} which is in denied range {}".format(
+                        host, ip, net)
     return False, None
+
+
+_LOOPBACKS = (ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1"))
+
+
+def _deny_probes(ip):
+    """The addresses to test `ip` as. A connect to 0.0.0.0 / :: lands
+    on the local host, as does ::1 - but a deny-list that names only
+    127.0.0.0/8 (as the documented example does) matched none of them,
+    so "0", "0.0.0.0" or "::" reached loopback-only services on the
+    websh host. Unspecified and loopback addresses are therefore also
+    tested as the loopback of either family."""
+    if ip.is_unspecified or ip.is_loopback:
+        return (ip,) + _LOOPBACKS
+    return (ip,)
 
 
 def load_config():
@@ -1220,10 +1314,12 @@ def load_config():
                   denied_users lists constrain which usernames may connect,
                   but only when no fixed username is set on the entry.
     """
-    global _config_cache, _config_mtime, _config_rejected
+    global _config_cache, _config_mtime, _config_rejected, _config_unusable
     path = os.environ.get("WEBSH_CONFIG", "")
-    if not path or not os.path.isfile(path):
+    if not path:
         return _CONFIG_EMPTY
+    if not os.path.isfile(path):
+        return _config_fallback(path, "file not found")
     try:
         mtime = os.path.getmtime(path)
         if _config_cache is not None and mtime == _config_mtime:
@@ -1267,22 +1363,52 @@ def load_config():
             # Raw passthrough; validated field-by-field in config_public.
             "form_defaults": cfg.get("form_defaults"),
         }
+        if _config_unusable is not None:
+            _log("INFO", "websh.json at {} loaded again".format(path))
+        _config_unusable = None
         _config_cache = result
         _config_mtime = mtime
         _config_rejected = None
         return result
     except _PlaintextCredsRejected as e:
-        # Cache the rejection under this file version so the ERROR is
-        # logged once per edit, not once per request.
+        # Logged once per edit, not once per request (the fallback only
+        # logs when the reason changes).
         _config_rejected = str(e)
-        _config_cache = _CONFIG_EMPTY
-        _config_mtime = mtime
-        _log("ERROR", "websh.json rejected (WEBSH_REQUIRE_VAULT=1): {}"
-             .format(e))
-        return _CONFIG_EMPTY
+        return _config_fallback(path, "rejected (WEBSH_REQUIRE_VAULT=1): " + str(e))
     except Exception as e:
-        _log("WARN", "failed to load config: {}".format(e))
+        # Not cached under this mtime: a half-written file (non-atomic
+        # save) is re-read on the next request and recovers by itself.
+        return _config_fallback(path, str(e) or type(e).__name__)
+
+
+def _config_fallback(path, reason):
+    """websh.json is named but unusable (missing, unreadable, malformed,
+    rejected). Keep enforcing the last version that loaded - the policy
+    in force a moment ago is the operator's actual intent - or, with none
+    to keep, lock everything. Returning the empty config instead silently
+    turned restrict_hosts off and emptied denied_hosts: a trailing comma
+    in an edit opened the proxy to every host."""
+    global _config_unusable
+    kept = _config_cache if (_config_cache is not None
+                             and _config_cache is not _CONFIG_LOCKED) else None
+    if kept is None and reason == "file not found":
+        # Never loaded and not there: an install without a config (the
+        # PHP shim always passes a default WEBSH_CONFIG path, whether or
+        # not the operator created the file). That is "no config", as it
+        # always was - not a broken one. Only a file that was loaded and
+        # then vanished keeps its last version, below.
+        if _config_unusable != reason:
+            _log("INFO", "WEBSH_CONFIG={} does not exist - running without "
+                 "a websh.json".format(path))
+        _config_unusable = reason
         return _CONFIG_EMPTY
+    if _config_unusable != reason:
+        _log("ERROR", "websh.json at {} unusable ({}) - {}".format(
+            path, reason,
+            "keeping the last good configuration" if kept is not None else
+            "refusing all connections until it is fixed"))
+    _config_unusable = reason
+    return kept if kept is not None else _CONFIG_LOCKED
 
 
 # ── Credential vault (websh.creds.json) ─────────────────────────────
@@ -1349,10 +1475,25 @@ def _load_creds():
     refuse-to-write and config_public flips vault_enabled off until
     process restart.
     """
-    global _creds_cache, _creds_cache_key, _vault_disabled
+    global _creds_cache, _creds_cache_key, _vault_disabled, _creds_unreadable
     path = _creds_path()
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):
+        # Genuinely absent: a fresh install. Writing creates it.
+        _creds_unreadable = None
         return dict(_CREDS_EMPTY, vaults={})
+
+    def unusable(reason):
+        # Present but not usable (bad JSON, wrong shape, EACCES, EIO, a
+        # dangling symlink...). Readers get an empty store; writers are
+        # refused until the file is readable again - see _save_creds_atomic.
+        global _creds_unreadable
+        if _creds_unreadable != reason:
+            _log("ERROR", "creds file {} unusable ({}) - saving and deleting "
+                 "credentials is refused until it is fixed; nothing on "
+                 "disk was changed".format(path, reason))
+        _creds_unreadable = reason
+        return dict(_CREDS_EMPTY, vaults={})
+
     try:
         st = os.stat(path)
         key = (st.st_mtime, st.st_size)
@@ -1361,14 +1502,11 @@ def _load_creds():
         with open(path, "r") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
-        _log("WARN", "failed to load creds: {}".format(e))
-        return dict(_CREDS_EMPTY, vaults={})
+        return unusable(str(e) or type(e).__name__)
     if not isinstance(data, dict):
         # Operator typo or partial write from an external tool produced
-        # a JSON array/string/number at the root. Treat as empty store.
-        _log("WARN", "creds file {}: root is not an object; "
-             "treating as empty".format(path))
-        return dict(_CREDS_EMPTY, vaults={})
+        # a JSON array/string/number at the root.
+        return unusable("root is not an object")
     if data.get("version") != _CREDS_SCHEMA_VERSION:
         if not _vault_disabled:
             _log("WARN",
@@ -1379,9 +1517,10 @@ def _load_creds():
         _vault_disabled = True
         return dict(_CREDS_EMPTY, vaults={})
     if not isinstance(data.get("vaults"), dict):
-        _log("WARN", "creds file {}: missing or non-object 'vaults'; "
-             "treating as empty".format(path))
-        return dict(_CREDS_EMPTY, vaults={})
+        return unusable("missing or non-object 'vaults'")
+    if _creds_unreadable is not None:
+        _log("INFO", "creds file {} is readable again".format(path))
+    _creds_unreadable = None
     _creds_cache = data
     _creds_cache_key = key
     return _creds_cache
@@ -1401,6 +1540,9 @@ def _save_creds_atomic(data):
     """
     if _vault_disabled:
         raise RuntimeError("vault disabled — refusing to write")
+    if _creds_unreadable is not None:
+        # Backstop: the handlers answer 503 before getting here.
+        raise RuntimeError("creds file unusable — refusing to write")
     global _creds_cache, _creds_cache_key
     path = _creds_path()
     parent = os.path.dirname(path) or "."
@@ -1822,6 +1964,10 @@ class SSHSession(object):
         self.master_fd = -1
         self.pid = None
         self.output_buf = b""
+        # Replay log: the retained tail of ALL output (never drained by
+        # reads) and the absolute offset one past its last byte.
+        self._replay = b""
+        self._replay_end = 0
         self.buf_lock = Lock()
         # Session recording (asciicast v2); None when disabled.
         self._rec = None
@@ -1865,6 +2011,9 @@ class SSHSession(object):
         # rejection, assume auth succeeded so later shell output can't
         # accidentally trip the detector.
         self._auth_bytes_seen = 0
+        # Deadline for reading "permission denied" as ssh rejecting the
+        # auto-typed password; 0 = not watching. See AUTH_FAIL_WINDOW_SECONDS.
+        self._auth_watch_until = 0
         # Raw waitpid() status of the ssh child — used after exit to
         # classify auth vs network failure via the 255 exit code.
         self._exit_status = None
@@ -1908,7 +2057,18 @@ class SSHSession(object):
         if key:
             self._key_file = self._write_key(key)
 
-        self._spawn(host, port, username, cols, rows)
+        try:
+            self._spawn(host, port, username, cols, rows)
+        except BaseException:
+            # Half-built session: the caller never gets a handle to close,
+            # so release what is already on disk - the 0600 key file and
+            # the recording opened before the fork - here. If the fork
+            # itself failed there is no child to reap; if it succeeded and
+            # a later step raised, close() reaps it as usual.
+            if self.pid is None:
+                self._child_reaped = True
+            self.close()
+            raise
 
         self._reader = Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -1958,7 +2118,21 @@ class SSHSession(object):
             # cleanly instead of looping on the PTY, giving us a
             # locale-proof primary auth-failure signal.
             ("NumberOfPasswordPrompts", "1"),
+            # The session authenticates with what the web user supplied
+            # and nothing else. Without these, ssh also offered whatever
+            # the websh host has - the service account's ssh-agent
+            # (SSH_AUTH_SOCK was inherited) and its default ~/.ssh/id_*
+            # keys - so an anonymous visitor who typed only a host and a
+            # username got a shell wherever the OPERATOR's keys are
+            # authorized. A profile may still set these explicitly.
+            ("IdentityAgent", "none"),
+            ("IdentitiesOnly", "yes"),
         ]
+        if not self._key_file:
+            # Password (or keyboard-interactive) session: no key was
+            # given, so no key may be tried - not even the default ones
+            # ssh loads when no -i is passed.
+            defaults.append(("PubkeyAuthentication", "no"))
         if strict_disabled:
             # With StrictHostKeyChecking=no, also keep host keys out of
             # the websh user's known_hosts by default. If a profile
@@ -2009,6 +2183,10 @@ class SSHSession(object):
     def _spawn(self, host, port, username, cols, rows):
         """Fork a PTY and exec ssh."""
         env = os.environ.copy()
+        # SSH_AUTH_SOCK stays: a ProxyJump bastion (operator-configured)
+        # may authenticate with the service account's agent. The
+        # DESTINATION never does - IdentityAgent=none in _build_ssh_cmd
+        # applies to it alone, not to the jump hop.
         env["TERM"] = "xterm-256color"
         env["LANG"] = "en_US.UTF-8"
         env["LC_ALL"] = "en_US.UTF-8"
@@ -2187,14 +2365,14 @@ class SSHSession(object):
                             self._pw_buf = self._pw_buf[-256:]
                         self._pw_bytes_seen += len(data)
                         text = self._pw_buf.decode("latin-1", errors="replace").lower()
-                        prompted = any(p in text for p in PASSWORD_PROMPTS)
-                        if not prompted and (
-                                self._pw_bytes_seen > PASSWORD_ARM_MAX_BYTES or
+                        # The window is checked BEFORE the prompt: an armed
+                        # session that sat idle past it must not answer a
+                        # later "[sudo] password for u:".
+                        if (self._pw_bytes_seen > PASSWORD_ARM_MAX_BYTES or
                                 time.time() - self._pw_armed_at
                                 > PASSWORD_ARM_MAX_SECONDS):
                             self._disarm_password("no prompt within the auth window")
-                        elif prompted:
-                            time.sleep(0.1)
+                        elif _is_login_prompt(text) and not self._more_output_soon():
                             try:
                                 os.write(self.master_fd,
                                          (self._password + "\n").encode())
@@ -2206,6 +2384,8 @@ class SSHSession(object):
                             self._password_sent = True
                             self._password = None
                             self._pw_buf = b""
+                            self._auth_watch_until = (
+                                time.time() + AUTH_FAIL_WINDOW_SECONDS)
 
                     # After we sent the password, watch for ssh's
                     # "Permission denied" so we don't loop on bad creds.
@@ -2216,7 +2396,8 @@ class SSHSession(object):
                     # rejection signal — some targets phrase the failure
                     # differently and the second prompt is unambiguous.
                     elif (self._password_sent and not self.auth_failed
-                          and self._auth_bytes_seen < 4096):
+                          and self._auth_bytes_seen < 4096
+                          and time.time() < getattr(self, "_auth_watch_until", 0)):
                         self._auth_bytes_seen += len(data)
                         self._auth_buf += data
                         if len(self._auth_buf) > 512:
@@ -2243,10 +2424,7 @@ class SSHSession(object):
                             # *why* (the rejection message + the re-prompt)
                             # before we tear down.
                             with self.buf_lock:
-                                self.output_buf += data
-                                if len(self.output_buf) > OUTPUT_BUF_MAX:
-                                    self.output_buf = (
-                                        self.output_buf[-OUTPUT_BUF_KEEP:])
+                                self._append_output_locked(data)
                             self._signal()
                             self._auth_buf = b""
                             try:
@@ -2256,9 +2434,7 @@ class SSHSession(object):
                             break
 
                     with self.buf_lock:
-                        self.output_buf += data
-                        if len(self.output_buf) > OUTPUT_BUF_MAX:
-                            self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+                        self._append_output_locked(data)
                     self._signal()
 
                 # Check if child exited. Done under _reap_lock (see
@@ -2281,7 +2457,7 @@ class SSHSession(object):
                         if leftover:
                             self._record("o", leftover)
                             with self.buf_lock:
-                                self.output_buf += leftover
+                                self._append_output_locked(leftover)
                             self._signal()
                         else:
                             break
@@ -2289,6 +2465,18 @@ class SSHSession(object):
                         break
             except (OSError, ValueError):
                 pass
+
+            # Reap the child if we broke out before the inline WNOHANG reap
+            # (the auth-fail branch SIGTERMs and breaks, and a fast exit
+            # often surfaces as EIO before the inline reap sees it).
+            # Otherwise the ssh child lingers as a zombie holding a counted
+            # session slot until /api/disconnect or SESSION_TIMEOUT calls
+            # close(). It must run BEFORE the exit-255 check below: that
+            # check needs the exit status, and when the reap came after
+            # it, a rejected key (ssh exits 255 at once, no prompt ever)
+            # was reported as "SSH process exited immediately" instead of
+            # an authentication failure the user can act on.
+            self._reap_child()
 
             # ssh exit status 255 = anything ssh itself rejected: auth
             # failure, connection refused, host key mismatch, etc. If the
@@ -2303,8 +2491,10 @@ class SSHSession(object):
                     and os.WIFEXITED(self._exit_status)
                     and os.WEXITSTATUS(self._exit_status) == 255):
                 with self.buf_lock:
-                    tail = self.output_buf[-2048:].decode(
-                        "latin-1", errors="replace").lower()
+                    # The replay log, not output_buf: a reader may already
+                    # have drained the latter, taking the tail with it.
+                    tail = (getattr(self, "_replay", b"") or self.output_buf)[
+                        -2048:].decode("latin-1", errors="replace").lower()
                 if any(p in tail for p in AUTH_FAIL_PATTERNS):
                     self.auth_failed = True
                     _log("INFO", "session {} auth failed (exit 255){}".format(
@@ -2313,13 +2503,7 @@ class SSHSession(object):
 
             # Append terminal reset so the frontend restores normal screen
             with self.buf_lock:
-                self.output_buf += TERM_RESET
-
-            # Reap the child if we broke out before the inline WNOHANG reap
-            # (the auth-fail branch SIGTERMs and breaks). Otherwise the ssh
-            # child lingers as a zombie holding a counted session slot until
-            # /api/disconnect or SESSION_TIMEOUT eventually calls close().
-            self._reap_child()
+                self._append_output_locked(TERM_RESET)
 
             self.alive = False
             # Wake any consumer parked in wait_for_data so it observes
@@ -2388,6 +2572,45 @@ class SSHSession(object):
                 self._exit_status = status
             except Exception:
                 pass
+
+    def _append_output_locked(self, data):
+        """Append PTY output to both the legacy drain buffer and the replay
+        log. Caller holds buf_lock. Both are bounded; the replay log trims
+        with 50% slack so it isn't re-sliced on every chunk."""
+        self.output_buf += data
+        if len(self.output_buf) > OUTPUT_BUF_MAX:
+            self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+        if getattr(self, "_replay", None) is None:
+            return                         # bare test fixtures
+        self._replay += data
+        self._replay_end += len(data)
+        if len(self._replay) > OUTPUT_REPLAY_BYTES + OUTPUT_REPLAY_BYTES // 2:
+            self._replay = self._replay[-OUTPUT_REPLAY_BYTES:]
+
+    def read_since(self, cursor):
+        """Cursor read for lossless reconnect: the output from absolute
+        offset `cursor` on, WITHOUT consuming it. Returns (data, end,
+        lost, reset): `end` is the next cursor; `lost` counts bytes that
+        fell out of the replay window before this reader asked for them;
+        `reset` means the cursor was not one this session ever issued
+        (ahead of its output) and the reader must start over from the
+        retained window.
+
+        Cursor readers also clear the legacy drain buffer: it only exists
+        for readers without a cursor (older clients), and would otherwise
+        sit at its cap for the life of the session."""
+        with self.buf_lock:
+            end = self._replay_end
+            start = end - len(self._replay)
+            reset = cursor > end
+            if reset:
+                cursor = start
+            lost = max(0, start - cursor)
+            data = self._replay[max(cursor, start) - start:]
+            self.output_buf = b""
+        if data:
+            self.last_activity = time.time()
+        return data, end, lost, reset
 
     def read(self):
         """Return and clear buffered output."""
@@ -2592,6 +2815,18 @@ class SSHSession(object):
         # to deliver also signals.
         self._signal()
 
+    def _more_output_soon(self):
+        """True if the PTY produces more output within
+        PASSWORD_PROMPT_QUIET_SECONDS. Used only while a prompt-shaped
+        line is on screen: a real prompt is followed by silence, a banner
+        by more banner. Nothing is read here - the loop picks it up."""
+        try:
+            r, _, _ = select.select([self.master_fd], [], [],
+                                    PASSWORD_PROMPT_QUIET_SECONDS)
+        except (ValueError, OSError):
+            return True
+        return bool(r)
+
     def _disarm_password(self, why):
         """Forget the stored password without ever typing it. See
         PASSWORD_ARM_MAX_BYTES."""
@@ -2612,6 +2847,11 @@ class SSHSession(object):
         if (getattr(self, "_password", None) and not self._password_sent
                 and data.strip(b"\r\n\t ")):
             self._disarm_password("user input")
+        # ...and once they type, what the remote prints is the answer to
+        # THEIR command: "Permission denied" from `ls /root` is not ssh
+        # rejecting the password we typed.
+        if getattr(self, "_auth_watch_until", 0) and data.strip(b"\r\n\t "):
+            self._auth_watch_until = 0
         if self.master_fd < 0:
             # No PTY ever attached (or already closed) — treat as dead.
             self.alive = False
@@ -2711,12 +2951,21 @@ class SSHSession(object):
         return bool(self._control_path) and os.path.exists(self._control_path)
 
     def _mux_argv(self, remote_cmd):
-        """argv for a one-shot remote command over the ControlMaster."""
+        """argv for a one-shot remote command over the ControlMaster.
+
+        sshd hands the command string to the remote user's LOGIN shell,
+        which may be zsh, fish or csh. Every snippet here is POSIX sh, and
+        under zsh's default NOMATCH the listing's `for f in * .[!.]* ..?*`
+        aborted with "no matches found: ..?*" whenever one pattern matched
+        nothing - i.e. almost always - so the file browser could not list
+        any directory for a zsh user (the macOS default). Running it as
+        `exec sh -c '<snippet>'` makes the login shell parse one quoted
+        word and nothing else; the snippet itself always runs in sh."""
         return [
             "ssh", "-T",
             "-o", "BatchMode=yes",
             "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
+            "--", self._host, "exec sh -c " + shlex.quote(remote_cmd),
         ]
 
     def _mux_run(self, remote_cmd, timeout, timeout_msg,
@@ -2939,18 +3188,26 @@ class SSHSession(object):
             return False, "client sent fewer bytes than Content-Length"
         return True, ""
 
-    def finalize_upload(self, tmp_name, final_name):
-        """Move $HOME/<tmp_name> into the foreground tmux pane's cwd
+    def finalize_upload(self, tmp_name, final_name, dest_dir=None):
+        """Move $HOME/<tmp_name> into a directory on the remote host
         with auto-increment-on-conflict — without typing into the
-        foreground PTY. Persistent-only: tmux's own `#{pane_current_path}`
-        format variable is the cross-platform way to know the pane's
-        current working directory, so we don't need /proc introspection.
+        foreground PTY.
 
-        Returns (ok, final_path_or_error). For non-persistent sessions
-        returns (False, 'non-persistent') so the caller can fall back
-        to a client-side foreground mv (which has its own alt-screen
-        guard for vim/less/htop)."""
-        if not self.persistent or not self.slot_id:
+        dest_dir is an absolute remote path (the directory the file
+        browser is showing) — validated by the caller. Without one the
+        destination is the foreground tmux pane's cwd, read from tmux's
+        own `#{pane_current_path}`, which is the cross-platform way to
+        learn it without /proc introspection; that path is
+        persistent-only and returns (False, 'non-persistent') for other
+        sessions so the caller can fall back to a client-side foreground
+        mv (which has its own alt-screen guard for vim/less/htop).
+
+        An explicit dest_dir needs no tmux — only the ControlMaster
+        side-channel every session has — so uploads aimed at a chosen
+        directory are keystroke-free for non-persistent panes too.
+
+        Returns (ok, final_path_or_error)."""
+        if dest_dir is None and (not self.persistent or not self.slot_id):
             return False, "non-persistent"
         if not self._mux_ready():
             return False, "control socket not ready"
@@ -2960,10 +3217,21 @@ class SSHSession(object):
         # decoded values land in shell vars and never touch the parser.
         b_tmp = base64.b64encode(tmp_name.encode("utf-8")).decode("ascii")
         b_final = base64.b64encode(final_name.encode("utf-8")).decode("ascii")
-        target = "websh-" + self.slot_id
+        target = "websh-" + (self.slot_id or "")
+
+        if dest_dir is not None:
+            # The caller named the directory: decode it into $cwd the same
+            # way as every other name, so a directory with spaces, quotes
+            # or a newline in it is never parsed as shell syntax.
+            b_dir = base64.b64encode(dest_dir.encode("utf-8")).decode("ascii")
+            cwd_expr = _sh_b64('c', b_dir) + '; cwd="$c"; '
+        else:
+            cwd_expr = ('cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
+                        ' "#{pane_current_path}" 2>/dev/null); '
+                        '[ -n "$cwd" ] || cwd="$HOME"; ')
 
         # One ssh roundtrip via ControlMaster:
-        #   1. ask tmux for the pane's cwd (cross-platform)
+        #   1. resolve the destination directory (named, or the pane's)
         #   2. fall back to $HOME if tmux didn't tell us
         #   3. cd there
         #   4. find a non-colliding final name with the same ext-aware
@@ -2974,11 +3242,15 @@ class SSHSession(object):
         #      surface it to the user
         remote_cmd = (
             _sh_b64('t', b_tmp) + '; ' +
-            _sh_b64('f', b_final) + '; '
-            'cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
-                ' "#{pane_current_path}" 2>/dev/null); '
-            '[ -n "$cwd" ] || cwd="$HOME"; '
-            'cd -- "$cwd" || exit 1; '
+            _sh_b64('f', b_final) + '; ' +
+            cwd_expr +
+            # Distinct exit codes, because the shells disagree about the
+            # wording: dash's cd says "can't cd to /x" with no errno at
+            # all, where bash says "No such file or directory". Deciding
+            # here keeps the reason (and its HTTP status) the same on
+            # every remote.
+            '[ -d "$cwd" ] || exit 3; '
+            'cd -- "$cwd" || exit 4; '
             'b="${f%.*}"; e="${f##*.}"; '
             'if [ "$b.$e" = "$f" ]; then '
                 'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; '
@@ -2991,11 +3263,20 @@ class SSHSession(object):
                 # mangling and the name(1)(2)(3) accumulation.
                 'o="$f"; n=1; while [ -e "$f" ]; do f="$o($n)"; n=$((n+1)); done; '
             'fi; '
-            'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
+            'mv -- "$HOME/$t" "./$f" || exit 5; printf %s "$cwd/$f"'
         )
         proc, err = self._mux_run(remote_cmd, 15, "finalize timeout")
         if err:
             return False, err
+        if proc.returncode == 3:
+            return False, "no such file or directory"
+        if proc.returncode == 4:
+            return False, _remote_errno_text(proc.stderr, "permission denied")
+        if proc.returncode == 5:
+            # mv's own message carries the errno (busybox and coreutils
+            # both), so the user sees "Permission denied" / "Read-only
+            # file system" rather than an exit code.
+            return False, _remote_errno_text(proc.stderr, "move failed")
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "finalize exit %d: %s" % (proc.returncode, err)
@@ -3168,7 +3449,15 @@ class SSHSession(object):
         # filename that begins with a dash.
         remote_cmd = (
             _sh_b64('P', b64) + '; '
-            '[ -e "$P" ] || [ -L "$P" ] || exit 3; '
+            # Exit 3 ("already gone") only when the entry's directory is
+            # there and searchable: `[ -e ]` and `[ -L ]` are also both
+            # false when stat fails with EACCES/ESTALE, and reporting that
+            # as a successful delete left the file in place under an
+            # "Already deleted" toast. Anything else is exit 6.
+            'if ! [ -e "$P" ] && ! [ -L "$P" ]; then '
+              'D="${P%/*}"; [ -n "$D" ] || D=/; '
+              '[ -d "$D" ] && [ -x "$D" ] && exit 3; exit 6; '
+            'fi; '
             'if [ -d "$P" ] && [ ! -L "$P" ]; then '
               'rmdir -- "$P" || exit 5; '
             'else '
@@ -3185,6 +3474,8 @@ class SSHSession(object):
             # a retry after a lost response say "Delete failed" about a
             # delete that had succeeded.
             return True, "already gone"
+        if proc.returncode == 6:
+            return False, "permission denied"
         return False, _remote_errno_text(
             proc.stderr, "delete failed (exit %d)" % proc.returncode)
 
@@ -3264,7 +3555,16 @@ class SSHSession(object):
               '*) F="$HOME/$P";; '
             'esac; '
             'if [ -f "$F" ]; then '
-              'SZ=$(stat -c%s "$F" 2>/dev/null || stat -f%z "$F" 2>/dev/null || printf -- -1); '
+              # -L: measure what cat will stream. `[ -f ]` follows a
+              # symlink but plain stat reports the LINK's size, so a 12-byte
+              # link to a 100 KB file sent Content-Length: 12 and the
+              # browser saved 12 bytes as "Download complete".
+              'SZ=$(stat -L -c%s "$F" 2>/dev/null || stat -L -f%z "$F" 2>/dev/null || printf -- -1); '
+              # procfs/sysfs files report size 0 but have content
+              # (/proc/cpuinfo): a declared length of 0 made the browser
+              # save an empty file. Stream those with no declared length;
+              # a truly empty file then simply ends at once.
+              '[ "$SZ" = 0 ] && SZ=-1; '
               'printf "OK\\t%s\\n" "$SZ"; '
               'cat -- "$F"; '
             'else printf "ERR\\tFile not found\\n"; fi'
@@ -3426,6 +3726,22 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return sel
 
+    def _output_cursor(self, params):
+        """The reader's output cursor, or None for a legacy (cursor-less)
+        reader. SSE's Last-Event-ID wins over ?since: EventSource re-sends
+        its ORIGINAL URL on an automatic reconnect, but carries the id of
+        the last event it actually received in that header."""
+        raw = self.headers.get("Last-Event-ID")
+        if raw is None or not raw.strip():
+            raw = params.get("since", [None])[0]
+        if raw is None:
+            return None
+        try:
+            v = int(str(raw).strip())
+        except ValueError:
+            return None
+        return v if v >= 0 else None
+
     def _client_gone(self):
         """Return True if the peer has half-closed (sent FIN) or the
         socket has otherwise died. Non-blocking peek; if there's nothing
@@ -3581,6 +3897,7 @@ class Handler(BaseHTTPRequestHandler):
         allowed.discard("")
         if o_host in allowed:
             return False
+        _warn_proxy_host_once(self.headers.get("Host") or "", o_host)
         self._json({"error": "cross-site request refused"}, 403)
         return True
 
@@ -3711,6 +4028,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             getattr(self, name)()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            # The client went away mid-request: a closed tab, a cancelled
+            # upload, a long-poll the browser dropped (_output re-raises
+            # after unread() on purpose). Routine, not a server fault -
+            # it was logged as "[ERROR] unhandled error", and a 500 was
+            # then written into the dead socket.
+            _log("INFO", "client went away during {} for {}: {}".format(
+                name, self._client_ip(), type(e).__name__))
         except Exception as e:
             # Last line of defence. An exception escaping a handler used
             # to reach the worker's handle_error: traceback on stderr,
@@ -3828,7 +4153,11 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _valid_sid(self, sid):
-        return bool(sid and _UUID_RE.match(sid))
+        # A JSON body can carry any type here. re.match raises TypeError
+        # on a list/dict/int, which the dispatch backstop turned into a
+        # 500 (and an ERROR log line) for every session endpoint - a
+        # request that should simply be told "no such session".
+        return isinstance(sid, str) and bool(sid) and bool(_UUID_RE.match(sid))
 
     def _require_session(self, sid):
         """Validate `sid`, look it up, and reply 404 when it does not name
@@ -3873,6 +4202,12 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     # ── Vault save / delete ─────────────────────────────────────────
+
+    def _reply_creds_unreadable(self, event):
+        _access_log_emit(event, self._client_ip(), result="error",
+                         error="creds_unreadable")
+        self._json({"error": "credential store temporarily unavailable",
+                    "code": "creds_unreadable"}, 503)
 
     def _reply_vault_unavailable(self):
         """The shared 501 for every vault-gated path; pairs with
@@ -3957,6 +4292,9 @@ class Handler(BaseHTTPRequestHandler):
             # to a different (vault_id, conn_id) slot could read the same
             # pre-state and clobber our update on its own save.
             data = _load_creds()
+            if _creds_unreadable is not None:
+                self._reply_creds_unreadable("save")
+                return
             new_vaults = dict(data.get("vaults", {}))
             slot = dict(new_vaults.get(vault_id, {}))
             slot[conn_id] = rec
@@ -3989,6 +4327,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         with _creds_lock:
             data = _load_creds()
+            if _creds_unreadable is not None:
+                # Not "not found": the entry may well be in the file we
+                # cannot read, and a client would drop its card on a 404.
+                self._reply_creds_unreadable("save_delete")
+                return
             slot = dict(data.get("vaults", {}).get(vault_id, {}))
             if conn_id not in slot:
                 self._json({"error": "not found"}, 404)
@@ -4076,6 +4419,12 @@ class Handler(BaseHTTPRequestHandler):
                             "detail": "vault_key must be 32 bytes"}, 400)
                 return
             data = _load_creds()
+            if _creds_unreadable is not None:
+                # The entry may exist in the file we cannot read; "not
+                # found" would send the client down its vault_not_found
+                # path (a stale card) for what is an operator problem.
+                self._reply_creds_unreadable("connect")
+                return
             rec = data.get("vaults", {}).get(sv_vault, {}).get(sv_conn)
             if rec is None:
                 _access_log_emit("connect", ip, result="cred_not_found",
@@ -4402,6 +4751,7 @@ class Handler(BaseHTTPRequestHandler):
         session = self._require_session(sid)
         if session is None:
             return
+        cursor = self._output_cursor(params)
 
         # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
         # early if the client hung up so we don't drain bytes into a
@@ -4419,24 +4769,37 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 if self._client_gone():
                     return
-                data = session.read()
-                if data:
+                extra = {}
+                if cursor is None:
+                    data = session.read()
+                else:
+                    data, nxt, lost, reset = session.read_since(cursor)
+                    extra = {"cursor": nxt}
+                    if lost or reset:
+                        extra.update({"lost": lost, "reset": reset})
+                if data or len(extra) > 1:
                     # If the client hung up between read() and write(), we
                     # would still lose these bytes — push them back on
-                    # failure so the next /api/output picks them up.
+                    # failure so the next /api/output picks them up
+                    # (legacy readers; a cursor reader asks again).
+                    body = {
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                    }
+                    body.update(extra)
                     try:
-                        self._json({
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "alive": session.alive,
-                            "auth_failed": session.auth_failed,
-                        })
+                        self._json(body)
                     except (BrokenPipeError, ConnectionResetError, OSError):
-                        session.unread(data)
+                        if cursor is None:
+                            session.unread(data)
                         raise
                     return
                 if not session.alive:
-                    self._json({"data": "", "alive": False,
-                                "auth_failed": session.auth_failed})
+                    body = {"data": "", "alive": False,
+                            "auth_failed": session.auth_failed}
+                    body.update(extra)
+                    self._json(body)
                     return
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -4449,8 +4812,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        self._json({"data": "", "alive": session.alive,
-                    "auth_failed": session.auth_failed})
+        body = {"data": "", "alive": session.alive,
+                "auth_failed": session.auth_failed}
+        if cursor is not None:
+            body["cursor"] = cursor
+        self._json(body)
 
     def _stream(self):
         """SSE: stream output as 'data' events until session dies or client
@@ -4518,7 +4884,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            self._stream_session(session)
+            self._stream_session(session, self._output_cursor(params))
         finally:
             # Release the per-session stream slot regardless of how the
             # body exited (clean end, BrokenPipe, exception). Done under
@@ -4527,8 +4893,15 @@ class Handler(BaseHTTPRequestHandler):
             with sessions_lock:
                 session._stream_active = False
 
-    def _stream_session(self, session):
-        """Body of /api/stream once the per-session slot is held."""
+    def _stream_session(self, session, cursor=None):
+        """Body of /api/stream once the per-session slot is held.
+
+        With a cursor (current clients) output is read with read_since():
+        nothing is consumed, every data event carries `cursor` and an SSE
+        `id:` of the offset after it, and a write that silently went
+        nowhere costs nothing - the next connection asks again from the
+        client's own cursor. Without one (older cached clients) the
+        original destructive read()/unread() path is used unchanged."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -4555,13 +4928,16 @@ class Handler(BaseHTTPRequestHandler):
             # healthy channel delivers it instantly even on a session
             # that has nothing to print yet (idle reconnect, quiet tmux
             # pane, long-running command with no output).
-            primer = json.dumps({
+            primer = {
                 "data": "",
                 "alive": session.alive,
                 "auth_failed": session.auth_failed,
-            })
+            }
+            if cursor is not None:
+                primer["cursor"] = cursor
             self.wfile.write(
-                ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
+                ("event: data\ndata: " + json.dumps(primer) + "\n\n")
+                .encode("utf-8"))
             self.wfile.flush()
             # Connecting to /api/stream is itself proof of user interest in
             # the session. Without this bump, a quiet pane (idle vim, idle
@@ -4589,18 +4965,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 if self._client_gone():
-                    if data:
+                    if data and cursor is None:
                         session.unread(data)
                     return
-                data = session.read()
-                if data:
-                    payload = json.dumps({
+                extra = {}
+                if cursor is None:
+                    data = session.read()
+                else:
+                    data, nxt, lost, reset = session.read_since(cursor)
+                    if lost or reset:
+                        extra = {"lost": lost, "reset": reset}
+                    if not data and not extra:
+                        nxt = cursor
+                if data or extra:
+                    body = {
                         "data": base64.b64encode(data).decode("ascii"),
                         "alive": session.alive,
                         "auth_failed": session.auth_failed,
-                    })
+                    }
+                    head = "event: data\n"
+                    if cursor is not None:
+                        body["cursor"] = nxt
+                        body.update(extra)
+                        # EventSource sends this back as Last-Event-ID on
+                        # its automatic reconnect.
+                        head = "id: {}\n".format(nxt) + head
+                        cursor = nxt
                     self.wfile.write(
-                        ("event: data\ndata: " + payload + "\n\n")
+                        (head + "data: " + json.dumps(body) + "\n\n")
                         .encode("utf-8"))
                     self.wfile.flush()
                     last_send = time.time()
@@ -4629,16 +5021,22 @@ class Handler(BaseHTTPRequestHandler):
                                       selector=sel)
 
             # Drain any remaining buffered output before sending 'end'.
-            tail = session.read()
+            head = "event: data\n"
+            tbody = {"alive": False, "auth_failed": session.auth_failed}
+            if cursor is None:
+                tail = session.read()
+            else:
+                tail, nxt, lost, reset = session.read_since(cursor)
+                tbody["cursor"] = nxt
+                if lost or reset:
+                    tbody.update({"lost": lost, "reset": reset})
+                head = "id: {}\n".format(nxt) + head
             if tail:
-                payload = json.dumps({
-                    "data": base64.b64encode(tail).decode("ascii"),
-                    "alive": False,
-                    "auth_failed": session.auth_failed,
-                })
+                tbody["data"] = base64.b64encode(tail).decode("ascii")
+                payload = json.dumps(tbody)
                 try:
                     self.wfile.write(
-                        ("event: data\ndata: " + payload + "\n\n")
+                        (head + "data: " + payload + "\n\n")
                         .encode("utf-8"))
                     # Flush before the closing 'end' so a write failure
                     # on a buffered wfile (Python's default makefile in
@@ -4646,7 +5044,8 @@ class Handler(BaseHTTPRequestHandler):
                     # we can unread() the right bytes.
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    session.unread(tail)
+                    if cursor is None:
+                        session.unread(tail)
                     return
             end_payload = json.dumps({
                 "alive": False,
@@ -4658,8 +5057,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Client went away — give back any bytes we drained but
-            # didn't manage to deliver.
-            if data:
+            # didn't manage to deliver (legacy readers only: a cursor
+            # reader simply asks again from its own cursor).
+            if data and cursor is None:
                 session.unread(data)
             return
         finally:
@@ -4800,7 +5200,13 @@ class Handler(BaseHTTPRequestHandler):
         path on success, or `non-persistent` so the client knows to
         fall back to its own foreground-mv path.
 
-        Body: { session_id, tmp, final }."""
+        With an explicit `dir` (an absolute remote path — the directory
+        the file browser is showing) the file lands there instead, and
+        the move works for non-persistent sessions too: naming the
+        destination removes the only thing tmux was needed for. It grants
+        no new access — the same user could `mv` there from the shell.
+
+        Body: { session_id, tmp, final, dir? }."""
         if self._side_channel_throttled():
             return
         body = self._json_body()
@@ -4809,6 +5215,7 @@ class Handler(BaseHTTPRequestHandler):
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
         final = body.get("final", "")
+        dest_dir = body.get("dir", None)
         # Order pinned by the dispatch tests: sid shape, then tmp/final
         # validation, then registry existence.
         if not self._valid_sid(sid):
@@ -4824,10 +5231,16 @@ class Handler(BaseHTTPRequestHandler):
                 or "/" in final or "\x00" in final or final in ("..", ".")):
             self._json({"error": "invalid final"}, 400)
             return
+        # Same rules as rm/mkdir/mv: absolute, no NUL, not bare "/"-padding.
+        # A non-string (or a relative path) is a client bug, not a request
+        # to fall back to the pane's cwd - reject it rather than guess.
+        if dest_dir is not None and self._bad_dest_dir(dest_dir):
+            self._json({"error": "invalid dir"}, 400)
+            return
         session = self._require_session(sid)
         if session is None:
             return
-        ok, msg = session.finalize_upload(tmp, final)
+        ok, msg = session.finalize_upload(tmp, final, dest_dir)
         if not ok:
             # `non-persistent` is an expected, non-error outcome —
             # surface it with 200 so the client can branch cleanly
@@ -4835,9 +5248,18 @@ class Handler(BaseHTTPRequestHandler):
             if msg == "non-persistent":
                 self._json({"ok": False, "non_persistent": True})
                 return
-            self._json({"error": msg}, 502)
+            _access_log_emit("upload_place", self._client_ip(), sid=sid,
+                             target_host=getattr(session, "_host", ""),
+                             path=dest_dir or "", result="error", error=msg)
+            self._json({"error": msg}, _side_channel_status(msg))
             return
         session.last_activity = time.time()
+        # Where the bytes ended up. /api/upload logs the staging name in
+        # $HOME; without this the audit trail stopped short of the file's
+        # real resting place, which the client now gets to choose.
+        _access_log_emit("upload_place", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=msg, result="ok")
         self._json({"ok": True, "path": msg})
 
     def _upload_cancel(self):
@@ -4912,11 +5334,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # Absolute-only: the file browser always has a resolved path, and
         # refusing everything else keeps this endpoint from quietly
-        # deleting a $HOME-relative name the caller didn't mean. The
-        # bare-root check stops a delete that could only be a bug.
-        if (not isinstance(path, str) or not path.startswith("/")
-                or "\x00" in path or path.rstrip("/") == ""):
+        # deleting a $HOME-relative name the caller didn't mean.
+        if self._bad_abs_path(path):
             self._json({"error": "invalid path"}, 400)
+            return
+        if self._refuse_undecodable(path):
             return
         session = self._require_session(sid)
         if session is None:
@@ -4939,12 +5361,34 @@ class Handler(BaseHTTPRequestHandler):
         session.last_activity = time.time()
         self._json({"ok": True, "already_gone": True} if gone else {"ok": True})
 
+    def _refuse_undecodable(self, path):
+        """list_dir decodes remote names that are not valid UTF-8 with
+        U+FFFD replacements, so such a row can never name its file again:
+        a delete used to find nothing and report "already deleted" with
+        the file still there, rename said 404, download "not found". Say
+        what is actually wrong instead. Returns True when refused."""
+        if isinstance(path, str) and "\ufffd" in path:
+            self._json({"error": "this name is not valid UTF-8 and cannot "
+                        "be handled here - use the terminal",
+                        "code": "undecodable_name"}, 400)
+            return True
+        return False
+
     @staticmethod
     def _bad_abs_path(path):
         """True when `path` is not usable as an absolute remote path.
-        Shared by the mutating side-channel endpoints (rm/mkdir/mv)."""
+        Shared by the mutating side-channel endpoints (rm/mkdir/mv). The
+        bare-root rule stops an rm/mv of "/" that could only be a bug."""
         return (not isinstance(path, str) or not path.startswith("/")
                 or "\x00" in path or path.rstrip("/") == "")
+
+    @staticmethod
+    def _bad_dest_dir(path):
+        """True when `path` cannot be an upload destination. Unlike
+        _bad_abs_path this accepts "/": root's home is a legitimate place
+        to put a file, and the browser can show it."""
+        return (not isinstance(path, str) or not path.startswith("/")
+                or "\x00" in path or len(path) > 4096)
 
     @staticmethod
     def _bad_name(name):
@@ -5000,6 +5444,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._bad_abs_path(path):
             self._json({"error": "invalid path"}, 400)
             return
+        if self._refuse_undecodable(path):
+            return
         if self._bad_name(name):
             self._json({"error": "invalid name"}, 400)
             return
@@ -5030,6 +5476,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if not path or "\x00" in path:
             self._json({"error": "invalid path"}, 400)
+            return
+        if self._refuse_undecodable(path):
             return
         session = self._require_session(sid)
         if session is None:
@@ -5117,6 +5565,17 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = os.read(out_fd, BUF)
                 if not chunk:
                     break
+                if content_length is not None and sent + len(chunk) > content_length:
+                    # The file grew after stat. Bytes past the declared
+                    # Content-Length would corrupt the HTTP stream (the
+                    # client reads them as the next response); send what
+                    # was announced and stop.
+                    chunk = chunk[:content_length - sent]
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    sent += len(chunk)
+                    proc.kill()
+                    break
                 sent += len(chunk)
                 # Hard ceiling on bytes actually streamed. The upfront 413
                 # only fires when stat reported a size; when stat failed
@@ -5170,6 +5629,15 @@ class Handler(BaseHTTPRequestHandler):
 
         sid = body.get("session_id", "")
         terminate = bool(body.get("terminate", False))
+        # Type check first: a list is unhashable and sessions.get() would
+        # raise before the lookup even happens. Disconnect is idempotent -
+        # an id that names nothing gets the same {"ok": true} as one that
+        # was already gone - so something that isn't a string is answered
+        # the same way, not as a 500. (Only the type, not the UUID shape:
+        # this endpoint looks the key up as-is, and must keep doing so.)
+        if not isinstance(sid, str):
+            self._json({"ok": True})
+            return
         with sessions_lock:
             session = sessions.get(sid)
             if (session is not None and WEBSH_AUTH_HEADER
@@ -5547,6 +6015,13 @@ def main():
     load_config()
     if _config_rejected:
         _log("ERROR", "refusing to start: " + _config_rejected)
+        raise SystemExit(1)
+    if _config_unusable and _config_unusable != "file not found":
+        # A config that is named but can't be loaded at startup has no
+        # earlier good version to fall back on: say so loudly instead of
+        # serving a locked (or, before, a wide-open) proxy.
+        _log("ERROR", "refusing to start: WEBSH_CONFIG={} is unusable: {}".format(
+            os.environ.get("WEBSH_CONFIG", ""), _config_unusable))
         raise SystemExit(1)
     _warn_ignored_server_knobs()
     _warn_per_ip_misconfig()

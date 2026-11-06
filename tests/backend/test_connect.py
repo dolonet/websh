@@ -1083,7 +1083,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("alice", "tmux", 0)
         self.assertEqual(
             cmd,
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
             ' \\; set -g mouse on'
             ' \\; set -g status off')
 
@@ -1103,7 +1103,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertIn("-ge 3600", cmd)  # the TTL comparison
         # Ends with the exec so the login shell doesn't linger.
         self.assertTrue(cmd.rstrip().endswith(
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
             ' \\; set -g mouse on'
             ' \\; set -g status off'))
 
@@ -1202,22 +1202,23 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("ok", "tmux", 3600)
         self.assertIn("has-session -t websh-ok 2>/dev/null || exit", cmd)
 
-    def test_tmux_options_chained_after_new_session(self):
-        """Per-connect tmux options are tacked onto the same `tmux …`
-        invocation via `\\;`, so they apply to the global tmux server
-        whether the session was newly created or re-attached. `set -g
-        mouse on` is part of the baseline (hardcoded, not via the
-        options list) so the chain starts with it before user options."""
+    def test_tmux_options_chained_before_new_session(self):
+        """Per-connect tmux options ride in the same `tmux …` invocation
+        via `\\;` and come BEFORE new-session: history-limit is read only
+        when a pane is created, so set after new-session it never reached
+        the pane (TestScrollbackReachesTheNewPane runs this for real).
+        start-server first, because `set -g` needs a server."""
         cmd = server._build_remote_command(
             "ok", "tmux", 0,
             tmux_options=[("set-clipboard", "on"),
                           ("history-limit", "100000")])
         self.assertIn(
-            'new-session -A -D -s websh-ok -- "$SHELL" -l'
-            ' \\; set -g mouse on'
-            ' \\; set -g status off'
+            'tmux start-server'
             ' \\; set -g set-clipboard on'
-            ' \\; set -g history-limit 100000',
+            ' \\; set -g history-limit 100000'
+            ' \\; new-session -A -D -s websh-ok -- "$SHELL" -l'
+            ' \\; set -g mouse on'
+            ' \\; set -g status off',
             cmd)
 
     def test_mouse_on_baked_into_command(self):
@@ -1404,6 +1405,59 @@ class TestBuildSshCommand(unittest.TestCase):
         })._build_ssh_cmd("example.com", 22, "alice")
         self.assertEqual(self._option_values(cmd, "ConnectTimeout"), ["30"])
 
+
+class TestSessionUsesOnlyTheWebUsersCredentials(unittest.TestCase):
+    """A manual /api/connect needs only a host and a username. ssh used
+    to add whatever the websh host had - the service account's agent
+    (SSH_AUTH_SOCK was inherited) and its default ~/.ssh/id_* keys - so
+    a visitor who typed no password got a shell wherever the OPERATOR's
+    keys are authorized. Checked through `ssh -G`, i.e. what ssh itself
+    would actually use."""
+
+    def _session(self, key_file=None, ssh_options=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._ssh_options, _ = server._filter_ssh_options(ssh_options or {})
+        s._key_file = key_file
+        s._control_path = "/tmp/websh-test.sock"
+        s.persistent = False
+        s.slot_id = None
+        s.tmux_cmd = "tmux"
+        s._tmux_options = []
+        return s
+
+    def _effective(self, cmd):
+        # Resolve the exact argv with `ssh -G` (no network).
+        argv = ["ssh", "-G"] + [a for a in cmd[1:] if a != "--"]
+        env = dict(os.environ, SSH_AUTH_SOCK="/tmp/operator-agent.sock")
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             env=env, timeout=10).stdout
+        conf = {}
+        for line in out.splitlines():
+            k, _, v = line.partition(" ")
+            conf.setdefault(k, []).append(v)
+        return conf
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs OpenSSH")
+    def test_password_session_offers_no_key_and_no_agent(self):
+        conf = self._effective(self._session()._build_ssh_cmd("h.example", 22, "alice"))
+        self.assertEqual(conf["pubkeyauthentication"], ["false"])
+        self.assertEqual(conf["identityagent"], ["none"])
+        self.assertEqual(conf["identitiesonly"], ["yes"])
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs OpenSSH")
+    def test_key_session_offers_only_the_supplied_key(self):
+        fd, key = tempfile.mkstemp(suffix=".pem")
+        os.close(fd)
+        try:
+            conf = self._effective(
+                self._session(key_file=key)._build_ssh_cmd("h.example", 22, "alice"))
+        finally:
+            os.unlink(key)
+        self.assertEqual(conf["pubkeyauthentication"], ["true"])
+        self.assertEqual(conf["identityagent"], ["none"])
+        self.assertEqual(conf["identitiesonly"], ["yes"])
+        self.assertEqual(conf["identityfile"], [key],
+                         "no default ~/.ssh/id_* next to the supplied key")
 
 class TestRestrictHostsDoesNotFeedScanPattern(LiveServerCase):
     """Integration: under restrict_hosts: true, a manual /api/connect
@@ -1701,6 +1755,85 @@ class TestHeaderTrustAuth(unittest.TestCase):
             import shutil as _sh
             _sh.rmtree(d, ignore_errors=True)
 
+
+
+class TestFailedSpawnLeavesNothingBehind(unittest.TestCase):
+    """SSHSession.__init__ writes the private key to a 0600 temp file (and
+    opens the recording) BEFORE pty.fork(). If the fork raised, the
+    exception escaped the constructor, the caller never got a session to
+    close, and the key file stayed on disk for the life of the host."""
+
+    def test_key_file_is_removed_when_fork_fails(self):
+        import glob
+        import tempfile
+        tmp = tempfile.gettempdir()
+        before = set(glob.glob(os.path.join(tmp, "websh_key_*.pem")))
+        with unittest.mock.patch.object(server.pty, "fork",
+                                        side_effect=OSError(11, "EAGAIN")):
+            with self.assertRaises(OSError):
+                server.SSHSession("sid-leak", "h.example", 22, "alice", None,
+                                  80, 24, key="-----BEGIN KEY-----\nabc\n-----END KEY-----")
+        after = set(glob.glob(os.path.join(tmp, "websh_key_*.pem")))
+        self.assertEqual(after - before, set(),
+                         "private key left on disk after a failed spawn")
+
+    def test_close_after_failed_fork_does_not_touch_a_child(self):
+        # No fork happened, so there is no pid to signal: close() must
+        # not try to kill/reap anything.
+        with unittest.mock.patch.object(server.pty, "fork",
+                                        side_effect=OSError(11, "EAGAIN")), \
+             unittest.mock.patch.object(server.os, "kill") as kill:
+            with self.assertRaises(OSError):
+                server.SSHSession("sid-leak2", "h.example", 22, "alice", "pw",
+                                  80, 24)
+        kill.assert_not_called()
+
+
+class TestScrollbackReachesTheNewPane(unittest.TestCase):
+    """tmux applies history-limit only when a pane is created. The remote
+    command used to run `new-session ... \\; set -g history-limit N`, so
+    the new pane kept the old limit and the Scrollback setting did
+    nothing. Run the real command against a real tmux - on a PRIVATE
+    socket (-L) with $TMUX cleared, never the user's server."""
+
+    @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+    def test_history_limit_is_in_effect_for_the_created_pane(self):
+        import pty
+        sock = "websh-test-%d" % os.getpid()
+        tmux = "tmux -L " + sock
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env["SHELL"] = "/bin/sh"
+        # ssh provides TERM remotely; CI has no controlling terminal.
+        env["TERM"] = "xterm-256color"
+        cmd = server._build_remote_command(
+            "slotx", tmux, 0, [("history-limit", "77777")])
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe("sh", ["sh", "-c", cmd], env)
+        try:
+            limit = ""
+            deadline = time.time() + 10
+            while time.time() < deadline and limit.strip() != "77777":
+                time.sleep(0.2)
+                limit = subprocess.run(
+                    ["tmux", "-L", sock, "display", "-p", "-t", "websh-slotx",
+                     "#{history_limit}"],
+                    capture_output=True, text=True, env=env).stdout
+            self.assertEqual(limit.strip(), "77777")
+        finally:
+            subprocess.run(["tmux", "-L", sock, "kill-server"],
+                           capture_output=True, env=env)
+            try:            # a killed server may leave its socket file
+                os.unlink(os.path.join(env.get("TMUX_TMPDIR", "/tmp"),
+                                       "tmux-%d" % os.getuid(), sock))
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+            os.close(fd)
 
 if __name__ == "__main__":
     unittest.main()

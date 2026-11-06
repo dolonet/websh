@@ -41,12 +41,11 @@ had a brief disconnect.
 
 ## Per-connect tmux options
 
-Every persistent connect runs `tmux new-session … \; set -g …` so a
-small set of tmux options is applied uniformly regardless of what's on
-the target host. Mouse mode is baked in unconditionally; two toggles in
-the Options panel are user-configurable and also pushed into running
-panes the moment you change them, so the new behaviour takes effect
-without a reconnect:
+Every persistent connect runs `tmux start-server \; set -g … \; new-session …`
+so a small set of tmux options is applied uniformly regardless of what's
+on the target host. Mouse mode is baked in unconditionally; two toggles
+in the Options panel are user-configurable and also pushed into the
+running tmux server the moment you change them:
 
 - **Mouse** (always on, no toggle) — `set -g mouse on`. Wheel scrolls
   tmux scrollback in shell; alt-screen apps (vim, less, htop) get raw
@@ -56,7 +55,10 @@ without a reconnect:
   selections are pushed to the system clipboard via OSC52 (xterm.js
   ships them on).
 - **Scrollback** (number) — `history-limit` (default 100 000). How
-  many lines per pane tmux retains.
+  many lines per pane tmux retains. tmux fixes this when a pane is
+  created, so it is set before `new-session`; a change in Options applies
+  to sessions created from then on, while an already-open session keeps
+  the size it started with (a tmux limitation).
 
 The server accepts user-configurable options only via a fixed
 allow-list (`set-clipboard`, `history-limit` clamped to 100..10 M);

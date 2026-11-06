@@ -45,7 +45,7 @@ and logged as a `WARN` at startup (as is any name no knob reads):
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
-| `WEBSH_CONFIG` | *(unset)* | Path to `websh.json`. `server.py` loads a config only when this is set; the PHP proxy computes a default (`../../websh.json`). |
+| `WEBSH_CONFIG` | *(unset)* | Path to `websh.json`. `server.py` loads a config only when this is set; the PHP proxy computes a default (`../../websh.json`). A path that does not exist means "no config". A file that exists but cannot be read or parsed stops the server from starting; if it breaks while the server runs, the last version that loaded stays in force (logged at ERROR) until it is fixed - it never falls back to the permissive empty config. |
 | `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`). The bundled `websh.service` and Docker image ship the dependency and a writable creds path, so enabling the vault there is a one-line opt-in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | **Env-only.** Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. If the file is edited into that state while the server runs, the config is served as empty and one `ERROR` is logged per file version. See [`encryption.md`](encryption.md). |
@@ -55,6 +55,7 @@ and logged as a `WARN` at startup (as is any name no knob reads):
 | `MAX_UPLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/upload` (bytes) |
 | `MAX_DOWNLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/download` (bytes); the browser accumulates the stream into a Blob, so this also protects the tab |
 | `UPLOAD_TIMEOUT` | `1800` | Seconds before the side-channel ssh for an in-flight upload is killed |
+| `OUTPUT_REPLAY_BYTES` | `524288` (512 KiB) | Per-session replay window for lossless reconnect: a client that reconnects with its output cursor gets everything produced since, as long as it is still within this window (older bytes are reported to it as lost). Min 4096. |
 | `TRANSFER_IDLE_TIMEOUT` | `60` | Seconds to wait for the side-channel ssh to produce the download header / next chunk, or to accept the next upload chunk, before the helper is killed (download → `504`, upload → error). Bounds a wedged ControlMaster, which otherwise pinned a worker thread for the life of the session. |
 | `MAX_BODY_SIZE` | `8388608` (8 MiB) | Cap on the in-memory request body for control/JSON endpoints (connect, input, resize, save, …); stops a bogus Content-Length from buffering gigabytes into RAM |
 | `WEBSH_MAX_THREADS` | `4 × (MAX_SESSIONS + MAX_BG_SESSIONS) + 64` (`464` at defaults) | Hard cap on concurrent HTTP worker threads. New requests past the cap get an immediate `503 {"error":"busy"}`. Values below `1` are clamped to `1` with a startup WARN; there is no "unlimited" mode by design. |

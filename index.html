@@ -15,6 +15,8 @@
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{
+      color-scheme:dark;   /* native scrollbars, form controls and the
+                              canvas follow the UI, not the OS default */
       --bg:#0d1117;--sf:#161b22;--bd:#30363d;--tx:#e6edf3;--dim:#8b949e;
       --ac:#58a6ff;--ach:#79c0ff;--dg:#f85149;--ok:#3fb950;--wn:#d29922;
       --preview-red:#ff7b72;--preview-yel:#e3b341;--preview-dim:#7d8590;
@@ -67,6 +69,29 @@
     .sv-actions{display:flex;gap:4px;flex-shrink:0;margin-left:8px}
     .sv-btn{padding:4px 10px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--dim);font-size:11px;cursor:pointer;transition:.15s}
     .sv-btn.del:hover{color:var(--dg);background:rgba(248,81,73,.1)}
+    .sv-btn.edit:hover{color:var(--ac);background:rgba(88,166,255,.1)}
+    .sv-btn .ic{width:14px;height:14px;vertical-align:-2px}
+    /* Inline editor inside a saved card: rename without deleting and
+       re-entering the credentials. */
+    .sv.editing{cursor:default;display:block;padding:10px 12px}
+    .sv-edit{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+    .sv-edit input{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:12px;min-width:0}
+    .sv-edit input:focus{outline:none;border-color:var(--ac)}
+    .sv-edit input:disabled{opacity:.5;cursor:not-allowed}
+    .sv-edit .e-name{flex:1 1 100%}
+    .sv-edit .e-user{flex:1 1 90px}
+    .sv-edit .e-host{flex:2 1 150px}
+    .sv-edit .e-port{flex:0 0 68px}
+    /* Note on its own line, buttons right-aligned and sized to content:
+       as one flex row the note was squeezed into a narrow column and
+       Save stretched across the card. */
+    .sv-edit-row{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:8px}
+    /* .panel .btn-p is the full-width Connect button of the login form;
+       the card's buttons live inside that panel and must stay small. */
+    .sv-edit-row .btn,.panel .sv-edit-row .btn-p{flex:0 0 auto;width:auto;padding:5px 16px;font-size:12px;margin-top:0}
+    .sv-edit-note{display:block;margin-top:8px;font-size:11px;color:var(--dim)}
+    .sv-edit-note:empty{display:none}
+    .sv-edit-err{color:var(--dg)}
     .saved-list::-webkit-scrollbar{width:6px}
     .saved-list::-webkit-scrollbar-track{background:transparent}
     .saved-list::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
@@ -129,16 +154,16 @@
     #panes{flex:1;display:flex;overflow:hidden}
     .pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative}
     /* Drag-and-drop upload target: an outline + the reason/instruction. */
-    .pane-reconnect{position:absolute;top:40px;left:50%;transform:translateX(-50%);z-index:15;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid #e5a50a;border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+    .pane-reconnect{align-self:center;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid var(--wn);border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none!important;box-shadow:0 4px 14px rgba(0,0,0,.35)}
     /* Drag-and-drop target. Drawn as its own layer ABOVE the terminal:
        an `outline` on .pane paints under xterm's positioned render
        layers, so only the top (pane bar) and bottom strip of the frame
        were ever visible. ::before = full rounded dashed frame + dimmed,
        slightly blurred backdrop so the card stays legible over busy
        output; ::after = the card. --dz is the accent (amber = refused). */
-    .pane.drop-target{--dz:var(--ac);--dz-rgb:88,166,255}
-    .pane.drop-target.drop-refused{--dz:var(--wn);--dz-rgb:210,153,34}
-    .pane.drop-target::before{content:'';position:absolute;inset:6px;z-index:30;pointer-events:none;
+    .pane.drop-target,.fb-panel.drop-target{--dz:var(--ac);--dz-rgb:88,166,255}
+    .pane.drop-target.drop-refused,.fb-panel.drop-target.drop-refused{--dz:var(--wn);--dz-rgb:210,153,34}
+    .pane.drop-target::before,.fb-panel.drop-target::before{content:'';position:absolute;inset:6px;z-index:30;pointer-events:none;
       border:2px dashed var(--dz);border-radius:10px;
       background:rgba(13,17,23,.72);
       background-image:radial-gradient(ellipse at center,rgba(var(--dz-rgb),.16),rgba(var(--dz-rgb),.04) 70%);
@@ -146,18 +171,32 @@
       animation:dz-in .12s ease-out}
     /* Centered with inset:0 + margin:auto (a left:50% box shrink-wraps to
        half the pane and wrapped the text in narrow splits). */
-    .pane.drop-target::after{content:'\2B06\FE0E  ' attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;z-index:31;pointer-events:none;
+    .pane.drop-target::after,.fb-panel.drop-target::after{content:'\2B06\FE0E  ' attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;z-index:31;pointer-events:none;
       width:max-content;max-width:calc(100% - 48px);height:max-content;text-align:center;
       background:var(--sf);color:var(--tx);border:1px solid var(--dz);border-radius:10px;
       padding:12px 20px;font-size:14px;font-weight:600;letter-spacing:.2px;
       box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 4px rgba(var(--dz-rgb),.14);
       animation:dz-in .12s ease-out}
-    .pane.drop-target.drop-refused::after{content:'\26A0\FE0E  ' attr(data-drop-msg);color:var(--dz);font-weight:500}
+    .pane.drop-target.drop-refused::after,.fb-panel.drop-target.drop-refused::after{content:'\26A0\FE0E  ' attr(data-drop-msg);color:var(--dz);font-weight:500}
     @keyframes dz-in{from{opacity:0}to{opacity:1}}
-    @media (prefers-reduced-motion:reduce){.pane.drop-target::before,.pane.drop-target::after{animation:none}}
+    @media (prefers-reduced-motion:reduce){.pane.drop-target::before,.pane.drop-target::after,
+      .fb-panel.drop-target::before,.fb-panel.drop-target::after{animation:none}}
     .pane.active>.pane-bar{background:var(--sf)}
+    /* Which pane has focus, quietly: its name is in the accent colour
+       instead of dim grey. The bar tint alone was invisible with three
+       or four panes open; a badge or dot would have eaten width from
+       the label, which is already the first thing to be truncated. */
+    .pane.active>.pane-bar>.pane-label{color:var(--ac)}
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
-    .pane-badge{font-size:10px;padding:1px 6px;border-radius:10px;font-weight:500}
+    /* A dot carries the state; the word stays dim. The filled pill put a
+       block of red in the pane bar for every disconnect, and the floating
+       card below already shouts. */
+    .pane-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:500}
+    .pane-badge.s-on,.pane-badge.s-wait,.pane-badge.s-off{background:none;padding:0;color:var(--dim)}
+    .pane-badge::before{content:'';width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--dim)}
+    .pane-badge.s-on::before{background:var(--ok)}
+    .pane-badge.s-wait::before{background:var(--wn)}
+    .pane-badge.s-off::before{background:var(--dg)}
     .pane-label{font-size:11px;color:var(--dim);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .pane-tag{font-size:9px;padding:1px 5px;border-radius:6px;margin-left:4px;background:var(--bd);color:var(--dim);text-transform:uppercase;letter-spacing:.3px;font-weight:600}
     .pane-tag.ephemeral{background:rgba(210,153,34,.15);color:var(--wn)}
@@ -173,6 +212,22 @@
     .upload-progress-cancel{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:.15s;flex-shrink:0}
     .upload-progress-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
     .pane-term{flex:1;overflow:hidden;position:relative}
+    /* Status bars (reconnect, tmux, transport-retry) live HERE, over the
+       terminal, instead of in the pane's flex column. In the column each
+       one shrank the terminal: the text jumped, xterm refit and the PTY
+       was resized mid-disconnect - twice, since hiding the bar resized it
+       back. The stack is anchored to the terminal area, so it needs no
+       knowledge of the pane bar's height.
+
+       Bottom-right, not top-centre: centred at the top the card landed
+       squarely on the first line of output ("tail -f /va[Reconnect]ted")
+       and pressed against the pane bar. The bottom-right corner is the
+       emptiest part of a terminal - lines are left-aligned and rarely
+       full width - and it is where the eye already is when a session
+       dies, next to the prompt. */
+    .pane-overlays{position:absolute;bottom:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:6px;pointer-events:none}
+    .pane-overlays>*{max-width:100%}
+    .pane-overlays>*{pointer-events:auto}
     /* Dim the terminal of inactive panes so the one in use stands out: a
        faint translucent layer over the dark terminal lifts it toward grey.
        pointer-events:none keeps a click-through that focuses the pane; the
@@ -182,10 +237,12 @@
     .pane-term::after{content:'';position:absolute;inset:0;pointer-events:none;background:rgba(255,255,255,.06);opacity:0;transition:opacity .15s;z-index:20}
     .pane:not(.active) .pane-term::after{opacity:1}
     /* A few px of breathing room so the first column doesn't kiss the
-       frame. Padding goes on .xterm itself (not on .pane-term) because
-       FitAddon reads .xterm's padding to subtract it from the parent's
-       available width — keeping cols and visual width in sync. */
-    .xterm{padding:0 6px;box-sizing:border-box}
+       frame, and the top row (with its full-height cursor) doesn't sit on
+       the pane bar's border. Padding goes on .xterm itself (not on
+       .pane-term) because FitAddon reads .xterm's padding to subtract it
+       from the parent's available box — keeping rows/cols and visual size
+       in sync, so this costs no phantom row. */
+    .xterm{padding:4px 6px 2px;box-sizing:border-box}
     .xterm-viewport::-webkit-scrollbar{width:8px}
     .xterm-viewport::-webkit-scrollbar-track{background:transparent}
     .xterm-viewport::-webkit-scrollbar-thumb{background:var(--bd);border-radius:4px}
@@ -200,13 +257,23 @@
     body.resizing-v{cursor:row-resize!important;user-select:none!important}
 
     /* ── Reconnect bar ── */
-    .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:4px 8px;background:rgba(248,81,73,.08);border-bottom:1px solid var(--bd);flex-shrink:0}
+    /* Plain "the link dropped" is not an error: the card is neutral and the
+       coloured edge is kept for states the user has to act on. */
+    .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;flex-shrink:0;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+    /* A lone Reconnect button needs no card around it: the button is
+       already a shape. The shadow moves onto the button so it still
+       lifts off busy output. */
+    .reconnect-bar.bare{background:none;border:none;box-shadow:none;padding:0}
+    .reconnect-bar.bare .btn{box-shadow:0 4px 14px rgba(0,0,0,.45)}
+    .reconnect-bar.sev-err{border-left:3px solid var(--dg)}
+    .reconnect-bar.sev-warn{border-left:3px solid var(--wn)}
+    .reconnect-bar span:empty{display:none}
     .reconnect-bar .btn{font-size:11px;padding:3px 12px}
     .reconnect-bar .reconnect-pw{font-size:11px;padding:3px 8px;border-radius:4px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);min-width:180px;outline:none}
     .reconnect-bar .reconnect-pw:focus{border-color:var(--ac)}
 
     /* ── tmux-failed fallback bar ── */
-    .tmux-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:4px 8px;background:rgba(210,153,34,.1);border-bottom:1px solid var(--wn);flex-shrink:0;font-size:12px;color:var(--wn)}
+    .tmux-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 10px;background:var(--sf);border:1px solid var(--bd);border-left:3px solid var(--wn);border-radius:6px;flex-shrink:0;font-size:12px;color:var(--wn);box-shadow:0 4px 14px rgba(0,0,0,.35)}
     .tmux-bar .btn{font-size:11px;padding:3px 12px}
 
     /* ── connect-status / confirm modal ── */
@@ -229,6 +296,26 @@
     /* ── Top bar buttons ── */
     .top-r{display:flex;align-items:center;gap:6px}
     .tbtn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:15px;padding:4px;border-radius:4px;transition:.15s;line-height:1}
+    /* One size/weight for every icon; colour comes from the button. */
+    /* Scrollbars: the Options modal and the font preview rendered the
+       OS default (light) inside a dark UI. color-scheme:dark alone did
+       not cover them in Chromium, so style them explicitly. */
+    /* No `scrollbar-color` here on purpose: it is inherited, and in
+       Chromium any element that has it switches to the system scrollbar
+       (arrow buttons and all), overriding these rules and xterm's own.
+       Chromium takes the ::-webkit-* rules below; Firefox follows
+       color-scheme:dark from :root. */
+    *::-webkit-scrollbar{width:10px;height:10px}
+    *::-webkit-scrollbar-track{background:transparent}
+    *::-webkit-scrollbar-thumb{background:var(--bd);border-radius:5px}
+    *::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+    *::-webkit-scrollbar-corner{background:transparent}
+    .ic{width:16px;height:16px;display:inline-block;vertical-align:-3px;flex-shrink:0}
+    .pane-btn .ic{width:14px;height:14px;vertical-align:-2px}
+    .fb-ic .ic{width:16px;height:16px;vertical-align:-3px}
+    .fb-ic{color:var(--dim)}
+    .fb-row[data-type="d"] .fb-ic{color:var(--ac)}
+    .fb-row[data-type="l"] .fb-ic{color:var(--wn)}
     .tbtn:hover{color:var(--tx);background:rgba(255,255,255,.06)}
 
     /* ── Bell flash ── */
@@ -246,6 +333,7 @@
     .panel-title + .opt-section-hd{margin-top:0;padding-top:0;border-top:none}
     .opt-ctl input[type=checkbox]{accent-color:var(--ac);width:16px;height:16px;cursor:pointer;margin:0}
     .opt-hint{font-size:11px;color:var(--dim);margin-top:-8px;margin-bottom:14px;line-height:1.4}
+    .opt-hint code{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;background:var(--bg);border:1px solid var(--bd);border-radius:3px;padding:0 4px}
     .opt-ctl{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end}
     .opt-ctl input[type=range]{flex:1;max-width:180px;accent-color:var(--ac)}
     .opt-ctl input[type=number]{width:58px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:4px 6px;font:inherit;font-size:13px;text-align:right}
@@ -264,7 +352,7 @@
     .opt-btn.primary:hover{background:var(--ach);border-color:var(--ach)}
 
     /* ── File browser modal ── */
-    .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:680px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+    .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:680px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;position:relative}
     .fb-hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
     /* .panel-close is absolutely positioned for the other panels; here it
        belongs in the header row, not in the page's top-right corner. */
@@ -296,6 +384,25 @@
     .fb-up:hover{color:var(--tx);border-color:var(--dim)}
     .fb-list{flex:1;overflow-y:auto;padding:4px 0;min-height:180px}
     .fb-row{display:flex;align-items:center;gap:8px;padding:7px 14px;cursor:pointer;font-size:13px;transition:.1s}
+    /* Selection checkbox. Dim until the row is hovered or something is
+       selected, so an ordinary browse isn't a column of empty boxes. */
+    .fb-ck{flex-shrink:0;width:14px;height:14px;margin:0;accent-color:var(--ac);cursor:pointer;opacity:.35;transition:opacity .12s}
+    .fb-row:hover .fb-ck,.fb-ck:focus-visible,.fb-row.fb-picked .fb-ck{opacity:1}
+    .fb-list.has-sel .fb-ck{opacity:1}
+    .fb-row.fb-picked{background:rgba(88,166,255,.10)}
+    .fb-row.fb-picked:hover{background:rgba(88,166,255,.16)}
+    /* Bulk-action strip, shown only while something is selected. */
+    .fb-sel{display:flex;align-items:center;gap:8px;padding:7px 14px;border-bottom:1px solid var(--bd);background:rgba(88,166,255,.07);flex-shrink:0;font-size:12px;color:var(--tx)}
+    .fb-sel-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .fb-sel button{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 10px;border-radius:4px;font-size:11px;font-family:inherit;white-space:nowrap;flex-shrink:0;transition:.15s}
+    .fb-sel button:hover{color:var(--tx);border-color:var(--dim)}
+    .fb-sel .fb-sel-del:hover{color:var(--dg);border-color:var(--dg)}
+    /* The armed half of the confirmation reads as destructive before
+       it is hovered - it is the button about to delete things. */
+    .fb-sel .fb-sel-del.armed{color:var(--dg);border-color:var(--dg)}
+    .fb-sel .fb-sel-del.armed:hover{background:var(--dg);color:#fff}
+    .fb-sel .fb-sel-go{color:var(--ac);border-color:var(--ac)}
+    .fb-sel .fb-sel-go:hover{background:var(--ac);color:#fff}
     .fb-row:hover{background:rgba(255,255,255,.05)}
     .fb-ic{font-size:14px;flex-shrink:0;width:20px;text-align:center}
     .fb-nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -334,6 +441,14 @@
     .fb-msg{padding:20px;text-align:center;color:var(--dim);font-size:13px}
     .fb-msg.err{color:var(--dg)}
     .fb-ft{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bd);flex-shrink:0}
+    /* The pane's own progress bar sits behind this modal, so an upload
+       started from the browser mirrors it here. */
+    .fb-xfer{display:flex;align-items:center;gap:8px;padding:6px 14px;border-top:1px solid var(--bd);flex-shrink:0;font-size:11px;color:var(--dim)}
+    .fb-xfer-track{position:relative;flex:1;height:4px;border-radius:2px;background:var(--bd);overflow:hidden}
+    .fb-xfer-bar{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--ac);transition:width .15s}
+    .fb-xfer-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+    .fb-xfer-cancel{background:none;border:none;color:var(--dim);cursor:pointer;padding:2px 4px;border-radius:3px;flex-shrink:0}
+    .fb-xfer-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
     .fb-inp{flex:1;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:13px;font-family:'JetBrains Mono',ui-monospace,monospace}
     .fb-inp:focus{outline:none;border-color:var(--ac)}
     .fb-inp::placeholder{color:var(--dim);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
@@ -349,6 +464,38 @@
   </style>
 </head>
 <body>
+
+<!-- Icon sprite. One stroked 24x24 set in a single style, so the UI no
+     longer mixes colour emoji (🔍 📋 📁) with monochrome glyphs (⚙ ⛶ ✕)
+     that also render differently on every OS. Symbols are referenced as
+     <svg class="ic"><use href="#i-name"></use></svg>; `ic()` in websh.js
+     builds the same markup for dynamically created buttons. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <g id="g-ic" fill="none" stroke="currentColor" stroke-width="1.8"
+       stroke-linecap="round" stroke-linejoin="round"></g>
+  </defs>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 15.5 21 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <!-- Export = "write this out as a file": a document with a down arrow, not the
+       bare tray arrow, which is already what a plain download looks like. -->
+  <symbol id="i-export" viewBox="0 0 24 24"><path d="M13.5 3.5H7a1.5 1.5 0 0 0-1.5 1.5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M13.4 3.6v5h5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 11v6m0 0 2.5-2.5M12 17l-2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <!-- A real cog: the old "circle + eight straight rays" read as a sun, not as settings. -->
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M9.61 2.29A10 10 0 0 1 14.39 2.29L13.72 5.01A7.2 7.2 0 0 1 17.2 7.02L19.22 5.08A10 10 0 0 1 21.6 9.21L18.91 9.99A7.2 7.2 0 0 1 18.91 14.01L21.6 14.79A10 10 0 0 1 19.22 18.92L17.2 16.98A7.2 7.2 0 0 1 13.72 18.99L14.39 21.71A10 10 0 0 1 9.61 21.71L10.28 18.99A7.2 7.2 0 0 1 6.8 16.98L4.78 18.92A10 10 0 0 1 2.4 14.79L5.09 14.01A7.2 7.2 0 0 1 5.09 9.99L2.4 9.21A10 10 0 0 1 4.78 5.08L6.8 7.02A7.2 7.2 0 0 1 10.28 5.01Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+  <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 20V6m0 0 5 5m-5-5-5 5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v14m0 0 5-5m-5 5-5-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-split-h" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 5v14" stroke="currentColor" stroke-width="1.7"/></symbol>
+  <symbol id="i-split-v" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 12h17" stroke="currentColor" stroke-width="1.7"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V7m0 0-6 6m6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h3.2l2 2.4h7.8a2 2 0 0 1 2 2v7.6a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6.5 3.5h7l4.5 4.5v12a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M13.3 3.7V8.3h4.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13.8a4 4 0 0 0 5.7 0l2.6-2.6a4 4 0 1 0-5.7-5.7l-1.3 1.3M14 10.2a4 4 0 0 0-5.7 0l-2.6 2.6a4 4 0 1 0 5.7 5.7l1.3-1.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4l10-10a2.4 2.4 0 1 0-3.4-3.4L4.6 16.6z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
+  <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="m6 14 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 10 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
 
 <!-- Toast host — non-blocking notifications. showToast() appends here. -->
 <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="false"></div>
@@ -386,12 +533,12 @@
     <span class="top-slogan">Powerful web terminal</span>
   </div>
   <div class="top-r">
-    <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search">&#x1F50D;</button>
+    <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search"><svg class="ic"><use href="#i-search"></use></svg></button>
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
-    <button class="tbtn" onclick="exportTerminal()" title="Export terminal" aria-label="Export terminal">&#x1F4CB;</button>
-    <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options">&#x2699;</button>
-    <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen">&#x26F6;</button>
+    <button class="tbtn" onclick="exportTerminal()" title="Export terminal (save the output to a .txt file)" aria-label="Export terminal"><svg class="ic"><use href="#i-export"></use></svg></button>
+    <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options"><svg class="ic"><use href="#i-gear"></use></svg></button>
+    <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen"><svg class="ic"><use href="#i-fullscreen"></use></svg></button>
   </div>
 </div>
 
@@ -434,6 +581,14 @@
       <div class="opt-preview-hd">Preview</div>
       <div class="opt-preview-body" id="optPreview"></div>
     </div>
+    <div class="opt-section-hd">Keyboard &amp; clipboard</div>
+    <div class="opt-row">
+      <label>Ctrl+V pastes</label>
+      <div class="opt-ctl">
+        <input type="checkbox" id="optCtrlVPaste">
+      </div>
+    </div>
+    <div class="opt-hint">On by default. Turn it off to send <code>^V</code> to the shell instead — readline&rsquo;s quoted-insert, and Ctrl-V in vim. Ctrl+Shift+V and right-click paste either way; macOS keeps &#8984;V.</div>
     <div class="opt-section-hd">Terminal behavior (persistent session)</div>
     <div class="opt-row">
       <label>Auto-copy</label>
@@ -441,7 +596,7 @@
         <input type="checkbox" id="optTmuxClipboard">
       </div>
     </div>
-    <div class="opt-hint">Shift-drag to select text in the terminal; the selection is automatically copied to your clipboard.</div>
+    <div class="opt-hint">Shift-drag to select text in the terminal; the selection is automatically copied to your clipboard. Also lets the remote side (tmux copy-mode, vim) set your clipboard - but only right after you select or press a key in that pane, never from plain output.</div>
     <div class="opt-row">
       <label>Scrollback</label>
       <div class="opt-ctl">
@@ -601,15 +756,17 @@
 <div id="fbOv" class="ov h" onclick="if(event.target===this)closeFb()">
   <div class="fb-panel" role="dialog" aria-modal="true" aria-label="File browser">
     <div class="fb-hd">
-      <button class="fb-up" onclick="fbUp()" title="Parent directory" aria-label="Parent directory">&#x2191;</button>
+      <button class="fb-up" onclick="fbUp()" title="Parent directory" aria-label="Parent directory"><svg class="ic"><use href="#i-up"></use></svg></button>
       <!-- Clickable path segments (breadcrumbs), rendered by setFbPath.
            data-path carries the full resolved path for scripts/tests. -->
       <span class="fb-host" id="fbHost" hidden></span>
       <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
-      <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser">&#x00D7;</button>
+      <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser"><svg class="ic"><use href="#i-close"></use></svg></button>
     </div>
     <div class="fb-tools">
-      <button type="button" class="fb-tool" onclick="fbNewFolder()" title="Create a folder here">&#x002B; Folder</button>
+      <button type="button" class="fb-tool" onclick="fbNewFolder()" title="Create a folder here"><svg class="ic"><use href="#i-plus"></use></svg> Folder</button>
+      <button type="button" class="fb-tool" onclick="fbUploadHere()" title="Upload files into this folder"><svg class="ic"><use href="#i-upload"></use></svg> Upload</button>
+      <input type="file" id="fbUploadInput" class="h" multiple onchange="fbHandleUpload(this)">
       <button type="button" class="fb-tool" id="fbHidden" aria-pressed="false"
               onclick="toggleFbHidden()" title="Show dotfiles">Hidden</button>
       <input type="text" id="fbFilter" class="fb-filter" placeholder="Filter&hellip;"
@@ -626,7 +783,16 @@
                 onclick="setFbSort('mtime')" title="Sort by modification date">Date</button>
       </span>
     </div>
+    <div class="fb-sel h" id="fbSel">
+      <span class="fb-sel-n" id="fbSelN"></span>
+      <span id="fbSelActs"></span>
+    </div>
     <div class="fb-list" id="fbList"></div>
+    <div class="fb-xfer h" id="fbXfer">
+      <span class="fb-xfer-text"></span>
+      <span class="fb-xfer-track"><span class="fb-xfer-bar"></span></span>
+      <button type="button" class="fb-xfer-cancel" onclick="fbCancelXfer()" title="Cancel" aria-label="Cancel transfer"><svg class="ic"><use href="#i-close"></use></svg></button>
+    </div>
     <div class="fb-ft">
       <input type="text" id="fbManual" class="fb-inp" placeholder="Or type a path to download&hellip;" onkeydown="if(event.key==='Enter')fbDownloadManual()">
       <button class="btn btn-p" onclick="fbDownloadManual()">Download</button>

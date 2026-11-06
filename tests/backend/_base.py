@@ -114,6 +114,7 @@ class LiveServerCase(unittest.TestCase):
                 with open(cls.creds_path, "w") as f:
                     json.dump(cls.CREDS, f)
             server._creds_cache = None
+            server._creds_unreadable = None
             server._creds_cache_key = (0, 0)
 
         for name, value in cls.GLOBALS.items():
@@ -145,6 +146,7 @@ class LiveServerCase(unittest.TestCase):
             server._config_mtime = 0
         if cls.CREDS is not None or cls.CREDS_PATH:
             server._creds_cache = None
+            server._creds_unreadable = None
             server._creds_cache_key = (0, 0)
 
     @classmethod

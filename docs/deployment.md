@@ -265,6 +265,13 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:8765;
+        # REQUIRED: forward the browser-facing host. websh refuses a
+        # POST/DELETE whose Origin names a different host than the one
+        # the request was addressed to (CSRF protection). Without this
+        # line nginx sends "Host: 127.0.0.1:8765", every browser request
+        # looks cross-site, and connect / input / resize all get 403
+        # "cross-site request refused".
+        proxy_set_header Host $host;
         # Covers the SSE/long-poll idle gaps AND large uploads: with
         # request buffering on (nginx default) the proxy waits on this
         # timeout while websh streams a buffered upload to the remote and

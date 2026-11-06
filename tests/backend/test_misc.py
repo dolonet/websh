@@ -650,6 +650,53 @@ class TestAuthVaultStartupGuard(unittest.TestCase):
         self.assertIn(b"WEBSH_AUTH_HEADER", proc.stderr)
 
 
+class TestUnusableConfigStartupGuard(unittest.TestCase):
+    """WEBSH_CONFIG names a file that is missing or does not parse: at
+    startup there is no earlier good version to keep, so refuse to start
+    instead of serving a locked (before: a wide-open) proxy behind a
+    green /api/ping."""
+
+    def _start(self, cfg_path):
+        env = dict(os.environ)
+        for k in ("WEBSH_AUTH_HEADER", "WEBSH_VAULT_ENABLE", "WEBSH_REQUIRE_VAULT"):
+            env.pop(k, None)
+        env["PORT"] = "0"
+        env["WEBSH_CONFIG"] = cfg_path
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        return subprocess.run([sys.executable, "-c", "import server; server.main()"],
+                              env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=20)
+
+    def test_malformed_config_refuses_to_start(self):
+        d = tempfile.mkdtemp()
+        try:
+            cfg = os.path.join(d, "websh.json")
+            with open(cfg, "w") as f:
+                f.write('{"restrict_hosts": true,}')
+            proc = self._start(cfg)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(b"refusing to start", proc.stderr)
+            self.assertIn(b"websh.json", proc.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_unreadable_config_refuses_to_start(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads anything")
+        d = tempfile.mkdtemp()
+        try:
+            cfg = os.path.join(d, "websh.json")
+            with open(cfg, "w") as f:
+                f.write("{}")
+            os.chmod(cfg, 0)
+            proc = self._start(cfg)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(b"refusing to start", proc.stderr)
+        finally:
+            os.chmod(cfg, 0o600)
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestRequireVaultStartupGuard(unittest.TestCase):
     """WEBSH_REQUIRE_VAULT=1 + plaintext credentials in websh.json must be
     a STARTUP failure (exit 1 before binding), not a per-request one."""
