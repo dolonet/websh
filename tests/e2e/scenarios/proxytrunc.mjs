@@ -46,7 +46,10 @@ function startMiddlebox(upstream) {
   const held = [];                          // stalled sockets, destroyed on stop
   const sockets = new Set();                // every live socket, so close() can't hang
   let mode = 'pass';
-  const isUploadPiece = url => /[?&]action=upload&/.test(url);
+  // A sealed upload piece (E2E_SEALED=1) is a large POST to action=sealed:
+  // the proxy cannot see more than that, and does not need to - it cuts
+  // by size.
+  const isUploadPiece = url => /[?&]action=upload&/.test(url) || /[?&]action=sealed&/.test(url);
   const srv = http.createServer((req, res) => {
     const clen = +(req.headers['content-length'] || 0);
     if (req.method === 'POST' && isUploadPiece(req.url) && clen > THRESHOLD) {

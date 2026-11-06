@@ -169,6 +169,28 @@ whole. A truncation never reaches the server as a final error; the
 client only gives up (fast, with a "blocked or cut short" banner) when
 no piece lands within its wall-clock budget.
 
+#### Text pieces
+The same piece may come as `Content-Type: application/json` with body
+`{"b64": "<base64>"}` (standard, padded): the decoded bytes are the
+piece, and everything else - `offset` rules, `409` with `size`, the
+reply, `MAX_UPLOAD_SIZE` (applied to the decoded size), the access-log
+`bytes` - is as for a raw piece. Bad JSON or a missing / invalid `b64`
+→ `400 {"error": "invalid upload body"}`, nothing written; a body
+shorter than its Content-Length → `502 {"error": "client sent fewer
+bytes than Content-Length"}`, as for a cut raw piece. Advertised by `"upload_text": true` in
+`/api/config` (an older server would write the JSON into the file).
+Raw bodies behave exactly as before.
+
+Why: an endpoint-security product that intercepts HTTPS on a user's
+machine answered every `application/octet-stream` POST itself
+(`503 text/html`), while JSON passed. The client starts every upload
+binary; when binary is blocked - a non-2xx reply that is not websh's
+JSON, or cuts that go on at the smallest piece, where it would
+otherwise give up - it continues the same upload as text pieces from
+the size the server reports, and remembers that for the browser for
+30 days (`localStorage` `websh_upload_text`, the time it was set).
+`api.php` keeps the piece's content type.
+
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
 to its destination with collision auto-increment (`a.txt` → `a(1).txt`).
@@ -286,7 +308,13 @@ Public configuration for the client. Reply: `{"connections": [...],
 "restrict_hosts": bool, "isolate_storage": bool, "session_timeout":
 int, "version": str, "proto": int, "vault_enabled": bool}`
 (connection entries carry no secrets; deployments may extend this with
-additive fields).
+additive fields). Also `"upload_chunks": true`, `"upload_text": true`
+(upload pieces may be `{"b64": ...}` JSON, see `POST /api/upload`) and
+`"sealed": {"available": bool, "identity": "<fingerprint>"|null}` -
+whether this server can open a [sealed channel](#sealed-channel) (it
+can iff `cryptography` imports and its identity key loads) and the
+fingerprint of its identity key: SHA-256 of the key's
+SubjectPublicKeyInfo DER, uppercase hex in 16 groups of 4.
 
 ### POST /api/client_diag
 A page's diagnostics beacon (`navigator.sendBeacon` on `pagehide`, sent
@@ -311,6 +339,9 @@ large, `429` more than 10 per IP in 10 minutes. A server without the
 action answers `404`, which a beacon ignores. Through `api.php` it is an
 ordinary JSON action.
 
+### POST /api/seal_open, POST /api/sealed?c= (sealed channel)
+See [Sealed channel](#sealed-channel) below.
+
 ### GET /api/ping
 Liveness (also used by the PHP shim's auto-start probe). Reply:
 `{"ok": true, "version": str, "proto": int}`.
@@ -320,3 +351,111 @@ Liveness (also used by the PHP shim's auto-start probe). Reply:
 `GET /`, `/index.html`, `/websh.js`, `/assets/websh-logo.svg` are
 served from the script directory with security headers (CSP etc.);
 everything else under GET → `404 {"error": "not found"}`.
+
+## Sealed channel
+
+An opt-in second encryption layer under TLS (the client's "Encrypt
+traffic inside websh" option; what it protects: `docs/security.md`,
+"Sealed traffic"). With it on, the client sends every call except
+`config` and `ping` through these two actions; with it off, nothing
+here is used and every request is what the sections above describe.
+Without `cryptography` both answer `501 {"error": "sealed mode
+unavailable"}`. Through `api.php` both pass unchanged: the body
+verbatim, the reply verbatim and unbuffered, with the backend's status.
+
+Sealed traffic uses wire version 2, negotiated separately from the plain
+API's unchanged `proto: 1`. A cached wire-1 client must reload before
+using encryption with this server. Unsupported handshakes fail visibly
+before any protected API request; there is no insecure wire fallback.
+The server identity key and existing browser identity pins do not change.
+
+### POST /api/seal_open
+Body `{"wire": 2, "pub": b64(client ephemeral P-256 public key, raw uncompressed,
+65 bytes)}`. Reply 200:
+`{"wire": 2, "channel": "<32 hex>", "pub": b64(server ephemeral raw 65 B),
+"identity": b64(identity SPKI DER), "sig": b64(ECDSA-P256-SHA256, raw
+r||s 64 B, over client_pub || server_pub || channel_ascii || ":sealed:2")}`.
+Missing or unsupported `wire` gets HTTP 409 with
+`{"code":"sealed_upgrade_required","wire":2,"error":<reload guidance>}`.
+The client likewise refuses a missing or unsupported reply version
+before deriving a usable channel or sending any protected request.
+`400 {"error": "bad key"}` for a key that is not a P-256 point; shares
+the per-IP side-channel rate limit (`429`).
+
+Keys: `shared = ECDH(client_eph, server_eph)`;
+`K_c2s = HKDF-SHA256(shared, salt = client_pub || server_pub, info =
+"websh sealed c2s", 32 B)`, `K_s2c` the same with `"websh sealed s2c"`;
+AES-256-GCM. The client verifies `sig` with `identity`, and the
+fingerprint of `identity` against the one it pinned on first use,
+before it uses the channel.
+
+Channels live in server memory: idle ones expire after an hour, at
+most 2000 exist (the least recently used is dropped). A restart
+forgets them all.
+
+### POST /api/sealed?c=<channel>
+Frames: `iv (12 random bytes) || AES-GCM ciphertext+tag`. Request AAD
+is `<channel> ":c2s"`. Response AAD is
+`<channel> ":s2c:2:" <request_seq> ":" <frame_index>` in ASCII, with
+decimal integers. Each response starts its frame index at 0 and advances
+it once per header, body or empty end frame. The request seq is captured
+for that request, not read from the shared channel's changing counter.
+Another request's reply or a duplicated, reordered, omitted or foreign
+frame fails authentication instead of supplying a session id or output
+to the wrong pane.
+
+Both legs are text, not binary: a security product on the owner's
+machine that intercepts HTTPS answered every `application/octet-stream`
+POST itself (`503 text/html`) and never let it through, while JSON
+bodies and `text/event-stream` replies pass.
+
+Request body (`application/json`): `{"f": "<base64(frame)>"}` (standard
+base64 with padding), holding exactly one c2s frame whose plaintext is
+one JSON header line, `\n`, then the raw inner body.
+Header: `{"seq": int, "method": "GET"|"POST", "action": "<action>",
+"query": {name: string}}`, and for upload pieces `"len": int` (the
+number of real bytes at the start of the inner body; the rest is
+padding and is dropped) and `"pad": true` (a padding-only piece: the
+server replies `{"ok": true, "pad": true}` and runs nothing).
+
+Checked in this order, and nothing is executed when one fails:
+unknown or expired channel `410 {"error": "channel unknown"}`; body
+missing `400 {"error": "bad frame"}`, larger than ~11 MiB `413`, shorter
+than its Content-Length `400 {"error": "client sent fewer bytes than
+Content-Length"}` (the upload code's "cut" signal); malformed JSON, a
+missing or non-base64 `f`, a frame that does not decrypt or a
+malformed header `400 {"error": "bad frame"}`; a
+`seq` already used on this channel, or more than 4096 below the
+highest seen, `400 {"error": "replay"}`; `seal_open`, `sealed`,
+`config`, `ping` and `client_diag` inside `400`.
+
+Otherwise the inner request goes to the same handler as the plain
+`/api/<action>?<query>` with that method and body (same validation,
+rate limits, access-log events; an unknown action is the inner `404`),
+and the outer reply is `200 text/event-stream` (`Cache-Control:
+no-cache`, `X-Accel-Buffering: no`): each s2c frame is one SSE event,
+`data: <base64(frame)>` followed by a blank line, written as it is
+produced. The first frame's plaintext is
+`{"status": int, "headers": {...}}` (the inner status and headers -
+Content-Type, Content-Length, Content-Disposition, ...); each following
+frame is a piece of the inner body, sent as the handler writes it (the
+SSE stream and downloads stream); an empty frame ends the reply. A
+reply that stops without the empty frame is truncated: the client
+treats it as a dropped connection. An inner reply that declared a
+Content-Length and did not reach it (a cut download) gets no end frame.
+
+An outer non-200 reply is unverified transport information. A proxy can
+replace a successfully executed request's reply with a 410 or a busy 503,
+so neither proves non-execution. Read-only GET calls may reopen a lost
+channel and retry once. POST calls are never resent by the sealed fetch
+boundary after an unverified response, a post-send network failure, or
+an invalid or truncated encrypted reply. Their outcome is reported as
+uncertain; future calls can open a fresh channel. Input drops that
+uncertain batch and its queued suffix for the same session, preserves
+typing for a newer session, and accepts later fresh typing. A local
+handshake failure remains a safe, unsent `sealed_unavailable` hold.
+
+The upload XHR boundary likewise does not resend a 410 internally. Its
+caller may retry immutable positional pieces safely. Only normalized
+transport cut/size signals are passed through; an unverified outer 409
+size is never accepted as evidence that an upload is complete.

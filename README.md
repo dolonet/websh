@@ -37,7 +37,7 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 ## Requirements
 
-- **Backend.** Python 3.9+ with `ssh` in PATH. Stdlib only — no pip dependencies.
+- **Backend.** Python 3 (tested on 3.12) with `ssh` in PATH. Stdlib only — no pip dependencies.
 - **Browser.** Any modern browser. xterm.js is loaded from a CDN.
 - **Optional persistent sessions.** `tmux` on the target host — any
   reasonably recent version. See
@@ -127,7 +127,7 @@ python3 server.py
 
 Open http://localhost:8765 — that's it. No pip install, no npm, no build step.
 
-Requires Python 3.9+ and `ssh` in your PATH. The server binds to
+Requires Python 3 (tested on 3.12) and `ssh` in your PATH. The server binds to
 `127.0.0.1` by default; set `HOST=0.0.0.0` to expose it on the LAN.
 
 ## Quick start (shared hosting)
@@ -238,7 +238,7 @@ scripts/check.sh
 scripts/e2e.sh
 ```
 
-CI runs all of it on every push and PR: the backend on Python 3.9 and 3.12, each with and without `cryptography` (the vault's optional dependency), plus the frontend suite, the PHP smoke test, ruff, and a Docker build that boots the image and checks `/api/ping`, `/api/config` and the page.
+CI runs all of it on every push and PR: the backend on Python 3.12, with and without `cryptography` (the vault's optional dependency), plus the frontend suite, the PHP smoke test, ruff, and a Docker build that boots the image and checks `/api/ping`, `/api/config` and the page.
 
 Backend line + branch coverage of `server.py` is about 88%:
 

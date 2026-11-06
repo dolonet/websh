@@ -39,9 +39,11 @@ Persistent panes wrap the shell in tmux on the target.
   one script file. Deployment is "copy four files".
 - **`server.py` and `websh.js` stay single files.** They are large; use
   the code map (below) instead of splitting them.
-- **Python 3.9** must work: no `match`, no `X | Y` annotations, no
-  3.10+ stdlib. CI runs 3.9 and 3.12, each with and without
-  `cryptography`.
+- **Python 3.9 and 3.12** are tested in CI, each with and without
+  `cryptography`; `scripts/check.sh --full` covers the additional Docker
+  legs. The 3.9 CI legs use Ubuntu 22.04, which still supplies that
+  interpreter; 3.12 uses the current Ubuntu runner. Keep runtime code
+  compatible with 3.9.
 - **The wire protocol is versioned** (`proto` in `/api/ping`,
   `/api/config`; `docs/protocol.md`). Old cached clients keep talking to
   a new server for hours: additions must be ignorable, removals need a
@@ -90,7 +92,7 @@ keep them true when you change the code under them.
     python3 server.py                       run locally (PORT=8765 HOST=127.0.0.1 by env, not flags)
     scripts/check.sh                        everything that must be green; exit status is the verdict
     scripts/check.sh --quick                while iterating
-    scripts/check.sh --full                 + the CI matrix in docker (3.9, no cryptography)
+    scripts/check.sh --full                 + the CI matrix in docker (no cryptography, tmux 3.1c)
     scripts/check.sh --results              failures as results only, no test source (the implementer's view)
     python3 -m unittest tests.backend.test_transport.TestStreamEdges     one backend class
     (cd tests/frontend && node test_connect.js | grep -A8 "=== name")    one frontend test's output
@@ -115,7 +117,7 @@ keep them true when you change the code under them.
 5. Update the docs the change makes untrue, and `docs/invariants.md`
    when a new "must never happen again" appears.
 6. Commit and push, then **look at CI** - it runs what your machine
-   cannot (Python 3.9, no `cryptography`, no terminal):
+   cannot (no `cryptography`, no terminal):
    `gh run list -R <owner>/websh -L 3`. In a checkout with an `upstream`
    remote `gh` may be looking at the wrong repository; pin it once with
    `gh repo set-default`.

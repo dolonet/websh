@@ -115,7 +115,26 @@ blocked or cut short — a proxy or firewall on this network is likely
 limiting uploads; a smaller file may still go through"). A genuinely
 final reply (413, invalid path) still stops at once with its own
 message, never the proxy text; a slow-but-progressing upload is never
-killed by the wall-clock cap (onprogress re-arms it).
+killed by the wall-clock cap (onprogress re-arms it). A timeout delivered
+one millisecond before the clock deadline must not grant a second whole
+stall budget. CI caught a 1500 ms bound taking 3009 ms because the early
+callback retried and started a fresh full watchdog. The deterministic
+`upload deadline: …` guards cover binary/text early callbacks and genuine
+progress over three budgets without duplicating or losing file bytes.
+Where binary itself is blocked (an HTTPS-intercepting security product
+on the user's machine answers application/octet-stream POSTs itself),
+the upload does not give up: a non-websh reply, or cuts at the floor,
+switch it to `{"b64": ...}` pieces that continue from the server's size
+(the 409 resume), and the browser keeps that for 30 days. A stall (no
+reply at all) never switches, and the switch never restarts the
+upload's one wall-clock budget: a proxy that holds pieces still ends in
+the visible failure within `UPLOAD_WALLCLOCK_MS` (e2e `proxytrunc`). Off that
+path every request is what it was.
+Guard (text fallback): backend `test_upload_text.py`; frontend
+`test_upload_text.js` (`upload text: …`); e2e `uploadblocked` (an
+interceptor that answers octet-stream POSTs 503: on the code before the
+fallback both uploads failed "server error (HTTP 503)", as the owner's
+did 26 times in 12-21 Oct).
 Guard: frontend `upload in pieces: a truncated piece shrinks on the next
 try`, `a 400 "fewer bytes" truncation … completes whole`, `forward
 progress resets the try budget and keeps the shrunk size`, `an
@@ -182,7 +201,8 @@ resets the renderer, each with a `console.warn`. A pane coming back on
 screen is repainted, refitted only if its box changed (no
 `/api/resize` otherwise). Hidden tabs are not watched (U1, U2). A page
 leaving with a stuck-looking pane sends one `client_diag` beacon (no
-content), logged as one line.
+content), logged as one line - except in sealed mode (X7), where it is
+not sent at all.
 Guard: e2e `wedge` (a parser hook throws once while a plain pane
 prints: typed text back on screen in ~0.2 s, output keeps flowing to
 its last line, 3 rounds; on the code before the fix the pane froze at
@@ -406,12 +426,98 @@ user's login shell. Guard: backend `TestSideChannelSnippetsExecuted`.
 needs a user gesture). Guard: frontend `CURSOR_HIDE: OSC 52…` and the
 clipboard tests around it.
 
+**X7. Sealed mode never downgrades, and what crosses the network says
+nothing.** The owner (2026-10): a work laptop behind a TLS-inspecting
+proxy, DPI at the ISP - "nobody may read, or even partly understand,
+what I type or upload". Written before release (not yet a bug that
+reached a user): what must hold once the Options checkbox
+"Encrypt traffic inside websh" is on. Every API call but `config` /
+`ping` goes as `seal_open` / `sealed&c=<channel>`; no URL, header or
+body carries an action, a session id, credentials, keys typed, output,
+paths, file names or contents. If the channel cannot be opened, or the
+server's identity differs from the pinned one, nothing is sent - not
+in clear, not through the unverified key - and the user sees why.
+A lost channel may be reopened automatically for a read. A mutation is
+never resent after an unverified outer reply, even 410 or a busy 503,
+or after a damaged/truncated encrypted reply: a proxy can replace the
+reply after execution. Uncertain input drops its sent batch and queued
+suffix for that same session, warns the user, and accepts fresh typing.
+A late failure for an old session cannot discard a newer session's keys.
+Sealed wire 2 binds every reply frame to the request sequence and frame
+position, including its header and clean end. Recorded replies cannot
+identify another connection, and replayed, reordered or missing frames
+cannot become accepted output or an upload success. Older wire versions
+are refused with reload guidance; plain API compatibility is unchanged.
+Guards: frontend `sealed replies: …`; backend
+`test_every_response_frame_is_bound_to_request_and_position`,
+`test_old_or_missing_wire_version_is_refused_before_dispatch`, and frontend
+`sealed input queue: …`. Keys held locally before submission while the
+channel is unusable (key-changed modal or handshake failure) follow
+I3: a short blockage delivers them once, in order; older than
+`INPUT_HOLD_MS` they are dropped, never delivered late. Through
+`api.php` the sealed bytes pass unchanged and unbuffered.
+Frames travel as text - requests `application/json` `{"f": base64}`,
+replies `text/event-stream`, one `data: <base64>` event per frame -
+never as `application/octet-stream`: on the owner's Mac an
+endpoint-security product that intercepts HTTPS answered every
+octet-stream POST with its own `503 text/html` (nginx: 400/499, 0
+bytes), so the first, binary format failed for its only user on the
+day it shipped (2026-10-21). A replayed, tampered or unknown-channel
+frame executes nothing. Inside, a request means exactly what the plain
+URL means (rate limits, access log with the inner action). Upload
+pieces of one upload are one size on the wire, the total rounded up
+to a size bucket, the file byte-identical. Off means today's requests,
+byte for byte. The `client_diag` beacon (O9) is not sent while on.
+Guard: backend `test_sealed.py` (a reference client, a wire tap that
+looks at the raw bytes, a real PTY shell behind a fake `ssh`); frontend
+`test_sealed.js` (a fake server speaking the wire contract, every
+request recorded raw and decrypted; `sealed I3: …`); backend
+`TestSealedThroughPhpProxy` (php -S or the websh-php-smoke image);
+backend `TestSealedThroughNginx` (production's proxy directives);
+e2e `sealed`, `sealedtoggle`, `sealedrestart`, `sealedblocked` (a
+middlebox that answers octet-stream POSTs 503, as measured),
+`sealedprod` (a production-like front: nginx stream + PROXY protocol,
+HTTP/2), `sealedurl` (safe against a deployment), and any scenario with
+`E2E_SEALED=1` (requests are still counted by their inner action;
+`tabstress` there caught the lock badge squeezing the tab strip below
+one tab's width at 560 px).
+
+How the code holds X7: every API call goes through one of three
+boundaries - `apiFetch` (fetch), `openEventSource` (the output stream),
+`newApiXhr` (upload pieces) - which decide plain or sealed per call
+from `settings.sealed`; the call sites are unchanged. A call that
+cannot be sealed gets a local `503 {"code":"sealed_unavailable"}` that
+was never sent (the output loops retry inside their budget; the input
+queue holds the batch in `p.sealHeld`, ahead of later keys, and sends it
+when the channel can be tried again), plus a toast and no badge. An
+unverified response after submission is a delivery-unknown transport
+error, never an API refusal that would permit input retry. Keys are
+never delivered late (I3): a sealed
+call whose caller gave up while it waited for the channel (the input
+stall timer) is not sent, and an `input` that waited for the channel
+longer than `INPUT_HOLD_MS` (the "key changed" dialog left open) is
+dropped with a toast, never sent; held batches whose oldest key is older
+than `INPUT_HOLD_MS` are all dropped with that toast (never the end of
+a command without its start). Closing a sealed stream cancels its
+body quietly - no unhandled rejection in the page. The server runs the inner request through
+the same `_dispatch` with only path, headers, body and `wfile` swapped
+(`Handler._sealed`), so I1-I4 and O1-O9 hold through it unchanged.
+
 ## Tests themselves
 
 **T1. A green run means `failed: 0`.** A frontend run that dies prints
 no summary; that is a failure. `scripts/check.sh` enforces it.
 
-**T2. Tests wait for a signal, not for time.** The frontend harness
+**T2. Tests wait for a signal, not for time.** Browser pixel and terminal-size
+baselines wait for `document.fonts.ready` and settled layout. A late
+webfont changed an unlinked control's lowest ink row from 11 to 14 and
+its cell height from 15 to 17; it also changed a correctly fitted pane
+from 140x47 to 147x41. Comparing later output with the cached fallback
+font baseline falsely reported a persistent underline or lost rows.
+Guards: `linkstyle` and `tabsolo` retain their exact visual, PTY size and
+resize-count assertions after font readiness.
+
+The frontend harness
 waits on `bootReady`; hand-built windows are closed with `closeDom`.
 Fixed sleeps made one run in six fail. In a browser scenario one synthetic
 mouse jump straight onto a link, pressed at once, can click before

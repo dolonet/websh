@@ -33,8 +33,9 @@ and logged as a `WARN` at startup (as is any name no knob reads):
 - `WEBSH_SOCKET`: choosing the filesystem path the backend binds and
   removes during Unix-socket startup;
 - `WEBSH_AUTH_HEADER` — flipping authentication semantics;
-- `WEBSH_ACCESS_LOG`, `WEBSH_CREDS_PATH`, `WEBSH_RECORD_DIR` — paths
-  the server writes to (arbitrary-path file create/overwrite);
+- `WEBSH_ACCESS_LOG`, `WEBSH_CREDS_PATH`, `WEBSH_RECORD_DIR`,
+  `WEBSH_SEALED_KEY_FILE` — paths the server writes to (arbitrary-path
+  file create/overwrite);
 - `WEBSH_RECORD_INPUT` — ignored everywhere, see below.
 
 | Variable | Default | Description |
@@ -48,6 +49,7 @@ and logged as a `WARN` at startup (as is any name no knob reads):
 | `WEBSH_CONFIG` | *(unset)* | Path to `websh.json`. `server.py` loads a config only when this is set; the PHP proxy computes a default (`../../websh.json`). A path that does not exist means "no config". A file that exists but cannot be read or parsed stops the server from starting; if it breaks while the server runs, the last version that loaded stays in force (logged at ERROR) until it is fixed - it never falls back to the permissive empty config. |
 | `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`). The bundled `websh.service` and Docker image ship the dependency and a writable creds path, so enabling the vault there is a one-line opt-in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | **Env-only.** Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
+| `WEBSH_SEALED_KEY_FILE` | `websh.sealed.key` next to the credential store (`WEBSH_CREDS_PATH`'s directory) | **Env-only.** The sealed channel's identity key (ECDSA P-256, PEM). Created with mode `0600` on first start when missing; its fingerprint is logged at start (`sealed channel: identity …`) and pinned by browsers on first use, so keep it across reinstalls - a new key makes every browser that pinned the old one ask whether to trust it. An existing file that cannot be read or is not a P-256 key is never overwritten: sealed mode stays unavailable (logged at `ERROR`). Needs `cryptography`; independent of `WEBSH_VAULT_ENABLE`. See [`security.md`](security.md#sealed-traffic). |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. If the file is edited into that state while the server runs, the config is served as empty and one `ERROR` is logged per file version. See [`encryption.md`](encryption.md). |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` (and `WEBSH_AUTH_HEADER`) from |
 | `WEBSH_AUTH_HEADER` | *(unset)* | **Env-only.** Header-trust authentication: set to a header name (e.g. `Remote-User` from oauth2-proxy/Authelia) and every request except `/api/ping` requires it; sessions are stamped with their creator's identity and cross-user access is `403`. The header is only read from `TRUSTED_PROXIES` peers. Mutually exclusive with `WEBSH_VAULT_ENABLE` — the server refuses to start with both set (the vault is keyed by a client-supplied id, not by identity). See [`security.md`](security.md#header-trust-authentication). |

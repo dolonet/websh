@@ -28,18 +28,41 @@ SHARED_PID=
 BACKEND_PID_FILE=$WORK/backend.pid
 cleanup() {
   kill $STUB_PID $PHP_PID $AUTO_PID $PLANTED_PID $SHARED_PID 2>/dev/null || true
-  # The private launcher records the exact PID before loading the backend, including
-  # when auto-start fails before its first response. Never kill by pattern.
-  if [ -s "$BACKEND_PID_FILE" ]; then
-    backend_pid=$(cat "$BACKEND_PID_FILE")
-    if [[ "$backend_pid" =~ ^[0-9]+$ ]]; then
-      kill "$backend_pid" 2>/dev/null || true
-      for i in $(seq 1 50); do
-        kill -0 "$backend_pid" 2>/dev/null || break
-        sleep 0.1
-      done
-    fi
-  fi
+  # Every attempted launcher is ours, but only kill a PID while its
+  # command still names this private launcher (a PID may have been reused).
+  python3 - "$BACKEND_PID_FILE" "$WORK/site/www/console/server.py" <<'PY_CLEAN'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+record, launcher = sys.argv[1:]
+try:
+    candidates = {int(p) for p in Path(record).read_text().split() if p.isdigit()}
+except FileNotFoundError:
+    candidates = set()
+def owned(pid):
+    try:
+        return os.fsencode(launcher) in Path('/proc', str(pid), 'cmdline').read_bytes().split(b'\0')
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+for pid in candidates:
+    if owned(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+deadline = time.monotonic() + 5
+while any(owned(pid) for pid in candidates) and time.monotonic() < deadline:
+    time.sleep(0.05)
+for pid in candidates:
+    if owned(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+PY_CLEAN
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -157,7 +180,10 @@ import os
 from pathlib import Path
 import runpy
 
-Path(os.environ['WEBSH_SMOKE_PIDFILE']).write_text(str(os.getpid()))
+# A slow first startup can overlap a later rejected attempt. Keep both
+# PIDs so the fixture selects the socket owner and cleans every child.
+with Path(os.environ['WEBSH_SMOKE_PIDFILE']).open('a') as record:
+    record.write(str(os.getpid()) + '\n')
 runpy.run_path(str(Path(__file__).with_name('backend.py')), run_name='__main__')
 LAUNCHER
 AUTO_PORT=$(free_port)
@@ -176,9 +202,39 @@ json_ok "auto-start ping" "$r"
 [ -S "$WORK/site/websh.sock" ] || fail "no socket next to websh.json" "$(ls -la "$WORK/site")"
 mode=$(stat -c %a "$WORK/site/websh.sock")
 [ "$mode" = "600" ] || fail "backend socket is not owner-only" "$mode"
-pid=$(cat "$BACKEND_PID_FILE")
-[[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
-  || fail "auto-started server.py not found" "no live recorded PID"
+# Select the actual socket owner, not the latest attempted startup: that
+# later child may already have exited because the first owns the socket.
+pid=$(python3 - "$BACKEND_PID_FILE" "$WORK/site/www/console/server.py" "$WORK/site/websh.sock" <<'PY_OWNER'
+import os
+from pathlib import Path
+import sys
+
+record, launcher, sock = sys.argv[1:]
+inodes = {line.split()[6] for line in Path('/proc/net/unix').read_text().splitlines()[1:]
+          if len(line.split()) >= 8 and line.split()[7] == sock}
+owners = []
+for candidate in set(Path(record).read_text().split()):
+    if not candidate.isdigit():
+        continue
+    proc = Path('/proc', candidate)
+    try:
+        if os.fsencode(launcher) not in (proc / 'cmdline').read_bytes().split(b'\0'):
+            continue
+        for fd in (proc / 'fd').iterdir():
+            try:
+                target = os.readlink(fd)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if target.startswith('socket:[') and target[8:-1] in inodes:
+                owners.append(candidate)
+                break
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        continue
+if len(owners) != 1:
+    sys.exit('expected exactly one recorded private Unix socket owner')
+print(owners[0])
+PY_OWNER
+) || fail "auto-started server.py not found" "no live recorded socket owner"
 # exec() hands php -S's own listening socket down to the child; any
 # other listener is one server.py opened.
 own_tcp=$(python3 - "$pid" "$AUTO_PORT" <<'PY'

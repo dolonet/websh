@@ -423,6 +423,11 @@
 
     /* ── Top bar buttons ── */
     .top-r{display:flex;align-items:center;gap:6px}
+    /* The lock sits on the corner of the Options button: it takes no
+       width from the tab strip (U10 - a 560 px window still fits a tab). */
+    .opt-gear{position:relative}
+    .sealed-badge{position:absolute;right:-2px;bottom:-2px;display:flex;color:var(--ok);background:var(--sf);border-radius:50%;padding:1px;pointer-events:auto}
+    .sealed-badge .ic{width:10px;height:10px}
     .tbtn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:15px;padding:4px;border-radius:4px;transition:.15s;line-height:1}
     /* One size/weight for every icon; colour comes from the button. */
     /* Scrollbars: the Options modal and the font preview rendered the
@@ -609,6 +614,7 @@
   <symbol id="i-export" viewBox="0 0 24 24"><path d="M13.5 3.5H7a1.5 1.5 0 0 0-1.5 1.5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M13.4 3.6v5h5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 11v6m0 0 2.5-2.5M12 17l-2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <!-- A real cog: the old "circle + eight straight rays" read as a sun, not as settings. -->
   <symbol id="i-gear" viewBox="0 0 24 24"><path d="M9.61 2.29A10 10 0 0 1 14.39 2.29L13.72 5.01A7.2 7.2 0 0 1 17.2 7.02L19.22 5.08A10 10 0 0 1 21.6 9.21L18.91 9.99A7.2 7.2 0 0 1 18.91 14.01L21.6 14.79A10 10 0 0 1 19.22 18.92L17.2 16.98A7.2 7.2 0 0 1 13.72 18.99L14.39 21.71A10 10 0 0 1 9.61 21.71L10.28 18.99A7.2 7.2 0 0 1 6.8 16.98L4.78 18.92A10 10 0 0 1 2.4 14.79L5.09 14.01A7.2 7.2 0 0 1 5.09 9.99L2.4 9.21A10 10 0 0 1 4.78 5.08L6.8 7.02A7.2 7.2 0 0 1 10.28 5.01Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 20V6m0 0 5 5m-5-5-5 5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v14m0 0 5-5m-5 5-5-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
@@ -678,7 +684,7 @@
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
     <button class="tbtn" onclick="exportTerminal()" title="Export terminal (save the output to a .txt file)" aria-label="Export terminal"><svg class="ic"><use href="#i-export"></use></svg></button>
-    <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options"><svg class="ic"><use href="#i-gear"></use></svg></button>
+    <button class="tbtn opt-gear" onclick="openOptions()" title="Options" aria-label="Options"><svg class="ic"><use href="#i-gear"></use></svg><span id="sealedBadge" class="sealed-badge h" role="img" aria-label="Traffic encrypted inside websh"><svg class="ic"><use href="#i-lock"></use></svg></span></button>
     <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen"><svg class="ic"><use href="#i-fullscreen"></use></svg></button>
   </div>
 </div>
@@ -746,6 +752,15 @@
       </div>
     </div>
     <div class="opt-hint">How many lines of output to keep above the screen. More lines = longer history to scroll through.</div>
+    <div class="opt-section-hd">Network</div>
+    <div class="opt-row">
+      <label for="optSealed">Encrypt traffic inside websh</label>
+      <div class="opt-ctl">
+        <input type="checkbox" id="optSealed">
+      </div>
+    </div>
+    <div class="opt-hint" id="optSealedHint">A second layer under TLS, for networks that inspect HTTPS.</div>
+    <div class="opt-hint h" id="optSealedPinRow">Server key this browser trusts: <code id="optSealedPin"></code></div>
     <div class="opt-section-hd vault-only">Credential vault</div>
     <div class="opt-row vault-only">
       <label>Saved credentials</label>
@@ -877,6 +892,23 @@
       <button class="btn" onclick="confirmCancel()">Cancel</button>
       <button class="btn" onclick="confirmTerminate(true)">Terminate and never ask again</button>
       <button class="btn btn-d" onclick="confirmTerminate(false)">Terminate</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sealed mode: the server presented a different identity key than
+     the one this browser pinned. Nothing goes through the channel until
+     the user decides. -->
+<div id="ovSealedMismatch" class="ov h"
+     role="dialog" aria-modal="true" aria-labelledby="sealedMmTitle">
+  <div class="tm-panel">
+    <h2 id="sealedMmTitle">The server key has changed</h2>
+    <div class="tm-sub">Encrypted traffic is on, and the server presented a different key than the one this browser trusts. If the server was not reinstalled, someone may be intercepting the connection. Nothing has been sent.</div>
+    <div class="tm-sub" style="margin-top:10px">Trusted key: <code id="sealedOldFp"></code></div>
+    <div class="tm-sub">New key: <code id="sealedNewFp"></code></div>
+    <div class="tm-row">
+      <button class="btn" id="sealedCancelBtn" onclick="sealedMismatchAnswer(false)">Cancel</button>
+      <button class="btn btn-d" id="sealedTrustBtn" onclick="sealedMismatchAnswer(true)">Trust the new key</button>
     </div>
   </div>
 </div>

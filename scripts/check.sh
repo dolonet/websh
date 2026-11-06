@@ -2,7 +2,7 @@
 # Everything that must be green before a commit. Exit status is the verdict.
 #   scripts/check.sh            backend, frontend x3, lint, syntax, PHP
 #   scripts/check.sh --quick    backend, frontend x1, lint, syntax
-#   scripts/check.sh --full     + backend on Python 3.9 and without `cryptography` (docker)
+#   scripts/check.sh --full     + Python 3.9, no cryptography, tmux 3.1c (docker)
 #   scripts/check.sh --results  results only: which checks failed and what they saw,
 #                               never a line of test source (the implementer's view,
 #                               see agents/README.md); combinable with --quick
@@ -94,7 +94,7 @@ if [ "$MODE" = --full ]; then
   # websh's attach chain must still bring the pane up. Only this machine
   # has no such tmux; CI has none either.
   step "tmux 3.1c attach chain"
-  if docker run --rm -v "$PWD":/w -w /w python:3.9-slim-bullseye sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq tmux >/dev/null 2>&1; tmux -V | grep -q '^tmux 3.1' || { echo 'not tmux 3.1'; exit 1; }; python -m unittest tests.backend.test_tmux_links" >"$LOG/m" 2>&1
+  if docker run --rm -v "$PWD":/w -w /w python:3.12-slim-bullseye sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq tmux >/dev/null 2>&1; tmux -V | grep -q '^tmux 3.1' || { echo 'not tmux 3.1'; exit 1; }; python -m unittest tests.backend.test_tmux_links" >"$LOG/m" 2>&1
   then ok "$(tail -1 "$LOG/m")"; else bad "$(tail -1 "$LOG/m")"; grep -E '^(FAIL|ERROR):' "$LOG/m" | head; fi
 fi
 

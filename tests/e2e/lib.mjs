@@ -81,7 +81,11 @@ export class LocalServer {
     this.proc = spawn('python3', ['server.py'], {
       cwd: REPO, stdio: ['ignore', this.log, this.log],
       env: { ...process.env, PORT: String(this.port), HOST: '127.0.0.1',
-             WEBSH_CONFIG: '/nonexistent', ...this.env },
+             WEBSH_CONFIG: '/nonexistent',
+             // The sealed-mode identity of the private instance: kept out
+             // of the repository, one per port (E2E_SEALED=1 needs it).
+             WEBSH_SEALED_KEY_FILE: path.join(os.tmpdir(), `websh-e2e-${this.port}.sealed.key`),
+             ...this.env },
     });
     for (let i = 0; i < 100; i++) {
       try { if ((await fetch(this.url + 'api/ping')).ok) return; } catch (e) {}
@@ -115,7 +119,16 @@ export class H2Front {
     const d = this.dir;
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
       '-subj', '/CN=127.0.0.1', '-keyout', d + '/k.pem', '-out', d + '/c.pem'], { stdio: 'ignore' });
-    fs.writeFileSync(d + '/nginx.conf', `
+    fs.writeFileSync(d + '/nginx.conf', this.conf(d));
+    this.proc = spawn('nginx', ['-p', d, '-c', d + '/nginx.conf'], { stdio: 'ignore' });
+    for (let i = 0; i < 50; i++) {
+      try { execFileSync('curl', ['-skf', '-o', '/dev/null', this.url + 'api/ping']); return; } catch (e) {}
+      await sleep(100);
+    }
+    throw new Error('private nginx did not start on port ' + this.port + ' (see ' + d + '/error.log)');
+  }
+  conf(d) {
+    return `
 daemon off; pid ${d}/nginx.pid; error_log ${d}/error.log info;
 events { worker_connections 1024; }
 http {
@@ -138,13 +151,7 @@ http {
       proxy_buffering off;
     }
   }
-}`);
-    this.proc = spawn('nginx', ['-p', d, '-c', d + '/nginx.conf'], { stdio: 'ignore' });
-    for (let i = 0; i < 50; i++) {
-      try { execFileSync('curl', ['-skf', '-o', '/dev/null', this.url + 'api/ping']); return; } catch (e) {}
-      await sleep(100);
-    }
-    throw new Error('private nginx did not start on port ' + this.port + ' (see ' + d + '/error.log)');
+}`;
   }
   accessLog() { try { return fs.readFileSync(this.dir + '/access.log', 'utf8'); } catch (e) { return ''; } }
   async stop() {
@@ -157,6 +164,65 @@ http {
     }
     if (process.env.E2E_KEEP_NGINX) return;
     try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// ── the production front (websh.gorev.space, see AGENTS.local.md) ───
+// The public :443 is an nginx stream{} block (SNI demux, shared with
+// mtg) that forwards with PROXY protocol to an http vhost
+// `listen 127.0.0.1:8443 ssl proxy_protocol`. That listen line has no
+// `http2`, but other vhosts on the same socket do, and nginx applies it
+// to the socket: browsers get HTTP/2 (`curl --http2` says 2, ALPN h2;
+// checked 2026-10-21). E2E_PROD_H1=1 builds the HTTP/1.1 variant (six
+// connections per host in Chromium). Same proxy directives
+// as /etc/nginx/sites-enabled/websh, gzip on at http level, real_ip
+// from the PROXY header. meta.front = 'prod'. The scenario talks to the
+// stream port; the vhost is on port + 1.
+export class ProdFront extends H2Front {
+  conf(d) {
+    const vhost = this.port + 1;
+    return `
+load_module /usr/lib/nginx/modules/ngx_stream_module.so;
+daemon off; pid ${d}/nginx.pid; error_log ${d}/error.log info;
+events { worker_connections 1024; }
+stream {
+  server {
+    listen 127.0.0.1:${this.port};
+    proxy_protocol on;
+    proxy_timeout 1d;
+    proxy_pass 127.0.0.1:${vhost};
+  }
+}
+http {
+  default_type application/octet-stream;
+  access_log ${d}/access.log;
+  gzip on;
+  set_real_ip_from 127.0.0.1;
+  real_ip_header proxy_protocol;
+  client_body_temp_path ${d}/body; proxy_temp_path ${d}/proxy;
+  fastcgi_temp_path ${d}/fcgi; uwsgi_temp_path ${d}/uwsgi; scgi_temp_path ${d}/scgi;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:e2e_SSL:1m; ssl_session_timeout 1440m; ssl_session_tickets off;
+  server {
+    listen 127.0.0.1:${vhost} ssl${process.env.E2E_PROD_H1 === '1' ? '' : ' http2'} proxy_protocol;
+    ssl_certificate ${d}/c.pem; ssl_certificate_key ${d}/k.pem;
+    client_max_body_size 2g;
+    proxy_request_buffering off;
+    location / {
+      proxy_pass         http://127.0.0.1:${this.upstream};
+      proxy_http_version 1.1;
+      # prod has $host; here the port is not 443, and $host would drop
+      # it (the Origin carries it): the one deliberate difference.
+      proxy_set_header   Host              $http_host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $remote_addr;
+      proxy_set_header   X-Forwarded-Proto $scheme;
+      proxy_read_timeout 1800s;
+      proxy_send_timeout 1800s;
+      proxy_buffering    off;
+    }
+  }
+}`;
   }
 }
 
@@ -192,19 +258,76 @@ export class Browser {
     if (!b.ws) throw new Error('Chromium did not come up');
     if (b.ws.readyState !== 1) await new Promise(r => { b.ws.onopen = r; });
     b.id = 0; b.pending = new Map();
-    b.errors = []; b.console = []; b.requests = {}; b.trace = null; b._req = {};
+    b.errors = []; b.console = []; b.requests = {}; b.trace = null; b._req = {}; b.inputListeners = [];
     b.ws.onmessage = m => b._on(JSON.parse(m.data));
-    await b.send('Page.enable'); await b.send('Runtime.enable'); await b.send('Network.enable');
+    await b.send('Page.enable'); await b.send('Runtime.enable');
+    // maxPostDataSize: without it DevTools puts every request body into
+    // its event; a sealed upload's ~1 MB binary piece bodies stalled the
+    // DevTools connection for good (every later evaluate hung, the page
+    // itself was fine - found 2026-10-21). Bodies above it are left out
+    // of the event; their size is still in the Content-Length header.
+    await b.send('Network.enable', { maxPostDataSize: 256 * 1024 });
+    if (process.env.E2E_SEALED === '1') await b._countSealed();
     return b;
+  }
+  // Under E2E_SEALED=1 every API request is `sealed`, so counting
+  // actions by URL (b.requests.input, .upload, .resize, .connect - "no
+  // /api/resize", "sent in pieces") would count nothing and pass
+  // vacuously. The page encrypts each request with Web Crypto AES-GCM,
+  // and the plaintext starts with the spec's header line
+  // {"seq", "method", "action", ...}: a wrapper around
+  // crypto.subtle.encrypt, installed before the page's own scripts,
+  // reports that action, and it is counted like a plain URL's. It
+  // counts what the page sealed (a retried piece is sealed again, so
+  // it counts again - as a resent plain request does).
+  async _countSealed() {
+    await this.send('Runtime.addBinding', { name: '__wsSealedReq' });
+    await this.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => {
+      const s = crypto.subtle; if (!s) return;
+      const enc = s.encrypt.bind(s);
+      s.encrypt = function (alg, key, data) {
+        try {
+          if (alg && alg.name === 'AES-GCM' && data) {
+            const u = data instanceof ArrayBuffer ? new Uint8Array(data)
+              : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            const nl = u.indexOf(10);
+            if (u[0] === 123 && nl > 0 && nl < 8192) {
+              const h = JSON.parse(new TextDecoder().decode(u.subarray(0, nl)));
+              if (h && typeof h.action === 'string') {
+                let data;
+                if (h.action === 'input')
+                  try { data = JSON.parse(new TextDecoder().decode(u.subarray(nl + 1))).data; } catch (e) {}
+                window.__wsSealedReq(JSON.stringify({ a: h.action, pad: !!h.pad, data }));
+              }
+            }
+          }
+        } catch (e) {}
+        return enc(alg, key, data);
+      };
+    })();` });
   }
   _on(d) {
     const p = d.params;
+    if (d.method === 'Runtime.bindingCalled' && p.name === '__wsSealedReq') {
+      try {
+        const x = JSON.parse(p.payload);
+        this.requests[x.a] = (this.requests[x.a] || 0) + 1;
+        if (x.pad) this.requests.upload_pad = (this.requests.upload_pad || 0) + 1;
+        if (x.a === 'input' && typeof x.data === 'string') this.inputListeners.forEach(f => f(x.data));
+        if (this.trace) this.trace.push(`${stamp()} >> ${x.a} (sealed)`);
+      } catch (e) {}
+    }
     if (d.method === 'Runtime.exceptionThrown')
       this.errors.push((p.exceptionDetails.exception || {}).description || p.exceptionDetails.text);
     if (d.method === 'Runtime.consoleAPICalled') {
       const text = p.args.map(a => a.value !== undefined ? a.value : a.description).join(' ');
       if (p.type === 'error') this.errors.push('console.error: ' + text);
       if (this.trace) this.trace.push(`${stamp()} ${text.slice(0, 160)}`);
+    }
+    if (d.method === 'Network.requestWillBeSent' && /[?&]action=input\b/.test(p.request.url)) {
+      let data;
+      try { data = JSON.parse(p.request.postData || '{}').data; } catch (e) {}
+      if (typeof data === 'string') this.inputListeners.forEach(f => f(data));
     }
     if (d.method === 'Network.requestWillBeSent') {
       const a = (p.request.url.match(/action=(\w+)/) || [])[1];
@@ -239,9 +362,21 @@ export class Browser {
     await this.send('Page.navigate', { url });
     for (let i = 0; i < 150; i++) {
       await sleep(200);
-      try { if (await this.ev('typeof bootReady') === 'object') { await this.ev('bootReady.then(() => 1)'); return; } } catch (e) {}
+      try { if (await this.ev('typeof bootReady') === 'object') { await this.ev('bootReady.then(() => 1)'); await this._sealedOn(); return; } } catch (e) {}
     }
     throw new Error('websh did not boot at ' + url);
+  }
+  // What websh sends to the shells: the `data` of every input request,
+  // from the network in plain mode, from the page's encryption in sealed
+  // mode (where the network shows only ciphertext).
+  onInput(fn) { this.inputListeners.push(fn); }
+  // E2E_SEALED=1: every scenario runs with sealed mode switched on, the
+  // way a user does it (Options checkbox), before it connects anything.
+  // Requests are still counted by their (inner) action: _countSealed.
+  async _sealedOn() {
+    if (process.env.E2E_SEALED !== '1') return;
+    const on = await this.ev(`(() => { if (!settings.sealed) { openOptions(); document.getElementById('optSealed').click(); closeOptions(); } return settings.sealed === true; })()`);
+    if (!on) throw new Error('E2E_SEALED=1 but sealed mode could not be switched on');
   }
   _fill(persistent) {
     return `iH.value=${JSON.stringify(cfg.host)}; iU.value=${JSON.stringify(cfg.user)}; ` +

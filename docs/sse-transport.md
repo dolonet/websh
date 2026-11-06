@@ -71,6 +71,24 @@ invalidates the previous loop's ticket (`p.outGen`).
    event, transient errors are left to EventSource's own auto-retry
    plus our wall-clock budget (below).
 
+With "Encrypt traffic inside websh" on (`docs/protocol.md`, "Sealed
+channel"), `openEventSource` returns a `SealedEventSource` instead: the
+same stream read through a sealed `fetch` whose body is decrypted frame
+by frame as it arrives. It keeps EventSource's behaviour the code above
+relies on - named events, `onerror` + a retry after ~3 s from the last
+event id (sent as `since=`) when the connection drops or ends,
+`readyState` 2 for good on a non-200 reply - so the first-message
+timer, the stall detector and the cursor logic are the same code.
+
+Sealed wire 2 authenticates each response against its request seq and
+frame index. A lost channel can be reopened automatically for these
+read-only output requests. It cannot authorize replaying a POST: an
+unverified outer 410/503 or damaged reply may follow successful execution.
+Such input reports an uncertain outcome and drops its already queued
+same-session suffix; only later fresh typing starts a new request. A
+local handshake failure still holds unsent input safely. Cached sealed
+wire-1 pages must reload; ordinary plain API clients remain compatible.
+
 ### Silent connection death
 
 A connection that dies without a FIN - Wi-Fi switched, laptop slept, a

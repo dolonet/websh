@@ -96,6 +96,10 @@ export async function run({ b, t }) {
     return false; })()`), 10000);
   t.ok(printed >= 0, 'the samples are printed and the prompt is back');
   if (printed < 0) return;
+  // A late webfont changes glyph baselines and cell height. Measure both
+  // the reference and hovered text only after fonts and layout have settled;
+  // otherwise fallback-font row 11 is compared with webfont row 14.
+  await b.ev(`document.fonts.ready.then(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))))`);
   // Mouse off the terminal.
   const mouse = (type, pt, mods, buttons) => b.send('Input.dispatchMouseEvent',
     { type, x: pt.x, y: pt.y, modifiers: mods || 0, button: type === 'mouseMoved' ? 'none' : 'left',
