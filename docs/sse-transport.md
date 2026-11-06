@@ -94,6 +94,18 @@ cursor (`kickOutput`), so nothing is lost or printed twice:
 Long-poll requests are aborted after 25 s (the server answers within
 10), an unanswered `/api/input` after 10 s.
 
+### Input
+
+One `/api/input` per pane is in flight at a time; keys typed meanwhile
+form the next batch. Requests fired without waiting overtook each
+other (HTTP/2 multiplexing, then one backend thread per request) and
+text arrived scrambled. A reply that proves the bytes never reached
+the PTY (503, 429, 502) resends the same batch first; a network error
+is not retried - the write may have landed, and a doubled key is worse
+than a lost one. `404` means the session is gone: the pane reconnects,
+and for a persistent pane the batch is held for the re-attach (see
+`docs/persistent-sessions.md`, "Coming back after an absence").
+
 The `'open'` event (HTTP headers received) is deliberately **not**
 listened to. Headers traverse a buffering proxy fine while the body
 sits in the buffer — disarming the timer or resetting the retry

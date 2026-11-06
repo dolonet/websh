@@ -1689,6 +1689,7 @@ window.addEventListener('pageshow', (e) => {
   }
 });
 
+// ── Output payload (both transports) ────────────────────────────────
 // Apply one decoded JSON payload from either transport. Returns true if
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
@@ -1887,6 +1888,7 @@ function transportFatal(p, e) {
   if(activeId===p.id) updatePaneBadge(p);
 }
 
+// ── Output channel: SSE stream, long-poll fallback, stall detection ─
 // Entry point used in place of the old pollOutput(). Tries SSE first,
 // then transparently downgrades to long-poll on incompatible proxies.
 function startOutput(p) {
@@ -2186,6 +2188,7 @@ function recoverClosedStream(p, mySid, gen) {
   });
 }
 
+// ── Input: ordered, held across a persistent re-attach ─────────────
 // Keystrokes leave in order: at most ONE /api/input per pane is in
 // flight, and whatever is typed meanwhile goes out as the next batch.
 // Firing a request per 10ms batch without waiting let them overtake

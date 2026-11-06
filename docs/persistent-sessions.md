@@ -21,6 +21,30 @@ pane with the same slot id and tmux re-attaches you to the existing
 session. Slot ids are per pane instance — closing a pane with `[x]`
 does not free the slot for reuse.
 
+## Coming back after an absence
+
+The server keeps an ssh process per pane only while the browser is
+there: a pane that has not been heard from for `SESSION_TIMEOUT`
+(default 300 s - laptop asleep, tab frozen, network gone) is closed on
+the websh host. The tmux session on the target is untouched.
+
+When the browser returns, the pane learns that its server session is
+gone (any request answers `404 session not found`) and re-attaches to
+the same tmux session by its slot id, typically within 2-3 seconds.
+No reload, no click.
+
+Keys typed in that window are not lost: they are held and sent once
+tmux has attached and gone quiet (it switches to the alternate screen
+on attach), because keys written while ssh is still logging in are
+eaten by the login. They are held for at most 20 s, and only for
+persistent panes - a non-persistent pane reconnects to a *new* shell,
+which must never receive keys meant for the old one. A pane that is
+simply disconnected (nobody is reconnecting it) drops what is typed.
+
+The same happens when websh itself is restarted (a deploy): the
+server drops its streams without declaring the sessions ended, and
+every pane re-attaches on its own.
+
 ## Terminating a session
 
 Clicking `[x]` on a persistent pane pops a confirm modal (Cancel /

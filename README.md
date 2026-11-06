@@ -69,7 +69,11 @@ Tick **Persistent session** at connect — websh wraps the shell in a tmux sessi
 ### 🛡️ Resilience
 
 - **Nothing lost on reconnect.** Output is read by cursor from a replay window, so a dropped stream, a sleeping laptop or a proxy that cut the connection resumes exactly where it stopped — no gap, no duplicate.
-- **Transport self-heals.** A closed SSE stream is reopened on its own; a proxy that buffers SSE sends that pane to long-polling; brief network errors are retried rather than ending the session.
+- **Keys arrive in the order typed.** One input request per pane is in flight at a time; what is typed meanwhile goes as the next batch.
+- **Comes back by itself after a Wi-Fi switch or sleep.** A connection that died silently raises no error in the browser. websh notices within seconds — a server heartbeat, the output offset in every input reply, the browser's network and wake-up events — and restarts the output channel; no page reload.
+- **A long absence costs a few seconds.** When the server-side session has expired, a persistent pane re-attaches to the same tmux shell on its own, and keys typed meanwhile are delivered once tmux is ready. Keys are never replayed into a *new* shell.
+- **A websh restart or deploy does not disconnect anyone.** Panes find their sessions again on the restarted server.
+- **Transport self-heals.** A closed SSE stream is reopened on its own; a proxy that buffers SSE sends that pane to long-polling, which keeps probing the stream in the background and switches back when it works; brief network errors are retried rather than ending the session.
 - **Clean teardown.** The ssh child is always reaped (no zombies holding session slots), idle sessions time out, the last output of a session is delivered before it is marked ended, and a client hanging up mid-request is routine, not a server error.
 
 ### 📁 File transfer
@@ -181,6 +185,9 @@ plaintext caveat see [`docs/encryption.md`](docs/encryption.md).
 | Deployment recipes | [`docs/deployment.md`](docs/deployment.md) |
 | SSE transport design | [`docs/sse-transport.md`](docs/sse-transport.md) |
 | Auth-failure detection | [`docs/auth-fail-detection.md`](docs/auth-fail-detection.md) |
+| HTTP API | [`docs/protocol.md`](docs/protocol.md) |
+| Invariants: what must never break | [`docs/invariants.md`](docs/invariants.md) |
+| Working on the code | [`AGENTS.md`](AGENTS.md) |
 
 ## Project structure
 
@@ -195,6 +202,9 @@ test_server.py            Back-compat runner for the backend suite
 tests/backend/            Backend tests — unit + integration (unittest)
 tests/frontend/           Frontend tests on jsdom
 tests/php/                PHP proxy smoke test
+tests/e2e/                Browser scenarios: real Chromium, real ssh, network faults
+scripts/                  check.sh (all tests), e2e.sh, deploy.sh, codemap.py
+AGENTS.md                 Guide for contributors and coding agents
 .github/workflows/        CI: backend matrix, frontend, PHP, ruff, Docker
 docs/                     Design notes & reference docs
 Dockerfile                Container deployment
@@ -208,12 +218,18 @@ LICENSE                   MIT license
 # Backend (Python, stdlib only — unittest): ~680 tests
 python3 -m unittest discover -s tests/backend -t .   # or: python3 test_server.py -v
 
-# Frontend (Node 20 + jsdom): ~1100 assertions
+# Frontend (Node 20 + jsdom): ~1170 assertions
 cd tests/frontend && npm install && npm test
 
 # PHP proxy (needs php-cli with curl) and lint
 php -l api.php && bash tests/php/smoke.sh
 ruff check .
+
+# All of the above, with one verdict
+scripts/check.sh
+
+# Browser scenarios: Wi-Fi switch, sleep, restart, typing order (tests/e2e/README.md)
+scripts/e2e.sh
 ```
 
 CI runs all of it on every push and PR: the backend on Python 3.9 and 3.12, each with and without `cryptography` (the vault's optional dependency), plus the frontend suite, the PHP smoke test, ruff, and a Docker build that boots the image and checks `/api/ping`, `/api/config` and the page.

@@ -1803,7 +1803,9 @@ class TestScrollbackReachesTheNewPane(unittest.TestCase):
         tmux = "tmux -L " + sock
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
         env["SHELL"] = "/bin/sh"
-        # ssh provides TERM remotely; CI has no controlling terminal.
+        # What ssh gives the remote side. Without it (a CI runner has no
+        # TERM) tmux refuses to attach - "missing or unsuitable terminal" -
+        # and this test failed on every push while passing on any desk.
         env["TERM"] = "xterm-256color"
         cmd = server._build_remote_command(
             "slotx", tmux, 0, [("history-limit", "77777")])
