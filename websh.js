@@ -23,7 +23,22 @@ function api(action, opts) {
   let url = `${API}?action=${action}${opts.query || ''}`;
   let init = {};
   if (opts.body) { init.method='POST'; init.body=JSON.stringify(opts.body); init.headers={'Content-Type':'application/json'} }
-  return fetch(url, init).then(r => { return r.json() });
+  // A non-JSON reply (a reverse proxy's own HTML error page for a 5xx,
+  // a captive portal) used to surface as "Unexpected token <" in the
+  // toast. Turn it into an {error} the callers already handle.
+  return fetch(url, init).then(r => r.json().catch(() => ({
+    error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
+           ' (unexpected reply from the server or a proxy)'})));
+}
+
+// Capacity/rate errors are identified by a machine-readable `code`
+// (servers before it only sent prose, so the text match stays as the
+// fallback).
+const CAP_CODES = ['rate_limited', 'session_cap_per_ip',
+                   'session_cap_background', 'session_cap_global'];
+function isCapacityError(r, msg) {
+  if (r && CAP_CODES.indexOf(r.code) >= 0) return true;
+  return /too many (connection attempts|active sessions|background sessions)/i.test(msg || '');
 }
 
 // ── Pane management ─────────────────────────────────────────────────
@@ -443,10 +458,26 @@ function createPane(container) {
       if (!data || data.length > 4096 || data.slice(0, 7) !== 'file://') return false;
       let slash = data.indexOf('/', 7);
       if (slash < 0) return false;
+      let host = data.slice(7, slash).toLowerCase();
+      // Query/fragment are not part of a path: `file://h/srv?x#y` used
+      // to become the directory "/srv?x#y".
+      let raw = data.slice(slash).split(/[?#]/)[0];
       let path;
-      try { path = decodeURIComponent(data.slice(slash)); }
+      try { path = decodeURIComponent(raw); }
       catch (e) { return false; }
-      if (path.charAt(0) !== '/' || path.indexOf('\x00') >= 0) return false;
+      // No control characters at all (NUL, newline, ESC...): a path the
+      // file browser then lists and offers delete buttons in must be a
+      // plain one.
+      if (path.charAt(0) !== '/' || /[\x00-\x1f\x7f]/.test(path)) return false;
+      // The host part used to be discarded, so a nested `ssh other-box`,
+      // a `docker exec`, or merely `cat`-ing a file containing an OSC 7
+      // sequence moved the file browser's start directory - which then
+      // opened that path on THIS pane's host, with delete buttons. Pin
+      // the host of the first OSC 7 this session sees (the shell ssh
+      // landed in) and ignore reports from any other host; when the
+      // nested session exits, the outer shell's own reports apply again.
+      if (p.osc7Host === undefined || p.osc7Host === null) p.osc7Host = host;
+      else if (host !== p.osc7Host) return true;     // consumed, not applied
       p.cwd = path;
       return true;
     });
@@ -493,6 +524,7 @@ function createPane(container) {
   // covers the cold-layout case and fitPaneWhenStable covers the
   // webfont-load case.
   new ResizeObserver(() => { fit.fit() }).observe(termEl);
+  wirePaneDrop(p);
 
   return p;
 }
@@ -522,7 +554,8 @@ function activatePane(id) {
 function updatePaneBadge(p) {
   let badge = p.el.querySelector('[data-pane-badge]');
   if (!badge) return;
-  let s = p.sid ? 'connected' : (p.connecting ? 'connecting' : 'disconnected');
+  let s = p.sid ? (p.reconnecting ? 'reconnecting' : 'connected')
+                : (p.connecting ? 'connecting' : 'disconnected');
   let busy = !!p.upload || !!p.download;
   // Title upkeep stays OUTSIDE the memo below: it depends on activeId,
   // which changes without this pane's own state changing (pane switch),
@@ -540,7 +573,8 @@ function updatePaneBadge(p) {
                p.persistent ? 1 : 0].join('');
   if (p._badgeState === state) return;
   p._badgeState = state;
-  badge.className = 'pane-badge ' + (s==='connected'?'s-on':s==='connecting'?'s-wait':'s-off');
+  badge.className = 'pane-badge ' + (s==='connected'?'s-on':
+                                     (s==='connecting'||s==='reconnecting')?'s-wait':'s-off');
   badge.textContent = s.charAt(0).toUpperCase() + s.slice(1);
   let ub = p.el.querySelector('[data-upload-btn]');
   if (ub) ub.disabled = !p.sid || busy;
@@ -705,6 +739,8 @@ function _destroyPane(id, terminate) {
   // still POST and add a card. Clearing it also drops the closure's `p` ref.
   clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
+  p._pendingSettled = [];     // nothing to resume on a destroyed pane
+  clearInterval(p._reconnTimer); p._reconnTimer = null;
   // Disconnect main session
   if (p.sid) {
     p.polling = false;
@@ -1373,6 +1409,7 @@ function endSession(p, o) {
   // The tracked cwd belongs to the shell that just went away; a
   // reconnect starts somewhere else and must re-learn it.
   p.cwd = '';
+  p.osc7Host = null;     // a new session pins its own OSC 7 host
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
   if (o.disconnect && sid) {
@@ -1588,6 +1625,41 @@ function clearRetryClock(p) {
   p.firstFailureAt = 0;
   p.retryCount = 0;
   p.pollRetries = 0;
+  setReconnecting(p, false);
+}
+
+// While the transport retries inside RECONNECT_BUDGET_MS the terminal
+// just stopped updating - nothing said the connection was being
+// re-established or how long websh would keep trying; the user only
+// learned at the end, from a red line. Show it on the pane itself: a
+// small banner with the time left, and a "Reconnecting" badge.
+function setReconnecting(p, on) {
+  if (!p || !p.el) return;
+  if (!!p.reconnecting === !!on && (!on || p._reconnTimer)) return;
+  p.reconnecting = !!on;
+  let el = p.el.querySelector('.pane-reconnect');
+  if (!on) {
+    clearInterval(p._reconnTimer); p._reconnTimer = null;
+    if (el) el.remove();
+    updatePaneBadge(p);
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'pane-reconnect';
+    el.setAttribute('role', 'status');
+    let body = p.el;                      // .pane is position:relative
+    body.appendChild(el);
+  }
+  let paint = () => {
+    let left = Math.max(0, Math.ceil(
+      (RECONNECT_BUDGET_MS - (Date.now() - (p.firstFailureAt || Date.now()))) / 1000));
+    el.textContent = 'Connection lost — reconnecting… (' + left + ' s)';
+  };
+  paint();
+  clearInterval(p._reconnTimer);
+  p._reconnTimer = setInterval(paint, 1000);
+  updatePaneBadge(p);
 }
 
 function transportFatal(p, e) {
@@ -1596,6 +1668,7 @@ function transportFatal(p, e) {
   // the pane again — and must not reset p.connecting, which would defuse
   // connectPane's in-flight duplicate guard during an auto-reconnect.
   if (!p.polling) return;
+  setReconnecting(p, false);
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
@@ -1695,6 +1768,7 @@ function streamOutput(p) {
     }
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
+    setReconnecting(p, true);
     // EventSource will retry on its own ~3s; we just enforce the
     // total-elapsed budget. No need to schedule an explicit retry.
   };
@@ -1710,6 +1784,7 @@ function pollOutput(p) {
   }).catch(e => {
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
+    setReconnecting(p, true);
     setTimeout(() => { if(p.polling) pollOutput(p) }, d);
   });
 }
@@ -2132,7 +2207,7 @@ function realConnect(opts, run) {
       if (/not allowed|not in the allowed list/i.test(r.error)) {
         throw { kind: 'policy_deny', msg: r.error };
       }
-      if (/too many (connection attempts|active sessions|background sessions)/i.test(r.error)) {
+      if (isCapacityError(r, r.error)) {
         throw { kind: 'rate_limited', msg: r.error };
       }
       // Saved-variant /api/connect surfaces vault-specific errors:
@@ -2255,7 +2330,7 @@ function mapConnectError(err, opts) {
   if (/timeout/i.test(msg)) {
     return {kind: 'timeout', host, user, msg};
   }
-  if (/too many (connection attempts|active sessions|background sessions)/i.test(msg)) {
+  if (isCapacityError(err, msg)) {
     return {kind: 'rate_limited', host, user, msg};
   }
   return {kind: 'error', host, user, msg};
@@ -3392,6 +3467,10 @@ function loadServerConfig() {
   }).catch(() => {
     overlayMode = 'initial';
     showOverlay();
+    // Config unreachable: the prefix can't be known, so show what the
+    // unscoped namespace holds (the pre-isolation behaviour) rather
+    // than an empty list.
+    try { renderSaved(); } catch (e) {}
   });
 }
 
@@ -3482,10 +3561,24 @@ function triggerUpload(id) {
 }
 
 function handleUpload(id, input) {
-  let p = panes[id];
-  if (!p || !p.sid || !input.files.length || (!p.host && !p.connection)) return;
-  let files = Array.prototype.slice.call(input.files);
+  let files = Array.prototype.slice.call(input.files || []);
   input.value = '';
+  startUploadFiles(id, files);
+}
+
+// Why a pane can't take an upload right now, or '' when it can. Shared
+// by the Upload button path and drag-and-drop, so both refuse for the
+// same reasons - and a drop can say which one.
+function uploadBlocker(p) {
+  if (!p || !p.sid) return 'This pane is not connected.';
+  if (!p.host && !p.connection) return 'This pane is not connected.';
+  if (p.upload || p.download) return 'A transfer is already running in this pane.';
+  return '';
+}
+
+function startUploadFiles(id, files) {
+  let p = panes[id];
+  if (!files.length || uploadBlocker(p)) return;
   let totalSize = 0;
   files.forEach(f => { totalSize += f.size });
   p.upload = {
@@ -3504,6 +3597,120 @@ function handleUpload(id, input) {
   updatePaneBadge(p);
   uploadNextFile(p);
 }
+
+// ── Drag-and-drop upload ────────────────────────────────────────────
+// Dropping files on a pane uploads them exactly like the Upload button
+// (same destination: the pane's working directory on persistent panes,
+// $HOME + mv otherwise). Folders are refused - the upload pipeline
+// streams single files.
+function _dragHasFiles(ev) {
+  let t = ev.dataTransfer && ev.dataTransfer.types;
+  return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
+}
+
+// How long the highlight survives without a dragover. While a drag is
+// over an element the browser repeats dragover continuously (at least
+// every ~350 ms even when the pointer is still), so silence means the
+// drag is over - cancelled with Esc, released outside the window, or
+// ended somewhere that sent us nothing.
+const DROP_HEARTBEAT_MS = 1200;
+let _dropHighlighted = false;
+
+function showDropTarget(p) {
+  let el = p.el;
+  let why = uploadBlocker(p);
+  el.classList.add('drop-target');
+  el.classList.toggle('drop-refused', !!why);
+  el.setAttribute('data-drop-msg', why || 'Drop to upload');
+  _dropHighlighted = true;
+  clearTimeout(el._dropTimer);
+  el._dropTimer = setTimeout(() => hideDropTarget(el), DROP_HEARTBEAT_MS);
+}
+
+function hideDropTarget(el) {
+  clearTimeout(el._dropTimer);
+  el._dropTimer = null;
+  el.classList.remove('drop-target', 'drop-refused');
+}
+
+function clearAllDropTargets() {
+  if (!_dropHighlighted) return;
+  _dropHighlighted = false;
+  document.querySelectorAll('.pane.drop-target').forEach(hideDropTarget);
+}
+
+function wirePaneDrop(p) {
+  let el = p.el;
+  // The highlight used to be driven by a dragenter/dragleave counter
+  // alone. A cancelled drag (Esc, or released outside the browser) gets
+  // no final dragleave in Chromium, so the counter never reached zero
+  // and "Drop to upload" + the dashed outline stayed on the pane for
+  // good. Now: dragleave checks whether the pointer really left the
+  // pane (relatedTarget), every dragover re-arms a heartbeat, and the
+  // document-level listeners below clear on any sign the drag is over.
+  el.addEventListener('dragenter', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    showDropTarget(p);
+  });
+  el.addEventListener('dragover', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = uploadBlocker(p) ? 'none' : 'copy';
+    showDropTarget(p);
+  });
+  el.addEventListener('dragleave', ev => {
+    if (!_dragHasFiles(ev)) return;
+    // Moving between the pane's own children fires dragleave on the old
+    // child with relatedTarget = the new one: still inside, keep it.
+    if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+    hideDropTarget(el);
+  });
+  el.addEventListener('drop', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    clearAllDropTargets();
+    let why = uploadBlocker(p);
+    if (why) { showToast(why, 'warn'); return; }
+    let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
+    let files = [], folders = 0;
+    if (items.length) {
+      for (let it of items) {
+        if (it.kind !== 'file') continue;
+        let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+        if (entry && entry.isDirectory) { folders++; continue; }
+        let f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    } else {
+      files = Array.from(ev.dataTransfer.files || []);
+    }
+    if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+    if (files.length) { activatePane(p.id); startUploadFiles(p.id, files); }
+  });
+}
+
+// A file dropped anywhere else would make the browser navigate to it -
+// replacing websh and dropping every session. Swallow stray drops.
+document.addEventListener('dragover', ev => { if (_dragHasFiles(ev)) ev.preventDefault(); });
+document.addEventListener('drop', ev => {
+  clearAllDropTargets();
+  if (!_dragHasFiles(ev)) return;
+  ev.preventDefault();
+  showToast('Drop files onto a terminal pane to upload them.', 'warn');
+});
+// Signals that the drag is over, whatever the pane saw:
+// - the pointer left the window (dragleave with no relatedTarget);
+// - dragend (a drag that started in the page);
+// - ANY mouse/pointer movement or press: browsers suppress these for
+//   the whole duration of a drag, so seeing one means it has ended;
+// - the window lost focus (user switched away mid-drag).
+document.addEventListener('dragleave', ev => { if (!ev.relatedTarget) clearAllDropTargets(); });
+document.addEventListener('dragend', clearAllDropTargets);
+['mousemove', 'pointermove', 'pointerdown', 'keydown'].forEach(t =>
+  document.addEventListener(t, clearAllDropTargets, true));
+window.addEventListener('blur', clearAllDropTargets);
 
 // Encode filename as base64 to avoid ANY shell injection
 function safeShellName(name) { return btoa(unescape(encodeURIComponent(name))); }
@@ -3943,6 +4150,8 @@ let _fbListedSid = null;
 // null. At most one is open at a time: opening a second runs this to
 // dismiss the first, so the list never shows two competing editors.
 let _fbConfirm = null;
+// The entries behind the rows on screen, for client-side re-sorting.
+let _fbEntries = null;
 
 // Escape while an inline editor is open dismisses it ("no") instead of
 // closing the whole browser, which is what the user means and saves
@@ -3963,6 +4172,16 @@ function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
+  // Which machine this is. The browser can delete and rename, and with
+  // several panes open (or after a nested ssh changed OSC 7) the rows
+  // alone don't say which host they live on.
+  let hostEl = $('fbHost');
+  if (hostEl) {
+    let who = (p.user ? p.user + '@' : '') + (p.host || '');
+    hostEl.textContent = who;
+    hostEl.title = who ? 'Files on ' + who : '';
+    hostEl.hidden = !who;
+  }
   // A fresh open never shows another pane's rows: clear the previous
   // listing (and invalidate its in-flight request) before the first
   // load, so the keep-while-loading logic has nothing stale to keep.
@@ -3980,7 +4199,7 @@ function showFileBrowser(id) {
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
   // fall back to the historical ~.
-  if (p.cwd) loadFbDir(p.cwd);
+  if (p.cwd) loadFbDir(p.cwd, {fallbackHome: true});
   else loadFbDir('~', {paneCwd: true});
 }
 
@@ -4000,6 +4219,11 @@ function setFbPath(path) {
     b.type = 'button';
     b.className = 'fb-crumb' + (cur ? ' cur' : '');
     b.textContent = label;
+    if (cur) {
+      // Where you already are: announced, but not a do-nothing Tab stop.
+      b.setAttribute('aria-current', 'location');
+      b.tabIndex = -1;
+    }
     if (!cur) b.addEventListener('click', () => loadFbDir(full));
     return b;
   };
@@ -4066,15 +4290,11 @@ function loadFbDir(path, o) {
     .then(r => {
       if (stale()) return;
       list.removeAttribute('aria-busy');
-      if (r.error) {
-        list.innerHTML = '<div class="fb-msg err">' + esc(r.error) + '</div>';
-        return;
-      }
       // A response with no resolved path is not a listing we can render:
       // every downstream path is built by joining onto r.path, so an
       // absent one would produce "undefined/name" download targets.
-      if (!r.path || !Array.isArray(r.entries)) {
-        list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+      if (r.error || !r.path || !Array.isArray(r.entries)) {
+        fbLoadFailed(list, path, o, r.error || 'Failed to load');
         return;
       }
       // A fresh directory starts unfiltered — a filter left over from
@@ -4090,8 +4310,30 @@ function loadFbDir(path, o) {
     .catch(() => {
       if (stale()) return;
       list.removeAttribute('aria-busy');
-      list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+      fbLoadFailed(list, path, o, 'Failed to load');
     });
+}
+
+// A listing that could not be loaded. If a usable listing is still on
+// screen (a click into an unreadable folder, a network blip), keep it -
+// breadcrumbs, Up and every row still work - and say what failed. Only
+// with nothing to keep does the list show the error. A start directory
+// that came from the shell (OSC 7) may be stale - deleted, or on
+// another host after a nested ssh - so that one falls back to the
+// pane's own directory / $HOME instead of a dead end.
+function fbLoadFailed(list, path, o, msg) {
+  // The page (or the list) may be gone by the time a slow reply fails.
+  if (!list || !list.isConnected) return;
+  if (o && o.fallbackHome) {
+    showToast(path + ': ' + msg + ' — showing the pane directory instead', 'warn');
+    loadFbDir('~', {paneCwd: true});
+    return;
+  }
+  if (_fbListedSid && list.querySelector('.fb-row')) {
+    showToast(path + ': ' + msg, 'err');
+    return;
+  }
+  list.innerHTML = '<div class="fb-msg err">' + esc(msg) + '</div>';
 }
 
 // The pane whose listing is on screen - or null (with a reload kicked
@@ -4117,6 +4359,7 @@ function renderFbEntries(entries, absPath) {
   // Every row here is about to be replaced, so an armed confirmation
   // from the previous listing no longer refers to anything on screen.
   _fbConfirm = null;
+  _fbEntries = entries;
   list.innerHTML = '';
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
@@ -4126,6 +4369,7 @@ function renderFbEntries(entries, absPath) {
     // both starts with a dot and matches no filter term.
     row.dataset.parent = '1';
     row.addEventListener('click', () => loadFbDir(parent));
+    makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
   for (let e of sortFbEntries(entries)) {
@@ -4144,11 +4388,23 @@ function renderFbEntries(entries, absPath) {
     } else {
       activate(() => {
         let id = _fbId;
+        let tp = id && panes[id];
+        // One transfer per pane. startFastDownload() refuses a second
+        // one silently, and we used to close the browser first - so the
+        // click did nothing at all and said nothing. Keep the browser
+        // open and explain.
+        if (tp && (tp.upload || tp.download)) {
+          showToast('A ' + (tp.upload ? 'upload' : 'download') +
+                    ' is already running in this pane — wait for it or cancel it first.',
+                    'warn');
+          return;
+        }
         closeFb();
         if (id) startFastDownload(id, fullPath);
       });
     }
     wireFbRow(row, fullPath, e.name, e.type);
+    makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
   if (!entries.length) {
@@ -4158,6 +4414,22 @@ function renderFbEntries(entries, absPath) {
   }
   // Apply the dotfile toggle and any active name filter to the fresh rows.
   applyFbVisibility();
+}
+
+// Rows were plain <div>s with a click handler: a keyboard user could
+// reach the ✎/✕ buttons but never open a folder or download a file.
+// Enter/Space on the ROW itself (not on a button or editor inside it,
+// whose own keys must keep their meaning) acts like a click.
+function makeFbRowKeyboardable(row) {
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  row.addEventListener('keydown', ev => {
+    if (ev.target !== row) return;
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      row.click();
+    }
+  });
 }
 
 function makeFbRow(type, name, size, mtime, o) {
@@ -4254,7 +4526,30 @@ function setFbSort(key) {
   else { settings.fbSort = key; settings.fbSortDir = key === 'name' ? 1 : -1; }
   saveSettings();
   syncFbSortUi();
-  reloadFbDir();
+  // Sorting is a reorder of rows already on screen - no roundtrip. It
+  // used to re-fetch the directory, which destroyed an open rename
+  // editor (and its typed text) and, offline, replaced a good listing
+  // with "Failed to load". The row NODES are moved, so an open editor
+  // or an armed delete confirmation survives the reorder.
+  if (!reorderFbRows()) reloadFbDir();
+}
+
+function reorderFbRows() {
+  let list = $('fbList');
+  if (!list || !_fbEntries) return false;
+  let byName = new Map();
+  for (let row of list.querySelectorAll('.fb-row')) {
+    if (row.dataset.parent !== '1') byName.set(row.dataset.name, row);
+  }
+  let parent = list.querySelector('.fb-row[data-parent="1"]');
+  let anchor = parent ? parent.nextSibling : list.firstChild;
+  for (let e of sortFbEntries(_fbEntries)) {
+    let row = byName.get(e.name);
+    if (!row) continue;
+    list.insertBefore(row, anchor);
+    anchor = row.nextSibling;
+  }
+  return true;
 }
 
 // Paint the active column and its arrow. Called on open as well as on
@@ -4302,15 +4597,28 @@ function askFbDelete(row, fullPath, name, type) {
   cancelFbConfirm();
   let restore = row.innerHTML;
   row.classList.add('fb-confirm');
+  // Say what kind of thing is about to go. A folder is removed only
+  // when empty (rmdir, never recursive) - say that up front instead of
+  // letting the user find out from an error.
+  let what = type === 'd' ? 'folder ' : type === 'l' ? 'link ' : '';
+  let note = type === 'd' ? ' <span class="fb-cf-note">(only if empty)</span>' : '';
   row.innerHTML =
-    '<span class="fb-cf-q">Delete <b>' + esc(name) + '</b>?</span>' +
+    '<span class="fb-cf-q">Delete ' + what + '<b>' + esc(name) + '</b>?' + note + '</span>' +
     '<button type="button" class="fb-cf-no">Cancel</button>' +
     '<button type="button" class="fb-cf-yes">Delete</button>';
   let done = () => {
+    // Only pull focus back if it was inside this editor - an editor
+    // closed because the user started one on another row must not
+    // yank focus away from where they now are.
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     row.classList.remove('fb-confirm');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
+    applyFbVisibility();
+    // The focused Cancel button was just destroyed; without this, focus
+    // fell to <body> and the next Tab restarted at the top of the modal.
+    if (hadFocus) { let b = row.querySelector('[data-fb-del]'); if (b) b.focus(); }
   };
   _fbConfirm = done;
   row.querySelector('.fb-cf-no').addEventListener('click', ev => {
@@ -4319,7 +4627,7 @@ function askFbDelete(row, fullPath, name, type) {
   row.querySelector('.fb-cf-yes').addEventListener('click', ev => {
     ev.stopPropagation();
     _fbConfirm = null;
-    doFbDelete(row, fullPath, name, done);
+    doFbDelete(row, fullPath, name, done, type);
   });
   // The button that opened this strip was just destroyed by the
   // innerHTML swap, so a keyboard user's focus would fall to <body> and
@@ -4328,14 +4636,19 @@ function askFbDelete(row, fullPath, name, type) {
   try { row.querySelector('.fb-cf-no').focus(); } catch (e) {}
 }
 
-function doFbDelete(row, fullPath, name, undo) {
+function fbKindLabel(type) {
+  return type === 'd' ? 'folder ' : type === 'l' ? 'link ' : '';
+}
+
+function doFbDelete(row, fullPath, name, undo, type) {
   let p = fbSessionForAction();
   if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Deleting ' + esc(name) + '…</span>';
   api('rm', {body: {session_id: p.sid, path: fullPath}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Deleted ' + name, 'ok');
+      showToast((r && r.already_gone ? 'Already deleted: ' : 'Deleted ') +
+                fbKindLabel(type) + name, 'ok');
       // Re-list rather than dropping the row locally: the directory may
       // have changed for other reasons, and a delete already costs one
       // roundtrip.
@@ -4356,15 +4669,35 @@ function applyFbVisibility() {
   let fInp = $('fbFilter');
   let filt = (fInp && fInp.value || '').trim().toLowerCase();
   let showHidden = !!settings.fbShowHidden;
+  let total = 0, shown = 0;
   for (let row of list.querySelectorAll('.fb-row')) {
-    // ".." and an open editor row are always shown.
-    if (row.dataset.parent === '1' || row.classList.contains('fb-edit')) {
-      row.classList.remove('fb-hide'); continue;
+    if (row.dataset.parent === '1') { row.classList.remove('fb-hide'); continue; }
+    total++;
+    // An open editor or an ARMED DELETE CONFIRMATION is always shown:
+    // hiding a pending destructive question (by typing in the filter or
+    // flipping Hidden) left it answerable by the next blind Escape.
+    if (row.classList.contains('fb-edit') ||
+        row.classList.contains('fb-confirm')) {
+      row.classList.remove('fb-hide'); shown++; continue;
     }
     let name = row.dataset.name || '';
     let hideDot = !showHidden && name.charAt(0) === '.';
     let hideFilt = filt && name.toLowerCase().indexOf(filt) < 0;
     row.classList.toggle('fb-hide', !!(hideDot || hideFilt));
+    if (!(hideDot || hideFilt)) shown++;
+  }
+  // A directory with entries but nothing visible must not look empty.
+  let note = $('fbNoMatch');
+  if (total && !shown) {
+    if (!note) {
+      note = document.createElement('div');
+      note.id = 'fbNoMatch'; note.className = 'fb-msg';
+      list.appendChild(note);
+    }
+    note.textContent = filt ? 'No matches for “' + filt + '”'
+                            : 'Only hidden files here — toggle Hidden to show them';
+  } else if (note) {
+    note.remove();
   }
 }
 function applyFbFilter() { applyFbVisibility(); }
@@ -4380,6 +4713,7 @@ function syncFbHiddenUi() {
   let on = !!settings.fbShowHidden;
   b.classList.toggle('on', on);
   b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.title = on ? 'Hide dotfiles' : 'Show dotfiles';
 }
 
 // ── File browser: rename (mv) ───────────────────────────────────────
@@ -4406,10 +4740,13 @@ function askFbRename(row, fullPath, name, type) {
   let inp = row.querySelector('.fb-ed-inp');
   inp.value = name;
   let done = () => {
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     row.classList.remove('fb-edit');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
+    applyFbVisibility();
+    if (hadFocus) { let b = row.querySelector('[data-fb-ren]'); if (b) b.focus(); }
   };
   _fbConfirm = done;
   let commit = () => {
@@ -4419,7 +4756,7 @@ function askFbRename(row, fullPath, name, type) {
     if (next.indexOf('/') >= 0) {
       showToast('Name cannot contain "/"', 'err'); return;
     }
-    doFbRename(row, fullPath, next, done);
+    doFbRename(row, fullPath, next, done, type);
   };
   row.querySelector('.fb-ed-no').addEventListener('click', ev => {
     ev.stopPropagation(); done();
@@ -4441,14 +4778,14 @@ function askFbRename(row, fullPath, name, type) {
   } catch (e) {}
 }
 
-function doFbRename(row, fullPath, newName, undo) {
+function doFbRename(row, fullPath, newName, undo, type) {
   let p = fbSessionForAction();
   if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Renaming…</span>';
   api('mv', {body: {session_id: p.sid, path: fullPath, name: newName}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Renamed to ' + newName, 'ok');
+      showToast('Renamed ' + fbKindLabel(type) + 'to ' + newName, 'ok');
       reloadFbDir();
     })
     .catch(e => {
@@ -4474,8 +4811,13 @@ function fbNewFolder() {
   list.insertBefore(row, list.firstChild);
   let inp = row.querySelector('.fb-ed-inp');
   let done = () => {
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     if (row.parentNode) row.parentNode.removeChild(row);
+    if (hadFocus) {
+      let b = document.querySelector('.fb-tool[onclick^="fbNewFolder"]');
+      if (b) b.focus();
+    }
   };
   _fbConfirm = done;
   let commit = () => {
@@ -4510,7 +4852,7 @@ function doFbMkdir(row, name, undo) {
   api('mkdir', {body: {session_id: p.sid, path: full}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Created ' + name, 'ok');
+      showToast('Created folder ' + name, 'ok');
       reloadFbDir();
     })
     .catch(e => {
@@ -4661,8 +5003,25 @@ function applySettings(opts){
 // will use to render" is: two consecutive fits return the same cols.
 // So we iterate fit-once-per-RAF until cols stabilises (or hit a
 // safety cap of 8 attempts — at most ~130 ms total, imperceptible).
+// Callbacks waiting for the pane's in-flight fit to finish. Every exit
+// of a fit - settled, aborted, font load failed, or the 10 s stuck
+// timer - drains this, so a caller's onSettled is never lost. It used
+// to be: a second call while a fit was running returned early and
+// dropped its onSettled, and kickPanesAfterAbsence only reopens the SSE
+// stream from that callback - so a tab brought back while the 1 s drift
+// watchdog (or a hung font load) held the flag stayed frozen.
+function _drainPendingSettled(p) {
+  let q = p._pendingSettled;
+  if (!q || !q.length) return;
+  p._pendingSettled = [];
+  if (panes[p.id] !== p) return;          // pane gone: nothing to resume
+  q.forEach(cb => { try { cb(p); } catch (e) { console.error(e); } });
+}
+
 function fitPaneWhenStable(p, opts){
   if (!p || !panes[p.id] || !p.fitAddon) return;
+  let onSettled = (opts && opts.onSettled) || null;
+  if (onSettled) (p._pendingSettled = p._pendingSettled || []).push(onSettled);
   // Re-entry guard: settle-loop forceMeasure() and the fontFamily
   // round-trip both cause xterm to fire its own change events. If a
   // second fitPaneWhenStable call races in before the first finishes
@@ -4670,8 +5029,13 @@ function fitPaneWhenStable(p, opts){
   // they pile up async Promises that each trigger the same xterm
   // chain, exponentially saturating the event loop. Skip cleanly —
   // the in-flight call will land on the latest values anyway.
-  if (p._fitInFlight) return;
+  if (p._fitInFlight) return;             // queued above; drained on its exit
   p._fitInFlight = true;
+  // Identity of THIS fit. The stuck timer can clear the flag and a new
+  // fit can set it again while this one's promise chain is still
+  // pending; the token keeps the old chain from acting as the owner.
+  let token = {};
+  p._fitToken = token;
   // Stuck-timer safety. If the font load hangs (CDN unreachable,
   // captive portal, document.fonts.ready waiting on an unrelated
   // never-completing face) the flag would stay true forever and every
@@ -4683,17 +5047,21 @@ function fitPaneWhenStable(p, opts){
   // a pane closed mid-settle keeps the timer's closure-captured `p`
   // alive for up to 10 s.
   let stuckTimer = setTimeout(() => {
-    p._fitInFlight = false;
+    if (p._fitToken === token) { p._fitInFlight = false; p._fitToken = null; }
     p._stuckTimer = null;
+    _drainPendingSettled(p);
   }, 10000);
   p._stuckTimer = stuckTimer;
   let shouldFlush = !opts || opts.flush !== false;
-  let onSettled = (opts && opts.onSettled) || null;
+  let owns = () => p._fitInFlight && p._fitToken === token && panes[p.id] === p;
   let release = () => {
     clearTimeout(stuckTimer);
     if (p._stuckTimer === stuckTimer) p._stuckTimer = null;
-    p._fitInFlight = false;
+    if (p._fitToken === token) { p._fitInFlight = false; p._fitToken = null; }
   };
+  // Aborted exits still resume whoever was waiting (the stream restart
+  // matters more than a perfect fit).
+  let abort = () => { release(); _drainPendingSettled(p); };
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   // `document.fonts.load(spec)` actively triggers the load AND resolves
@@ -4707,7 +5075,7 @@ function fitPaneWhenStable(p, opts){
         .then(() => document.fonts.ready)
     : Promise.resolve();
   waitFont.then(() => {
-    if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+    if (!owns()) { abort(); return; }
     // Invalidate xterm's CharSizeService cache via a no-op fontFamily
     // round-trip. xterm v5's options setter has a value-equality
     // short-circuit (`rawOptions[k] !== v && fire(k)`), so the
@@ -4734,14 +5102,14 @@ function fitPaneWhenStable(p, opts){
     // (~130 ms total, imperceptible).
     let attempts = 0, lastCols = -1;
     let step = () => {
-      if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+      if (!owns()) { abort(); return; }
       forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
       if (cols === lastCols || attempts >= 8) {
         release();
         if (shouldFlush) flushPaneResize(p);
-        if (onSettled) onSettled(p);
+        _drainPendingSettled(p);
         return;
       }
       lastCols = cols;
@@ -4749,7 +5117,7 @@ function fitPaneWhenStable(p, opts){
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }).catch(() => { release(); });
+  }).catch(() => { abort(); });
 }
 
 // Periodic drift watchdog. Even with the settle loop, edge cases can
@@ -5313,5 +5681,10 @@ _initVaultBroadcast();
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
 loadServerConfig();
-renderSaved();
+// No renderSaved() here: under isolate_storage the storage prefix is
+// only known once /api/config answers, and a render now read the
+// SHARED namespace - the login screen showed another deployment's
+// saved cards (name, user, host) until config arrived, and a click in
+// that window connected with the wrong entry. loadServerConfig()
+// renders once the prefix is right (and its failure path renders too).
 focusFirst();

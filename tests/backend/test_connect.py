@@ -1011,6 +1011,19 @@ class TestConnectValidation(LiveServerCase):
         # fail validation.
         self.assertNotEqual(code, 400)
 
+    def test_capacity_errors_carry_a_machine_readable_code(self):
+        # The client matched these by prose regex; now there's a code.
+        orig = server.RATE_LIMIT_MAX
+        server.RATE_LIMIT_MAX = 0
+        try:
+            body, code = self._post("/api/connect", {
+                "host": "example.com", "username": "u", "password": "p",
+                "cols": 80, "rows": 24})
+        finally:
+            server.RATE_LIMIT_MAX = orig
+        self.assertEqual(code, 429)
+        self.assertEqual(body.get("code"), "rate_limited")
+
     def test_destination_syntax_in_host_rejected(self):
         """`user@host` / `ssh://...` are what ssh parses as a destination
         but getaddrinfo() cannot resolve - the deny-list used to fall

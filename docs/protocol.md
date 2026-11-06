@@ -144,10 +144,12 @@ the ControlMaster side channel: `rm -f` for files and symlinks,
 directory fails rather than taking the tree with it. Symlinks are
 unlinked, never followed.
 
-Reply `{"ok": true}`, or `502 {"error": msg}` where msg distinguishes
-"no such file or directory", "directory not empty or not writable",
-and "permission denied". `400` for a relative path, bare `/`, an
-embedded NUL, or a non-string.
+Reply `{"ok": true}`; `{"ok": true, "already_gone": true}` when the
+entry no longer exists (the goal state holds, so a retry after a lost
+response is not an error). Failures carry the remote tool's own
+reason, e.g. `{"error": "Directory not empty"}`, with a status by
+kind — see "Side-channel failure statuses" below. `400` for a relative
+path, bare `/`, an embedded NUL, or a non-string.
 
 Grants no privilege the session lacks — the user has an interactive
 shell on that host as that account. The reason it exists is that the
@@ -158,8 +160,10 @@ running in the foreground PTY.
 Body: `session_id`, `path` (absolute). Creates one directory,
 **non-recursive** (`mkdir`, not `mkdir -p`) — a mistyped path fails
 rather than silently building a chain. The final path segment may not
-be `.` or `..`. Reply `{"ok": true}`, or `502 {"error": msg}` ("name
-already exists" / "could not create …"); `400` for a bad path.
+be `.` or `..`. Reply `{"ok": true}`, or an error: `409` "name
+already exists", otherwise the remote's reason ("No such file or
+directory" for a missing parent, "Permission denied", …); `400` for a
+bad path.
 
 ### POST /api/mv
 Body: `session_id`, `path` (absolute source), `name` (bare filename).
@@ -167,9 +171,16 @@ Renames the entry to a **sibling** in the same directory — the
 destination is always `dirname(path)/name`, so it cannot move an entry
 elsewhere; `name` is rejected if it contains `/`, is `.`/`..`, is
 empty, holds a NUL, or exceeds 255 bytes. Refuses to overwrite an
-existing target. Reply `{"ok": true}`, or `502 {"error": msg}` ("a
-file with that name already exists" / "permission denied" / "no such
-file"); `400` for a bad path or name.
+existing target. Reply `{"ok": true}`, or an error: `404` "no such
+file or directory", `409` "a file with that name already exists",
+otherwise the remote's reason; `400` for a bad path or name.
+
+#### Side-channel failure statuses
+rm / mkdir / mv map the failure reason to a status: `404` no such
+file; `409` exists / not empty / busy / not a directory / is a
+directory; `403` permission denied / operation not permitted /
+read-only file system; `400` name too long; `502` anything else (ssh
+or side-channel failure).
 
 ### GET /api/download?session_id=&path=
 Streams the file as `application/octet-stream` with

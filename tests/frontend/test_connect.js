@@ -5669,6 +5669,29 @@ test('OSC 7 tracks the remote working directory', async () => {
   cleanup(env);
 });
 
+test('OSC 7 from another host (nested ssh, cat of a file) does not move the cwd', async () => {
+  const env = await mkEnv(FB_PLAN()); const win = env.win;
+  const p = await _onePane(win);
+  p.term.parser._fireOsc(7, 'file://prod/home/alice/app');
+  ok(p.cwd === '/home/alice/app' && p.osc7Host === 'prod', 'first report pins the host');
+  // `ssh db` inside the pane: the nested shell reports ITS directory.
+  ok(p.term.parser._fireOsc(7, 'file://db/var/lib/postgresql') === true, 'consumed (not echoed)');
+  ok(p.cwd === '/home/alice/app', 'foreign host ignored; got ' + p.cwd);
+  // Back in the outer shell: its own reports apply again (host match is case-insensitive).
+  p.term.parser._fireOsc(7, 'file://PROD/srv');
+  ok(p.cwd === '/srv', 'own host applies again; got ' + p.cwd);
+  // Query/fragment are not part of the path; control characters are refused.
+  p.term.parser._fireOsc(7, 'file://prod/srv/www?x=1#frag');
+  ok(p.cwd === '/srv/www', 'query/fragment stripped; got ' + p.cwd);
+  ok(p.term.parser._fireOsc(7, 'file://prod/tmp/a%0Ab') === false, 'newline in path refused');
+  ok(p.term.parser._fireOsc(7, 'file://prod/tmp/a%1Bb') === false, 'ESC in path refused');
+  ok(p.cwd === '/srv/www', 'refused payloads left cwd untouched');
+  // A new session re-learns its host.
+  win.endSession(p, {});
+  ok(p.osc7Host === null && p.cwd === '', 'endSession resets cwd and the pinned host');
+  cleanup(env);
+});
+
 test('file browser opens at the OSC 7 cwd, without asking the server', async () => {
   const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/srv/app')); const win = env.win;
   const p = await _onePane(win);
@@ -6270,6 +6293,367 @@ test('file browser: a mutating action is refused when the listed session changed
   ok(env.log.filter(e => e.action === 'rm').length === 0, 'no rm was sent through the new session');
   ok(env.log.filter(e => e.action === 'ls').length >= 2, 'a reload was kicked off instead');
   cleanup(env);
+});
+
+test('returning to a tab while a fit is in flight still reopens the stream', async () => {
+  // kickPanesAfterAbsence reopens SSE only from fitPaneWhenStable's
+  // onSettled. A fit already in flight (the 1 s drift watchdog, or a
+  // font load still pending) used to make the second call return early
+  // and DROP that callback: the tab came back frozen.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  // A font load that stays pending until we release it.
+  let releaseFont;
+  const pending = new Promise(r => { releaseFont = r; });
+  win.document.fonts = {load: () => pending, ready: Promise.resolve()};
+  let restarts = 0;
+  const realStart = win.startOutput;
+  win.startOutput = (q) => { restarts++; };
+  win.fitPaneWhenStable(p);                 // watchdog-style fit, in flight
+  ok(p._fitInFlight === true, 'a fit is in flight');
+  win.kickPanesAfterAbsence();              // tab comes back now
+  await sleep(30);
+  ok(restarts === 0, 'stream restart waits for the running fit');
+  releaseFont();
+  await sleep(200);
+  ok(restarts === 1, 'queued restart ran once the fit finished; got ' + restarts);
+  ok(!p._fitInFlight, 'fit released');
+  win.startOutput = realStart;
+  cleanup(env);
+});
+
+test('file browser: sorting reorders in place, no refetch, open editor survives', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const lsBefore = env.log.filter(e => e.action === 'ls').length;
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-ren]').click();
+  const inp = row.querySelector('.fb-ed-inp');
+  inp.value = 'typed-but-not-saved.txt';
+  win.setFbSort('size');
+  await sleep(20);
+  ok(env.log.filter(e => e.action === 'ls').length === lsBefore, 'no /api/ls for a sort');
+  ok(row.isConnected && row.classList.contains('fb-edit'), 'rename editor survived the reorder');
+  ok(row.querySelector('.fb-ed-inp').value === 'typed-but-not-saved.txt', 'typed text kept');
+  // By row node (data-name): the row in edit mode has no .fb-nm span.
+  const order = Array.from($(win, 'fbList').querySelectorAll('.fb-row'))
+    .map(r => r.dataset.name).filter(n => n && n !== '..');
+  // dirs first, then files by size desc: alpha(5000) mid(700) zeta(10)
+  ok(JSON.stringify(order.slice(2)) === JSON.stringify(['alpha.txt', 'mid.txt', 'zeta.txt']),
+     'files reordered by size; got ' + JSON.stringify(order));
+  cleanup(env);
+});
+
+test('file browser: clicking a file during a running transfer keeps the browser open and says why', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  p.upload = {cancelled: false};
+  rowFor(win, 'zeta.txt').click();
+  await sleep(10);
+  ok(!$(win, 'fbOv').hidden, 'browser stayed open');
+  ok(/already running/.test(win.document.body.textContent), 'toast explains the refusal');
+  p.upload = null;
+  cleanup(env);
+});
+
+test('file browser: a filter with no matches says so; an armed delete stays visible', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const f = $(win, 'fbFilter');
+  f.value = 'zzzz'; win.applyFbFilter();
+  ok(/No matches/.test($(win, 'fbList').textContent), '"No matches" shown for an empty filter result');
+  f.value = ''; win.applyFbFilter();
+  ok(!/No matches/.test($(win, 'fbList').textContent), 'note removed when rows are visible again');
+  // Arm a delete, then filter it out: the confirmation must stay on screen.
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-del]').click();
+  f.value = 'zeta'; win.applyFbFilter();
+  ok(!row.classList.contains('fb-hide'), 'armed delete confirmation is never hidden');
+  // Cancelling re-applies the filter to the restored row.
+  row.querySelector('.fb-cf-no').click();
+  ok(row.classList.contains('fb-hide'), 'after cancel the row obeys the filter again');
+  cleanup(env);
+});
+
+test('file browser a11y: rows work from the keyboard, focus comes back after editors', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const key = (el, k) => el.dispatchEvent(new win.KeyboardEvent('keydown', {key: k, bubbles: true}));
+  const dir = rowFor(win, 'adir');
+  ok(dir.tabIndex === 0 && dir.getAttribute('role') === 'button', 'rows are focusable buttons');
+  const lsBefore = env.log.filter(e => e.action === 'ls').length;
+  key(dir, 'Enter');
+  await sleep(20);
+  ok(env.log.filter(e => e.action === 'ls').length === lsBefore + 1, 'Enter on a folder row opens it');
+  await sleep(30);
+  // Enter on the ✎ button inside a row must NOT also activate the row.
+  const row = rowFor(win, 'mid.txt');
+  const ren = row.querySelector('[data-fb-ren]');
+  const lsNow = env.log.filter(e => e.action === 'ls').length;
+  key(ren, 'Enter');
+  await sleep(20);
+  ok(!$(win, 'fbOv').hidden && env.log.filter(e => e.action === 'ls').length === lsNow,
+     'keys on an inner button do not activate the row');
+  // Delete -> Cancel with focus inside the editor: focus returns to ✕.
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-no').focus();
+  row.querySelector('.fb-cf-no').click();
+  ok(win.document.activeElement === row.querySelector('[data-fb-del]'),
+     'focus back on the delete button, not <body>; got ' + win.document.activeElement.tagName);
+  // Dialog semantics + labels.
+  const panel = $(win, 'fbOv').querySelector('.fb-panel');
+  ok(panel.getAttribute('role') === 'dialog' && panel.getAttribute('aria-modal') === 'true', 'dialog semantics');
+  ok($(win, 'fbOv').querySelector('.panel-close').getAttribute('aria-label'), 'close button labelled');
+  win.toggleFbHidden();
+  ok($(win, 'fbHidden').title === 'Hide dotfiles', 'Hidden title follows its state');
+  win.toggleFbHidden();
+  const cur = $(win, 'fbPath').querySelector('.fb-crumb.cur');
+  ok(cur && cur.getAttribute('aria-current') === 'location' && cur.tabIndex === -1,
+     'current crumb announced, not a dead tab stop');
+  cleanup(env);
+});
+
+test('file browser: a failed navigation keeps the listing; a stale OSC 7 start falls back', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    // 1st: the OSC 7 directory is gone -> error; 2nd: pane-cwd fallback.
+    {action: 'ls', once: true, response: {error: 'directory not found'}},
+    {action: 'ls', once: true, response: {path: '/home/alice', entries: FB_ENTRIES}},
+    // 3rd: clicking into an unreadable folder fails.
+    {action: 'ls', once: true, response: {error: 'directory not found'}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  p.cwd = '/tmp/deleted-dir';
+  win.showFileBrowser(p.id);
+  await sleep(60);
+  const ls = env.log.filter(e => e.action === 'ls');
+  ok(ls.length === 2, 'fell back to a second listing; got ' + ls.length);
+  ok($(win, 'fbPath').getAttribute('data-path') === '/home/alice', 'landed in the pane dir');
+  ok(names(win).includes('zeta.txt'), 'rows shown');
+  rowFor(win, 'adir').click();
+  await sleep(40);
+  ok(names(win).includes('zeta.txt'), 'failed navigation kept the previous listing');
+  ok($(win, 'fbPath').getAttribute('data-path') === '/home/alice', 'breadcrumbs still usable');
+  ok(!/fb-msg err/.test($(win, 'fbList').innerHTML), 'no error replaced the list');
+  cleanup(env);
+});
+
+test('isolate_storage: the login screen never paints another deployment\'s saved cards', async () => {
+  // renderSaved() ran at module init, before /api/config told us the
+  // storage prefix - so it read the SHARED namespace and showed another
+  // deployment's cards until config arrived.
+  const plan = [{action: 'config', delay: 150,
+                 response: {restrict_hosts: false, connections: [], isolate_storage: true}}];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                               url: 'http://localhost/inst-a/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.localStorage.clear();
+  win.localStorage.setItem('websh_connections',
+    JSON.stringify([{name: 'OTHER-DEPLOYMENT', host: 'secret.internal', user: 'root', port: 22}]));
+  win.localStorage.setItem('/inst-a/websh_connections',
+    JSON.stringify([{name: 'MINE', host: 'mine.example', user: 'me', port: 22}]));
+  win.eval(js + EXPOSE);
+  await sleep(40);                        // config still in flight
+  const before = win.document.getElementById('savedList').textContent;
+  ok(!/OTHER-DEPLOYMENT|secret\.internal/.test(before),
+     'nothing from the shared namespace before config; got ' + JSON.stringify(before));
+  await sleep(200);
+  const after = win.document.getElementById('savedList').textContent;
+  ok(/MINE/.test(after) && !/OTHER-DEPLOYMENT/.test(after),
+     'path-scoped cards after config; got ' + JSON.stringify(after));
+  dom.window.close();
+});
+
+test('api(): a non-JSON reply becomes a readable error, not "Unexpected token <"', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const realFetch = win.fetch;
+  win.fetch = () => Promise.resolve({
+    status: 502, statusText: 'Bad Gateway',
+    json: () => Promise.reject(new SyntaxError("Unexpected token '<'"))});
+  const r = await win.api('rm', {body: {x: 1}});
+  ok(r && /HTTP 502 Bad Gateway/.test(r.error), 'error names the status; got ' + JSON.stringify(r));
+  ok(!/Unexpected token/.test(r.error), 'no JSON parser noise');
+  win.fetch = realFetch;
+  ok(win.isCapacityError({code: 'session_cap_global'}, 'whatever'), 'code recognised');
+  ok(win.isCapacityError({}, 'too many active sessions'), 'prose fallback kept for old servers');
+  ok(!win.isCapacityError({code: 'other'}, 'nope'), 'unrelated error is not capacity');
+  cleanup(env);
+});
+
+test('file browser: header names the host; delete/rename say folder vs file', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.user = 'alice'; p.host = 'prod.example';
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok($(win, 'fbHost').textContent === 'alice@prod.example' && !$(win, 'fbHost').hidden,
+     'user@host shown; got ' + $(win, 'fbHost').textContent);
+  const d = rowFor(win, 'adir');
+  d.querySelector('[data-fb-del]').click();
+  ok(/Delete folder/.test(d.textContent) && /only if empty/.test(d.textContent),
+     'folder confirm says folder + non-recursive; got ' + d.textContent);
+  d.querySelector('.fb-cf-no').click();
+  const f = rowFor(win, 'zeta.txt');
+  f.querySelector('[data-fb-del]').click();
+  ok(/Delete zeta\.txt\?/.test(f.textContent) && !/only if empty/.test(f.textContent),
+     'file confirm stays plain');
+  f.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  ok(/Deleted zeta\.txt/.test(win.document.body.textContent), 'file toast');
+  cleanup(env);
+});
+
+test('drag-and-drop: files dropped on a pane upload; folders and busy panes are refused; stray drops are swallowed', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.host = 'h.example';
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id, files) => started.push([id, files.map(f => f.name)]);
+  const fileItem = name => ({kind: 'file', getAsFile: () => ({name, size: 3}),
+                             webkitGetAsEntry: () => ({isDirectory: false})});
+  const dirItem = name => ({kind: 'file', getAsFile: () => ({name, size: 0}),
+                            webkitGetAsEntry: () => ({isDirectory: true})});
+  const drag = (target, type, items) => {
+    const ev = new win.Event(type, {bubbles: true, cancelable: true});
+    Object.defineProperty(ev, 'dataTransfer', {value: {
+      types: ['Files'], items, files: items.map(i => i.getAsFile()), dropEffect: ''}});
+    target.dispatchEvent(ev);
+    return ev;
+  };
+  drag(p.el, 'dragenter', [fileItem('a.txt')]);
+  ok(p.el.classList.contains('drop-target'), 'pane highlights as a drop target');
+  ok(p.el.getAttribute('data-drop-msg') === 'Drop to upload', 'instruction shown');
+  const ev = drag(p.el, 'drop', [fileItem('a.txt'), dirItem('src'), fileItem('b.bin')]);
+  ok(ev.defaultPrevented, 'drop handled (browser does not navigate)');
+  ok(!p.el.classList.contains('drop-target'), 'highlight cleared');
+  ok(started.length === 1 && JSON.stringify(started[0][1]) === '["a.txt","b.bin"]',
+     'files uploaded, folder skipped; got ' + JSON.stringify(started));
+  ok(/Folders can.t be uploaded/.test(win.document.body.textContent), 'folder refusal explained');
+  // Busy pane: refused with the reason.
+  p.upload = {cancelled: false};
+  drag(p.el, 'dragenter', [fileItem('c.txt')]);
+  ok(/already running/.test(p.el.getAttribute('data-drop-msg')), 'busy reason shown while dragging');
+  drag(p.el, 'drop', [fileItem('c.txt')]);
+  ok(started.length === 1, 'nothing started on a busy pane');
+  p.upload = null;
+  // A drop outside any pane must not navigate the tab away.
+  const stray = drag(win.document.body, 'drop', [fileItem('d.txt')]);
+  ok(stray.defaultPrevented, 'stray drop swallowed');
+  // The Upload button path hands its FileList to the same function.
+  const input = {files: [{name: 'e.txt', size: 1}], value: 'C:/fake/e.txt'};
+  win.handleUpload(p.id, input);
+  ok(started.length === 2 && started[1][1][0] === 'e.txt' && input.value === '',
+     'button path uses startUploadFiles and resets the input');
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
+test('reconnecting is shown on the pane while the transport retries, and cleared on recovery', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-rc', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  ok(!p.el.querySelector('.pane-reconnect'), 'no banner while healthy');
+  // A transient transport failure inside the budget.
+  p.firstFailureAt = Date.now();
+  win.setReconnecting(p, true);
+  const b = p.el.querySelector('.pane-reconnect');
+  ok(b && /reconnecting/.test(b.textContent) && /\(\d+ s\)/.test(b.textContent),
+     'banner with time left; got ' + (b && b.textContent));
+  const badge = p.el.querySelector('[data-pane-badge]');
+  ok(/Reconnecting/.test(badge.textContent) && /s-wait/.test(badge.className),
+     'badge says Reconnecting; got ' + badge.textContent);
+  // A real frame arrives -> retry clock cleared -> banner gone.
+  win.clearRetryClock(p);
+  ok(!p.el.querySelector('.pane-reconnect'), 'banner removed on recovery');
+  ok(/Connected/.test(badge.textContent), 'badge back to Connected');
+  ok(!p._reconnTimer, 'countdown timer stopped');
+  // Budget exhausted -> transportFatal takes over and removes the banner.
+  win.setReconnecting(p, true);
+  p.term.write = () => {};
+  win.transportFatal(p, new Error('x'));
+  ok(!p.el.querySelector('.pane-reconnect'), 'banner removed when giving up');
+  cleanup(env);
+});
+
+test('drag-and-drop: the highlight never gets stuck after a cancelled drag', async () => {
+  // Regression: the highlight was driven by a dragenter/dragleave counter
+  // only. A cancelled drag (Esc, or released outside the browser) gets no
+  // final dragleave in Chromium, so "Drop to upload" and the dashed
+  // outline stayed on the pane for good (reproduced in real Chromium).
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.host = 'h.example';
+  const lit = () => p.el.classList.contains('drop-target');
+  const fire = (target, type, extra) => {
+    const ev = new win.Event(type, {bubbles: true, cancelable: true});
+    Object.defineProperty(ev, 'dataTransfer', {value: {types: ['Files'], items: [], files: [], dropEffect: ''}});
+    if (extra && 'relatedTarget' in extra) Object.defineProperty(ev, 'relatedTarget', {value: extra.relatedTarget});
+    target.dispatchEvent(ev);
+  };
+  const child = p.el.querySelector('.pane-term');
+  // Moving between the pane's own children keeps the highlight.
+  fire(p.el, 'dragenter'); fire(child, 'dragenter');
+  fire(p.el, 'dragleave', {relatedTarget: child});
+  ok(lit(), 'moving onto a child keeps the highlight');
+  // Leaving the window (no relatedTarget) clears it at once.
+  fire(child, 'dragleave', {relatedTarget: null});
+  ok(!lit(), 'leaving the pane/window clears it');
+  // Any mouse movement means the drag is over (browsers suppress mouse
+  // events during a drag) - the cancel-then-move case.
+  fire(p.el, 'dragenter'); ok(lit(), 're-highlighted');
+  win.document.dispatchEvent(new win.MouseEvent('mousemove', {bubbles: true}));
+  ok(!lit(), 'mousemove after a cancel clears it');
+  // No events at all (cancel with the mouse still): heartbeat clears it.
+  fire(p.el, 'dragenter'); fire(p.el, 'dragover');
+  await sleep(600);
+  ok(lit(), 'still shown while within the heartbeat');
+  fire(p.el, 'dragover');                          // UA keeps sending these while held
+  await sleep(900);
+  ok(lit(), 'a held drag stays highlighted (heartbeat re-armed)');
+  await sleep(500);
+  ok(!lit(), 'silence past the heartbeat clears it');
+  // Refusal looks different from an invitation.
+  p.upload = {cancelled: false};
+  fire(p.el, 'dragenter');
+  ok(p.el.classList.contains('drop-refused'), 'busy pane is styled as refused');
+  win.document.dispatchEvent(new win.MouseEvent('mousemove', {bubbles: true}));
+  ok(!p.el.classList.contains('drop-refused') && !lit(), 'refused style cleared too');
+  p.upload = null;
+  cleanup(env);
+});
+
+test('drag-and-drop frame is its own layer above the terminal, not an outline', async () => {
+  // An `outline` on .pane paints UNDER xterm's positioned render layers:
+  // only the top (pane bar) and bottom strip of the frame were visible.
+  // The frame must be a pseudo-element stacked above the terminal.
+  const css = html;
+  ok(!/\.pane\.drop-target\{[^}]*outline/.test(css), 'no outline-based frame on .pane.drop-target');
+  const before = (css.match(/\.pane\.drop-target::before\{([^}]*)\}/) || [])[1] || '';
+  ok(/border:2px dashed/.test(before), 'dashed frame drawn by ::before');
+  const z = +((before.match(/z-index:(\d+)/) || [])[1] || 0);
+  ok(z > 20, 'frame stacks above the terminal layers (z-index ' + z + ' > 20)');
+  ok(/inset:\d+px/.test(before), 'frame spans the whole pane');
 });
 
 // =====================================================================
