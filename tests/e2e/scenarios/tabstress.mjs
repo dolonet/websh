@@ -119,13 +119,25 @@ export async function run({ b, t }) {
   await b.ev('zoomOut(); zoomOut(); 1');
   await sizeOk(P[0], 'tab 1 after zooming back');
 
-  // Drag tab 3 to the front with the mouse.
+  // Drag tab 3 to the front with the mouse, the way a user does it in a
+  // strip too narrow to show tab 1 and tab 3 at once: scroll the strip
+  // until tab 3 is visible (wheel), press it, drag left past the strip's
+  // left edge, release. The strip must not need tab 1 to be on screen.
+  const stripBox = await b.ev(`(() => { const r = document.getElementById('tabs').getBoundingClientRect(); return {l: r.left, r: r.right, y: r.top + r.height / 2}; })()`);
+  const wheel = async dx => b.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: (stripBox.l + stripBox.r) / 2, y: stripBox.y, deltaX: 0, deltaY: dx });
+  const t3Visible = () => b.ev(`(() => { const s = document.getElementById('tabs').getBoundingClientRect();
+    const l = document.querySelector('#tabs .tab[data-tab="${T[2]}"] .tab-label').getBoundingClientRect();
+    const x = l.left + l.width / 2; return x > s.left + 2 && x < s.right - 2 &&
+      document.elementFromPoint(x, l.top + l.height / 2)?.closest('.tab')?.getAttribute('data-tab') === ${J(T[2])}; })()`);
   await b.ev(`document.getElementById('tabs').scrollLeft = 0`);
+  for (let i = 0; i < 20 && !(await t3Visible()); i++) { await wheel(40); await sleep(50); }
+  t.ok(await t3Visible(), 'the wheel scrolls the strip until tab 3 can be pressed');
   const from = await centre(`#tabs .tab[data-tab="${T[2]}"] .tab-label`);
-  const to = await centre(`#tabs .tab[data-tab="${T[0]}"]`);
+  const toX = stripBox.l - 30;
   await mouse('mousePressed', from.x, from.y, 1);
-  for (let x = from.x; x > to.x - 60; x -= 15) await mouse('mouseMoved', x, from.y, 1);
-  await mouse('mouseReleased', to.x - 60, from.y, 0);
+  for (let x = from.x; x > toX; x -= 15) await mouse('mouseMoved', x, from.y, 1);
+  await mouse('mouseMoved', toX, from.y, 1);
+  await mouse('mouseReleased', toX, from.y, 0);
   const o = await order();
   t.ok(o[0] === T[2] && o[1] === T[0] && o[2] === T[1], `tab 3 dragged to the front (${J(o.slice(0, 3))})`);
   const filesDrop = await b.ev(`Object.values(panes).some(p => p.upload)`);

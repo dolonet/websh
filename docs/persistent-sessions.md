@@ -89,6 +89,18 @@ running tmux server the moment you change them:
   to sessions created from then on, while an already-open session keeps
   the size it started with (a tmux limitation).
 
+- **Hyperlinks** (always on, no toggle) —
+  `set -sq "terminal-features[90]" "xterm*:hyperlinks"`. Without the
+  `hyperlinks` feature tmux strips OSC 8 links (Claude Code,
+  `ls --hyperlink`) on their way to the browser. It is server-wide, so
+  it goes into one fixed slot of the array: running it on every connect
+  leaves one copy, where `set -as` would add one per connect to a
+  long-lived tmux server. It is set before `new-session` (a client
+  takes its features when it attaches), and quietly (`-q`): tmux older
+  than 3.2 has no such option, and its error would abort the whole
+  command chain, `new-session` included. Such a tmux still attaches,
+  just without links.
+
 The server accepts user-configurable options only via a fixed
 allow-list (`set-clipboard`, `history-limit` clamped to 100..10 M);
 anything else — including a legacy `tmux_mouse` field from older

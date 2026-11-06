@@ -8522,8 +8522,26 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   ok(/\*::-webkit-scrollbar\{/.test(code), 'scrollbars styled app-wide');
   ok(!/scrollbar-color/.test(code),
      'no inherited scrollbar-color (it overrides the webkit rules in Chromium)');
-  ok(/\.pane\.active>\.pane-bar>\.pane-label\{color:var\(--ac\)\}/.test(code),
-     'active pane is marked on its name only');
+  // Behaviour, not selector text (the label may sit in a wrapper): the
+  // accent-colour rules for the active pane hit its label, nothing else
+  // in its bar, and nothing at all when the pane is not active.
+  {
+    const acc = [];
+    Array.from(win.document.styleSheets).forEach(sh => Array.from(sh.cssRules || []).forEach(r => {
+      if (r.selectorText && r.style && /var\(--ac\)/.test(r.style.getPropertyValue('color')) && /\.pane\.active/.test(r.selectorText)) acc.push(r.selectorText);
+    }));
+    const hit = el => !!el && acc.some(sel => { try { return el.matches(sel); } catch (e) { return false; } });
+    const lab = p.el.querySelector('.pane-bar [data-pane-label]');
+    const others = Array.from(p.el.querySelectorAll('.pane-bar *')).filter(e => e !== lab && !lab.contains(e) && hit(e));
+    const wasActive = p.el.classList.contains('active');
+    p.el.classList.add('active');
+    const onActive = hit(lab);
+    p.el.classList.remove('active');
+    const onInactive = hit(lab);
+    if (wasActive) p.el.classList.add('active');
+    ok(onActive && !onInactive && others.length === 0,
+       'active pane is marked on its name only (active: ' + onActive + ', inactive: ' + onInactive + ', others: ' + others.length + ')');
+  }
   const symbols = (code.match(/<symbol id="i-/g) || []).length;
   ok(symbols >= 15, 'icon sprite present (' + symbols + ' symbols)');
   // The gear must be a cog, not the "circle + straight rays" that reads as a
@@ -8533,8 +8551,11 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   const exp = code.match(/<symbol id="i-export"[\s\S]*?<\/symbol>/)[0];
   ok(/M13\.4 3\.6v5h5/.test(exp), 'Export icon is a document with a down arrow');
   ok(!/[\u{1F300}-\u{1FAFF}]/u.test(code), 'no emoji left in the markup');
-  const paneIcons = p.el.querySelectorAll('.pane-bar svg.ic use');
-  ok(paneIcons.length === 6, 'pane bar buttons (5 + transfer cancel) use the sprite; got ' + paneIcons.length);
+  // The transfer card may sit in the bar or float over a lone pane (tabs
+  // step 2), so it is found by its pane id, not by its place.
+  const paneIcons = Array.from(p.el.querySelectorAll('.pane-bar .pane-btn svg.ic use'))
+    .concat(Array.from(win.document.querySelectorAll('[data-upload-progress="' + p.id + '"] .upload-progress-cancel svg.ic use')));
+  ok(paneIcons.length === 8, 'pane bar buttons (7: upload, download, Move to new tab, Move to tab, 2 splits, close) + transfer cancel use the sprite; got ' + paneIcons.length);
   ok(Array.from(paneIcons).every(u => /^#i-/.test(u.getAttribute('href'))), 'each references a symbol');
   // File rows: icon by type, actions as icons with their labels intact.
   win.showFileBrowser(p.id);
@@ -8565,16 +8586,25 @@ test('status bars float over the terminal instead of resizing it', async () => {
      'clicks pass through the stack, but not through the bars themselves');
   ok(!/\.reconnect-bar\{[^}]*flex-shrink/.test(code) || !/\.pane>\s*\.reconnect-bar/.test(code),
      'reconnect bar no longer participates in the pane column');
-  // All three bars end up in the stack, in DOM order, none in the column.
+  // The tmux and retry banners end up in the stack, none in the column.
+  // The Reconnect control no longer does (owner, 2026-10-05): it lives in
+  // the pane's bar row - the pane bar in a split, an overlaid strip of
+  // the same look for a lone pane ("reconnect in the bar" / "reconnect
+  // strip" tests below).
   win.showReconnectBar(p);
   win.showTmuxBar(p, 'tmux missing');
   p.firstFailureAt = Date.now();
   win.setReconnecting(p, true);
-  const inStack = ['[data-reconnect]', '[data-tmux-bar]', '.pane-reconnect']
+  const inStack = ['[data-tmux-bar]', '.pane-reconnect']
     .map(sel => { const el = p.el.querySelector(sel); return !!el && el.parentElement === stack; });
-  ok(inStack.every(Boolean), 'reconnect, tmux and retry banners all live in the stack; got ' + JSON.stringify(inStack));
-  ok(p.el.querySelector('.pane-bar').nextElementSibling.classList.contains('pane-term'),
-     'nothing sits between the pane bar and the terminal');
+  ok(inStack.every(Boolean), 'tmux and retry banners live in the stack; got ' + JSON.stringify(inStack));
+  const rc = p.el.querySelector('[data-reconnect]');
+  ok(!!rc && !stack.contains(rc), 'the Reconnect control is not a card in the stack over the terminal');
+  let between = [];
+  for (let e = p.el.querySelector('.pane-bar').nextElementSibling; e && !e.classList.contains('pane-term'); e = e.nextElementSibling)
+    if (!e.classList.contains('reconnect-strip')) between.push(e.className);
+  ok(between.length === 0,
+     'nothing but the (overlaid) reconnect strip sits between the pane bar and the terminal; got ' + JSON.stringify(between));
   win.setReconnecting(p, false);
   cleanup(env);
 });
@@ -8645,7 +8675,7 @@ test('saved connections can be edited in place', async () => {
 //   #tabs .tab[data-tab=ID]   one per tab, in strip order; the shown one has .active
 //   .tab .tab-dot             state dot: s-on (green) / s-wait (amber) / s-off (red)
 //   .tab .tab-label           text = the .pane-label text of the tab's active pane
-//   .tab .tab-split           split marker, only shown with 2+ panes, text has the count
+//   .tab .tab-split           split marker, only shown with 2+ panes, tooltip "N panes"
 //   .tab .tab-close           the x; a click on it closes the tab and nothing else
 //   .tab.activity             unseen output in an inactive tab
 //   #tabNew                   the "+" button, after the last tab
@@ -8674,19 +8704,99 @@ async function until(fn, ms) {
 }
 
 function installLayoutModel(win) {
-  const lay = {box: {cols: 80, rows: 24}, ros: []};
+  // barRows (0 unless a test sets it): the pane bar's height in rows.
+  // While a pane's .pane-bar is shown, everything inside that pane's
+  // .pane-term is that much shorter - so hiding the bar gives the
+  // terminal more rows, and the ResizeObserver sees the change.
+  const lay = {box: {cols: 80, rows: 24}, ros: [], barRows: 0};
   const hiddenEl = el => {
     if (!el || !el.isConnected) return true;
     for (let e = el; e && e.nodeType === 1; e = e.parentElement) {
       if (e.hidden || (e.classList && e.classList.contains('h'))) return true;
       if (e.style && e.style.display === 'none') return true;
-      if (win.getComputedStyle(e).display === 'none') return true;
+      if (displayOf(e) === 'none') return true;
     }
     return false;
   };
+  // jsdom's getComputedStyle ignores selector specificity (the later
+  // rule wins), so `.tab-root.solo .pane-bar{display:none}` written
+  // before `.pane-bar{display:flex}` would read as shown. Cascade the
+  // `display` declarations ourselves: !important, then specificity,
+  // then source order; inline style over sheet rules.
+  let displayRules = null;
+  // Same cascade for any other property (the model asks for `position`:
+  // a pane bar taken out of flow - drawn over the terminal - takes no
+  // rows from it).
+  const propRules = {};
+  const specificity = sel => {
+    const s = sel.replace(/::?[a-z-]+\([^)]*\)/g, m => /^:not\(/.test(m) ? m.slice(5, -1) : ':x');
+    const a = (s.match(/#[\w-]+/g) || []).length;
+    const b = (s.match(/\.[\w-]+|\[[^\]]*\]|:(?!:)[\w-]+/g) || []).length;
+    const c = (s.replace(/#[\w-]+|\.[\w-]+|\[[^\]]*\]|::?[\w-]+/g, ' ').match(/[a-z][\w-]*/gi) || []).length;
+    return a * 10000 + b * 100 + c;
+  };
+  const collectRules = (prop) => {
+    prop = prop || 'display';
+    const out = [];
+    let order = 0;
+    const walk = rules => Array.from(rules || []).forEach(r => {
+      if (r.cssRules && !r.selectorText) { walk(r.cssRules); return; }
+      if (!r.selectorText || !r.style) return;
+      const v = r.style.getPropertyValue(prop);
+      if (!v) return;
+      const imp = r.style.getPropertyPriority(prop) === 'important';
+      r.selectorText.split(',').forEach(sel => out.push({sel: sel.trim(), v: v.trim(), imp, spec: specificity(sel), order: order++}));
+    });
+    Array.from(win.document.styleSheets).forEach(sh => { try { walk(sh.cssRules); } catch (e) {} });
+    return out;
+  };
+  const displayOf = el => {
+    if (!displayRules) displayRules = collectRules();
+    let best = null;
+    for (const r of displayRules) {
+      let m = false;
+      try { m = el.matches(r.sel); } catch (e) {}
+      if (!m) continue;
+      if (!best || (r.imp !== best.imp ? r.imp : (r.spec !== best.spec ? r.spec > best.spec : r.order > best.order))) best = r;
+    }
+    const inl = el.style && el.style.getPropertyValue('display');
+    if (inl && !(best && best.imp)) return inl;
+    return best ? best.v : '';
+  };
+  lay.displayOf = displayOf;
+  const propOf = (el, prop) => {
+    if (!propRules[prop]) propRules[prop] = collectRules(prop);
+    let best = null;
+    for (const r of propRules[prop]) {
+      let m = false;
+      try { m = el.matches(r.sel); } catch (e) {}
+      if (!m) continue;
+      if (!best || (r.imp !== best.imp ? r.imp : (r.spec !== best.spec ? r.spec > best.spec : r.order > best.order))) best = r;
+    }
+    const inl = el.style && el.style.getPropertyValue(prop);
+    if (inl && !(best && best.imp)) return inl;
+    return best ? best.v : '';
+  };
+  lay.propOf = propOf;
+  // Out of flow: absolute/fixed itself (an element inside an out-of-flow
+  // box below `upTo` is covered by that box's own check).
+  lay.outOfFlow = (el, upTo) => {
+    for (let e = el; e && e.nodeType === 1 && e !== upTo; e = e.parentElement)
+      if (/^(absolute|fixed)$/.test(propOf(e, 'position'))) return true;
+    return false;
+  };
   lay.hidden = hiddenEl;
+  const barOver = el => {
+    if (!lay.barRows || !el || !el.closest) return 0;
+    const term = el.closest('.pane-term');
+    const pane = term && term.closest('.pane');
+    if (!pane) return 0;
+    const bar = Array.from(pane.children).find(c => c.classList.contains('pane-bar'));
+    return bar && !hiddenEl(bar) && !/^(absolute|fixed)$/.test(propOf(bar, 'position')) ? lay.barRows : 0;
+  };
+  lay.barOver = barOver;
   const sizeOf = el => hiddenEl(el) ? {width: 0, height: 0}
-    : {width: lay.box.cols * 9, height: lay.box.rows * 18};
+    : {width: lay.box.cols * 9, height: (lay.box.rows - barOver(el)) * 18};
   lay.sizeOf = sizeOf;
   const P = win.HTMLElement.prototype;
   const def = (k, f) => Object.defineProperty(P, k, {get() { return f(this); }, configurable: true});
@@ -8739,7 +8849,7 @@ function installLayoutModel(win) {
       // The box holds box.cols x box.rows cells at the font size the
       // first terminal was made with; a bigger font fits fewer.
       const k = (lay.baseFont && t.options && t.options.fontSize) ? lay.baseFont / t.options.fontSize : 1;
-      return {cols: Math.floor(lay.box.cols * k), rows: Math.floor(lay.box.rows * k)};
+      return {cols: Math.floor(lay.box.cols * k), rows: Math.floor((lay.box.rows - barOver(t.element)) * k)};
     }
     fit() {
       const d = this.proposeDimensions();
@@ -8790,7 +8900,7 @@ const TAB_EXPOSE = `
   Object.defineProperty(window, 'activeId', {get: () => activeId, configurable: true});
 })();`;
 
-async function mkTabEnv(plan, pre) {
+async function mkTabEnv(plan, pre, o) {
   const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
                                url: 'http://localhost/websh/'});
   const win = dom.window;
@@ -8798,6 +8908,7 @@ async function mkTabEnv(plan, pre) {
   const state = {dead: false};
   makeFakes(win);
   const lay = installLayoutModel(win);
+  if (o && o.barRows) lay.barRows = o.barRows;
   win.fetch = makeFetch(plan, log, state);
   _injectVaultGlobals(win);
   win.localStorage.clear();
@@ -8958,8 +9069,8 @@ test('tabs: the strip sits in the top bar with dot, label, split marker and +', 
   ts = tabEls(win);
   ok(ts.length === 1, 'a split does not make a tab; got ' + ts.length);
   const sm2 = ts[0] && ts[0].querySelector('.tab-split');
-  ok(!!sm2 && !env.lay.hidden(sm2) && /2/.test(sm2.textContent),
-     'split marker shows the pane count 2; got ' + (sm2 ? JSON.stringify(sm2.textContent) : 'none'));
+  ok(!!sm2 && !env.lay.hidden(sm2) && markerSays(sm2, 2),
+     'split marker shown, its tooltip says "2 panes"; got ' + (sm2 ? JSON.stringify(sm2.title) : 'none'));
   ok(b && tabOfPane(b) === tabId(ts[0]), 'the split pane is in the same tab');
   cleanup(env);
 });
@@ -9511,7 +9622,7 @@ test('tabs: a manifest saved by the previous version loads as one tab with its w
   const root = t && tabRootById(win, tabId(t));
   ok(!!root && !!root.querySelector('.split-h .split-v'), 'the nested split is kept');
   const sm = t && t.querySelector('.tab-split');
-  ok(!!sm && /3/.test(sm.textContent), 'split marker says 3; got ' + (sm ? JSON.stringify(sm.textContent) : 'none'));
+  ok(!!sm && markerSays(sm, 3), 'split marker says "3 panes"; got ' + (sm ? JSON.stringify(sm.title) : 'none'));
   await sleep(50);
   // And the next reload (new format now) still has everything.
   const snap = snapshotStorage(win);
@@ -9884,6 +9995,4356 @@ test('tabs: a background reconnect while the + form is open does not hijack the 
   ok(panesOfTab(win, tabOfPane(a)).length === 1 && a.sid === 'sid-a.host', 'a keeps its tab and session');
   cleanup(env);
 });
+
+// =====================================================================
+// Tabs (step 2): a lone pane has no bar of its own.
+// Written from the behaviour spec, before the feature existed.
+//
+// DOM contract these tests rely on (the implementer provides it):
+//   .pane > .pane-bar         hidden (.h, [hidden] or display:none, also
+//                             through a class on an ancestor such as
+//                             .tab-root.solo) while its tab has ONE pane;
+//                             shown in a tab with 2+ panes
+//   #paneTools                group in .top, after #tabNew and before
+//                             .top-r; shown only when the active tab has
+//                             exactly one pane, hidden otherwise (also
+//                             when there is no tab: initial login form)
+//   #paneTools [data-act=upload|download|split-h|split-v|close]
+//                             buttons acting on the active pane;
+//                             upload/download .disabled until it is
+//                             connected and while a transfer runs
+//   .upload-progress          (with .upload-progress-text and
+//                             .upload-progress-cancel) a VISIBLE one for a
+//                             lone pane's transfer - in #paneTools or as
+//                             a card over the pane
+//   .pane-tag.persistent / .pane-tag.ephemeral
+//                             the marker stays visible for a lone pane
+//                             (in the tab handle or #paneTools)
+// The layout model gives the bar 2 rows: the bar shown, the terminal
+// has 22 of the box's 24 rows; hidden, all 24.
+// =====================================================================
+const BAR = 2;
+const S2 = {barRows: BAR};
+const barOf = p => p && p.el && p.el.querySelector('.pane-bar');
+const barShown = (env, p) => { const b = barOf(p); return !!b && !env.lay.hidden(b); };
+const tools = win => $(win, 'paneTools');
+const toolsShown = env => !!tools(env.win) && !env.lay.hidden(tools(env.win));
+const toolBtn = (win, act) => { const g = tools(win); return g ? g.querySelector('[data-act="' + act + '"]') : null; };
+const ACTS = ['upload', 'download', 'split-h', 'split-v', 'close'];
+function needTools(win) {
+  const g = !!tools(win);
+  ok(g, 'top-bar pane actions present: #paneTools');
+  return g;
+}
+const sizesSent = (env, sid, from) => resizesFor(env, sid, from).map(e => e.body.cols + 'x' + e.body.rows);
+// The size the server last heard for a session: the connect, then every
+// resize after it.
+function serverSize(env, sid) {
+  let s = null;
+  env.log.forEach(e => {
+    if (e.action === 'connect' && e.body && ('sid-' + (e.body.host || e.body.connection)) === sid && e.body.cols)
+      s = e.body.cols + 'x' + e.body.rows;
+    if (e.action === 'resize' && e.body && e.body.session_id === sid) s = e.body.cols + 'x' + e.body.rows;
+  });
+  return s;
+}
+// Settles the debounced resize of a pane so later counts start clean.
+async function settled(win, p) {
+  win.flushPaneResize(p);
+  await until(() => p.lastSentCols === p.term.cols && p.lastSentRows === p.term.rows, 1000);
+  await sleep(200);            // past the 150 ms resize debounce
+}
+function visibleAll(env, sel) {
+  return Array.from(env.win.document.querySelectorAll(sel)).filter(e => !env.lay.hidden(e));
+}
+function fireChange(win, input) {
+  const code = input.getAttribute && input.getAttribute('onchange');
+  if (code) win.eval('(function(){' + code + '})').call(input);
+  else input.dispatchEvent(new win.Event('change', {bubbles: true}));
+}
+// Records every <input> .click() (the file picker opening).
+function pickerSpy(win) {
+  const seen = [];
+  const P = win.HTMLInputElement.prototype;
+  const orig = P.click;
+  P.click = function() { seen.push(this); };
+  seen.restore = () => { P.click = orig; };
+  return seen;
+}
+// XHR that reports some progress and then hangs until aborted.
+function hangingXhr(win) {
+  const st = {xhrs: []};
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; st.xhrs.push(this); }
+    open(m, url) { this.url = url; }
+    setRequestHeader() {}
+    abort() { this.aborted = true; }
+    send() { win.setTimeout(() => { if (!this.aborted && this.upload.onprogress) this.upload.onprogress({loaded: 400}); }, 2); }
+  };
+  return st;
+}
+
+test('solo: a lone pane has no bar; its terminal gets the height and the server that size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const g0 = tools(win);
+  ok(!g0 || env.lay.hidden(g0), 'no pane actions in the top bar while the initial login form is up');
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  ok(!barShown(env, a), 'the lone pane\'s .pane-bar is not shown');
+  ok(a.term.cols === 80 && a.term.rows === 24,
+     'the terminal has the whole box, 80x24 (22 rows would mean the bar still takes its place); got ' + a.term.cols + 'x' + a.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'the server has 80x24 for the PTY; got ' + serverSize(env, 'sid-a.host'));
+  if (!needTools(win)) { cleanup(env); return; }
+  ok(toolsShown(env), '#paneTools is shown with one pane in the tab');
+  const top = win.document.querySelector('.top');
+  const g = tools(win);
+  const F = win.Node.DOCUMENT_POSITION_FOLLOWING;
+  ok(top.contains(g), '#paneTools is in the top bar');
+  ok(!!($(win, 'tabNew').compareDocumentPosition(g) & F) && !!(g.compareDocumentPosition(top.querySelector('.top-r')) & F),
+     '#paneTools sits after the tab strip and "+" and before the global buttons (.top-r)');
+  ACTS.forEach(act => {
+    const btn = toolBtn(win, act);
+    ok(!!btn && !env.lay.hidden(btn), 'top-bar button [data-act=' + act + '] is there and shown');
+    const u = btn && btn.querySelector('svg.ic use');
+    ok(!!u && /^#i-/.test(u.getAttribute('href') || ''), '[data-act=' + act + '] uses the icon sprite like the pane bar');
+    ok(!!btn && !!btn.getAttribute('aria-label'), '[data-act=' + act + '] has an aria-label');
+  });
+  ok(toolBtn(win, 'upload') && !toolBtn(win, 'upload').disabled, 'upload is enabled for a connected pane');
+  ok(toolBtn(win, 'download') && !toolBtn(win, 'download').disabled, 'download is enabled for a connected pane');
+  ok(!!(toolBtn(win, 'upload') || {}).title && !!(toolBtn(win, 'close') || {}).title, 'the buttons carry tooltips');
+  cleanup(env);
+});
+
+test('solo: a split brings the bars back and refits once; closing back to one pane hides it and refits once', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  needTools(win);
+  await settled(win, a);
+  ok(a.term.rows === 24 && !barShown(env, a), 'start: lone pane, no bar, 24 rows; got ' + a.term.rows);
+  let mark = env.log.length;
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'setup: split'); cleanup(env); return; }
+  await until(() => a.term.rows === 24 - BAR, 1000);
+  await sleep(300);
+  ok(barShown(env, a) && barShown(env, b), 'with two panes both bars are shown');
+  ok(!toolsShown(env), 'and the top-bar pane actions are hidden');
+  ok(a.term.rows === 24 - BAR, 'the first pane gave the bar its rows: ' + (24 - BAR) + '; got ' + a.term.rows);
+  let rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x' + (24 - BAR), 'exactly one /api/resize 80x' + (24 - BAR) + ' for the first pane; got ' + JSON.stringify(rs));
+  ok(b.term.rows === 24 - BAR, 'the new pane, with its bar, has ' + (24 - BAR) + ' rows; got ' + b.term.rows);
+  await settled(win, b);
+  mark = env.log.length;
+  win.closePane(b.id);
+  await until(() => !win.panes[b.id], 500);
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a), 'one pane left: its bar is hidden again');
+  ok(toolsShown(env), 'and the pane actions are back in the top bar');
+  ok(a.term.rows === 24, 'the terminal gets the bar\'s rows back: 24; got ' + a.term.rows);
+  rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'exactly one /api/resize 80x24; got ' + JSON.stringify(rs));
+  ok(env.log.filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo: switching between a one-pane tab and a split tab flips bars and top-bar actions, with no resize', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  if (!needTabs(win) || !a1) { cleanup(env); return; }
+  needTools(win);
+  const a2 = await tSplit(win, a1, 'v', 'a2.host');
+  const b = await tNewTab(win, 'b.host');
+  if (!a2 || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  await settled(win, b);
+  ok(tabId(activeTab(win)) === tB, 'B (one pane) in front');
+  ok(!barShown(env, b) && toolsShown(env), 'B: no pane bar, actions in the top bar');
+  ok(b.term.rows === 24, 'B\'s terminal has 24 rows; got ' + b.term.rows);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => !toolsShown(env), 500);
+  ok(!toolsShown(env), 'A (two panes) in front: top-bar pane actions hidden');
+  ok(barShown(env, a1) && barShown(env, a2), 'A: both panes show their bar');
+  await settled(win, a1); await settled(win, a2);
+  ok(a1.term.rows === 24 - BAR && a2.term.rows === 24 - BAR, 'A\'s terminals leave room for their bars; got ' + a1.term.rows + '/' + a2.term.rows);
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await until(() => toolsShown(env), 500);
+  ok(toolsShown(env) && !barShown(env, b), 'back on B: actions in the top bar, no pane bar');
+  ok(b.term.rows === 24, 'B still 24 rows; got ' + b.term.rows);
+  // Now everything is settled: switching back and forth sends nothing.
+  await sleep(200);
+  const mark = env.log.length;
+  for (let i = 0; i < 3; i++) {
+    clickTab(win, tabById(win, tA)); await until(() => tabId(activeTab(win)) === tA, 500);
+    await sleep(20);
+    clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500);
+    await sleep(20);
+  }
+  await sleep(300);
+  const rs = env.log.slice(mark).filter(e => e.action === 'resize').map(e => e.body.session_id + ' ' + e.body.cols + 'x' + e.body.rows);
+  ok(rs.length === 0, 'switching tabs (sizes unchanged) sends no /api/resize; got ' + JSON.stringify(rs));
+  ok(toolsShown(env) && !barShown(env, b), 'ends on B with the right chrome');
+  cleanup(env);
+});
+
+test('solo: the top-bar actions act on the active pane of the active tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'ls', response: {path: '/home/u', entries: []}},
+  ]), null, S2); const win = env.win;
+  const urls = recordUrls(win);
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host', {persistent: true});
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'B in front');
+  const esc = async () => {
+    win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+    await until(() => hidden($(win, 'ov')), 500);
+  };
+  // Split horizontal / vertical: the login form for a split of b.
+  press(win, toolBtn(win, 'split-h'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'split-h opens the login form');
+  ok(win.pendingSplit && win.pendingSplit.fromId === b.id && win.pendingSplit.dir === 'h',
+     'for a horizontal split of the active pane; got ' + JSON.stringify(win.pendingSplit));
+  await esc();
+  press(win, toolBtn(win, 'split-v'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(win.pendingSplit && win.pendingSplit.fromId === b.id && win.pendingSplit.dir === 'v',
+     'split-v: a vertical split of the active pane; got ' + JSON.stringify(win.pendingSplit));
+  await esc();
+  await until(() => toolsShown(env) && !barShown(env, b), 500);
+  ok(panesOfTab(win, tB).length === 1 && !barShown(env, b) && toolsShown(env) && hidden($(win, 'ov')),
+     'dismissed: B unchanged, still one pane without a bar; panes=' + panesOfTab(win, tB).length +
+     ' bar=' + barShown(env, b) + ' tools=' + toolsShown(env) + ' form open=' + !hidden($(win, 'ov')));
+  // Upload: the file picker opens, and what is picked goes to b.
+  const st = hangingXhr(win);
+  const picks = pickerSpy(win);
+  press(win, toolBtn(win, 'upload'));
+  picks.restore();
+  const inp = picks.find(i => i.type === 'file');
+  ok(!!inp, 'upload opens a file picker; inputs clicked: ' + picks.length);
+  if (inp) {
+    Object.defineProperty(inp, 'files', {value: [{name: 'top.txt', size: 4}], configurable: true});
+    fireChange(win, inp);
+    await until(() => st.xhrs.length > 0, 500);
+    ok(st.xhrs.length === 1 && /session_id=sid-b\.host/.test(st.xhrs[0].url || ''),
+       'the picked file uploads into b; got ' + JSON.stringify(st.xhrs.map(x => x.url)));
+    ok(!a.upload, 'nothing goes to the pane in the hidden tab');
+    if (b.upload) win.cancelTransfer(b.id);
+    await until(() => !b.upload, 3000);
+  }
+  // Download: the file browser for b.
+  await until(() => !toolBtn(win, 'download').disabled, 3000);
+  press(win, toolBtn(win, 'download'));
+  await until(() => !hidden($(win, 'fbOv')), 500);
+  ok(!hidden($(win, 'fbOv')), 'download opens the file browser');
+  ok(($(win, 'fbHost') || {}).textContent === 'u@b.host', 'on b\'s host; got ' + JSON.stringify(($(win, 'fbHost') || {}).textContent));
+  await until(() => urls.some(u => /action=ls/.test(u)), 500);
+  const ls = urls.filter(u => /action=ls/.test(u));
+  ok(ls.length > 0 && ls.every(u => /session_id=sid-b\.host/.test(u)), 'the listing is for b\'s session; got ' + JSON.stringify(ls));
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+  await until(() => hidden($(win, 'fbOv')), 500);
+  // Close on a live tmux pane: the same terminate question as the pane's own x.
+  const modal = confirmCounter(win);
+  press(win, toolBtn(win, 'close'));
+  await until(() => modal.opened > 0, 500);
+  ok(modal.opened === 1, 'close on a live tmux pane asks to terminate, once; got ' + modal.opened);
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!win.panes[b.id] && b.sid === 'sid-b.host', 'Cancel keeps it');
+  press(win, toolBtn(win, 'close'));
+  await until(() => modal.opened > 1, 500);
+  win.confirmTerminate(false);
+  await until(() => !win.panes[b.id], 500);
+  const d = disconnectsFor(env, 'sid-b.host');
+  ok(d.length === 1 && d[0].body.terminate === true, 'b terminated once; got ' + JSON.stringify(d.map(e => e.body)));
+  ok(!tabById(win, tB) && tabId(activeTab(win)) === tA, 'its tab is gone and A is in front');
+  ok(!!win.panes[a.id] && a.sid === 'sid-a.host', 'a untouched');
+  // Close on a short-lived lone pane in the last tab: initial form.
+  ok(toolsShown(env), 'A (one pane): actions in the top bar');
+  press(win, toolBtn(win, 'close'));
+  await until(() => !win.panes[a.id], 500);
+  ok(!win.panes[a.id] && disconnectsFor(env, 'sid-a.host').length === 1, 'close closed a, no question');
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')) && win.overlayMode === 'initial', 'last pane gone: the initial login form');
+  await until(() => !toolsShown(env), 500);
+  ok(!toolsShown(env), 'and no pane actions in the top bar');
+  cleanup(env);
+});
+
+test('solo: top-bar upload/download are disabled until the pane is connected and while a transfer runs', async () => {
+  // A pane exists without a session while it reconnects after a reload:
+  // the connect below is held for 400 ms.
+  const env0 = await mkTabEnv(TAB_PLAN(), null, S2);
+  const a0 = await tConnect(env0.win, 'slow.host');
+  if (!needTabs(env0.win) || !a0) { cleanup(env0); return; }
+  const snap = snapshotStorage(env0.win);
+  cleanup(env0);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'slow.host', response: {session_id: 'sid-slow.host', alive: true}, delay: 400},
+  ]), snap, S2); const win = env.win;
+  if (!needTools(win)) { cleanup(env); return; }
+  const pending = () => paneList(win).find(p => p.host === 'slow.host' && !p.sid);
+  const seen = await until(() => !!pending() && win.activeId === pending().id && toolsShown(env), 350);
+  if (seen) {
+    ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled,
+       'upload and download are disabled while the lone pane (re)connects');
+  } else {
+    ok(false, 'while the restored pane connects, it is active and #paneTools is shown');
+  }
+  await until(() => paneList(win).some(p => p.host === 'slow.host' && p.sid), 2000);
+  const s = paneList(win).find(p => p.host === 'slow.host');
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled && !toolBtn(win, 'download').disabled, 'enabled once connected');
+  const a = await tNewTab(win, 'a.host');
+  if (!a) { ok(false, 'setup: second tab'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, s));
+  await until(() => win.activeId === s.id, 500);
+  // A running transfer disables both, like the pane's own buttons.
+  const st = hangingXhr(win);
+  win.handleUpload(s.id, {files: [{name: 'x.bin', size: 5000}], value: ''});
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled, 'disabled while an upload runs');
+  // Switching to the idle tab: the buttons follow that tab's pane.
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled, 'in the other tab the buttons are for its (idle, connected) pane');
+  clickTab(win, tabElOfPane(win, s));
+  await until(() => win.activeId === s.id, 500);
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled, 'back: disabled again (the upload is still running)');
+  win.cancelTransfer(s.id);
+  await until(() => !s.upload, 3000);
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled, 'enabled again once the transfer is over');
+  // The session drops: disabled again.
+  win.endSession(s, {badge: true});
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled, 'disabled after the session ended');
+  ok(st.xhrs.length >= 1, 'the upload really started');
+  cleanup(env);
+});
+
+test('solo: a lone pane\'s upload shows its progress and a working cancel, for its own tab only', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'no progress shown before an upload');
+  const st = hangingXhr(win);
+  win.handleUpload(a.id, {files: [{name: 'report.pdf', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length > 0, 500);
+  let vis = visibleAll(env, '.upload-progress');
+  ok(vis.length === 1, 'one upload progress is visible for the lone pane; got ' + vis.length);
+  const pr = vis[0];
+  await until(() => pr && /report\.pdf|\d+%/.test((pr.querySelector('.upload-progress-text') || {}).textContent || ''), 500);
+  ok(!!pr && /report\.pdf|\d+%/.test((pr.querySelector('.upload-progress-text') || {}).textContent || ''),
+     'it says what is being uploaded / how far; got ' + JSON.stringify(pr && (pr.querySelector('.upload-progress-text') || {}).textContent));
+  const cancel = pr && pr.querySelector('.upload-progress-cancel');
+  ok(!!cancel && !env.lay.hidden(cancel), 'its cancel button is visible');
+  ok(!barShown(env, a), 'and the pane bar stays hidden (the progress is not shown by bringing it back)');
+  ok(a.term.rows === 24, 'the terminal keeps its 24 rows during the upload; got ' + a.term.rows);
+  // Another tab: its pane has no transfer, nothing shown there.
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await sleep(20);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'in the other tab, a\'s upload progress is not shown');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  vis = visibleAll(env, '.upload-progress');
+  ok(vis.length === 1, 'back in A, the progress is shown again');
+  const c2 = vis[0] && vis[0].querySelector('.upload-progress-cancel');
+  if (c2) press(win, c2);
+  await until(() => st.xhrs.some(x => x.aborted), 500);
+  ok(st.xhrs.length === 1 && st.xhrs[0].aborted, 'cancel aborts the upload');
+  ok(/cancel/i.test(((visibleAll(env, '.upload-progress')[0] || {}).textContent) || ''),
+     'the visible banner says Cancelled; got ' + JSON.stringify(((visibleAll(env, '.upload-progress')[0] || {}).textContent) || ''));
+  await until(() => !a.upload, 3000);
+  await until(() => visibleAll(env, '.upload-progress').length === 0, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'and then goes away');
+  cleanup(env);
+});
+
+test('solo: the persistent / short-lived marker stays visible for a lone pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host', {persistent: true});
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  // B (short-lived) in front.
+  await until(() => visibleAll(env, '.pane-tag.ephemeral').length >= 1 && visibleAll(env, '.pane-tag.persistent').length === 0, 500);
+  ok(visibleAll(env, '.pane-tag.ephemeral').length >= 1, 'short-lived lone pane: a visible short-lived marker');
+  ok(visibleAll(env, '.pane-tag.persistent').length === 0, 'and no visible persistent marker');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => visibleAll(env, '.pane-tag.persistent').length >= 1 && visibleAll(env, '.pane-tag.ephemeral').length === 0, 500);
+  ok(visibleAll(env, '.pane-tag.persistent').length >= 1, 'persistent lone pane: a visible persistent marker');
+  ok(visibleAll(env, '.pane-tag.ephemeral').length === 0, 'and no visible short-lived marker');
+  ok(!barShown(env, a), 'without bringing the pane bar back');
+  cleanup(env);
+});
+
+test('solo: a split whose login fails and is dismissed leaves the lone pane without a bar, at full height', async () => {
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'bad.host', response: {auth_failed: true, alive: false}},
+  ]), null, S2);
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  needTools(win);
+  await settled(win, a);
+  win.splitPane(a.id, 'h');
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'nope';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await until(() => !hidden($(win, 'tmuxOv')) && /Authentication failed/.test($(win, 'tmTitle').textContent), 1000);
+  clickBtn(win, 'tmCancel');
+  await until(() => hidden($(win, 'tmuxOv')), 500);
+  clickBtn(win, 'btnCancel');
+  await until(() => hidden($(win, 'ov')), 500);
+  await until(() => a.term.rows === 24 && !barShown(env, a), 1000);
+  await sleep(300);
+  ok(paneList(win).length === 1, 'one pane left');
+  ok(!barShown(env, a) && toolsShown(env), 'no pane bar, actions in the top bar');
+  ok(a.term.rows === 24, 'full height again: 24 rows; got ' + a.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'the server ends with 80x24; got ' + serverSize(env, 'sid-a.host'));
+  cleanup(env);
+});
+
+test('solo: after a reload a one-pane tab has no bar and a split tab has both', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S2); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { cleanup(env1); return; }
+  const b1 = await tNewTab(w1, 'b1.host');
+  const b2 = b1 && await tSplit(w1, b1, 'h', 'b2.host');
+  if (!b2) { ok(false, 'setup'); cleanup(env1); return; }
+  clickTab(w1, tabElOfPane(w1, a));
+  await until(() => tabId(activeTab(w1)) === tabOfPane(a), 500);
+  await sleep(50);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  const env = await mkTabEnv(TAB_PLAN(), snap, S2); const win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 3, 2000);
+  const pa = paneList(win).find(p => p.host === 'a.host');
+  const pb1 = paneList(win).find(p => p.host === 'b1.host');
+  const pb2 = paneList(win).find(p => p.host === 'b2.host');
+  if (!pa || !pb1 || !pb2) { ok(false, 'three panes restored'); cleanup(env); return; }
+  ok(tabOfPane(pa) === tabId(activeTab(win)), 'A (one pane) is in front after the reload');
+  await settled(win, pa);
+  ok(!barShown(env, pa), 'its pane bar is not shown');
+  ok(toolsShown(env), 'the pane actions are in the top bar');
+  ok(pa.term.rows === 24, 'its terminal has 24 rows; got ' + pa.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'and the server has 80x24; got ' + serverSize(env, 'sid-a.host'));
+  const ca = env.log.find(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(!!ca && ca.body.cols === 80 && ca.body.rows === 24,
+     'the restored lone pane connects at its full height, 80x24 (not 22 rows and a resize after); got ' +
+     (ca ? ca.body.cols + 'x' + ca.body.rows : 'no connect'));
+  ok(sizesSent(env, 'sid-a.host').every(x => x === '80x24'), 'and is never resized to the 22-row size; got ' + JSON.stringify(sizesSent(env, 'sid-a.host')));
+  ok(env.log.filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  clickTab(win, tabElOfPane(win, pb1));
+  await until(() => tabId(activeTab(win)) === tabOfPane(pb1), 500);
+  await until(() => !toolsShown(env), 500);
+  ok(barShown(env, pb1) && barShown(env, pb2) && !toolsShown(env), 'the split tab shows both bars and no top-bar actions');
+  cleanup(env);
+});
+
+// ---- Step 2, second round: trying to break it ----
+test('solo (break): rapid split / close / split / close ends bar-less at full height, no degenerate size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const mark = env.log.length;
+  for (let i = 0; i < 4; i++) {
+    const b = await tSplit(win, a, i % 2 ? 'v' : 'h', 'r' + i + '.host');
+    if (!b) { ok(false, 'split ' + i); break; }
+    win.closePane(b.id);
+    await until(() => !win.panes[b.id], 500);
+  }
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a) && toolsShown(env), 'ends without a bar, actions in the top bar');
+  ok(a.term.rows === 24 && serverSize(env, 'sid-a.host') === '80x24', 'ends 80x24 on both sides; term ' + a.term.rows + ' server ' + serverSize(env, 'sid-a.host'));
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length <= 8 && rs.every(x => x === '80x22' || x === '80x24'), 'only the two real sizes, at most one per change; got ' + JSON.stringify(rs));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo (break): the bar flips while output floods: still one resize, output intact', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  await settled(win, a);
+  const written = [];
+  const w0 = a.term.write.bind(a.term);
+  a.term.write = d => { written.push(typeof d === 'string' ? d : String.fromCharCode.apply(null, Array.from(d))); };
+  const mark = env.log.length;
+  let n = 0;
+  const flood = setInterval(() => { for (let k = 0; k < 5; k++) win.handleOutputPayload(a, {data: b64(win, 'L' + (++n) + '\n'), alive: true}, a.sid); }, 1);
+  await sleep(30);
+  win.closePane(b.id);
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  clearInterval(flood);
+  a.term.write = w0;
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'one resize to 80x24 under flood; got ' + JSON.stringify(rs));
+  ok(!barShown(env, a) && toolsShown(env), 'bar gone, actions in the top bar');
+  const got = written.join('');
+  let missing = 0;
+  for (let i = 1; i <= n; i++) if (got.indexOf('L' + i + '\n') < 0) missing++;
+  ok(n > 20 && missing === 0, 'all ' + n + ' flooded lines reached the terminal; missing ' + missing);
+  cleanup(env);
+});
+
+test('solo (break): cancel a lone pane\'s upload, switch tabs at once, come back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !needTools(win) || !b) { cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  const st = hangingXhr(win);
+  win.handleUpload(a.id, {files: [{name: 'c.bin', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  press(win, visibleAll(env, '.upload-progress')[0].querySelector('.upload-progress-cancel'));
+  clickTab(win, tabElOfPane(win, b));
+  await until(() => win.activeId === b.id, 500);
+  ok(st.xhrs[0] && st.xhrs[0].aborted, 'the upload was aborted');
+  ok(visibleAll(env, '.upload-progress').length === 0, 'B shows no progress of a\'s cancelled upload');
+  ok(!toolBtn(win, 'upload').disabled, 'B\'s upload button is enabled (B is idle)');
+  await until(() => !a.upload, 3000);
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  await sleep(20);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'back in A after the banner expired: nothing left over');
+  ok(!toolBtn(win, 'upload').disabled && !toolBtn(win, 'download').disabled, 'A\'s buttons are enabled again');
+  ok(!barShown(env, a) && a.term.rows === 24, 'no bar, 24 rows');
+  // And a new upload works and shows again.
+  win.handleUpload(a.id, {files: [{name: 'd.bin', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  ok(visibleAll(env, '.upload-progress').length === 1 && st.xhrs.length === 2, 'a second upload starts and shows');
+  win.cancelTransfer(a.id);
+  cleanup(env);
+});
+
+test('solo (break): reload in the middle of an upload leaves no progress and usable buttons', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S2); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { cleanup(env1); return; }
+  hangingXhr(w1);
+  w1.handleUpload(a.id, {files: [{name: 'm.bin', size: 1000}], value: ''});
+  await until(() => !!a.upload, 500);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  const env = await mkTabEnv(TAB_PLAN(), snap, S2); const win = env.win;
+  await until(() => paneList(win).some(p => p.sid), 2000);
+  const p = paneList(win)[0];
+  if (!p || !needTools(win)) { cleanup(env); return; }
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'no stale progress after the reload');
+  ok(!toolBtn(win, 'upload').disabled, 'upload is enabled');
+  ok(!barShown(env, p) && p.term.rows === 24, 'no bar, 24 rows');
+  cleanup(env);
+});
+
+test('solo (break): a hidden tab drops from 2 panes to 1; shown, it is bar-less with one resize', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const a2 = a && await tSplit(win, a, 'h', 'a2.host');
+  const b = a2 && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { cleanup(env); return; }
+  await settled(win, b);
+  ok(a.lastSentRows === 24 - BAR, 'a settled at ' + (24 - BAR) + ' rows; got ' + a.lastSentRows);
+  const mark = env.log.length;
+  // A's tab is hidden; one of its panes goes (as when another browser tab signs out of the vault).
+  win.closePane(a2.id);
+  await until(() => !win.panes[a2.id], 500);
+  await sleep(300);
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'B stays in front');
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'nothing sent for the hidden pane; got ' + JSON.stringify(sizesSent(env, 'sid-a.host', mark)));
+  ok(a.term.rows === 24 - BAR, 'the hidden terminal is not refitted; got ' + a.term.rows);
+  ok(toolsShown(env) && !barShown(env, b), 'B\'s chrome is unchanged');
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a) && toolsShown(env), 'shown: a has no bar, actions in the top bar');
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'exactly one resize, 80x24; got ' + JSON.stringify(rs));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo (break): zoom on a lone pane fits the bar-less box, one resize per step', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const f0 = a.term.options.fontSize;
+  let mark = env.log.length;
+  win.zoomIn();
+  const k = f0 / (f0 + 2);
+  const want = Math.floor(80 * k) + 'x' + Math.floor(24 * k);
+  await until(() => a.term.cols + 'x' + a.term.rows === want, 1500);
+  await sleep(300);
+  ok(a.term.cols + 'x' + a.term.rows === want, 'zoomed in: ' + want + ' (the whole box, no bar); got ' + a.term.cols + 'x' + a.term.rows);
+  let rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === want, 'one resize ' + want + '; got ' + JSON.stringify(rs));
+  ok(!barShown(env, a) && toolsShown(env), 'no bar after the zoom');
+  mark = env.log.length;
+  win.zoomOut();
+  await until(() => a.term.rows === 24, 1500);
+  await sleep(300);
+  rs = sizesSent(env, 'sid-a.host', mark);
+  ok(a.term.rows === 24 && rs.length === 1 && rs[0] === '80x24', 'zoomed back: 80x24, one resize; got ' + JSON.stringify(rs));
+  cleanup(env);
+});
+
+// =====================================================================
+// Tabs (step 3): moving panes between tabs
+// =====================================================================
+// What the user sees: a pane can leave its split and become a tab of its
+// own ("Move to new tab", or its bar dragged onto the strip), join
+// another tab (its bar dropped on that tab: split right of that tab's
+// active pane), and a whole tab can be dropped on an edge of a pane in
+// the tab on screen, its layout landing beside that pane. Nothing of
+// this reconnects, restarts or loses anything: same session, same
+// terminal (scrollback), same typed keys, same upload.
+//
+// Hooks the tests use:
+//   movePaneToNewTab(paneId)          the pane leaves its split (sibling
+//                                     takes its space) and becomes a new
+//                                     tab, shown, with the pane active.
+//                                     A pane alone in its tab: no-op.
+//   movePaneToTab(paneId, tabId)      the pane joins tab tabId as a
+//                                     horizontal split (.split-h) right
+//                                     of that tab's active pane; that tab
+//                                     is shown. Its old tab goes when it
+//                                     is left empty. Own tab: no-op.
+//   mergeTabInto(tabId, paneId, side) side 'left'|'right'|'top'|'bottom':
+//                                     tab tabId's whole layout is put
+//                                     beside pane paneId (left/right ->
+//                                     .split-h, top/bottom -> .split-v;
+//                                     left/top = the merged layout first);
+//                                     tab tabId disappears. A pane of tab
+//                                     tabId itself: no-op.
+//   .pane-bar [data-act="to-tab"]     "Move to new tab" button in every
+//                                     pane bar (bars show only with 2+
+//                                     panes). #paneTools must NOT offer an
+//                                     enabled, visible [data-act="to-tab"]
+//                                     (a lone pane is already its own tab).
+//   Gestures                          plain mouse events, like the tab
+//                                     reorder (not HTML5 drag-and-drop:
+//                                     that is the file-upload channel):
+//                                     mousedown (button 0) on a pane bar
+//                                     outside its buttons, or on a tab;
+//                                     mousemove with buttons=1 past a few
+//                                     px; mouseup. The drop target is the
+//                                     element under the pointer: the tests
+//                                     dispatch on it AND answer
+//                                     document.elementFromPoint with it.
+//     pane bar -> #tabs (not on a tab) or #tabNew   = movePaneToNewTab
+//     pane bar -> #tabs .tab[data-tab=X]             = movePaneToTab(X)
+//     tab      -> a pane of the tab on screen, near an edge = mergeTabInto
+//   .drop-zone-left|right|top|bottom  on the hovered .pane (or an element
+//                                     inside it) while a tab is dragged
+//                                     over it, before release; none left
+//                                     anywhere after the drag ends.
+// A pane bar's drag starting on the pane's .pane-label: that is where
+// the user grabs a header.
+// =====================================================================
+const S3 = {barRows: BAR};
+const moveFns = win => typeof win.movePaneToNewTab === 'function' && typeof win.movePaneToTab === 'function' &&
+  typeof win.mergeTabInto === 'function';
+function needMove(win) {
+  const g = moveFns(win);
+  ok(g, 'move hooks exist: movePaneToNewTab(paneId), movePaneToTab(paneId, tabId), mergeTabInto(tabId, paneId, side)');
+  return g;
+}
+// Calls that would mean the pane's session was restarted or torn down.
+const RESTART_FNS = ['connectPane', 'reconnectPane', 'closeStream', 'abortPoll', 'endSession', 'startOutput',
+                     'beginSessionIO', '_destroyPane'];
+function sessionSpy(win, ps) {
+  const calls = [];
+  RESTART_FNS.forEach(n => {
+    const f = win[n];
+    if (typeof f !== 'function') return;
+    win[n] = function (x) {
+      const hit = ps.find(p => x === p || x === p.id);
+      if (hit) calls.push(n + '(' + hit.host + ')');
+      return f.apply(this, arguments);
+    };
+  });
+  ps.forEach(p => {
+    ['reset', 'clear', 'dispose'].forEach(m => {
+      const f = p.term[m];
+      p.term[m] = function () { calls.push('term.' + m + '(' + p.host + ')'); return f ? f.apply(this, arguments) : undefined; };
+    });
+  });
+  return calls;
+}
+const sessionCalls = (env, from) => env.log.slice(from).filter(e => e.action === 'connect' || e.action === 'disconnect')
+  .map(e => e.action + ' ' + JSON.stringify(e.body && (e.body.host || e.body.session_id)));
+// The structure of a tab, as text: (h a.host b.host) for a horizontal
+// split of a over b, nested as it is in the DOM.
+function shape(win, tid) {
+  const root = tabRootById(win, tid);
+  if (!root) return 'no root for ' + tid;
+  const node = el => {
+    if (el.classList.contains('pane')) {
+      const p = win.panes[el.getAttribute('data-pane')];
+      return p ? p.host : '?' + el.getAttribute('data-pane');
+    }
+    const dir = el.classList.contains('split-h') ? 'h' : el.classList.contains('split-v') ? 'v' : null;
+    if (!dir) return null;
+    const kids = Array.from(el.children).map(node).filter(Boolean);
+    return '(' + dir + ' ' + kids.join(' ') + ')';
+  };
+  return Array.from(root.children).map(node).filter(Boolean).join(' ');
+}
+// The same from the saved manifest, per tab in strip order.
+function savedShapes(win) {
+  let m = null;
+  try { m = JSON.parse(win.localStorage.getItem(win.storageKey('websh_panes')) || 'null'); } catch (e) {}
+  if (!m || !Array.isArray(m.tabs)) return null;
+  const node = n => !n ? '' : n.type === 'leaf' ? ((m.panes[n.pane] || {}).host || '?')
+    : '(' + n.dir + ' ' + node(n.a) + ' ' + node(n.b) + ')';
+  return {tabs: m.tabs.map(t => node(t.layout)), active: m.active};
+}
+const shapesNow = win => tabEls(win).map(t => shape(win, tabId(t)));
+const zoneOf = p => {
+  const sides = ['left', 'right', 'top', 'bottom'];
+  const has = el => sides.filter(s => el.classList.contains('drop-zone-' + s));
+  let z = has(p.el);
+  p.el.querySelectorAll('*').forEach(e => { z = z.concat(has(e)); });
+  return z.join(',');
+};
+const anyZone = win => win.document.querySelectorAll('.drop-zone-left,.drop-zone-right,.drop-zone-top,.drop-zone-bottom').length;
+// Mouse gestures. The pointer is "over" `el`: events are dispatched on it
+// and elementFromPoint answers with it.
+function pointer(win) {
+  const st = {over: null};
+  win.document.elementFromPoint = () => st.over;
+  win.document.elementsFromPoint = () => { const out = []; for (let e = st.over; e; e = e.parentElement) out.push(e); return out; };
+  const fireAt = (el, type, x, y, buttons) => {
+    st.over = el;
+    el.dispatchEvent(new win.MouseEvent(type, {bubbles: true, cancelable: true, button: 0, buttons: buttons,
+                                               clientX: x, clientY: y, view: win}));
+  };
+  return {
+    down: (el, x, y) => fireAt(el, 'mousedown', x, y, 1),
+    move: (el, x, y) => fireAt(el, 'mousemove', x, y, 1),
+    up: (el, x, y) => fireAt(el, 'mouseup', x, y, 0),
+    moveNoButton: (el, x, y) => fireAt(el, 'mousemove', x, y, 0),
+  };
+}
+const centre = el => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+function edgePoint(el, side) {
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (side === 'left') return [r.left + r.width * 0.05, cy];
+  if (side === 'right') return [r.right - r.width * 0.05, cy];
+  if (side === 'top') return [cx, r.top + r.height * 0.05];
+  return [cx, r.bottom - r.height * 0.05];
+}
+const labelEl = p => p.el.querySelector('.pane-label') || barOf(p);
+// Drag pane p's bar onto `target` (an element of the strip).
+function dragPaneBar(win, p, target) {
+  const m = pointer(win);
+  const g = labelEl(p);
+  const [x0, y0] = centre(g);
+  m.down(g, x0, y0);
+  m.move(g, x0 + 3, y0 + 3);
+  m.move(win.document.querySelector('#tabs') || g, x0 + 40, y0 + 2);
+  const [x1, y1] = centre(target);
+  m.move(target, x1, y1 + 1);
+  m.up(target, x1, y1 + 1);
+}
+// Drag tab tEl onto `side` of pane p.
+function dragTabOnto(win, tEl, p, side, o) {
+  const m = pointer(win);
+  const [x0, y0] = centre(tEl);
+  m.down(tEl, x0, y0);
+  m.move(tEl, x0 + 2, y0 + 30);
+  const [x, y] = edgePoint(p.el, side);
+  const into = p.el.querySelector('.pane-term') || p.el;
+  m.move(into, x, y);
+  m.move(into, x + (side === 'right' ? -1 : 1), y);
+  if (o && o.beforeUp) o.beforeUp();
+  if (!(o && o.noUp)) m.up(into, x, y);
+  return m;
+}
+async function splitTabEnv(win, hosts) {
+  const a = await tConnect(win, hosts[0]);
+  const b = a && await tSplit(win, a, 'h', hosts[1]);
+  return [a, b];
+}
+
+test('move: "Move to new tab" takes the pane out of its split into a new tab, same session', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const urls = recordUrls(win);
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  await settled(win, a); await settled(win, b);
+  const tA = tabOfPane(a);
+  ok(barShown(env, a) && barShown(env, b), 'setup: two panes in one tab, both with a bar');
+  const btn = barOf(b) && barOf(b).querySelector('[data-act="to-tab"]');
+  ok(!!btn && !env.lay.hidden(btn) && !btn.disabled, 'the pane bar has a visible, enabled "Move to new tab" button [data-act="to-tab"]');
+  ok(!!btn && /tab/i.test((btn.title || '') + ' ' + (btn.getAttribute('aria-label') || '')),
+     'it says what it does in its tooltip / aria-label; got ' + (btn ? JSON.stringify(btn.title + ' | ' + btn.getAttribute('aria-label')) : 'none'));
+  if (!btn) { cleanup(env); return; }
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a, b]);
+  const termB = b.term, elB = b.el;
+  const f0 = b.term._focusCalls;
+  const polls = () => urls.filter(u => /action=output/.test(u) && /sid-b\.host/.test(u)).length;
+  press(win, btn);
+  await until(() => tabEls(win).length === 2, 500);
+  ok(tabEls(win).length === 2, 'two tabs now; got ' + tabEls(win).length);
+  const tB = tabOfPane(b);
+  ok(!!tB && tB !== tA, 'b is in a new tab, not in its old one');
+  ok(tabId(activeTab(win)) === tB, 'the new tab is in front');
+  ok(win.activeId === b.id, 'b is the active pane; got ' + win.activeId);
+  ok(b.term._focusCalls > f0, 'keyboard focus went into b');
+  ok(shape(win, tA) === 'a.host', 'a has the old tab to itself, no split left: ' + shape(win, tA));
+  ok(shape(win, tB) === 'b.host', 'the new tab holds b alone: ' + shape(win, tB));
+  ok(!a.el.style.flex, 'a takes the whole space (no leftover flex); got ' + JSON.stringify(a.el.style.flex));
+  ok(win.panes[b.id] === b && b.el === elB && b.term === termB && !termB._disposed,
+     'the same pane, element and terminal (scrollback kept)');
+  ok(!!termB.element && elB.contains(termB.element), 'the terminal is still mounted in its pane');
+  ok(b.sid === 'sid-b.host' && a.sid === 'sid-a.host', 'both sessions unchanged');
+  ok(spy.length === 0, 'nothing was reconnected, restarted or reset; got ' + JSON.stringify(spy));
+  const p0 = polls();
+  await until(() => polls() >= p0 + 2, 1000);
+  ok(polls() >= p0 + 2 && b.polling, 'b\'s output keeps flowing after the move');
+  ok(sessionCalls(env, mark).length === 0, 'no /api/connect or /api/disconnect; got ' + JSON.stringify(sessionCalls(env, mark)));
+  // Step 2: both tabs are one-pane tabs now.
+  await sleep(300);
+  ok(!barShown(env, b) && toolsShown(env), 'b, alone in its tab: no bar, the actions in the top bar');
+  ok(tabLabel(tabById(win, tB)) === paneLabel(b), 'the new tab is labelled like b: ' + JSON.stringify(tabLabel(tabById(win, tB))));
+  ok(tabLabel(tabById(win, tA)) === paneLabel(a), 'the old tab is labelled like a: ' + JSON.stringify(tabLabel(tabById(win, tA))));
+  const smA = tabById(win, tA).querySelector('.tab-split');
+  ok(!smA || env.lay.hidden(smA), 'the old tab lost its split marker');
+  ok(dotState(tabById(win, tB)) === 's-on', 'the new tab\'s dot says connected; got ' + dotState(tabById(win, tB)));
+  // One resize for b (bar gone: 22 -> 24 rows); none yet for a, hidden.
+  let rb = sizesSent(env, 'sid-b.host', mark);
+  ok(b.term.rows === 24 && rb.length === 1 && rb[0] === '80x24', 'b: one resize to 80x24; got ' + JSON.stringify(rb) + ', term ' + b.term.rows + ' rows');
+  ok(sizesSent(env, 'sid-a.host', mark).length === 0, 'a, now in a hidden tab, is not resized while hidden; got ' + JSON.stringify(sizesSent(env, 'sid-a.host', mark)));
+  clickTab(win, tabById(win, tA));
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  const ra = sizesSent(env, 'sid-a.host', mark);
+  ok(!barShown(env, a) && ra.length === 1 && ra[0] === '80x24', 'a, shown: no bar, one resize to 80x24; got ' + JSON.stringify(ra));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('move: the move is saved at once; a reload restores both tabs and which one is in front', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id || win.activeId === b.id, 500);
+  win.movePaneToNewTab(b.id);
+  const saved = savedShapes(win);
+  ok(!!saved && saved.tabs.length === 3, 'saved at once: three tabs in the manifest; got ' + JSON.stringify(saved));
+  ok(!!saved && saved.tabs.indexOf('b.host') >= 0 && saved.tabs.indexOf('a.host') >= 0 && saved.tabs.indexOf('c.host') >= 0,
+     'each pane in its own saved tab; got ' + JSON.stringify(saved && saved.tabs));
+  ok(!!saved && saved.tabs[saved.active] === 'b.host', 'the saved active tab is b\'s; got ' + JSON.stringify(saved));
+  const want = shapesNow(win);
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S3); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 3, 2000);
+  ok(JSON.stringify(shapesNow(w2)) === JSON.stringify(want), 'after reload the same tabs in the same order; got ' +
+     JSON.stringify(shapesNow(w2)) + ' want ' + JSON.stringify(want));
+  ok(activeTab(w2) && shape(w2, tabId(activeTab(w2))) === 'b.host', 'b\'s tab is in front again');
+  cleanup(env2);
+});
+
+test('move: a pane alone in its tab offers no "Move to new tab", and the call changes nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needMove(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tb = toolBtn(win, 'to-tab');
+  ok(!tb || env.lay.hidden(tb) || tb.disabled, 'the top-bar actions of a lone pane have no usable "Move to new tab"');
+  await sleep(100);
+  const mark = env.log.length;
+  const before = shapesNow(win), saved0 = JSON.stringify(savedShapes(win));
+  const spy = sessionSpy(win, [a, b]);
+  win.movePaneToNewTab(b.id);
+  win.movePaneToNewTab(a.id);          // a lone pane in a hidden tab
+  await sleep(200);
+  ok(JSON.stringify(shapesNow(win)) === JSON.stringify(before), 'tabs unchanged; got ' + JSON.stringify(shapesNow(win)));
+  ok(tabRoots(win).length === 2, 'no empty tab root left behind; got ' + tabRoots(win).length);
+  ok(tabId(activeTab(win)) === tabOfPane(b) && win.activeId === b.id, 'b\'s tab still in front');
+  ok(spy.length === 0 && env.log.slice(mark).filter(e => e.action !== 'output' && e.action !== 'input').length === 0,
+     'nothing sent, nothing restarted; got ' + JSON.stringify(spy.concat(env.log.slice(mark).filter(e => e.action !== 'output').map(e => e.action))));
+  ok(JSON.stringify(savedShapes(win)) === saved0, 'the saved layout is unchanged');
+  // Its own tab, by the other hook: also nothing.
+  win.movePaneToTab(b.id, tabOfPane(b));
+  await sleep(100);
+  ok(JSON.stringify(shapesNow(win)) === JSON.stringify(before), 'moving a pane into its own tab changes nothing; got ' + JSON.stringify(shapesNow(win)));
+  cleanup(env);
+});
+
+test('move: keys typed but not yet sent when the pane moves arrive once, in order', async () => {
+  // /api/input answers slowly: one batch in flight, more keys queued
+  // behind it while the pane changes tabs.
+  const got = [];
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'input', match: bd => bd && bd.session_id === 'sid-b.host' && bd.data,
+     response: bd => { got.push(bd.data); return {ok: true}; }, delay: 150},
+  ]), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  b.term._onDataCb('ec');
+  await until(() => !!b.inputInFlight, 500);
+  b.term._onDataCb('ho ');
+  b.term._onDataCb('one');
+  ok(!!b.inputInFlight && b.inputQueue.length > 0, 'setup: a batch in flight and keys queued');
+  const spy = sessionSpy(win, [b]);
+  win.movePaneToNewTab(b.id);
+  b.term._onDataCb(' two\r');
+  await until(() => got.join('') === 'echo one two\r', 2000);
+  await sleep(200);
+  ok(got.join('') === 'echo one two\r', 'everything typed arrived once, in order; got ' + JSON.stringify(got));
+  ok(spy.length === 0, 'and the session was not restarted; got ' + JSON.stringify(spy));
+  cleanup(env);
+});
+
+test('move: a pane moved during its upload keeps uploading, its progress and cancel stay visible', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const st = hangingXhr(win);
+  win.handleUpload(b.id, {files: [{name: 'big.iso', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  ok(visibleAll(env, '.upload-progress').length === 1, 'setup: progress shown in b\'s bar');
+  win.movePaneToNewTab(b.id);
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(50);
+  ok(!!b.upload && st.xhrs.length >= 1 && !st.xhrs.some(x => x.aborted), 'the upload goes on (not cancelled, not restarted)');
+  const vis = visibleAll(env, '.upload-progress');
+  ok(vis.length === 1 && b.el.contains(vis[0]), 'its progress is visible, on b, although b has no bar now; got ' + vis.length);
+  const cancel = vis[0] && vis[0].querySelector('.upload-progress-cancel');
+  ok(!!cancel && !env.lay.hidden(cancel), 'with its cancel button');
+  if (cancel) press(win, cancel);
+  await until(() => st.xhrs.some(x => x.aborted), 500);
+  ok(st.xhrs.some(x => x.aborted), 'and cancel still works');
+  cleanup(env);
+});
+
+test('move: dragging a pane bar onto the strip makes it a new tab; a click on the bar does nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a, b]);
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id, files) => started.push(id);
+  // A click on the label (press and release, no movement) is not a drag.
+  const m = pointer(win);
+  const [lx, ly] = centre(labelEl(b));
+  m.down(labelEl(b), lx, ly); m.up(labelEl(b), lx, ly);
+  ok(tabEls(win).length === 1 && shape(win, tA) === '(h a.host b.host)', 'a click on the bar moves nothing; got ' + shapesNow(win));
+  // A drag that ends over the panes, not the strip: nothing either.
+  m.down(labelEl(b), lx, ly); m.move(labelEl(b), lx + 50, ly + 60); m.move(a.el, lx + 80, ly + 100); m.up(a.el, lx + 80, ly + 100);
+  ok(tabEls(win).length === 1 && shape(win, tA) === '(h a.host b.host)', 'a bar dropped back on the panes moves nothing; got ' + shapesNow(win));
+  // Onto the strip itself, not on a tab.
+  dragPaneBar(win, b, $(win, 'tabs'));
+  await until(() => tabEls(win).length === 2, 500);
+  ok(tabEls(win).length === 2, 'b\'s bar dropped on the strip: a new tab; got ' + tabEls(win).length);
+  const tB = tabOfPane(b);
+  ok(tB && tB !== tA && tabId(activeTab(win)) === tB && win.activeId === b.id, 'b is in it, in front and active');
+  ok(shape(win, tA) === 'a.host' && shape(win, tB) === 'b.host', 'a alone in the old tab, b in the new; got ' + JSON.stringify(shapesNow(win)));
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + JSON.stringify(spy.concat(sessionCalls(env, mark))));
+  ok(started.length === 0, 'the drag started no upload');
+  ok(!win.document.querySelector('.dragging'), 'no drag state left behind');
+  // And again from the other tab, onto "+".
+  clickTab(win, tabById(win, tA));
+  const c = await tSplit(win, a, 'v', 'c.host');
+  if (!c) { ok(false, 'setup: c'); cleanup(env); win.startUploadFiles = realStart; return; }
+  dragPaneBar(win, c, $(win, 'tabNew'));
+  await until(() => tabEls(win).length === 3, 500);
+  ok(tabEls(win).length === 3 && shape(win, tabOfPane(c)) === 'c.host' && tabId(activeTab(win)) === tabOfPane(c),
+     'a bar dropped on "+" also makes a new tab; got ' + JSON.stringify(shapesNow(win)));
+  ok(hidden($(win, 'ov')), 'and does not open the login form');
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
+test('move: a pane bar dropped on another tab joins it, split right of that tab\'s active pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const c1 = await tNewTab(win, 'c1.host');
+  const c2 = c1 && await tSplit(win, c1, 'v', 'c2.host');
+  if (!c2) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tC = tabOfPane(c1);
+  win.activatePane(c1.id);                      // c1 is C's active pane
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await settled(win, b);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [b]);
+  dragPaneBar(win, b, tabById(win, tC));
+  await until(() => panesOfTab(win, tC).length === 3, 500);
+  ok(shape(win, tC) === '(v (h c1.host b.host) c2.host)', 'b sits right of c1 (C\'s active pane); got ' + shape(win, tC));
+  ok(shape(win, tA) === 'a.host', 'a alone in A; got ' + shape(win, tA));
+  ok(tabEls(win).length === 2, 'no new tab; got ' + tabEls(win).length);
+  ok(tabId(activeTab(win)) === tC && win.activeId === b.id, 'C is shown with b active');
+  const sm = tabById(win, tC).querySelector('.tab-split');
+  ok(!!sm && markerSays(sm, 3), 'C\'s split marker says "3 panes"; got ' + (sm ? JSON.stringify(sm.title) : 'none'));
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + JSON.stringify(spy.concat(sessionCalls(env, mark))));
+  await sleep(300);
+  ok(sizesSent(env, 'sid-b.host', mark).length === 0, 'b keeps its bar and size: no resize; got ' + JSON.stringify(sizesSent(env, 'sid-b.host', mark)));
+  ok(JSON.stringify(savedShapes(win).tabs) === JSON.stringify(shapesNow(win)), 'saved as shown; got ' + JSON.stringify(savedShapes(win)));
+  // Dropped on its own tab: nothing.
+  const now = JSON.stringify(shapesNow(win));
+  dragPaneBar(win, c2, tabById(win, tC));
+  await sleep(100);
+  ok(JSON.stringify(shapesNow(win)) === now, 'a bar dropped on its own tab changes nothing; got ' + JSON.stringify(shapesNow(win)));
+  cleanup(env);
+});
+
+test('move: moving the last pane out of a tab removes that tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needMove(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = b && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  win.movePaneToTab(b.id, tC);
+  await until(() => tabEls(win).length === 2, 500);
+  ok(tabEls(win).length === 2 && !tabById(win, tB) && !tabRootById(win, tB), 'b\'s old tab is gone, handle and root; got ' + tabEls(win).length);
+  ok(shape(win, tC) === '(h c.host b.host)', 'b joined C right of c; got ' + shape(win, tC));
+  ok(tabId(activeTab(win)) === tC, 'C is shown');
+  ok(b.sid === 'sid-b.host' && win.panes[b.id] === b, 'b is the same live pane');
+  ok(Object.keys(win.panes).length === 3 && hidden($(win, 'ov')), 'nothing else closed, no login form');
+  const saved = savedShapes(win);
+  ok(!!saved && saved.tabs.length === 2, 'saved without the empty tab; got ' + JSON.stringify(saved));
+  cleanup(env);
+});
+
+test('merge: dragging a tab onto an edge of a pane puts its whole layout there; the zone shows first', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await settled(win, a);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a, b]);
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id) => started.push(id);
+  let during = {};
+  dragTabOnto(win, tabById(win, tB), a, 'left', {beforeUp: () => {
+    during.front = tabId(activeTab(win));
+    during.aShown = !env.lay.hidden(a.el);
+    during.zone = zoneOf(a);
+  }});
+  ok(during.front === tA && during.aShown, 'while B is dragged over the panes, A (in front before) stays on screen; front=' +
+     during.front + ' a shown=' + during.aShown);
+  ok(during.zone === 'left', 'before release the left drop zone is highlighted on a; got ' + JSON.stringify(during.zone));
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1 && !tabById(win, tB) && !tabRootById(win, tB), 'the dragged tab is gone; tabs: ' + tabEls(win).length);
+  ok(shape(win, tA) === '(h b.host a.host)', 'b landed left of a, side by side; got ' + shape(win, tA));
+  ok(tabId(activeTab(win)) === tA, 'A is in front');
+  ok(anyZone(win) === 0, 'no drop zone left after the drop');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + JSON.stringify(spy.concat(sessionCalls(env, mark))));
+  ok(started.length === 0, 'the drag started no upload');
+  const sm = tabById(win, tA).querySelector('.tab-split');
+  ok(!!sm && markerSays(sm, 2), 'A\'s split marker says "2 panes"');
+  await sleep(300);
+  ok(barShown(env, a) && barShown(env, b) && !toolsShown(env), 'two panes: both bars, no top-bar actions');
+  const ra = sizesSent(env, 'sid-a.host', mark), rb = sizesSent(env, 'sid-b.host', mark);
+  ok(ra.length === 1 && ra[0] === '80x' + (24 - BAR), 'a: one resize, to make room for its bar; got ' + JSON.stringify(ra));
+  ok(rb.length === 1 && rb[0] === '80x' + (24 - BAR), 'b: one resize; got ' + JSON.stringify(rb));
+  const saved = savedShapes(win);
+  ok(!!saved && JSON.stringify(saved.tabs) === JSON.stringify(['(h b.host a.host)']), 'saved at once; got ' + JSON.stringify(saved));
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
+test('merge: the side picks the split; a split tab keeps its own layout inside', async () => {
+  for (const [side, want] of [['left', '(h (v b1.host b2.host) a.host)'], ['right', '(h a.host (v b1.host b2.host))'],
+                              ['top', '(v (v b1.host b2.host) a.host)'], ['bottom', '(v a.host (v b1.host b2.host))']]) {
+    const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+    const a = await tConnect(win, 'a.host');
+    if (!needTabs(win) || !a) { cleanup(env); return; }
+    const b1 = await tNewTab(win, 'b1.host');
+    const b2 = b1 && await tSplit(win, b1, 'v', 'b2.host');
+    if (!b2) { ok(false, 'setup'); cleanup(env); return; }
+    const tA = tabOfPane(a), tB = tabOfPane(b1);
+    clickTab(win, tabById(win, tA));
+    await until(() => tabId(activeTab(win)) === tA, 500);
+    let zone = null;
+    dragTabOnto(win, tabById(win, tB), a, side, {beforeUp: () => { zone = zoneOf(a); }});
+    await until(() => tabEls(win).length === 1, 500);
+    ok(zone === side, side + ': the ' + side + ' zone is highlighted before release; got ' + JSON.stringify(zone));
+    ok(shape(win, tA) === want, side + ': ' + want + '; got ' + shape(win, tA));
+    ok([a, b1, b2].every(p => win.panes[p.id] === p && p.sid === 'sid-' + p.host), side + ': all three panes live, same sessions');
+    cleanup(env);
+  }
+});
+
+test('merge: by the hook, into a nested split; the saved layout reloads the same', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !needMove(win) || !a1 || !a2) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = b && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const spy = sessionSpy(win, [a1, a2, b]);
+  win.mergeTabInto(tB, a2.id, 'bottom');
+  ok(shape(win, tA) === '(h a1.host (v a2.host b.host))', 'b under a2, inside the existing split; got ' + shape(win, tA));
+  ok(tabEls(win).length === 2 && !tabById(win, tB), 'B is gone, C stays');
+  ok(spy.length === 0, 'nothing restarted; got ' + JSON.stringify(spy));
+  const want = shapesNow(win);
+  ok(!!savedShapes(win) && JSON.stringify(savedShapes(win).tabs) === JSON.stringify(want), 'saved at once; got ' + JSON.stringify(savedShapes(win)));
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S3); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 4, 2000);
+  ok(JSON.stringify(shapesNow(w2)) === JSON.stringify(want), 'reload: the merged layout is back; got ' + JSON.stringify(shapesNow(w2)));
+  ok(activeTab(w2) && shape(w2, tabId(activeTab(w2))) === want[0], 'with the merged tab in front');
+  cleanup(env2);
+});
+
+test('merge: a tab dropped on its own panes, on a hidden tab\'s pane, or released outside does nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !needMove(win) || !a1 || !a2) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await sleep(100);
+  const before = JSON.stringify(shapesNow(win)), saved0 = JSON.stringify(savedShapes(win));
+  const mark = env.log.length;
+  // The tab on screen dragged onto one of its own panes.
+  let zone = null;
+  dragTabOnto(win, tabById(win, tA), a2, 'right', {beforeUp: () => { zone = zoneOf(a2); }});
+  await sleep(100);
+  ok(JSON.stringify(shapesNow(win)) === before, 'A onto its own pane: nothing changes; got ' + JSON.stringify(shapesNow(win)));
+  ok(!zone, 'and no drop zone offered on its own pane; got ' + JSON.stringify(zone));
+  ok(anyZone(win) === 0, 'no zone left');
+  // The hook, too.
+  win.mergeTabInto(tA, a1.id, 'left');
+  ok(JSON.stringify(shapesNow(win)) === before, 'mergeTabInto(A, a pane of A): nothing');
+  // B dragged over a1, button released outside the window: the next
+  // move has no button down. Nothing may happen, no zone stays.
+  const m = dragTabOnto(win, tabById(win, tB), a1, 'left', {noUp: true});
+  m.moveNoButton(a1.el, 30, 30);
+  m.up(a1.el, 30, 30);                 // a stray mouseup later
+  await sleep(100);
+  ok(JSON.stringify(shapesNow(win)) === before, 'a drag whose button went up outside merges nothing; got ' + JSON.stringify(shapesNow(win)));
+  ok(anyZone(win) === 0, 'and leaves no drop zone');
+  ok(!win.document.querySelector('.dragging'), 'and no drag state');
+  ok(env.log.slice(mark).filter(e => e.action === 'connect' || e.action === 'disconnect').length === 0, 'nothing sent');
+  ok(JSON.stringify(savedShapes(win)) === saved0, 'saved layout unchanged');
+  cleanup(env);
+});
+
+test('move: OS file drags still upload, and are never taken for a pane or tab drag', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id, files) => started.push(id);
+  const item = {kind: 'file', getAsFile: () => ({name: 'x.txt', size: 3}), webkitGetAsEntry: () => ({isDirectory: false})};
+  const fileDrag = (target, type, x, y) => {
+    const ev = new win.MouseEvent(type, {bubbles: true, cancelable: true, clientX: x || 0, clientY: y || 0, buttons: 1});
+    Object.defineProperty(ev, 'dataTransfer', {value: {types: ['Files'], items: [item], files: [item.getAsFile()], dropEffect: ''}});
+    win.document.elementFromPoint = () => target;
+    target.dispatchEvent(ev);
+    return ev;
+  };
+  const before = JSON.stringify(shapesNow(win));
+  // A file dragged over the strip and onto a tab: no tab, no move.
+  fileDrag($(win, 'tabs'), 'dragenter'); fileDrag($(win, 'tabs'), 'dragover');
+  fileDrag(tabById(win, tC), 'dragover'); fileDrag(tabById(win, tC), 'drop');
+  ok(JSON.stringify(shapesNow(win)) === before && tabEls(win).length === 2, 'a file dropped on a tab moves and creates nothing');
+  // A file over the edge of a pane: the upload highlight, not a merge zone.
+  const [x, y] = edgePoint(a.el, 'left');
+  fileDrag(a.el, 'dragenter', x, y); fileDrag(a.el, 'dragover', x, y);
+  ok(a.el.classList.contains('drop-target') && !zoneOf(a), 'a file over a pane edge shows the upload highlight, no merge zone');
+  const ev = fileDrag(a.el, 'drop', x, y);
+  ok(ev.defaultPrevented && started.length === 1 && started[0] === a.id, 'and uploads into a; got ' + JSON.stringify(started));
+  ok(JSON.stringify(shapesNow(win)) === before, 'layout untouched by the file drop');
+  // Panes that moved still take files.
+  win.movePaneToNewTab(b.id);
+  await until(() => tabEls(win).length === 3, 500);
+  fileDrag(b.el, 'dragenter'); fileDrag(b.el, 'drop');
+  ok(started.length === 2 && started[1] === b.id, 'a file dropped on b after its move uploads into b; got ' + JSON.stringify(started));
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  win.mergeTabInto(tC, a.id, 'right');
+  await until(() => tabEls(win).length === 2, 500);
+  fileDrag(c.el, 'dragenter'); fileDrag(c.el, 'drop');
+  ok(started.length === 3 && started[2] === c.id, 'a file dropped on c after its tab merged uploads into c; got ' + JSON.stringify(started));
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
+test('move (break): back and forth ten times; same session, one tab per move, saved each time', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  await settled(win, a); await settled(win, b);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a, b]);
+  let bad = [];
+  for (let i = 0; i < 10; i++) {
+    win.movePaneToNewTab(b.id);
+    if (tabEls(win).length !== 2 || shape(win, tabOfPane(b)) !== 'b.host') bad.push(i + ' out: ' + JSON.stringify(shapesNow(win)));
+    const s1 = savedShapes(win);
+    if (!s1 || s1.tabs.length !== 2) bad.push(i + ' out saved: ' + JSON.stringify(s1));
+    win.movePaneToTab(b.id, tA);
+    if (tabEls(win).length !== 1 || shape(win, tA) !== '(h a.host b.host)') bad.push(i + ' back: ' + JSON.stringify(shapesNow(win)));
+    const s2 = savedShapes(win);
+    if (!s2 || s2.tabs.length !== 1) bad.push(i + ' back saved: ' + JSON.stringify(s2));
+  }
+  ok(bad.length === 0, 'every move gives the expected tabs and saves them; ' + JSON.stringify(bad.slice(0, 3)));
+  ok(tabRoots(win).length === 1, 'no stray tab roots; got ' + tabRoots(win).length);
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'never a reconnect or restart; got ' + JSON.stringify(spy.concat(sessionCalls(env, mark)).slice(0, 5)));
+  await sleep(400);
+  const rs = env.log.slice(mark).filter(e => e.action === 'resize');
+  ok(rs.length <= 2, 'the PTYs are resized at most once each for the whole burst (bars back where they were); got ' +
+     JSON.stringify(rs.map(e => e.body.session_id + ' ' + e.body.cols + 'x' + e.body.rows)));
+  ok(rs.filter(degenerate).length === 0, 'no degenerate resize');
+  ok(barShown(env, a) && barShown(env, b) && a.term.rows === 24 - BAR && b.term.rows === 24 - BAR, 'ends as it started: both bars, 22 rows');
+  cleanup(env);
+});
+
+
+// Structure checks after any sequence of moves: every pane in exactly one
+// tab root, no empty roots or wrappers, every split has two parts, the
+// handles and roots match the tab list, and the saved manifest says the
+// same as the DOM.
+function layoutProblems(win) {
+  const bad = [];
+  const roots = tabRoots(win), handles = tabEls(win);
+  if (roots.length !== handles.length) bad.push(roots.length + ' roots for ' + handles.length + ' tabs');
+  handles.forEach(h => { if (!tabRootById(win, tabId(h))) bad.push('tab ' + tabId(h) + ' has no root'); });
+  roots.forEach(r => {
+    const kids = Array.from(r.children).filter(c => /\b(pane|split-h|split-v)\b/.test(c.className));
+    if (kids.length !== 1) bad.push('root ' + r.getAttribute('data-tab') + ' has ' + kids.length + ' layout nodes');
+  });
+  win.document.querySelectorAll('#panes .split-h, #panes .split-v').forEach(w => {
+    const parts = Array.from(w.children).filter(c => /\b(pane|split-h|split-v)\b/.test(c.className));
+    const hs = Array.from(w.children).filter(c => c.classList.contains('split-handle'));
+    if (parts.length !== 2 || hs.length !== 1) bad.push('a split with ' + parts.length + ' parts and ' + hs.length + ' handles');
+  });
+  paneList(win).forEach(p => {
+    if (!win.document.contains(p.el)) bad.push(p.host + ' not in the document');
+    else if (!p.el.closest('.tab-root')) bad.push(p.host + ' outside any tab');
+  });
+  if (win.document.querySelectorAll('#panes .pane').length !== paneList(win).length) bad.push('stray .pane elements');
+  const sv = savedShapes(win);
+  if (!sv || JSON.stringify(sv.tabs) !== JSON.stringify(shapesNow(win))) bad.push('saved ' + JSON.stringify(sv && sv.tabs) + ' vs shown ' + JSON.stringify(shapesNow(win)));
+  else if (sv.tabs[sv.active] !== shape(win, tabId(activeTab(win)))) bad.push('saved active tab is not the one in front');
+  handles.forEach(h => {
+    const n = panesOfTab(win, tabId(h)).length;
+    const root = tabRootById(win, tabId(h));
+    if (root && root.classList.contains('solo') !== (n === 1)) bad.push('tab ' + tabId(h) + ' solo=' + root.classList.contains('solo') + ' with ' + n + ' panes');
+  });
+  return bad;
+}
+
+test('move (break): twenty random moves and merges keep a sound layout, saved as shown, sessions untouched', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !needMove(win) || !a1 || !a2) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host');
+  const b2 = b1 && await tSplit(win, b1, 'v', 'b2.host');
+  const c = b2 && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  const all = [a1, a2, b1, b2, c];
+  const mark = env.log.length;
+  const spy = sessionSpy(win, all);
+  // A fixed pseudo-random sequence (same every run).
+  let seed = 7;
+  const rnd = n => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const sides = ['left', 'right', 'top', 'bottom'];
+  const log = [], bad = [];
+  for (let i = 0; i < 20; i++) {
+    const ts = tabEls(win).map(tabId);
+    const p = all[rnd(all.length)];
+    const op = rnd(3);
+    if (op === 0) { win.movePaneToNewTab(p.id); log.push('new ' + p.host); }
+    else if (op === 1) { const t = ts[rnd(ts.length)]; win.movePaneToTab(p.id, t); log.push(p.host + '->' + t); }
+    else {
+      const t = ts[rnd(ts.length)], side = sides[rnd(4)];
+      win.mergeTabInto(t, p.id, side); log.push('merge ' + t + ' ' + side + ' of ' + p.host);
+    }
+    const pr = layoutProblems(win);
+    if (pr.length) bad.push(i + ' ' + log[log.length - 1] + ': ' + pr.join('; '));
+  }
+  ok(bad.length === 0, 'after every step the layout is sound and saved as shown; ' + JSON.stringify(bad.slice(0, 3)));
+  ok(paneList(win).length === 5 && all.every(p => win.panes[p.id] === p && p.sid === 'sid-' + p.host),
+     'all five panes alive with their sessions');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + JSON.stringify(spy.concat(sessionCalls(env, mark)).slice(0, 5)));
+  await sleep(400);
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  // Every pane still in a tab that can be shown, fitted when it is (each
+  // tab is left on screen until its panes have settled).
+  for (const h of tabEls(win)) {
+    clickTab(win, h);
+    await until(() => tabId(activeTab(win)) === tabId(h), 500);
+    for (const p of panesOfTab(win, tabId(h))) await settled(win, p);
+  }
+  const wrong = all.filter(p => {
+    const want = panesOfTab(win, tabOfPane(p)).length > 1 ? 24 - BAR : 24;
+    return p.lastSentRows !== want || p.term.rows !== want;
+  }).map(p => p.host + ' ' + p.term.rows + '/' + p.lastSentRows);
+  ok(wrong.length === 0, 'each pane, once shown, has its rows and the server has them too; wrong: ' + JSON.stringify(wrong));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'still no degenerate resize');
+  // And a reload brings back what was shown.
+  const want = shapesNow(win);
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S3); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 5, 2000);
+  ok(JSON.stringify(shapesNow(w2)) === JSON.stringify(want), 'reload: the same layout; got ' + JSON.stringify(shapesNow(w2)) + ' want ' + JSON.stringify(want));
+  cleanup(env2);
+});
+
+test('move (break): a pane moved while it is still connecting after a reload ends up connected, in its new tab', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S3); const w1 = env1.win;
+  const [a, b] = await splitTabEnv(w1, ['a.host', 'b.host']);
+  if (!needTabs(w1) || !a || !b) { cleanup(env1); return; }
+  await sleep(50);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  // b's connect answers late.
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: bd => bd && bd.host === 'b.host', response: {session_id: 'sid-b.host', alive: true}, delay: 400},
+  ]), snap, S3); const win = env.win;
+  if (!needMove(win)) { cleanup(env); return; }
+  await until(() => paneList(win).length === 2 && paneList(win).some(p => p.host === 'a.host' && p.sid), 1500);
+  const pb = paneList(win).find(p => p.host === 'b.host');
+  ok(!!pb && !pb.sid, 'setup: b is still connecting');
+  if (!pb) { cleanup(env); return; }
+  win.movePaneToNewTab(pb.id);
+  ok(tabEls(win).length === 2 && shape(win, tabOfPane(pb)) === 'b.host', 'b moved to its own tab while connecting');
+  await until(() => pb.sid === 'sid-b.host', 2000);
+  await sleep(300);
+  ok(pb.sid === 'sid-b.host' && win.panes[pb.id] === pb, 'its connect completed into the same pane');
+  ok(shape(win, tabOfPane(pb)) === 'b.host' && tabEls(win).length === 2, 'and it stayed in its new tab; got ' + JSON.stringify(shapesNow(win)));
+  ok(env.log.filter(e => e.action === 'connect' && e.body.host === 'b.host').length === 1, 'one connect for b, not two');
+  ok(dotState(tabElOfPane(win, pb)) === 's-on', 'its tab says connected; got ' + dotState(tabElOfPane(win, pb)));
+  ok(tabLabel(tabElOfPane(win, pb)) === paneLabel(pb) && paneLabel(pb) !== '', 'its tab carries its label: ' + JSON.stringify(tabLabel(tabElOfPane(win, pb))));
+  ok(layoutProblems(win).length === 0, 'layout sound: ' + JSON.stringify(layoutProblems(win)));
+  ok(!barShown(env, pb) && pb.term.rows === 24 && serverSize(env, 'sid-b.host') === '80x24',
+     'alone in its tab: no bar, 24 rows, and the server has 80x24; got ' + pb.term.rows + ' rows, server ' + serverSize(env, 'sid-b.host'));
+  cleanup(env);
+});
+
+test('move (break): a persistent pane moved while it re-attaches keeps its keys and its tab', async () => {
+  const sent = [];
+  let n = 0;
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: bd => bd && bd.host === 'b.host' && bd.slot_id,
+     response: () => ({session_id: 'sid-b.host-' + (++n), alive: true}), delay: () => 1},
+    {action: 'input', match: bd => bd && /^sid-b\.host/.test(bd.session_id) && bd.data,
+     response: bd => { sent.push(bd.data); return {ok: true}; }},
+  ]), null, S3); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tSplit(win, a, 'h', 'b.host', {persistent: true});
+  if (!needTabs(win) || !needMove(win) || !b) { cleanup(env); return; }
+  ok(b.persistent && !!b.slotId, 'setup: b is a persistent pane');
+  // Its session is gone on the server: it re-attaches.
+  const sid0 = b.sid;
+  // slow the re-attach
+  env.win.fetch = (inner => function (url, init) {
+    if (/action=connect/.test(String(url))) return sleep(300).then(() => inner(url, init));
+    return inner(url, init);
+  })(env.win.fetch);
+  env.win.fetch.__state = env.state;
+  win.handleOutputPayload(b, {error: 'session not found'}, sid0);
+  ok(!b.sid && b.connecting, 'b is re-attaching');
+  b.term._onDataCb('ls -la\r');
+  win.movePaneToNewTab(b.id);
+  ok(shape(win, tabOfPane(b)) === 'b.host', 'b moved to its own tab during the re-attach');
+  await until(() => !!b.sid && b.sid !== sid0, 2000);
+  win.handleOutputPayload(b, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, b.sid);
+  await until(() => sent.join('') === 'ls -la\r', 1500);
+  ok(!!b.sid && b.sid !== sid0, 're-attached');
+  ok(sent.join('') === 'ls -la\r', 'the key typed during the re-attach arrived once; got ' + JSON.stringify(sent));
+  ok(shape(win, tabOfPane(b)) === 'b.host' && tabEls(win).length === 2, 'and b is still in its own tab; got ' + JSON.stringify(shapesNow(win)));
+  ok(layoutProblems(win).length === 0, 'layout sound: ' + JSON.stringify(layoutProblems(win)));
+  cleanup(env);
+});
+
+test('move (break): the dragged pane or tab closing mid-drag leaves nothing behind', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  // A pane bar dragged; the pane's shell exits before the drop.
+  const m = pointer(win);
+  const [x0, y0] = centre(labelEl(b));
+  m.down(labelEl(b), x0, y0);
+  m.move(labelEl(b), x0 + 20, y0 + 20);
+  m.move($(win, 'tabs'), x0 + 40, y0);
+  win.closePane(b.id);
+  m.up($(win, 'tabs'), x0 + 40, y0);
+  await sleep(50);
+  ok(tabEls(win).length === 2 && tabRoots(win).length === 2, 'no tab made for a pane that is gone; got ' + tabEls(win).length);
+  ok(layoutProblems(win).length === 0, 'layout sound: ' + JSON.stringify(layoutProblems(win)));
+  // A tab dragged over a pane; that tab is closed before the drop.
+  const tC = tabOfPane(c);
+  let zone = null;
+  dragTabOnto(win, tabById(win, tC), a, 'right', {beforeUp: () => { zone = zoneOf(a); win.closeTab(tC); }});
+  await sleep(50);
+  ok(zone === 'right', 'the zone was shown; got ' + JSON.stringify(zone));
+  ok(tabEls(win).length === 1 && shape(win, tabOfPane(a)) === 'a.host', 'nothing merged from a closed tab; got ' + JSON.stringify(shapesNow(win)));
+  ok(anyZone(win) === 0 && !win.document.querySelector('.dragging'), 'no zone or drag state left');
+  ok(layoutProblems(win).length === 0, 'layout sound: ' + JSON.stringify(layoutProblems(win)));
+  cleanup(env);
+});
+
+test('move (break): a tab drag over a pane, the window loses focus, comes back without the button', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S3); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !needMove(win) || !b) { cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  const before = JSON.stringify(shapesNow(win));
+  const m = dragTabOnto(win, tabElOfPane(win, b), a, 'left', {noUp: true});
+  ok(zoneOf(a) === 'left', 'zone shown while dragging');
+  win.dispatchEvent(new win.Event('blur'));
+  await sleep(20);
+  const zoneAfterBlur = zoneOf(a);
+  m.moveNoButton(a.el, 100, 100);
+  ok(anyZone(win) === 0, 'once the pointer is back without the button, no zone is left (after the blur alone: ' + JSON.stringify(zoneAfterBlur) + ')');
+  m.up(a.el, 100, 100);
+  ok(JSON.stringify(shapesNow(win)) === before, 'nothing merged; got ' + JSON.stringify(shapesNow(win)));
+  ok(tabId(activeTab(win)) === tabOfPane(a), 'A still in front');
+  // A click on a tab right after still switches tabs (no stale click blocker).
+  await sleep(450);
+  clickTab(win, tabElOfPane(win, b));
+  await until(() => tabId(activeTab(win)) === tabOfPane(b), 500);
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'a later click on B shows B');
+  cleanup(env);
+});
+
+// =====================================================================
+// Tabs (step 4) - keyboard.
+//
+// Alt+1..Alt+8 go to tab N (nothing if there is no tab N), Alt+9 to the
+// last tab, Alt+T is "+", Alt+W closes the active tab (same confirm rule
+// as the tab's x), Alt+Shift+[ / Alt+Shift+] previous / next tab with
+// wrap. Matched by e.code, so a Cyrillic layout (e.key 'е' for KeyT) and
+// macOS Option (e.key '¡' for Digit1) work. The combos are websh's: they
+// are consumed (preventDefault) and never reach the shell; every other
+// Alt combo (readline's Alt+B/F/D/., Alt+Backspace, Option+arrows) does.
+// Ctrl+Alt (AltGr on Windows layouts) never switches tabs. Under a modal
+// (login form, options, the terminate confirm) nothing happens.
+//
+// The real path is xterm's: keys are typed into xterm's hidden textarea
+// inside the pane, and xterm's keydown listener on that textarea first
+// asks the handler from attachCustomKeyEventHandler, and - unless it
+// returns false - turns the key into data (Alt+x -> ESC x), emits it on
+// onData, and CANCELS the event (preventDefault + stopPropagation), so a
+// plain bubbling listener on document never sees it. xtermKeys() below
+// installs exactly that model on a pane; on "mac" it models Option
+// without macOptionIsMeta: xterm leaves the key alone in keydown and the
+// composed character ('¡', '∫', ...) arrives afterwards (keypress/input)
+// unless the keydown was default-prevented.
+// =====================================================================
+const US_PUNCT = {BracketLeft: ['[', '{'], BracketRight: [']', '}'], Period: ['.', '>'],
+                  Comma: [',', '<'], Minus: ['-', '_'], Slash: ['/', '?']};
+function xtermData(e) {
+  if (e.ctrlKey && e.altKey) return null;          // AltGr / Ctrl+Alt: not modelled, sends nothing
+  if (e.metaKey) return null;
+  if (e.altKey) {
+    if (e.code === 'Backspace') return '\x1b\x7f';
+    if (e.code === 'ArrowLeft') return '\x1b[1;3D';
+    if (e.code === 'ArrowRight') return '\x1b[1;3C';
+    let m = /^Key([A-Z])$/.exec(e.code);
+    if (m) return '\x1b' + (e.shiftKey ? m[1] : m[1].toLowerCase());
+    m = /^Digit(\d)$/.exec(e.code);
+    if (m) return '\x1b' + m[1];
+    if (US_PUNCT[e.code]) return '\x1b' + US_PUNCT[e.code][e.shiftKey ? 1 : 0];
+    return null;
+  }
+  if (!e.ctrlKey && e.key && e.key.length === 1) return e.key;
+  if (e.code === 'Enter') return '\r';
+  return null;
+}
+function xtermKeys(win, p, mac) {
+  const host = p.el.querySelector('.pane-term') || p.el;
+  let ta = host.querySelector('textarea.xterm-helper-textarea');
+  if (!ta) {
+    ta = win.document.createElement('textarea');
+    ta.className = 'xterm-helper-textarea';
+    host.appendChild(ta);
+    ta.addEventListener('keydown', e => {
+      const term = p.term;
+      if (term._customKey && term._customKey(e) === false) return;
+      if (mac && e.altKey && !e.ctrlKey && !e.metaKey) return;   // composed char comes later
+      const d = xtermData(e);
+      if (d == null) return;
+      if (term._onDataCb) term._onDataCb(d);
+      e.preventDefault(); e.stopPropagation();
+    });
+  }
+  return ta;
+}
+const KEYCODES = {BracketLeft: 219, BracketRight: 221, Period: 190, Backspace: 8, ArrowLeft: 37, ArrowRight: 39, Enter: 13};
+// Dispatch one keydown like a browser would; returns the event.
+function keyOn(win, target, code, key, mods, mac) {
+  mods = mods || {};
+  const ev = new win.KeyboardEvent('keydown', {key, code, bubbles: true, cancelable: true,
+    altKey: !!mods.alt, shiftKey: !!mods.shift, ctrlKey: !!mods.ctrl, metaKey: !!mods.meta, repeat: false});
+  let kc = KEYCODES[code];
+  if (kc == null) { const m = /^(?:Key|Digit)(.)$/.exec(code); kc = m ? m[1].toUpperCase().charCodeAt(0) : 0; }
+  try { Object.defineProperty(ev, 'keyCode', {value: kc}); Object.defineProperty(ev, 'which', {value: kc}); } catch (e) {}
+  target.dispatchEvent(ev);
+  // macOS Option without macOptionIsMeta: the composed character is
+  // typed unless the keydown was cancelled.
+  if (mac && ev.altKey && !ev.ctrlKey && !ev.metaKey && !ev.defaultPrevented && key.length === 1) {
+    const p = target.__pane;
+    if (p && p.term._onDataCb) p.term._onDataCb(key);
+  }
+  return ev;
+}
+// Keys go into the active pane's xterm textarea.
+function typeIn(win, p, code, key, mods, mac) {
+  const ta = xtermKeys(win, p, mac);
+  ta.__pane = p;
+  try { ta.focus(); } catch (e) {}
+  return keyOn(win, ta, code, key, mods, mac);
+}
+const activePane = win => win.panes[win.activeId];
+// Everything /api/input carried, per session.
+function inputRecorder() {
+  const got = [];
+  const entry = {action: 'input', match: bd => bd && typeof bd.data === 'string',
+                 response: bd => { got.push({sid: bd.session_id, data: bd.data}); return {ok: true}; }};
+  return {got, entry, all: () => got.map(g => g.data).join(''),
+          of: sid => got.filter(g => g.sid === sid).map(g => g.data).join('')};
+}
+// Wait until everything typed so far has been flushed: type a sentinel
+// (plain key) into pane p, wait for it on the wire. Input is ordered.
+let _sentinelN = 0;
+async function flushedThrough(win, rec, p) {
+  const s = String.fromCharCode(0x71 + (_sentinelN++ % 8));   // q..x, one key
+  const mark = '@' + s;
+  const ta = xtermKeys(win, p);
+  ta.__pane = p;
+  keyOn(win, ta, 'Digit2', '@', {shift: true});
+  keyOn(win, ta, 'Key' + s.toUpperCase(), s);
+  const okk = await until(() => rec.of(p.sid).indexOf(mark) >= 0, 1500);
+  ok(okk, 'sentinel ' + JSON.stringify(mark) + ' reached the shell of ' + p.host + ' (input path alive)');
+  return okk;
+}
+const show = s => JSON.stringify(s);
+async function threeTabs(win, opts) {
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host', opts && opts.b);
+  const c = b && await tNewTab(win, 'c.host');
+  return [a, b, c];
+}
+const tabIdx = win => tabEls(win).indexOf(activeTab(win));
+const titleOf = t => {
+  if (!t) return '';
+  const own = t.getAttribute('title') || '';
+  const kids = Array.from(t.querySelectorAll('[title]')).map(x => x.getAttribute('title')).join(' | ');
+  return own + (kids ? ' | ' + kids : '');
+};
+
+test('tabs keys: Alt+1..Alt+8 go to tab N from inside the terminal; Alt+9 to the last; a missing N does nothing', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup: three tabs'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  ok(tabId(activeTab(win)) === tC, 'setup: C in front');
+  let ev = typeIn(win, c, 'Digit1', '1', {alt: true});
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(tabId(activeTab(win)) === tA, 'Alt+1 typed in C\'s terminal shows tab 1 (A); active tab is now #' + tabIdx(win));
+  ok(win.activeId === a.id, 'and A\'s pane is the active pane');
+  ok(ev.defaultPrevented, 'Alt+1 is consumed (preventDefault)');
+  ev = typeIn(win, a, 'Digit2', '2', {alt: true});
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'Alt+2 shows tab 2 (B)');
+  ok(b.term._focusCalls > 0, 'keyboard focus goes into B\'s pane');
+  ok(ev.defaultPrevented, 'Alt+2 consumed');
+  ev = typeIn(win, b, 'Digit9', '9', {alt: true});
+  await until(() => tabId(activeTab(win)) === tC, 500);
+  ok(tabId(activeTab(win)) === tC, 'Alt+9 shows the last tab (C)');
+  ok(ev.defaultPrevented, 'Alt+9 consumed');
+  // Missing tab: nothing changes, but the key is still not the shell's.
+  const before = tabId(activeTab(win)), beforePane = win.activeId;
+  const ev5 = typeIn(win, c, 'Digit5', '5', {alt: true});
+  const ev8 = typeIn(win, c, 'Digit8', '8', {alt: true});
+  await sleep(30);
+  ok(tabId(activeTab(win)) === before && win.activeId === beforePane, 'Alt+5 / Alt+8 with 3 tabs change nothing');
+  ok(ev5.defaultPrevented && ev8.defaultPrevented, 'Alt+5 / Alt+8 with no such tab are still consumed');
+  // Alt+3 when on tab 3 already: stays.
+  typeIn(win, c, 'Digit3', '3', {alt: true});
+  ok(tabId(activeTab(win)) === tC, 'Alt+3 on tab 3 stays on tab 3');
+  await flushedThrough(win, rec, c);
+  await flushedThrough(win, rec, c);
+  const all = rec.all();
+  ok(!/\x1b[0-9]/.test(all), 'no ESC+digit reached any shell; /api/input carried ' + show(all));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+N also works when the focus is not in a terminal (after clicking the tab strip)', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ev = keyOn(win, $(win, 'tabs'), 'Digit1', '1', {alt: true});
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  ok(tabId(activeTab(win)) === tabOfPane(a), 'Alt+1 dispatched on the tab strip shows tab 1');
+  ok(ev.defaultPrevented, 'consumed');
+  const ev2 = keyOn(win, win.document.body, 'BracketRight', '}', {alt: true, shift: true});
+  await until(() => tabId(activeTab(win)) === tabOfPane(b), 500);
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'Alt+Shift+] on body shows the next tab');
+  ok(ev2.defaultPrevented, 'consumed');
+  cleanup(env);
+});
+
+test('tabs keys: Alt+Shift+[ / Alt+Shift+] go to the previous / next tab and wrap, one step per press', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ids = [a, b, c].map(tabOfPane);
+  const seen = [];
+  for (let i = 0; i < 4; i++) {
+    const ev = typeIn(win, activePane(win), 'BracketRight', '}', {alt: true, shift: true});
+    await sleep(5);
+    seen.push(ids.indexOf(tabId(activeTab(win))) + (ev.defaultPrevented ? '' : '!'));
+  }
+  ok(show(seen) === show(['0', '1', '2', '0']),
+     'from C, Alt+Shift+] x4 goes A,B,C,A (wraps, one step each, consumed); got ' + show(seen) + ' (! = not consumed)');
+  const back = [];
+  for (let i = 0; i < 4; i++) {
+    const ev = typeIn(win, activePane(win), 'BracketLeft', '{', {alt: true, shift: true});
+    await sleep(5);
+    back.push(ids.indexOf(tabId(activeTab(win))) + (ev.defaultPrevented ? '' : '!'));
+  }
+  ok(show(back) === show(['2', '1', '0', '2']),
+     'from A, Alt+Shift+[ x4 goes C,B,A,C (wraps); got ' + show(back));
+  ok(win.activeId === c.id, 'the active pane follows the tab');
+  await flushedThrough(win, rec, c);
+  const all = rec.all();
+  ok(!/\x1b[{}\[\]]/.test(all), 'no ESC+{ / ESC+} reached a shell; /api/input carried ' + show(all));
+  cleanup(env);
+});
+
+test('tabs keys: with one tab, next/previous and Alt+1/Alt+9 stay put and still do not reach the shell', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const evs = [typeIn(win, a, 'BracketRight', '}', {alt: true, shift: true}),
+               typeIn(win, a, 'BracketLeft', '{', {alt: true, shift: true}),
+               typeIn(win, a, 'Digit1', '1', {alt: true}), typeIn(win, a, 'Digit9', '9', {alt: true})];
+  ok(tabEls(win).length === 1 && win.activeId === a.id, 'still one tab, same pane');
+  ok(evs.every(e => e.defaultPrevented), 'all four consumed; got ' + show(evs.map(e => e.defaultPrevented)));
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[19{}]/.test(rec.all()), 'nothing of them on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: a Cyrillic layout (e.key "е"/"ц"/"х"/"ъ") and macOS Option ("¡","™","†","∑","”","’") work by e.code', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  // Cyrillic (ЙЦУКЕН): Digit keys give digits, KeyT -> 'е', KeyW -> 'ц', [ -> 'х', ] -> 'ъ'.
+  typeIn(win, c, 'Digit1', '1', {alt: true});
+  ok(tabId(activeTab(win)) === tA, 'cyrillic Alt+1 -> tab 1');
+  typeIn(win, a, 'BracketRight', 'Ъ', {alt: true, shift: true});
+  ok(tabId(activeTab(win)) === tB, 'cyrillic Alt+Shift+] (e.key "Ъ") -> next tab');
+  typeIn(win, b, 'BracketLeft', 'Х', {alt: true, shift: true});
+  ok(tabId(activeTab(win)) === tA, 'cyrillic Alt+Shift+[ (e.key "Х") -> previous tab');
+  const evT = typeIn(win, a, 'KeyT', 'е', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'cyrillic Alt+T (e.key "е") opens the + form');
+  ok(evT.defaultPrevented, 'and is consumed');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabEls(win).length === 3, 'dismissing it made no tab');
+  const evW = typeIn(win, a, 'KeyW', 'ц', {alt: true});
+  await until(() => !tabById(win, tA), 500);
+  ok(!tabById(win, tA) && !win.panes[a.id], 'cyrillic Alt+W (e.key "ц") closes the active tab (A)');
+  ok(evW.defaultPrevented, 'and is consumed');
+  await flushedThrough(win, rec, activePane(win));
+  ok(!/\x1b[1te{}\[\]]|[еёцхъЪХ]/i.test(rec.all()), 'nothing of the cyrillic combos on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: macOS Option+digit / Option+T / Option+W / Option+Shift+[ ] act and the symbols never reach the shell', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  const M = true;
+  typeIn(win, c, 'Digit1', '¡', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tA, 'Option+1 (e.key "¡") -> tab 1');
+  typeIn(win, a, 'Digit2', '™', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tB, 'Option+2 (e.key "™") -> tab 2');
+  typeIn(win, b, 'Digit9', 'ª', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tC, 'Option+9 (e.key "ª") -> last tab');
+  typeIn(win, c, 'BracketRight', '’', {alt: true, shift: true}, M);
+  ok(tabId(activeTab(win)) === tA, 'Option+Shift+] (e.key "’") -> next tab, wrapping C -> A');
+  typeIn(win, a, 'BracketLeft', '”', {alt: true, shift: true}, M);
+  ok(tabId(activeTab(win)) === tC, 'Option+Shift+[ (e.key "”") -> previous tab, wrapping A -> C');
+  typeIn(win, c, 'KeyT', '†', {alt: true}, M);
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'Option+T (e.key "†") opens the + form');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  typeIn(win, c, 'KeyW', '∑', {alt: true}, M);
+  await until(() => !tabById(win, tC), 500);
+  ok(!tabById(win, tC), 'Option+W (e.key "∑") closes the active tab');
+  await flushedThrough(win, rec, activePane(win));
+  ok(!/[¡™ª’”†∑]/.test(rec.all()), 'none of the Option symbols reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+T is "+": opens the form, connecting makes a new active tab; dismissing makes none', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), {local: {websh_connections: JSON.stringify([
+    {name: 'saved one', host: 's.host', user: 'u', port: 22}])}});
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const ev = typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'Alt+T opens the login form');
+  ok(ev.defaultPrevented, 'Alt+T is consumed');
+  ok(!hidden($(win, 'btnCancel')), 'as for "+": the form can be dismissed');
+  ok(/saved one/.test($(win, 'savedList').textContent), 'as for "+": saved connections are listed');
+  ok(tabEls(win).length === 1, 'opening the form alone creates no tab');
+  // Alt+T again while the form is open: nothing new.
+  keyOn(win, $(win, 'iH'), 'KeyT', 't', {alt: true});
+  ok(!hidden($(win, 'ov')) && tabEls(win).length === 1, 'Alt+T inside the open form changes nothing');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabEls(win).length === 1 && win.activeId === a.id, 'dismissed: no tab made, A still in front');
+  typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  const b = await tConnect(win, 'b.host');
+  await until(() => tabEls(win).length === 2, 500);
+  ok(!!b && tabEls(win).length === 2 && tabOfPane(b) !== tabOfPane(a), 'connecting from it makes a new tab');
+  ok(b && tabId(activeTab(win)) === tabOfPane(b) && win.activeId === b.id, 'and the new tab is active');
+  await flushedThrough(win, rec, a.sid ? a : b);
+  ok(!/\x1bt/i.test(rec.all()), 'no ESC+t reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+W closes the active tab, asks once for a tmux tab, honours "don\'t ask again"', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host', {persistent: true});
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host', {persistent: true});
+  const c = b2 && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup: A, B (two tmux panes), C'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b1), tC = tabOfPane(c);
+  const modal = confirmCounter(win);
+  // A short-lived tab: closes without a question; the right neighbour, else left, takes over.
+  let ev = typeIn(win, c, 'KeyW', 'w', {alt: true});
+  await until(() => !tabById(win, tC), 500);
+  ok(!tabById(win, tC) && !win.panes[c.id], 'Alt+W in C closes C');
+  ok(ev.defaultPrevented, 'Alt+W consumed');
+  ok(modal.opened === 0, 'no confirm for a short-lived tab');
+  ok(disconnectsFor(env, 'sid-c.host').length === 1, 'C disconnected once');
+  ok(tabId(activeTab(win)) === tB, 'the left neighbour (B) is in front');
+  // tmux tab: one confirm for both panes; Cancel keeps everything.
+  typeIn(win, activePane(win), 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened > 0, 500);
+  ok(modal.opened === 1, 'Alt+W on a tab with two tmux panes asks once; got ' + modal.opened);
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!tabById(win, tB) && !!b1.sid && !!b2.sid, 'Cancel keeps B and both sessions');
+  typeIn(win, activePane(win), 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened > 1, 500);
+  ok(modal.opened === 2, 'asked again (once) on the second Alt+W');
+  win.confirmTerminate(false);
+  await until(() => !tabById(win, tB), 500);
+  await sleep(30);
+  ok(modal.opened === 2, 'still one question per Alt+W');
+  ok(disconnectsFor(env, 'sid-b1.host').filter(e => e.body.terminate).length === 1 &&
+     disconnectsFor(env, 'sid-b2.host').filter(e => e.body.terminate).length === 1, 'both tmux sessions terminated once');
+  ok(tabEls(win).length === 1 && tabId(activeTab(win)) === tA, 'A remains, in front');
+  await flushedThrough(win, rec, a);
+  ok(!/\x1bw/i.test(rec.all()), 'no ESC+w reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+W with "don\'t ask again" asks nothing; Alt+W on the last tab returns to the login form', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host', {persistent: true});
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  win.localStorage.setItem('websh_terminate_no_ask', '1');
+  const modal = confirmCounter(win);
+  typeIn(win, b, 'KeyW', 'w', {alt: true});
+  await until(() => tabEls(win).length === 1, 500);
+  ok(modal.opened === 0 && tabEls(win).length === 1, 'tmux tab closed by Alt+W without a question');
+  ok(disconnectsFor(env, 'sid-b.host').some(e => e.body.terminate), 'and its session terminated');
+  typeIn(win, a, 'KeyW', 'w', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(Object.keys(win.panes).length === 0 && !hidden($(win, 'ov')), 'Alt+W on the last tab: no panes, the initial login form');
+  ok(win.overlayMode === 'initial', 'the form is the initial one; got ' + win.overlayMode);
+  cleanup(env);
+});
+
+test('tabs keys: other Alt combos reach the shell unchanged and switch nothing', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b] = await (async () => { const x = await tConnect(win, 'a.host'); return [x, x && await tNewTab(win, 'b.host')]; })();
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b);
+  const combos = [['KeyB', 'b', {alt: true}, '\x1bb'], ['KeyF', 'f', {alt: true}, '\x1bf'],
+                  ['Period', '.', {alt: true}, '\x1b.'], ['KeyD', 'd', {alt: true}, '\x1bd'],
+                  ['Backspace', 'Backspace', {alt: true}, '\x1b\x7f'],
+                  ['ArrowLeft', 'ArrowLeft', {alt: true}, '\x1b[1;3D'], ['ArrowRight', 'ArrowRight', {alt: true}, '\x1b[1;3C'],
+                  ['BracketLeft', '[', {alt: true}, '\x1b['], ['BracketRight', ']', {alt: true}, '\x1b]']];
+  combos.forEach(k => typeIn(win, b, k[0], k[1], k[2]));
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'none of them switched tabs (Alt+Left/Right included)');
+  await flushedThrough(win, rec, b);
+  const want = combos.map(k => k[3]).join('');
+  const got = rec.of(b.sid);
+  ok(got.indexOf(want) === 0, 'B\'s shell got exactly ' + show(want) + ' (Alt+B,F,.,D,Backspace,Left,Right,[,] in order); got ' + show(got));
+  cleanup(env);
+});
+
+test('tabs keys: Ctrl+Alt+digit / Ctrl+Alt+Shift+] (AltGr) never switch tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tC = tabOfPane(c);
+  const evs = [];
+  for (const d of ['1', '2', '9']) evs.push(typeIn(win, c, 'Digit' + d, d === '2' ? '@' : d, {alt: true, ctrl: true}));
+  evs.push(typeIn(win, c, 'BracketRight', '}', {alt: true, ctrl: true, shift: true}));
+  evs.push(typeIn(win, c, 'KeyW', 'w', {alt: true, ctrl: true}));
+  evs.push(typeIn(win, c, 'KeyT', 't', {alt: true, ctrl: true}));
+  await sleep(30);
+  ok(tabId(activeTab(win)) === tC && tabEls(win).length === 3 && hidden($(win, 'ov')),
+     'Ctrl+Alt+1/2/9, Ctrl+Alt+Shift+], Ctrl+Alt+W, Ctrl+Alt+T: still on C, 3 tabs, no form');
+  ok(evs.every(e => !e.defaultPrevented), 'websh did not cancel them (AltGr characters must still type); got ' +
+     show(evs.map(e => e.defaultPrevented)));
+  // And an AltGr event as Chrome on Windows really sends it: ctrlKey+altKey+AltGraph.
+  const ev = new win.KeyboardEvent('keydown', {key: '@', code: 'Digit2', ctrlKey: true, altKey: true, bubbles: true, cancelable: true});
+  ev.getModifierState = m => m === 'AltGraph';
+  xtermKeys(win, c).dispatchEvent(ev);
+  ok(tabId(activeTab(win)) === tC, 'AltGr+2 does not switch tabs');
+  cleanup(env);
+});
+
+test('tabs keys: under the login form, the options and the terminate confirm the shortcuts do nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host', {persistent: true});
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  // Each key alone, checked right after it: a sequence could undo
+  // itself (Alt+1 then Alt+9 lands where it started).
+  const moved = [];
+  const allKeys = (target, where) => {
+    const confirmWas = !hidden($(win, 'confirmOv'));
+    [['Digit1', '1', {alt: true}], ['Digit9', '9', {alt: true}], ['BracketLeft', '{', {alt: true, shift: true}],
+     ['BracketRight', '}', {alt: true, shift: true}], ['KeyW', 'w', {alt: true}]].forEach(k => {
+      keyOn(win, target, k[0], k[1], k[2]);
+      if (tabId(activeTab(win)) !== tB || tabEls(win).length !== 2 || win.activeId !== b.id ||
+          (!confirmWas && !hidden($(win, 'confirmOv')))) {
+        moved.push(where + ': ' + k[0] + (k[2].shift ? '+shift' : ''));
+        if (!confirmWas && !hidden($(win, 'confirmOv'))) win.confirmCancel();
+        if (tabById(win, tB)) clickTab(win, tabById(win, tB));
+      }
+    });
+  };
+  // 1. The + form, keys typed in its host field and on the body.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  allKeys($(win, 'iH'), 'form/host field'); allKeys(win.document.body, 'form/body');
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2 && win.activeId === b.id,
+     'login form open: Alt+1/9/Shift+[/Shift+]/W switched, closed or asked nothing; did: ' + show(moved));
+  ok(!hidden($(win, 'ov')), 'the form is still open');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  // 2. Options.
+  win.openOptions();
+  ok(!hidden($(win, 'ovOpt')), 'setup: options open');
+  moved.length = 0;
+  allKeys(win.document.body, 'options');
+  keyOn(win, win.document.body, 'KeyT', 't', {alt: true});
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2,
+     'options open: nothing switched, closed or asked; did: ' + show(moved));
+  ok(hidden($(win, 'ov')), 'options open: Alt+T did not open the login form over it');
+  win.closeOptions();
+  // 3. The terminate confirm (Alt+W on the tmux tab), then more keys under it.
+  const modal = confirmCounter(win);
+  typeIn(win, b, 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened === 1, 500);
+  ok(modal.opened === 1, 'setup: Alt+W asks to terminate');
+  moved.length = 0;
+  allKeys(win.document.body, 'confirm');
+  keyOn(win, win.document.body, 'KeyT', 't', {alt: true});
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2,
+     'confirm open: no switch, nothing closed; did: ' + show(moved));
+  ok(modal.opened === 1 && !hidden($(win, 'confirmOv')), 'confirm still the one question');
+  ok(hidden($(win, 'ov')), 'confirm open: Alt+T did not open the login form');
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!tabById(win, tA) && !!tabById(win, tB), 'Cancel keeps both tabs');
+  cleanup(env);
+});
+
+test('tabs keys: tooltips name the shortcut - tab N says Alt+N (N<=8), + says Alt+T, and they follow the order', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ts = tabEls(win);
+  ts.forEach((t, i) => ok(titleOf(t).indexOf('Alt+' + (i + 1)) >= 0,
+    'tab ' + (i + 1) + ' tooltip mentions Alt+' + (i + 1) + '; got ' + show(titleOf(t))));
+  ok(titleOf($(win, 'tabNew')).indexOf('Alt+T') >= 0, '"+" tooltip mentions Alt+T; got ' + show(titleOf($(win, 'tabNew'))));
+  // Close tab 1: the former tab 2 is now tab 1, and says so.
+  closeTabX(win, tabElOfPane(win, a));
+  await until(() => tabEls(win).length === 2, 500);
+  const t2 = tabEls(win);
+  ok(t2.length === 2 && titleOf(t2[0]).indexOf('Alt+1') >= 0 && titleOf(t2[0]).indexOf('Alt+2') < 0,
+     'after closing tab 1, B (now first) says Alt+1, not Alt+2; got ' + show(titleOf(t2[0])));
+  ok(titleOf(t2[1]).indexOf('Alt+2') >= 0 && titleOf(t2[1]).indexOf('Alt+3') < 0,
+     'C (now second) says Alt+2; got ' + show(titleOf(t2[1])));
+  cleanup(env);
+});
+
+test('tabs keys: the tooltip of tab 9 and later does not promise Alt+9..', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  let p = await tConnect(win, 'h1.host');
+  if (!needTabs(win) || !p) { cleanup(env); return; }
+  for (let i = 2; i <= 10; i++) p = await tNewTab(win, 'h' + i + '.host');
+  const ts = tabEls(win);
+  ok(ts.length === 10, 'setup: 10 tabs; got ' + ts.length);
+  ok(titleOf(ts[7]).indexOf('Alt+8') >= 0, 'tab 8 says Alt+8; got ' + show(titleOf(ts[7])));
+  ok(!/Alt\+9\b/.test(titleOf(ts[8])) && !/Alt\+10/.test(titleOf(ts[9])),
+     'tab 9 of 10 does not claim Alt+9 (that is the last tab), tab 10 does not claim Alt+10; got ' + show(titleOf(ts[8])) + ' / ' + show(titleOf(ts[9])));
+  // Alt+9 is still "last".
+  clickTab(win, ts[0]);
+  await until(() => tabId(activeTab(win)) === tabId(ts[0]), 500);
+  keyOn(win, win.document.body, 'Digit9', '9', {alt: true});
+  ok(tabId(activeTab(win)) === tabId(ts[9]), 'Alt+9 with 10 tabs goes to the 10th, the last');
+  keyOn(win, win.document.body, 'Digit8', '8', {alt: true});
+  ok(tabId(activeTab(win)) === tabId(ts[7]), 'Alt+8 goes to the 8th');
+  cleanup(env);
+});
+
+test('tabs keys (break): held Alt+Shift+] (autorepeat) and a burst of Alt+N leave one consistent tab in front', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ids = [a, b, c].map(tabOfPane);
+  for (let i = 0; i < 31; i++) {
+    const ev = new win.KeyboardEvent('keydown', {key: '}', code: 'BracketRight', altKey: true, shiftKey: true,
+      repeat: i > 0, bubbles: true, cancelable: true});
+    xtermKeys(win, activePane(win)).dispatchEvent(ev);
+  }
+  // from C (index 2): 31 steps -> (2+31)%3 = 0
+  ok(tabId(activeTab(win)) === ids[0], '31 autorepeated next-tab steps from C land on A; on #' + ids.indexOf(tabId(activeTab(win))));
+  for (const d of ['2', '3', '1', '3', '2']) typeIn(win, activePane(win), 'Digit' + d, d, {alt: true});
+  ok(tabId(activeTab(win)) === ids[1] && win.activeId === b.id, 'Alt+2,3,1,3,2 in a burst ends on B with B\'s pane active');
+  const roots = tabRoots(win).filter(r => !env.lay.hidden(r));
+  ok(roots.length === 1 && roots[0].getAttribute('data-tab') === ids[1], 'exactly one tab layout visible, B\'s; got ' + roots.length);
+  await flushedThrough(win, rec, b);
+  ok(!/\x1b[123}]/.test(rec.all()), 'none of it on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+// ---- step 4, second round: trying to break the tab keys ----
+const tabKeyAt = (win, target, code, key, mods) => keyOn(win, target, code, key, Object.assign({alt: true}, mods || {}));
+const paneTabsSound = win => {
+  // every pane in exactly one tab root, one root visible, active pane in the active tab
+  const errs = [];
+  paneList(win).forEach(p => { if (!tabOfPane(p)) errs.push(p.host + ' has no tab'); });
+  const vis = tabRoots(win).filter(r => !r.classList.contains('h'));
+  if (vis.length !== 1) errs.push(vis.length + ' roots visible');
+  if (activeTab(win) && vis[0] && vis[0].getAttribute('data-tab') !== tabId(activeTab(win))) errs.push('visible root is not the active tab');
+  const ap = win.panes[win.activeId];
+  if (ap && tabOfPane(ap) !== tabId(activeTab(win))) errs.push('active pane ' + ap.host + ' is not in the active tab');
+  if (tabEls(win).length !== tabRoots(win).length) errs.push('tabs ' + tabEls(win).length + ' vs roots ' + tabRoots(win).length);
+  return errs;
+};
+
+// While a tab or pane drag is in progress the tab keys do nothing: they
+// are still consumed (never reach the shell) and the drag goes on
+// unchanged - the zone stays where it was, the release does what it
+// would have done without the key.
+test('tabs keys (break): during a tab drag Alt+N / Alt+W / Alt+T / Alt+Shift+] do nothing; the drop still works', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S3); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const modal = confirmCounter(win);
+  let zone = null, zoneAfter = null, state = null;
+  const evs = [];
+  dragTabOnto(win, tabById(win, tC), a, 'right', {beforeUp: () => {
+    zone = zoneOf(a);
+    evs.push(typeIn(win, a, 'Digit2', '2', {alt: true}));            // from the terminal (focus stays there)
+    evs.push(tabKeyAt(win, win.document.body, 'Digit3', '3'));
+    evs.push(typeIn(win, a, 'BracketRight', '}', {alt: true, shift: true}));
+    evs.push(typeIn(win, a, 'Digit9', '9', {alt: true}));
+    evs.push(typeIn(win, a, 'KeyW', 'w', {alt: true}));
+    evs.push(typeIn(win, a, 'KeyT', 't', {alt: true}));
+    zoneAfter = zoneOf(a);
+    state = {front: tabId(activeTab(win)), tabs: tabEls(win).length, form: !hidden($(win, 'ov')),
+             confirm: modal.opened, dragging: !!win.document.querySelector('.dragging')};
+  }});
+  await sleep(50);
+  ok(zone === 'right', 'setup: zone shown on A; got ' + show(zone));
+  ok(state.front === tA && state.tabs === 3 && !state.form && state.confirm === 0,
+     'mid-drag Alt+2/3/Shift+]/9/W/T: no switch, no close, no form, no confirm; got ' +
+     show({front: state.front === tA ? 'A' : state.front, tabs: state.tabs, form: state.form, confirm: state.confirm}));
+  ok(evs.every(e => e.defaultPrevented), 'all consumed; prevented: ' + show(evs.map(e => e.defaultPrevented)));
+  ok(zoneAfter === 'right' && state.dragging, 'the drag goes on unchanged: zone still "right", tab still dragging; got ' +
+     show(zoneAfter) + '/' + state.dragging);
+  ok(show(shapesNow(win)) === show(['(h a.host c.host)', 'b.host']),
+     'the release merged C to the right of A as it would without the keys; got ' + show(shapesNow(win)));
+  ok(anyZone(win) === 0 && !win.document.querySelector('.dragging') && layoutProblems(win).length === 0 &&
+     paneTabsSound(win).length === 0, 'nothing left behind: ' + show(layoutProblems(win).concat(paneTabsSound(win))));
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[0-9tw}]/.test(rec.all()), 'none of the keys reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): during a pane-bar drag Alt+N does nothing; the drop on the strip still makes a tab', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const c = await tNewTab(win, 'c.host');
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  const tA = tabOfPane(a);
+  const spy = sessionSpy(win, [a, b, c]);
+  const m = pointer(win);
+  const [x0, y0] = centre(labelEl(b));
+  m.down(labelEl(b), x0, y0);
+  m.move(labelEl(b), x0 + 20, y0 + 20);
+  m.move($(win, 'tabs'), x0 + 40, y0);
+  const e1 = typeIn(win, b, 'Digit2', '2', {alt: true});
+  const e2 = tabKeyAt(win, win.document.body, 'BracketRight', '}', {shift: true});
+  ok(tabId(activeTab(win)) === tA && tabEls(win).length === 2, 'mid pane-drag Alt+2 / Alt+Shift+] switch nothing');
+  ok(e1.defaultPrevented && e2.defaultPrevented, 'and are consumed');
+  m.move($(win, 'tabs'), x0 + 42, y0);
+  m.up($(win, 'tabs'), x0 + 42, y0);
+  await until(() => tabEls(win).length === 3, 500);
+  ok(tabEls(win).length === 3 && panesOfTab(win, tabOfPane(b)).length === 1 && tabOfPane(b) !== tA,
+     'the drop on the strip still made b a tab of its own; tabs ' + tabEls(win).length);
+  ok(b.sid === 'sid-b.host' && spy.length === 0, 'same session, nothing restarted; got ' + show(spy));
+  ok(layoutProblems(win).length === 0 && paneTabsSound(win).length === 0,
+     'layout sound: ' + show(layoutProblems(win).concat(paneTabsSound(win))));
+  await flushedThrough(win, rec, b);
+  ok(!/\x1b[0-9}]/.test(rec.all()), 'nothing reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): Alt+W on a tab whose pane is still connecting after a reload', async () => {
+  const rec = h => ({label: 'u@' + h, via: 'manual', host: h, port: 22, user: 'u', auth: 'pw',
+                     persistent: false, slot_id: null, tmux_cmd: 'tmux', cols: 80, rows: 24});
+  const pre = {local: {websh_panes: JSON.stringify({version: 2,
+    layout: {type: 'leaf', pane: 'p1'}, panes: {p1: rec('a.host')}})},
+    session: {websh_panes_session: JSON.stringify({p1: {password: 'pw-a.host'}})}};
+  const env0 = await mkTabEnv(TAB_PLAN(), pre); const w0 = env0.win;
+  await until(() => paneList(w0).some(p => p.sid), 2000);
+  if (!needTabs(w0)) { cleanup(env0); return; }
+  const b0 = await tNewTab(w0, 'b.host');
+  if (!b0) { ok(false, 'setup'); cleanup(env0); return; }
+  const snap = snapshotStorage(w0);                 // B in front
+  cleanup(env0);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'b.host', response: {session_id: 'sid-b-late', alive: true}, delay: 300},
+  ]), snap);
+  const win = env.win;
+  await until(() => tabEls(win).length === 2, 1500);
+  const b = paneList(win).find(p => p.host === 'b.host');
+  ok(!!b && !b.sid && b.connecting && tabId(activeTab(win)) === tabOfPane(b), 'setup: B in front, still connecting');
+  if (!b) { cleanup(env); return; }
+  const ev = typeIn(win, b, 'KeyW', 'w', {alt: true});
+  ok(ev.defaultPrevented, 'Alt+W consumed');
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1, 'B closed by Alt+W while connecting');
+  await until(() => disconnectsFor(env, 'sid-b-late').length > 0, 1000);
+  await sleep(50);
+  ok(disconnectsFor(env, 'sid-b-late').length === 1, 'the late session is disconnected once');
+  ok(tabEls(win).length === 1 && tabRoots(win).length === 1 && paneList(win).length === 1, 'nothing came back');
+  ok(hidden($(win, 'ov')) && paneTabsSound(win).length === 0, 'A in front, no form; ' + show(paneTabsSound(win)));
+  cleanup(env);
+});
+
+test('tabs keys (break): Alt+T twice in a row opens one form; connecting makes one tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const modal = (() => { const el = $(win, 'ov'); const c = {opened: 0}; let was = !hidden(el);
+    new win.MutationObserver(() => { const n = !hidden(el); if (n && !was) c.opened++; was = n; })
+      .observe(el, {attributes: true, attributeFilter: ['class']}); return c; })();
+  const e1 = typeIn(win, a, 'KeyT', 't', {alt: true});
+  const e2 = typeIn(win, a, 'KeyT', 't', {alt: true});     // same tick, before anything renders
+  const e3 = keyOn(win, win.document.activeElement || win.document.body, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  await sleep(30);
+  ok(modal.opened === 1 && win.overlayMode === 'tab', 'one form, for a new tab; opened ' + modal.opened + ', mode ' + win.overlayMode);
+  ok(e1.defaultPrevented, 'the first Alt+T consumed');
+  void e2; void e3;
+  const b = await tConnect(win, 'b.host');
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(50);
+  ok(!!b && tabEls(win).length === 2 && paneList(win).length === 2, 'exactly one new tab; got ' + tabEls(win).length + ' tabs');
+  ok(hidden($(win, 'ov')), 'no second form left over');
+  cleanup(env);
+});
+
+// A text field outside a terminal (any input/textarea/contenteditable
+// that is not xterm's helper textarea) is left alone: no tab key acts
+// there and nothing is prevented, so every Alt/Option character types.
+async function textFieldRule(env, field, label, tB) {
+  const win = env.win;
+  if (!hidden($(win, 'ov'))) win.cancelConnect();
+  if (!hidden($(win, 'confirmOv'))) win.confirmCancel();
+  if (tabId(activeTab(win)) !== tB && tabById(win, tB)) { clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500); }
+  try { field.focus(); } catch (e) {}
+  const keys = [['Digit1', '¡'], ['Digit2', '™'], ['Digit9', 'ª'], ['KeyT', '†'], ['KeyW', '∑']].map(k => [k[0], k[1], {}]);
+  keys.push(['BracketLeft', '”', {shift: true}], ['BracketRight', '’', {shift: true}]);
+  const did = [], prevented = [];
+  keys.forEach(k => {
+    const ev = tabKeyAt(win, field, k[0], k[1], k[2]);
+    const name = k[0] + (k[2].shift ? '+shift' : '');
+    if (ev.defaultPrevented) prevented.push(name);
+    if (tabId(activeTab(win)) !== tB || tabEls(win).length !== 2 || !hidden($(win, 'confirmOv')) ||
+        !hidden($(win, 'ov'))) {
+      did.push(name);
+      if (!hidden($(win, 'ov'))) win.cancelConnect();
+      if (!hidden($(win, 'confirmOv'))) win.confirmCancel();
+      if (tabById(win, tB)) clickTab(win, tabById(win, tB));
+    }
+  });
+  await sleep(20);
+  if (!hidden($(win, 'ov'))) win.cancelConnect();
+  if (tabId(activeTab(win)) !== tB && tabById(win, tB)) { clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500); }
+  ok(did.length === 0, label + ': Alt+1/2/9/T/W/Shift+[/Shift+] did nothing (no switch, close, form); acted: ' + show(did));
+  ok(prevented.length === 0, label + ': none prevented, so the characters type; prevented: ' + show(prevented));
+}
+
+test('tabs keys (break): text fields outside a terminal (search box, file-browser filter, reconnect password, contenteditable) are left alone', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry, {action: 'ls', response: {ok: true, path: '/home/u', entries: []}}])); const win = env.win;
+  const [a, b] = await (async () => { const x = await tConnect(win, 'a.host'); return [x, x && await tNewTab(win, 'b.host', {persistent: true})]; })();
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b);   // tmux: a wrong Alt+W asks (and is cancelled) instead of closing B
+  // Search box of B.
+  win.toggleSearch();
+  const sb = b.el.querySelector('[data-search] input');
+  ok(!!sb && !hidden(b.el.querySelector('[data-search]')), 'setup: B\'s search box open');
+  if (sb) await textFieldRule(env, sb, 'search box', tB);
+  if (typeof win.closeSearch === 'function') win.closeSearch();
+  // File-browser filter.
+  const st = {front: tabId(activeTab(win)) === tB ? 'B' : 'A', ov: !hidden($(win, 'ov')), confirm: !hidden($(win, 'confirmOv')),
+              fbOv: !hidden($(win, 'fbOv')), bsid: b.sid};
+  win.showFileBrowser(b.id);
+  await until(() => !hidden($(win, 'fbOv')), 500);
+  const ff = $(win, 'fbFilter');
+  ok(!hidden($(win, 'fbOv')) && !!ff, 'setup: file browser open with its filter field; before: ' + show(st));
+  if (ff) await textFieldRule(env, ff, 'file-browser filter', tB);
+  win.closeFb();
+  await until(() => hidden($(win, 'fbOv')), 500);
+  // Reconnect password field.
+  const pw = b.el.querySelector('input.reconnect-pw');
+  ok(!!pw, 'setup: B has a reconnect password field');
+  if (pw) { pw.classList.remove('h'); await textFieldRule(env, pw, 'reconnect password', tB); pw.classList.add('h'); }
+  // A contenteditable outside a terminal.
+  const ce = win.document.createElement('div');
+  ce.setAttribute('contenteditable', 'true');
+  win.document.body.appendChild(ce);
+  await textFieldRule(env, ce, 'contenteditable', tB);
+  ce.remove();
+  // Back in B's terminal the keys work again.
+  const ev = typeIn(win, b, 'Digit1', '1', {alt: true});
+  ok(tabId(activeTab(win)) === tabOfPane(a) && ev.defaultPrevented, 'back in a terminal Alt+1 switches again');
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[0-9tw{}]|[¡™ª†∑”’]/.test(rec.all()), 'nothing reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): Ctrl+Tab, Ctrl+V and Ctrl+Shift+F still do their jobs from inside the terminal', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), {local: {websh_settings: JSON.stringify({ctrlVPaste: true})}}); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  const was = win.activeId;
+  // Ctrl+Tab at document level, like the existing test (xterm does not stop it: Tab with ctrl)
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Tab', code: 'Tab', ctrlKey: true, bubbles: true, cancelable: true}));
+  ok(win.activeId !== was && [a1.id, a2.id].includes(win.activeId), 'Ctrl+Tab cycles to the other pane');
+  const p = activePane(win);
+  // Ctrl+V: declined to xterm (custom handler false), as before.
+  const ev = new win.KeyboardEvent('keydown', {key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true});
+  const r = p.term._customKey ? p.term._customKey(ev) : null;
+  const expectPaste = win._ctrlVShouldPaste ? win._ctrlVShouldPaste(ev) : null;
+  ok(r === !expectPaste, 'Ctrl+V: the custom key handler answers as _ctrlVShouldPaste says (paste=' + expectPaste + ', handler=' + r + ')');
+  // Alt+V is not a tab key: handler lets xterm have it.
+  const ev2 = new win.KeyboardEvent('keydown', {key: 'v', code: 'KeyV', altKey: true, bubbles: true, cancelable: true});
+  ok(p.term._customKey(ev2) === true && !ev2.defaultPrevented, 'Alt+V goes to xterm untouched');
+  // Ctrl+Shift+F opens the search box of the active pane.
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'F', code: 'KeyF', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true}));
+  const sb = p.el.querySelector('[data-search]');
+  ok(!!sb && !hidden(sb), 'Ctrl+Shift+F opens the active pane\'s search');
+  cleanup(env);
+});
+
+// =====================================================================
+// Tab names, the layout miniature, putting a pane or a tab back into
+// another tab (spring-loaded tabs, the tab menu, a pane's "Move to tab").
+//
+// The DOM hooks these tests rely on:
+//   rename   a double-click (dblclick) on a tab's .tab-label opens an
+//            <input> inside that .tab, holding the title, all of it
+//            selected and focused. Enter or blur saves, Escape cancels.
+//            A name shows in .tab-label and in the .tab's title.
+//   marker   .tab-split holds an <svg> with a viewBox and one
+//            <rect data-pane="<pane id>" x y width height> per pane, laid
+//            out as the tab's splits (split-h side by side, split-v one
+//            above the other); the rect of the tab's active pane has
+//            class "on". The tooltip (title of .tab-split) says "N panes".
+//            Hidden (or no rects) with one pane.
+//   menus    [role="menu"] holding [role="menuitem"] items, by their
+//            text: "Rename", "Move into tab" (opens a list of the other
+//            tabs, one item per tab, by its title: click, Enter or
+//            ArrowRight on it), "Close". A right-click (contextmenu) on
+//            a tab opens it. A closed menu is hidden or removed.
+//            A pane's "Move to tab" is a button [data-act="move-to"] in
+//            its bar and in #paneTools (a lone pane); it opens a menu of
+//            the other tabs the same way.
+//   merging  "Move into tab" puts the whole layout right of the target
+//            tab's active pane (as movePaneToTab does for one pane), and
+//            shows that tab.
+//   spring   while a tab or a pane label is dragged (mouse events, as
+//            today), the pointer resting ~500 ms over another tab of the
+//            strip (elementFromPoint / the event target is in that .tab)
+//            shows that tab; the drag goes on.
+// =====================================================================
+KEYCODES.Escape = 27; KEYCODES.ArrowDown = 40; KEYCODES.ArrowUp = 38;
+const S4 = {barRows: BAR};
+function markerSays(sm, n) {
+  const t = (sm && (sm.getAttribute('title') || sm.getAttribute('aria-label'))) || '';
+  return new RegExp('(^|\\D)' + n + ' panes').test(t);
+}
+// ---- rename ----
+const renameField = t => t ? t.querySelector('input') : null;
+// What a browser sends for a double click on the title.
+function dblTab(win, t) {
+  const l = t.querySelector('.tab-label') || t;
+  for (let i = 1; i <= 2; i++) {
+    l.dispatchEvent(new win.MouseEvent('mousedown', {bubbles: true, cancelable: true, button: 0, buttons: 1, detail: i}));
+    l.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true, cancelable: true, button: 0, buttons: 0, detail: i}));
+    l.dispatchEvent(new win.MouseEvent('click', {bubbles: true, cancelable: true, button: 0, detail: i}));
+  }
+  const ev = new win.MouseEvent('dblclick', {bubbles: true, cancelable: true, button: 0, detail: 2});
+  l.dispatchEvent(ev);
+  return ev;
+}
+function typeName(win, inp, v) { inp.value = v; inp.dispatchEvent(new win.Event('input', {bubbles: true})); }
+function blurField(win, inp) {
+  if (win.document.activeElement === inp) inp.blur();
+  else {
+    inp.dispatchEvent(new win.FocusEvent('blur'));
+    inp.dispatchEvent(new win.FocusEvent('focusout', {bubbles: true}));
+  }
+}
+// Rename tab element t by double-click; how: 'enter' | 'blur' | 'esc'.
+async function renameTo(env, t, v, how) {
+  const win = env.win;
+  dblTab(win, t);
+  const inp = renameField(t);
+  if (!inp) return false;
+  typeName(win, inp, v);
+  if (how === 'blur') blurField(win, inp);
+  else if (how === 'esc') keyOn(win, inp, 'Escape', 'Escape');
+  else keyOn(win, inp, 'Enter', 'Enter');
+  await until(() => !renameField(t), 300);
+  return true;
+}
+function needRename(env, t) {
+  dblTab(env.win, t);
+  const inp = renameField(t);
+  ok(!!inp, 'a double-click on the tab title opens a text field in the tab (an <input> inside .tab)');
+  if (inp) keyOn(env.win, inp, 'Escape', 'Escape');
+  return !!inp;
+}
+const tipOf = t => (t && t.getAttribute('title')) || '';
+const rawManifest = win => win.localStorage.getItem(win.storageKey('websh_panes')) || '';
+
+// ---- the miniature ----
+function miniRects(t) {
+  const sp = t && t.querySelector('.tab-split');
+  const svg = sp && sp.querySelector('svg');
+  if (!svg) return null;
+  return Array.from(svg.querySelectorAll('rect[data-pane]')).map(r => ({
+    el: r, pane: r.getAttribute('data-pane'), on: r.classList.contains('on'),
+    x: parseFloat(r.getAttribute('x')), y: parseFloat(r.getAttribute('y')),
+    w: parseFloat(r.getAttribute('width')), h: parseFloat(r.getAttribute('height'))}));
+}
+// A tree from rect geometry: columns first (side by side = h), else rows (v).
+function geomTree(win, rs) {
+  if (rs.length === 1) { const p = win.panes[rs[0].pane]; return p ? p.host : '?' + rs[0].pane; }
+  const groups = (k0, k1) => {
+    const s = rs.slice().sort((a, b) => a[k0] - b[k0]);
+    const out = []; let end = -Infinity;
+    s.forEach(r => {
+      if (!out.length || r[k0] >= end - 0.01) { out.push([r]); end = r[k0] + r[k1]; }
+      else { out[out.length - 1].push(r); end = Math.max(end, r[k0] + r[k1]); }
+    });
+    return out;
+  };
+  let g = groups('x', 'w');
+  if (g.length > 1) return {dir: 'h', kids: g.map(x => geomTree(win, x))};
+  g = groups('y', 'h');
+  if (g.length > 1) return {dir: 'v', kids: g.map(x => geomTree(win, x))};
+  return 'overlapping:' + rs.map(r => r.pane).join('+');
+}
+function domTree(win, el) {
+  if (el.classList.contains('pane')) { const p = win.panes[el.getAttribute('data-pane')]; return p ? p.host : '?'; }
+  const dir = el.classList.contains('split-h') ? 'h' : el.classList.contains('split-v') ? 'v' : null;
+  if (!dir) return null;
+  const kids = [];
+  Array.from(el.children).map(c => domTree(win, c)).filter(Boolean).forEach(k => {
+    if (typeof k === 'object' && k.dir === dir) kids.push.apply(kids, k.kids); else kids.push(k);
+  });
+  return {dir, kids};
+}
+const treeStr = n => typeof n === 'string' ? n : '(' + n.dir + ' ' + n.kids.map(treeStr).join(' ') + ')';
+function flatShape(win, tid) {
+  const root = tabRootById(win, tid);
+  const top = root && Array.from(root.children).map(c => domTree(win, c)).filter(Boolean)[0];
+  if (!top) return '';
+  // Flatten nested same-direction splits all the way down.
+  const norm = n => {
+    if (typeof n === 'string') return n;
+    const kids = [];
+    n.kids.map(norm).forEach(k => { if (typeof k === 'object' && k.dir === n.dir) kids.push.apply(kids, k.kids); else kids.push(k); });
+    return {dir: n.dir, kids};
+  };
+  return treeStr(norm(top));
+}
+// Everything wrong with tab element tEl's marker, as text.
+function miniProblems(env, tEl) {
+  const win = env.win;
+  const tid = tabId(tEl);
+  const ps = panesOfTab(win, tid);
+  const sp = tEl.querySelector('.tab-split');
+  const rs = miniRects(tEl);
+  if (ps.length < 2) return (sp && !env.lay.hidden(sp) && rs && rs.length) ? ['a marker shown for a one-pane tab'] : [];
+  const out = [];
+  if (!sp || env.lay.hidden(sp)) return ['no visible .tab-split for ' + ps.length + ' panes'];
+  if (!rs) return ['no <svg> miniature in .tab-split (it holds ' + show(sp.textContent) + ')'];
+  const want = ps.map(p => p.id).sort(), got = rs.map(r => r.pane).sort();
+  if (show(want) !== show(got)) out.push('rects for panes ' + show(got) + ', the tab has ' + show(want));
+  const svg = sp.querySelector('svg');
+  const vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  if (vb.length !== 4 || vb.some(isNaN)) out.push('the svg has no viewBox');
+  else rs.forEach(r => {
+    if (![r.x, r.y, r.w, r.h].every(isFinite) || r.w <= 0 || r.h <= 0) out.push('rect ' + r.pane + ' has no size');
+    else if (r.x < vb[0] - 0.01 || r.y < vb[1] - 0.01 || r.x + r.w > vb[0] + vb[2] + 0.01 || r.y + r.h > vb[1] + vb[3] + 0.01)
+      out.push('rect ' + r.pane + ' outside the viewBox');
+  });
+  if (!out.length) {
+    const g = treeStr(geomTree(win, rs)), d = flatShape(win, tid);
+    if (g !== d) out.push('drawn as ' + g + ', the tab is ' + d);
+  }
+  const t = win.tabById(tid);
+  let act = tid === tabId(activeTab(win)) ? win.activeId : (t && t.lastActive);
+  if (!ps.some(p => p.id === act)) act = ps[0].id;
+  const on = rs.filter(r => r.on).map(r => r.pane);
+  if (show(on) !== show([act])) out.push('highlighted ' + show(on) + ', the active pane is ' + act);
+  if (!markerSays(sp, ps.length)) out.push('tooltip ' + show(sp.getAttribute('title')) + ' does not say "' + ps.length + ' panes"');
+  return out;
+}
+const allMiniProblems = env => tabEls(env.win).reduce((o, t) => o.concat(miniProblems(env, t).map(x => tabId(t) + ': ' + x)), []);
+
+// ---- spring-loaded tabs ----
+function everActive(win, tEl) {
+  const st = {hit: false};
+  const mo = new win.MutationObserver(() => { if (tEl.classList.contains('active')) st.hit = true; });
+  mo.observe(tEl, {attributes: true, attributeFilter: ['class']});
+  st.stop = () => mo.disconnect();
+  return st;
+}
+// Press on tab tEl and move far enough to make it a drag.
+function grabTab(win, tEl) {
+  const m = pointer(win);
+  const [x0, y0] = centre(tEl);
+  m.down(tEl, x0, y0);
+  m.move(tEl, x0 + 2, y0 + 30);
+  return m;
+}
+function grabPane(win, p) {
+  const m = pointer(win);
+  const g = labelEl(p);
+  const [x0, y0] = centre(g);
+  m.down(g, x0, y0);
+  m.move(g, x0 + 3, y0 + 3);
+  m.move($(win, 'tabs'), x0 + 40, y0 + 2);
+  return m;
+}
+// Rest the pointer over element el (one move, then still) until fn().
+async function restOver(win, m, el, fn, ms, jitter) {
+  const lab = el.querySelector('.tab-label') || el;
+  const [x, y] = centre(el);
+  m.move(lab, x, y);
+  const t0 = _now();
+  let i = 0;
+  while (_now() - t0 < (ms || 1500)) {
+    if (fn()) return true;
+    await sleep(jitter ? 100 : 10);
+    if (jitter) { i++; m.move(lab, x + (i % 2 ? 2 : -2), y + (i % 2 ? 1 : -1)); }
+  }
+  return !!fn();
+}
+function overEdge(m, p, side) {
+  const [x, y] = edgePoint(p.el, side);
+  const into = p.el.querySelector('.pane-term') || p.el;
+  m.move(into, x, y);
+  m.move(into, x + (side === 'right' ? -1 : 1), y);
+  return () => m.up(into, x, y);
+}
+function outside(win, m, noButton) {
+  const body = win.document.body;
+  if (noButton) { m.moveNoButton(body, -20, 10); return; }
+  m.move(body, -20, 10);
+  m.up(body, -20, 10);
+}
+const noDragLeft = win => !win.document.querySelector('.dragging') && !win.document.body.classList.contains('pane-moving');
+
+// ---- menus ----
+function rightClick(win, el) {
+  const o = {bubbles: true, cancelable: true, button: 2, buttons: 2, clientX: 10, clientY: 10, view: win};
+  el.dispatchEvent(new win.MouseEvent('mousedown', o));
+  el.dispatchEvent(new win.MouseEvent('mouseup', Object.assign({}, o, {buttons: 0})));
+  const ev = new win.MouseEvent('contextmenu', o);
+  el.dispatchEvent(ev);
+  return ev;
+}
+const tabMenu = (win, t) => rightClick(win, t.querySelector('.tab-label') || t);
+const openMenus = env => visibleAll(env, '[role="menu"]');
+const itemsShown = env => visibleAll(env, '[role="menu"] [role="menuitem"]');
+const itemText = el => (el.textContent || '').replace(/\s+/g, ' ').trim();
+const findItem = (env, re) => itemsShown(env).find(e => re.test(itemText(e)));
+const MAIN_ITEMS = /^(Rename|Move (into|to) tab|Close)\b/i;
+const targetItems = env => itemsShown(env).filter(e => !MAIN_ITEMS.test(itemText(e)));
+const isItem = el => !!el && !!el.getAttribute && el.getAttribute('role') === 'menuitem';
+// Open the "Move into tab" / "Move to tab" list and choose `name`.
+async function chooseTarget(env, parentRe, name) {
+  const win = env.win;
+  if (parentRe) {
+    const p = findItem(env, parentRe);
+    if (!p) return 'no menu item ' + parentRe + ' among ' + show(itemsShown(env).map(itemText));
+    press(win, p);
+  }
+  await until(() => targetItems(env).some(e => itemText(e).indexOf(name) >= 0), 300);
+  const it = targetItems(env).find(e => itemText(e).indexOf(name) >= 0);
+  if (!it) return 'no item ' + show(name) + ' in the list; shown: ' + show(itemsShown(env).map(itemText));
+  press(win, it);
+  return null;
+}
+const keyAt = (win, code, key, mods) => keyOn(win, win.document.activeElement || win.document.body, code, key, mods);
+
+// =====================================================================
+// Feature 1: a tab's own name
+// =====================================================================
+test('tab name: a double-click on the title edits it in place, all selected; Enter saves it into the tab and its tooltip', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  const auto = tabLabel(t);
+  const connects = env.log.filter(e => e.action === 'connect').length;
+  dblTab(win, t);
+  const inp = renameField(t);
+  ok(!!inp && !env.lay.hidden(inp), 'a double-click on the tab\'s title opens a text field inside the tab');
+  if (!inp) { cleanup(env); return; }
+  ok(inp.value === auto, 'the field holds the current title ' + show(auto) + '; got ' + show(inp.value));
+  ok(win.document.activeElement === inp, 'the field has the keyboard focus; focus is on ' +
+     (win.document.activeElement ? win.document.activeElement.tagName + '.' + win.document.activeElement.className : 'nothing'));
+  ok(inp.selectionStart === 0 && inp.selectionEnd === inp.value.length && inp.value.length > 0,
+     'the whole title is selected; got ' + inp.selectionStart + '..' + inp.selectionEnd + ' of ' + inp.value.length);
+  ok(tabEls(win).length === 1 && noDragLeft(win), 'the double-click neither dragged nor closed anything');
+  const kx = keyOn(win, inp, 'KeyX', 'x');
+  ok(!kx.defaultPrevented, 'a plain key in the field is not swallowed (it types)');
+  typeName(win, inp, 'build box');
+  keyOn(win, inp, 'Enter', 'Enter');
+  await until(() => !renameField(t), 300);
+  ok(!renameField(t), 'Enter closes the field');
+  ok(tabLabel(t) === 'build box', 'the tab shows the new name; got ' + show(tabLabel(t)));
+  ok(/build box/.test(tipOf(t)), 'its tooltip too; got ' + show(tipOf(t)));
+  ok(hidden($(win, 'ov')) && env.log.filter(e => e.action === 'connect').length === connects,
+     'Enter in the field opened no login form and connected nothing');
+  await sleep(60);
+  ok(rec.all() === '', 'nothing typed in the field reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tab name: Escape cancels, clicking away saves, an empty (or blank) name gives the automatic title back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  const auto = tabLabel(t);
+  if (!needRename(env, t)) { cleanup(env); return; }
+  await renameTo(env, t, 'never', 'esc');
+  ok(!renameField(t) && tabLabel(t) === auto, 'Escape: the field goes, the title stays ' + show(auto) + '; got ' + show(tabLabel(t)));
+  ok(rawManifest(win).indexOf('never') < 0, 'a cancelled name is not saved');
+  await renameTo(env, t, 'logs', 'blur');
+  ok(!renameField(t) && tabLabel(t) === 'logs', 'clicking away (blur) saves; got ' + show(tabLabel(t)));
+  await renameTo(env, t, '', 'enter');
+  ok(tabLabel(t) === paneLabel(activePane(win)), 'an empty name: the automatic title (the active pane\'s label ' +
+     show(paneLabel(activePane(win))) + ') again; got ' + show(tabLabel(t)));
+  win.activatePane(a.id);
+  await until(() => tabLabel(t) === paneLabel(a), 300);
+  ok(tabLabel(t) === paneLabel(a), 'and it follows the active pane again; got ' + show(tabLabel(t)));
+  await renameTo(env, t, '   ', 'enter');
+  ok(tabLabel(t) === paneLabel(a), 'a name of spaces only counts as empty; got ' + show(tabLabel(t)));
+  cleanup(env);
+});
+
+test('tab name: once named, panes coming, going, switching or changing state never overwrite the name', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  if (!needRename(env, t)) { cleanup(env); return; }
+  await renameTo(env, t, 'mine', 'enter');
+  const seen = [];
+  const look = what => { if (tabLabel(t) !== 'mine' || !/mine/.test(tipOf(t))) seen.push(what + ': ' + show(tabLabel(t)) + ' / ' + show(tipOf(t))); };
+  look('renamed');
+  const b = await tSplit(win, a, 'h', 'b.host');
+  look('after a split');
+  win.activatePane(a.id); look('after switching panes');
+  b.reconnecting = true; win.updatePaneBadge(b); look('while a pane reconnects');
+  b.reconnecting = false; win.updatePaneBadge(b);
+  const c = await tNewTab(win, 'c.host');
+  look('after + made another tab');
+  clickTab(win, t); await until(() => activeTab(win) === t, 500); look('shown again');
+  win.closePane(b.id); await sleep(50); look('after closing a pane');
+  ok(seen.length === 0, 'the tab keeps its name everywhere; lost it: ' + show(seen));
+  ok(c && tabLabel(tabElOfPane(win, c)) === paneLabel(c), 'the other tab keeps its automatic title');
+  cleanup(env);
+});
+
+test('tab name: names are saved at once and survive a reload, in the strip order', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  const c = b && await tNewTab(win, 'c.host');
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const [tA, tB] = [tabElOfPane(win, a), tabElOfPane(win, b)];
+  if (!needRename(env, tA)) { cleanup(env); return; }
+  await renameTo(env, tA, 'alpha', 'enter');
+  await renameTo(env, tB, 'beta', 'blur');
+  ok(rawManifest(win).indexOf('alpha') >= 0 && rawManifest(win).indexOf('beta') >= 0, 'both names are in the saved layout at once');
+  const want = tabEls(win).map(tabLabel);
+  ok(show(want) === show(['alpha', 'beta', paneLabel(c)]), 'setup: titles ' + show(want));
+  const front = tabLabel(activeTab(win));
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 3, 2000);
+  await sleep(50);
+  const got = tabEls(w2).map(tabLabel);
+  ok(show(got) === show(want), 'after a reload the same titles in the same order; got ' + show(got) + ' want ' + show(want));
+  ok(tabEls(w2).every(t => tipOf(t).indexOf(tabLabel(t)) >= 0), 'and tooltips; got ' + show(tabEls(w2).map(tipOf)));
+  ok(tabLabel(activeTab(w2)) === front, 'the same tab in front: ' + show(tabLabel(activeTab(w2))));
+  // The automatic one still follows its pane after the reload.
+  const c2 = paneList(w2).find(p => p.host === 'c.host');
+  ok(!!c2 && tabLabel(tabElOfPane(w2, c2)) === paneLabel(c2), 'the unnamed tab is still automatic');
+  cleanup(env2);
+});
+
+test('tab name: a name stays with its tab through moves and merges; a merged-away tab takes its name with it', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !needMove(win) || !a1 || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = b && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  if (!needRename(env, tabById(win, tA))) { cleanup(env); return; }
+  await renameTo(env, tabById(win, tA), 'Alpha', 'enter');
+  await renameTo(env, tabById(win, tB), 'Beta', 'enter');
+  const nameOf = id => tabLabel(tabById(win, id));
+  win.movePaneToNewTab(a2.id);
+  ok(nameOf(tA) === 'Alpha', 'a pane moved out: the tab keeps "Alpha"; got ' + show(nameOf(tA)));
+  ok(tabLabel(tabElOfPane(win, a2)) === paneLabel(a2), 'the new tab is automatic, not "Alpha"; got ' + show(tabLabel(tabElOfPane(win, a2))));
+  win.movePaneToTab(c.id, tA);
+  ok(nameOf(tA) === 'Alpha', 'a pane moved in: still "Alpha"; got ' + show(nameOf(tA)));
+  win.mergeTabInto(tB, a1.id, 'left');
+  ok(nameOf(tA) === 'Alpha', 'a tab merged in: the target keeps "Alpha"; got ' + show(nameOf(tA)));
+  ok(!tabEls(win).some(t => tabLabel(t) === 'Beta'), 'no tab is called "Beta" any more; titles ' + show(tabEls(win).map(tabLabel)));
+  win.movePaneToNewTab(b.id);
+  ok(tabLabel(tabElOfPane(win, b)) === paneLabel(b), 'b taken out again gets an automatic title, not the old "Beta"; got ' +
+     show(tabLabel(tabElOfPane(win, b))));
+  ok(rawManifest(win).indexOf('Beta') < 0, 'and "Beta" is not in the saved layout any more');
+  const want = tabEls(win).map(tabLabel);
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 4, 2000);
+  await sleep(50);
+  ok(show(tabEls(w2).map(tabLabel)) === show(want), 'reloaded: ' + show(tabEls(w2).map(tabLabel)) + ' want ' + show(want));
+  cleanup(env2);
+});
+
+test('tab name: a double-click on another tab shows it as a click would and edits it; no drag, no close, order kept', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabElOfPane(win, a);
+  const order0 = tabEls(win).map(tabId);
+  const saved0 = JSON.stringify(savedShapes(win).tabs);
+  dblTab(win, tA);
+  const inp = renameField(tA);
+  ok(!!inp, 'the double-clicked tab A shows the field');
+  ok(activeTab(win) === tA, 'A is in front, as after a click');
+  ok(show(tabEls(win).map(tabId)) === show(order0) && tabEls(win).length === 3, 'order and count unchanged; got ' + show(tabEls(win).map(tabId)));
+  ok(noDragLeft(win) && JSON.stringify(savedShapes(win).tabs) === saved0, 'no drag state, layout unchanged');
+  ok(!tabEls(win).some(t => t !== tA && renameField(t)), 'only A has a field');
+  if (inp) keyOn(win, inp, 'Escape', 'Escape');
+  cleanup(env);
+});
+
+test('tab name (break): a name is text, never HTML; a very long one is cut to a sane length', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  if (!needRename(env, t)) { cleanup(env); return; }
+  const evil = '<img src=x onerror="window.__xss=1"><b>bold</b>';
+  await renameTo(env, t, evil, 'enter');
+  await sleep(30);
+  ok(tabLabel(t) === evil, 'the name shows literally; got ' + show(tabLabel(t)));
+  ok(!t.querySelector('img') && !t.querySelector('b'), 'no element made from it');
+  ok(tipOf(t).indexOf(evil) >= 0, 'the tooltip has it literally');
+  ok(!win.__xss, 'no script ran');
+  await renameTo(env, t, 'x'.repeat(5000), 'enter');
+  const n = (tabLabel(t) || '').length;
+  ok(n >= 20 && n <= 100, 'a 5000-character name is kept to a sane length (20..100 chars); got ' + n);
+  ok(rawManifest(win).indexOf('x'.repeat(200)) < 0, 'and saved cut, too');
+  cleanup(env);
+});
+
+test('tab name (break): while editing, tab keys, a press in the field and the tab re-rendering leave the field alone', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabElOfPane(win, b);
+  dblTab(win, tB);
+  const inp = renameField(tB);
+  ok(!!inp, 'B\'s field is open');
+  if (!inp) { cleanup(env); return; }
+  typeName(win, inp, 'half');
+  const acted = [];
+  [['Digit1', '1', {alt: true}], ['KeyW', 'w', {alt: true}], ['KeyT', 't', {alt: true}], ['BracketLeft', '{', {alt: true, shift: true}]]
+    .forEach(k => {
+      keyOn(win, inp, k[0], k[1], k[2]);
+      if (activeTab(win) !== tB || tabEls(win).length !== 2 || !hidden($(win, 'ov')) || !hidden($(win, 'confirmOv')) || !inp.isConnected) {
+        acted.push(k[0]);
+        if (!hidden($(win, 'ov'))) win.cancelConnect();
+      }
+    });
+  ok(acted.length === 0, 'Alt+1 / Alt+W / Alt+T / Alt+Shift+[ in the field do nothing to the tabs; acted: ' + show(acted));
+  // A press in the field (to place the caret, or select by dragging).
+  const f0 = b.term._focusCalls;
+  const m = pointer(win);
+  const [x, y] = centre(inp);
+  const md = new win.MouseEvent('mousedown', {bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: x, clientY: y, view: win});
+  inp.dispatchEvent(md);
+  m.move(inp, x + 40, y); m.move(inp, x + 80, y + 2); m.up(inp, x + 80, y + 2);
+  ok(!md.defaultPrevented, 'a press in the field is not prevented (the caret can be placed, text selected)');
+  ok(noDragLeft(win) && tabEls(win).length === 2 && activeTab(win) === tB, 'and does not start a tab drag');
+  ok(b.term._focusCalls === f0, 'and does not move the focus to the terminal (' + (b.term._focusCalls - f0) + ' focus calls)');
+  ok(inp.isConnected && renameField(tB) === inp, 'the field is still there');
+  // The tab re-renders under the field (state change, output elsewhere).
+  b.reconnecting = true; win.updatePaneBadge(b);
+  win.noteTabActivity(a);
+  b.reconnecting = false; win.updatePaneBadge(b);
+  ok(inp.isConnected && renameField(tB) === inp && inp.value === 'half', 'a re-render of the tab keeps the field and what was typed; field ' +
+     (inp.isConnected ? 'there, value ' + show(inp.value) : 'gone'));
+  keyOn(win, inp, 'Enter', 'Enter');
+  await until(() => !renameField(tB), 300);
+  ok(tabLabel(tB) === 'half', 'Enter saves what was typed; got ' + show(tabLabel(tB)));
+  await sleep(60);
+  ok(rec.all() === '', 'nothing reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+// =====================================================================
+// Feature 2: the marker draws the tab's layout
+// =====================================================================
+test('marker: a miniature of the tab\'s splits, one box per pane, the active pane highlighted; hidden for one pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  ok(miniProblems(env, t).length === 0, 'one pane: no marker; ' + show(miniProblems(env, t)));
+  const b = await tSplit(win, a, 'h', 'b.host');
+  ok(miniProblems(env, t).length === 0, 'a | b: ' + show(miniProblems(env, t)));
+  win.activatePane(a.id);
+  ok(miniProblems(env, t).length === 0, 'a made active, its box is the lit one: ' + show(miniProblems(env, t)));
+  const c = await tSplit(win, b, 'v', 'c.host');
+  ok(flatShape(win, tabId(t)) === '(h a.host (v b.host c.host))', 'setup: a | (b over c); got ' + flatShape(win, tabId(t)));
+  ok(miniProblems(env, t).length === 0, 'a | (b over c), c active: ' + show(miniProblems(env, t)));
+  const d = await tSplit(win, a, 'v', 'd.host');
+  ok(miniProblems(env, t).length === 0, '(a over d) | (b over c): ' + show(miniProblems(env, t)));
+  win.closePane(c.id); await sleep(30);
+  ok(miniProblems(env, t).length === 0, 'c closed: ' + show(miniProblems(env, t)));
+  win.closePane(d.id); win.closePane(b.id); await sleep(30);
+  ok(miniProblems(env, t).length === 0, 'back to one pane, no marker: ' + show(miniProblems(env, t)));
+  cleanup(env);
+});
+
+test('marker: follows moves and merges in every tab, also hidden ones, and comes back the same after a reload', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !needMove(win) || !a1 || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c1 = b && await tNewTab(win, 'c1.host');
+  const c2 = c1 && await tSplit(win, c1, 'v', 'c2.host');
+  if (!c2) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  const steps = [];
+  const step = what => { const p = allMiniProblems(env); if (p.length) steps.push(what + ': ' + p.join('; ')); };
+  step('start');
+  win.mergeTabInto(tB, a2.id, 'bottom'); step('B merged under a2');
+  win.movePaneToNewTab(a1.id); step('a1 out to a new tab');
+  win.movePaneToTab(c2.id, tA); step('c2 into A');
+  win.activatePane(c1.id); step('C shown (A hidden, its marker still right)');
+  win.movePaneToTab(a1.id, tA); step('a1 back into A');
+  win.activatePane(b.id); step('b active in A');
+  ok(steps.length === 0, 'the marker matched the layout after every step; wrong: ' + show(steps));
+  const snap = snapshotStorage(win);
+  const n = paneList(win).length;
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === n, 2000);
+  await sleep(50);
+  const p2 = allMiniProblems(env2);
+  ok(p2.length === 0, 'after a reload every marker matches its tab; wrong: ' + show(p2));
+  cleanup(env2);
+});
+
+test('marker: not redrawn on output frames, only when the layout or the active pane changes; theme colours, no literal colours', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  const rs = miniRects(t);
+  ok(!!rs && rs.length === 2, 'setup: the miniature is there; ' + show(miniProblems(env, t)));
+  if (!rs) { cleanup(env); return; }
+  await sleep(100);
+  let muts = 0;
+  const sp = t.querySelector('.tab-split');
+  const mo = new win.MutationObserver(l => { muts += l.length; });
+  mo.observe(sp, {attributes: true, childList: true, subtree: true, characterData: true});
+  for (let i = 0; i < 300; i++) { win.updatePaneBadge(a); win.updatePaneBadge(b); }
+  await sleep(250);              // real output polls run meanwhile
+  await new Promise(r => win.setTimeout(r, 0));
+  ok(muts === 0, '600 output-frame updates and 250 ms of polling: the marker untouched; ' + muts + ' DOM changes');
+  win.activatePane(win.activeId === a.id ? b.id : a.id);
+  await new Promise(r => win.setTimeout(r, 0));
+  ok(muts > 0 && miniProblems(env, t).length === 0, 'switching the active pane does redraw it: ' + muts + ' changes, ' + show(miniProblems(env, t)));
+  mo.disconnect();
+  const lit = miniRects(t).map(r => ['fill', 'stroke', 'style', 'color'].map(k => r.el.getAttribute(k) || '').join(' ')).join(' ') +
+    ' ' + (sp.querySelector('svg').getAttribute('style') || '');
+  ok(!/#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i.test(lit), 'no literal colour in the svg (theme via CSS); got ' + show(lit));
+  const css = Array.from(win.document.querySelectorAll('style')).map(s => s.textContent).join('\n');
+  ok(/\.tab-split[^{]*\{[^}]*var\(--/.test(css), 'index.html styles the miniature with theme variables (a .tab-split rule using var(--...))');
+  cleanup(env);
+});
+
+// =====================================================================
+// The marker follows the split proportions (a dragged handle, a restored
+// layout), not only the arrangement.
+//
+// Hooks / assumptions:
+//   - the real proportion of a split is its two children's flex-grow
+//     (style.flex as the handle drag and the layout restore write it;
+//     '' = the CSS default 1). The test layout model gives every box the
+//     same size, so a marker that measured the panes would see 50/50:
+//     the marker must read the proportions from the flex values.
+//   - for each split the rects of the panes under its first child and
+//     under its second child span a 1 px gap; the first child's span is
+//     ratio * (span of both - 1) +- 1 px; every rect >= 1x1 px, inside
+//     the viewBox; the rects together still fill the viewBox.
+//   - a drag is a real mousedown on .split-handle, mousemoves, a mouseup
+//     (the drag maps clientX/Y over the wrapper's box to the ratio).
+// =====================================================================
+const flexGrow = el => { const g = parseFloat(el.style.flexGrow); return isFinite(g) ? g : 1; };
+const layoutKids = el => Array.from(el.children).filter(c => c.classList.contains('pane') || c.classList.contains('split-h') || c.classList.contains('split-v'));
+const panesIn = el => el.classList.contains('pane') ? [el.getAttribute('data-pane')]
+  : Array.from(el.querySelectorAll('.pane')).map(e => e.getAttribute('data-pane'));
+// The fewest pixels a subtree needs along an axis (1 px per pane, 1 px gaps).
+function minNeed(el, horiz) {
+  if (el.classList.contains('pane')) return 1;
+  const k = layoutKids(el);
+  if (k.length < 2) return k.length ? minNeed(k[0], horiz) : 1;
+  const same = el.classList.contains(horiz ? 'split-h' : 'split-v');
+  return same ? minNeed(k[0], horiz) + 1 + minNeed(k[1], horiz) : Math.max(minNeed(k[0], horiz), minNeed(k[1], horiz));
+}
+const nameOf = (win, el) => el.classList.contains('pane')
+  ? ((win.panes[el.getAttribute('data-pane')] || {}).host || el.getAttribute('data-pane'))
+  : (el.classList.contains('split-h') ? 'h(' : 'v(') + layoutKids(el).map(c => nameOf(win, c)).join(',') + ')';
+// Everything wrong with the proportions drawn in tab element tEl's marker.
+function miniRatioProblems(env, tEl) {
+  const win = env.win;
+  const tid = tabId(tEl);
+  if (panesOfTab(win, tid).length < 2) return [];
+  const rs = miniRects(tEl);
+  if (!rs || !rs.length) return ['no miniature'];
+  const by = {}; rs.forEach(r => { by[r.pane] = r; });
+  const out = [];
+  const svg = tEl.querySelector('.tab-split svg');
+  const vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  rs.forEach(r => {
+    if (!(r.w >= 1 && r.h >= 1)) out.push('rect ' + r.pane + ' is ' + r.w + 'x' + r.h + ' px (each pane at least 1 px)');
+    if (vb.length === 4 && (r.x < vb[0] - 0.01 || r.y < vb[1] - 0.01 || r.x + r.w > vb[0] + vb[2] + 0.01 || r.y + r.h > vb[1] + vb[3] + 0.01))
+      out.push('rect ' + r.pane + ' outside the viewBox');
+  });
+  const span = (el, horiz) => {
+    const ids = panesIn(el).filter(id => by[id]);
+    if (!ids.length) return null;
+    const s = Math.min.apply(null, ids.map(id => horiz ? by[id].x : by[id].y));
+    const e = Math.max.apply(null, ids.map(id => horiz ? by[id].x + by[id].w : by[id].y + by[id].h));
+    return {s, e, len: e - s};
+  };
+  const root = tabRootById(win, tid);
+  const top = root && layoutKids(root)[0];
+  if (top && vb.length === 4) {
+    const sx = span(top, true), sy = span(top, false);
+    if (sx && sy && (sx.s > vb[0] + 0.01 || sx.e < vb[0] + vb[2] - 0.01 || sy.s > vb[1] + 0.01 || sy.e < vb[1] + vb[3] - 0.01))
+      out.push('the rects do not fill the miniature: x ' + sx.s + '..' + sx.e + ', y ' + sy.s + '..' + sy.e + ' of ' + vb.join(' '));
+  }
+  const walk = el => {
+    if (!el || el.classList.contains('pane')) return;
+    const k = layoutKids(el);
+    k.forEach(walk);
+    if (k.length < 2) return;
+    const horiz = el.classList.contains('split-h');
+    const A = span(k[0], horiz), B = span(k[1], horiz);
+    if (!A || !B) return;
+    const ratio = flexGrow(k[0]) / (flexGrow(k[0]) + flexGrow(k[1]));
+    const drawable = B.e - A.s - 1;
+    const ideal = ratio * drawable;
+    // Where a 1 px minimum must win over the proportion, only the minimum is asked for.
+    if (ideal < minNeed(k[0], horiz) + 0.5 || drawable - ideal < minNeed(k[1], horiz) + 0.5) return;
+    const what = nameOf(win, el) + ' at ' + Math.round(ratio * 100) + '/' + Math.round((1 - ratio) * 100);
+    if (Math.abs(A.len - ideal) > 1.0001)
+      out.push(what + ': first part drawn ' + A.len + ' of ' + drawable + ' px, want ~' + ideal.toFixed(1) + ' (+-1)');
+    if (Math.abs(B.s - A.e - 1) > 0.01) out.push(what + ': gap ' + (B.s - A.e) + ' px, want 1');
+  };
+  walk(top);
+  return out;
+}
+const allMiniRatioProblems = env => tabEls(env.win).reduce((o, t) => o.concat(miniRatioProblems(env, t).map(x => tabId(t) + ': ' + x)), []);
+const handleOf = wrap => wrap && Array.from(wrap.children).find(c => c.classList.contains('split-handle'));
+const wrapOf = p => p.el.parentElement;
+// A real handle drag of split `wrap` to `ratio` (what the drag maps the pointer to).
+function dragSplit(win, wrap, ratio, o) {
+  o = o || {};
+  const h = handleOf(wrap);
+  if (!h) return null;
+  const horiz = wrap.classList.contains('split-h');
+  const r = wrap.getBoundingClientRect();
+  const at = q => horiz ? [r.left + q * r.width, r.top + r.height / 2] : [r.left + r.width / 2, r.top + q * r.height];
+  const from = flexGrow(layoutKids(wrap)[0]) / (flexGrow(layoutKids(wrap)[0]) + flexGrow(layoutKids(wrap)[1]));
+  const m = pointer(win);
+  let [x, y] = at(from);
+  m.down(h, x, y);
+  const n = o.steps || 8;
+  for (let i = 1; i <= n; i++) { [x, y] = at(from + (ratio - from) * i / n); m.move(h, x, y); }
+  if (!o.noUp) m.up(h, x, y);
+  return {m, h, at};
+}
+const ratioOf = el => flexGrow(el) / (flexGrow(el) + flexGrow(el.nextElementSibling && el.nextElementSibling.classList.contains('split-handle') ? el.nextElementSibling.nextElementSibling : el.nextElementSibling));
+// Wait (up to ms) until tab element t's marker draws the proportions; ms taken, or -1.
+async function ratiosShown(env, t, ms) {
+  const t0 = _now();
+  const got = await until(() => miniRatioProblems(env, t).length === 0, ms || 300);
+  return got ? Math.round(_now() - t0) : -1;
+}
+
+test('marker ratio: a dragged split handle (h and v, nested) is drawn in its proportions within 300 ms of release, each pane at least 1 px', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  ok(miniRatioProblems(env, t).length === 0, 'setup: 50/50 drawn as halves; ' + show(miniRatioProblems(env, t)));
+  const outer = wrapOf(a);
+  ok(!!handleOf(outer), 'setup: the split has a .split-handle');
+  if (!handleOf(outer)) { cleanup(env); return; }
+  // a | b dragged to 70/30.
+  dragSplit(win, outer, 0.7);
+  ok(Math.abs(ratioOf(a.el) - 0.7) < 0.01, 'setup: the drag set a to 70% (flex ' + show(a.el.style.flex) + ' / ' + show(b.el.style.flex) + ')');
+  let ms = await ratiosShown(env, t);
+  const r1 = miniRects(t) || [];
+  ok(ms >= 0, 'a | b dragged to 70/30: the left box takes ~70% (within 300 ms of release); ' +
+     show(miniRatioProblems(env, t)) + ' rects ' + show(r1.map(r => r.pane + ':' + r.x + '+' + r.w)));
+  // and back to 25/75.
+  dragSplit(win, outer, 0.25);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'dragged on to 25/75: redrawn; ' + show(miniRatioProblems(env, t)));
+  // b split under: c; the vertical handle dragged to 30/70; outer to 60/40.
+  const c = await tSplit(win, b, 'v', 'c.host');
+  if (!c) { ok(false, 'setup: c'); cleanup(env); return; }
+  dragSplit(win, wrapOf(c), 0.3);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'a | (b over c), b over c dragged to 30/70: the upper box ~30% of the height; ' + show(miniRatioProblems(env, t)));
+  dragSplit(win, wrapOf(a), 0.6);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'then the outer handle to 60/40: both proportions drawn; ' + show(miniRatioProblems(env, t)));
+  ok(miniProblems(env, t).length === 0, 'and still the right arrangement and active pane; ' + show(miniProblems(env, t)));
+  // Extremes: the drag's limits 10/90 and 90/10, nested.
+  const d = await tSplit(win, a, 'h', 'd.host');
+  if (!d) { ok(false, 'setup: d'); cleanup(env); return; }
+  dragSplit(win, wrapOf(d), 0.9);
+  dragSplit(win, wrapOf(d).parentElement, 0.1);
+  dragSplit(win, wrapOf(c), 0.9);
+  await sleep(350);
+  const small = (miniRects(t) || []).filter(r => !(r.w >= 1 && r.h >= 1));
+  ok(miniRects(t) && miniRects(t).length === 4 && small.length === 0,
+     '(a | d) at 10% of the width, a | d 90/10, b over c 90/10: every pane still at least 1x1 px; ' +
+     show((miniRects(t) || []).map(r => r.pane + ':' + r.w + 'x' + r.h)));
+  ok(miniRatioProblems(env, t).length === 0, 'and where the pixels allow, the proportions; ' + show(miniRatioProblems(env, t)));
+  cleanup(env);
+});
+
+test('marker ratio: cheap - no DOM change while a drag stays within one pixel, none for 600 output frames or a window resize; correct after release', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  const sp = t.querySelector('.tab-split');
+  const wrap = wrapOf(a);
+  // Press, go to 65% (a ratio well inside a pixel at this size: 0.65 * 15 = 9.75)
+  // and stay pressed until any throttled update has run.
+  const g = dragSplit(win, wrap, 0.65, {noUp: true});
+  if (!g) { ok(false, 'setup: no handle'); cleanup(env); return; }
+  await sleep(350);
+  let muts = 0;
+  const mo = new win.MutationObserver(l => { muts += l.length; });
+  mo.observe(sp, {attributes: true, childList: true, subtree: true, characterData: true});
+  // 200 moves of +-1 px around 65% (720 px wide: +-0.0014).
+  for (let i = 0; i < 200; i++) { const [x, y] = g.at(0.65 + (i % 2 ? 1 : -1) / 720); g.m.move(g.h, x, y); }
+  await sleep(350);
+  ok(muts === 0, '200 mousemoves of +-1 px during the drag (no box changes size): the marker untouched; ' + muts + ' DOM changes');
+  // A sweep 65% -> 75% in 100 moves: the left box grows by ~1-2 px, so a few changes, not one per move.
+  muts = 0;
+  for (let i = 1; i <= 100; i++) { const [x, y] = g.at(0.65 + 0.1 * i / 100); g.m.move(g.h, x, y); }
+  await sleep(350);
+  ok(muts <= 20, 'a 100-move sweep 65% -> 75% (1-2 px in the miniature): at most a handful of DOM changes, not one per move; ' + muts);
+  const [ux, uy] = g.at(0.75);
+  g.m.up(g.h, ux, uy);
+  const ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'released at 75/25: drawn so within 300 ms; ' + show(miniRatioProblems(env, t)));
+  await sleep(100);
+  // Output frames.
+  muts = 0;
+  for (let i = 0; i < 300; i++) { win.updatePaneBadge(a); win.updatePaneBadge(b); }
+  await sleep(250);
+  ok(muts === 0, '600 updatePaneBadge calls (output frames) with a 75/25 split: the marker untouched; ' + muts + ' DOM changes');
+  // A window resize: proportions unchanged.
+  muts = 0;
+  env.lay.box = {cols: 120, rows: 40};
+  win.dispatchEvent(new win.Event('resize'));
+  await sleep(400);
+  env.lay.box = {cols: 70, rows: 20};
+  win.dispatchEvent(new win.Event('resize'));
+  await sleep(400);
+  ok(muts === 0, 'two window resizes (proportions unchanged): the marker untouched; ' + muts + ' DOM changes');
+  ok(miniRatioProblems(env, t).length === 0, 'and it still draws 75/25; ' + show(miniRatioProblems(env, t)));
+  mo.disconnect();
+  cleanup(env);
+});
+
+test('marker ratio: proportions come back after a reload, and follow split / close / move / merge, also in hidden tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const c = await tSplit(win, b, 'v', 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(a), 0.7);
+  dragSplit(win, wrapOf(c), 0.25);
+  const tA = tabOfPane(a);
+  // A second tab, its own split at 30/70, in front: A is hidden from here on.
+  const x = await tNewTab(win, 'x.host');
+  const y = x && await tSplit(win, x, 'h', 'y.host');
+  if (!y) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(x), 0.3);
+  await sleep(350);
+  const steps = [];
+  const step = what => { const p = allMiniRatioProblems(env); if (p.length) steps.push(what + ': ' + p.join('; ')); };
+  step('A 70/30 with b over c 25/75 (hidden), X 30/70 in front');
+  ok(steps.length === 0, 'the drawn proportions match in both tabs; wrong: ' + show(steps));
+  // Reload.
+  const snap = snapshotStorage(win);
+  const n = paneList(win).length;
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === n, 2000);
+  await sleep(50);
+  const ra = paneList(w2).find(p => p.host === 'a.host');
+  ok(!!ra && Math.abs(ratioOf(ra.el) - 0.7) < 0.01, 'setup: the reload restored a at 70% (' + (ra ? show(ra.el.style.flex) : 'no a') + ')');
+  const p2 = allMiniRatioProblems(env2);
+  ok(p2.length === 0, 'after a reload every marker draws its saved proportions (the hidden tab too); wrong: ' + show(p2));
+  // Layout changes, each checked in every tab.
+  const P = h => paneList(w2).find(p => p.host === h);
+  const steps2 = [];
+  const step2 = what => { const p = allMiniRatioProblems(env2); if (p.length) steps2.push(what + ': ' + p.join('; ')); };
+  const tA2 = tabOfPane(P('a.host')), tX2 = tabOfPane(P('x.host'));
+  w2.movePaneToTab(P('y.host').id, tA2); step2('y moved into A');
+  w2.closePane(P('c.host').id); await sleep(30); step2('c closed');
+  w2.movePaneToNewTab(P('b.host').id); step2('b out to a new tab');
+  w2.mergeTabInto(tabOfPane(P('b.host')), P('a.host').id, 'bottom'); step2('b\'s tab merged under a');
+  const e = await tSplit(w2, P('x.host'), 'h', 'e.host'); step2('x split: e');
+  if (e) { dragSplit(w2, wrapOf(e), 0.8); await sleep(350); step2('x | e dragged to 80/20'); }
+  // Make X hidden, then change X's layout: its hidden marker must follow.
+  w2.activatePane(P('a.host').id); step2('A shown');
+  w2.movePaneToTab(P('b.host').id, tX2); step2('b moved into hidden X');
+  w2.closePane(P('e.host') ? P('e.host').id : ''); await sleep(30); step2('e closed in hidden X');
+  ok(steps2.length === 0, 'after every split / close / move / merge each marker drew its tab\'s proportions; wrong: ' + show(steps2));
+  cleanup(env2);
+});
+
+// =====================================================================
+// A split or a close leaves every other divider where it was.
+//
+// Splitting a pane: the new split takes the share that pane had in its
+// parent split and divides it 50/50. Closing (or cancelling the login
+// of) a pane: the remaining sibling takes the split's share. h and v,
+// nested, and the saved layout keeps the ratios across a reload.
+//
+// Hooks / assumptions: as above, a split's proportion is its two
+// children's flex-grow ('' = 1). paneBoxes() lays the tree out from
+// those values (handles ignored, as their 3 px are) to fractions of the
+// tab: "on screen" here is that layout; 1 px = 1/720 of the width,
+// 1/432 of the height. The tester's browser scenario measures real pixels.
+// =====================================================================
+function paneBoxes(win, tid) {
+  const root = tabRootById(win, tid);
+  const top = root && layoutKids(root)[0];
+  const out = {};
+  const walk = (el, x0, y0, x1, y1) => {
+    if (!el) return;
+    if (el.classList.contains('pane')) {
+      const p = win.panes[el.getAttribute('data-pane')];
+      out[p ? p.host : el.getAttribute('data-pane')] = {x0, y0, x1, y1};
+      return;
+    }
+    const k = layoutKids(el);
+    if (k.length < 2) { walk(k[0], x0, y0, x1, y1); return; }
+    const r = flexGrow(k[0]) / (flexGrow(k[0]) + flexGrow(k[1]));
+    if (el.classList.contains('split-h')) {
+      const m = x0 + (x1 - x0) * r; walk(k[0], x0, y0, m, y1); walk(k[1], m, y0, x1, y1);
+    } else {
+      const m = y0 + (y1 - y0) * r; walk(k[0], x0, y0, x1, m); walk(k[1], x0, m, x1, y1);
+    }
+  };
+  walk(top, 0, 0, 1, 1);
+  return out;
+}
+const PX_W = 1 / 720 + 1e-9, PX_H = 1 / 432 + 1e-9;
+const fmtBox = b => b ? [b.x0, b.x1, b.y0, b.y1].map(v => Math.round(v * 1000) / 10).join('/') : 'none';
+// Hosts whose box moved by more than a pixel between two paneBoxes() results.
+function movedBoxes(before, after, hosts) {
+  const out = [];
+  hosts.forEach(h => {
+    const a = before[h], b = after[h];
+    if (!a || !b) { out.push(h + ' missing'); return; }
+    if (Math.abs(a.x0 - b.x0) > PX_W || Math.abs(a.x1 - b.x1) > PX_W || Math.abs(a.y0 - b.y0) > PX_H || Math.abs(a.y1 - b.y1) > PX_H)
+      out.push(h + ' ' + fmtBox(a) + ' -> ' + fmtBox(b) + ' (% x0/x1/y0/y1)');
+  });
+  return out;
+}
+// Box b equals the expected fractions (each +-1 px).
+function boxIs(b, x0, x1, y0, y1) {
+  return !!b && Math.abs(b.x0 - x0) <= PX_W && Math.abs(b.x1 - x1) <= PX_W && Math.abs(b.y0 - y0) <= PX_H && Math.abs(b.y1 - y1) <= PX_H;
+}
+
+test('divider share: splitting a pane keeps its share - A | B at 70/30, B split (h or v): A stays 70%, B and the new pane halve B\'s 30%', async () => {
+  for (const dir of ['h', 'v']) {
+    const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+    const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+    if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+    const tid = tabOfPane(a);
+    dragSplit(win, wrapOf(a), 0.7);
+    let bx = paneBoxes(win, tid);
+    ok(boxIs(bx['a.host'], 0, 0.7, 0, 1), dir + ': setup: a at 70% (' + fmtBox(bx['a.host']) + ')');
+    const c = await tSplit(win, b, dir, 'c.host');
+    if (!c) { ok(false, 'setup: c'); cleanup(env); return; }
+    bx = paneBoxes(win, tid);
+    ok(boxIs(bx['a.host'], 0, 0.7, 0, 1), dir + ': b split: a still 0..70% of the width; a ' + fmtBox(bx['a.host']) +
+       ' (flex a ' + show(a.el.style.flex) + ', new split ' + show(wrapOf(c).style.flex) + ')');
+    const halves = dir === 'h'
+      ? boxIs(bx['b.host'], 0.7, 0.85, 0, 1) && boxIs(bx['c.host'], 0.85, 1, 0, 1)
+      : boxIs(bx['b.host'], 0.7, 1, 0, 0.5) && boxIs(bx['c.host'], 0.7, 1, 0.5, 1);
+    ok(halves, dir + ': b and c halve b\'s old 30%; b ' + fmtBox(bx['b.host']) + ', c ' + fmtBox(bx['c.host']) +
+       ' (flex b ' + show(b.el.style.flex) + ', c ' + show(c.el.style.flex) + ')');
+    // One level deeper: c (in a 50/50 split inside b's share) split again, the other way.
+    const d = await tSplit(win, c, dir === 'h' ? 'v' : 'h', 'd.host');
+    const bx2 = paneBoxes(win, tid);
+    const mv = movedBoxes(bx, bx2, ['a.host', 'b.host']);
+    ok(!!d && mv.length === 0, dir + ': c split again: a and b do not move; moved: ' + show(mv));
+    const cd = bx2['c.host'], dd = bx2['d.host'], old = bx['c.host'];
+    const covers = cd && dd && old && Math.abs(Math.min(cd.x0, dd.x0) - old.x0) <= PX_W && Math.abs(Math.max(cd.x1, dd.x1) - old.x1) <= PX_W &&
+      Math.abs(Math.min(cd.y0, dd.y0) - old.y0) <= PX_H && Math.abs(Math.max(cd.y1, dd.y1) - old.y1) <= PX_H &&
+      Math.abs((cd.x1 - cd.x0) * (cd.y1 - cd.y0) - (dd.x1 - dd.x0) * (dd.y1 - dd.y0)) < 0.004;
+    ok(!!covers, dir + ': c and d halve c\'s old box ' + fmtBox(old) + '; c ' + fmtBox(cd) + ', d ' + fmtBox(dd));
+    cleanup(env);
+  }
+});
+
+test('divider share: closing a pane of a nested split leaves every other divider where it was (h, v, nested; a split login cancelled in flight moves nothing)', async () => {
+  const env = await mkTabEnv(TAB_PLAN([{action: 'connect', match: b => b.host === 'z.host',
+    response: {session_id: 'sid-z', alive: true}, delay: 300, once: true}]), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tid = tabOfPane(a);
+  const c = await tSplit(win, b, 'v', 'c.host');
+  const d = c && await tSplit(win, a, 'v', 'd.host');
+  if (!d) { ok(false, 'setup'); cleanup(env); return; }
+  // (a over d) | (b over c), outer 70/30, a over d 40/60, b over c 25/75.
+  dragSplit(win, wrapOf(a).parentElement, 0.7);
+  dragSplit(win, wrapOf(a), 0.4);
+  dragSplit(win, wrapOf(b), 0.25);
+  let bx = paneBoxes(win, tid);
+  ok(boxIs(bx['a.host'], 0, 0.7, 0, 0.4) && boxIs(bx['b.host'], 0.7, 1, 0, 0.25), 'setup: (a over d 40/60) | (b over c 25/75) at 70/30; ' +
+     show(Object.keys(bx).map(h => h + ' ' + fmtBox(bx[h]))));
+  const fails = [];
+  const check = (what, keep) => {
+    const now = paneBoxes(win, tid);
+    const mv = movedBoxes(bx, now, keep);
+    if (mv.length) fails.push(what + ': ' + mv.join('; '));
+    bx = now;
+  };
+  // A split started from c, Connect pressed, cancelled while it is in flight: nothing moves.
+  win.splitPane(c.id, 'h');
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'z.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(50);
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 1000);
+  await sleep(30);
+  check('a split of c, login cancelled', ['a.host', 'b.host', 'c.host', 'd.host']);
+  // c closed: b takes the whole right column; a and d stay.
+  win.closePane(c.id); await sleep(30);
+  const nb = paneBoxes(win, tid)['b.host'];
+  if (!boxIs(nb, 0.7, 1, 0, 1)) fails.push('c closed: b should fill 70..100% x 0..100%, is ' + fmtBox(nb));
+  check('c closed', ['a.host', 'd.host']);
+  // a closed: d takes the left column; b stays.
+  win.closePane(a.id); await sleep(30);
+  const nd = paneBoxes(win, tid)['d.host'];
+  if (!boxIs(nd, 0, 0.7, 0, 1)) fails.push('a closed: d should fill 0..70% x 0..100%, is ' + fmtBox(nd));
+  check('a closed', ['b.host']);
+  ok(fails.length === 0, 'every close left the other dividers where they were; wrong: ' + show(fails));
+  cleanup(env);
+});
+
+test('divider share: a deeper close keeps outer dividers, and the saved layout keeps every ratio across a reload', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tid = tabOfPane(a);
+  // a | (b over (c | e)): outer 30/70, b over (c|e) 60/40, c | e 20/80.
+  const c = await tSplit(win, b, 'v', 'c.host');
+  const e = c && await tSplit(win, c, 'h', 'e.host');
+  if (!e) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(a), 0.3);
+  dragSplit(win, wrapOf(b), 0.6);
+  dragSplit(win, wrapOf(c), 0.2);
+  const before = paneBoxes(win, tid);
+  ok(boxIs(before['a.host'], 0, 0.3, 0, 1) && boxIs(before['b.host'], 0.3, 1, 0, 0.6) && boxIs(before['c.host'], 0.3, 0.44, 0.6, 1),
+     'setup: a | (b over (c | e)) at 30/70, 60/40, 20/80; ' + show(Object.keys(before).map(h => h + ' ' + fmtBox(before[h]))));
+  // Reload: every box comes back.
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 4, 2000);
+  await sleep(50);
+  const P = h => paneList(w2).find(p => p.host === h);
+  const tid2 = tabOfPane(P('a.host'));
+  const after = paneBoxes(w2, tid2);
+  const mv = movedBoxes(before, after, ['a.host', 'b.host', 'c.host', 'e.host']);
+  ok(mv.length === 0, 'after a reload every pane is where it was; moved: ' + show(mv));
+  // Close c (deepest): e takes c | e's box; a and b stay.
+  w2.closePane(P('c.host').id); await sleep(30);
+  const x = paneBoxes(w2, tid2);
+  ok(movedBoxes(after, x, ['a.host', 'b.host']).length === 0 && boxIs(x['e.host'], 0.3, 1, 0.6, 1),
+     'c closed: a and b stay, e fills c | e\'s box (30..100% x 60..100%); moved ' + show(movedBoxes(after, x, ['a.host', 'b.host'])) +
+     ', e ' + fmtBox(x['e.host']));
+  // A split after the reload keeps the share too, and that is saved.
+  const f = await tSplit(w2, P('a.host'), 'v', 'f.host');
+  const y = paneBoxes(w2, tid2);
+  ok(!!f && boxIs(y['a.host'], 0, 0.3, 0, 0.5) && boxIs(y['f.host'], 0, 0.3, 0.5, 1) && movedBoxes(x, y, ['b.host', 'e.host']).length === 0,
+     'a split under after the reload: a and f halve a\'s 30% column, b and e stay; a ' + fmtBox(y['a.host']) + ', f ' + fmtBox(y['f.host']));
+  const snap2 = snapshotStorage(w2);
+  cleanup(env2);
+  const env3 = await mkTabEnv(TAB_PLAN(), snap2, S4); const w3 = env3.win;
+  await until(() => paneList(w3).filter(p => p.sid).length === 4, 2000);
+  await sleep(50);
+  const z = paneBoxes(w3, tabOfPane(paneList(w3).find(p => p.host === 'a.host')));
+  const mv3 = movedBoxes(y, z, ['a.host', 'b.host', 'e.host', 'f.host']);
+  ok(mv3.length === 0, 'and that layout comes back the same after a second reload; moved: ' + show(mv3));
+  cleanup(env3);
+});
+
+// =====================================================================
+// Feature 3a: spring-loaded tabs
+// =====================================================================
+test('spring: the tab on screen, dragged and held over another tab, brings that tab forward; dropped on a pane edge it merges there', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  ok(tabId(activeTab(win)) === tB, 'setup: B (the tab to put back) is in front');
+  await settled(win, b);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a, b]);
+  const m = grabTab(win, tabById(win, tB));
+  const tAel = tabById(win, tA);
+  const [x, y] = centre(tAel);
+  m.move(tAel.querySelector('.tab-label') || tAel, x, y);
+  await sleep(250);
+  ok(tabId(activeTab(win)) === tB, 'after 250 ms over A, B is still in front');
+  const came = await until(() => tabId(activeTab(win)) === tA, 1500);
+  ok(came, 'held over A, A comes to the front (within ~0.5 s)');
+  ok(!env.lay.hidden(a.el), 'a is on screen');
+  const up = overEdge(m, a, 'left');
+  ok(zoneOf(a) === 'left', 'the drag goes on: the left half of a is highlighted before release; got ' + show(zoneOf(a)));
+  up();
+  await until(() => tabEls(win).length === 1, 500);
+  ok(shape(win, tA) === '(h b.host a.host)', 'B landed left of a in A; got ' + show(shapesNow(win)));
+  ok(!tabById(win, tB) && !tabRootById(win, tB), 'B\'s tab is gone');
+  ok(tabId(activeTab(win)) === tA, 'A is in front');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + show(spy.concat(sessionCalls(env, mark))));
+  ok(anyZone(win) === 0 && noDragLeft(win), 'no zone, no drag state left');
+  const saved = savedShapes(win);
+  ok(!!saved && show(saved.tabs) === show(['(h b.host a.host)']), 'saved at once; got ' + show(saved));
+  await sleep(250);
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('spring: a pass over a tab switches nothing; a release before the rest switches nothing later; released outside, the first tab comes back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  const tAel = tabById(win, tA);
+  const ev = everActive(win, tAel);
+  // A pass: over A for one move, then on along the strip.
+  let m = grabTab(win, tabById(win, tB));
+  const [x, y] = centre(tAel);
+  m.move(tAel.querySelector('.tab-label') || tAel, x, y);
+  await sleep(60);
+  m.move($(win, 'tabs'), x + 1, y);
+  await sleep(900);
+  ok(!ev.hit, 'a pass over A (60 ms) never brought A forward');
+  m.up($(win, 'tabs'), x + 1, y);
+  ok(tabId(activeTab(win)) === tB && tabEls(win).length === 2, 'dropped on the strip: B in front, both tabs there');
+  // Released on A at once: no switch later from a leftover timer.
+  m = grabTab(win, tabById(win, tB));
+  m.move(tAel.querySelector('.tab-label') || tAel, x, y);
+  m.up(tAel.querySelector('.tab-label') || tAel, x, y);
+  await sleep(900);
+  ok(!ev.hit && tabId(activeTab(win)) === tB, 'released over A before the rest: A never shown afterwards');
+  // Rest, then out of the window and released there.
+  await sleep(50);
+  const shapes0 = show(shapesNow(win)), saved0 = show(savedShapes(win));
+  m = grabTab(win, tabById(win, tB));
+  const came = await restOver(win, m, tAel, () => tabId(activeTab(win)) === tA);
+  ok(came, 'setup: held over A, A came forward');
+  outside(win, m);
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(tabId(activeTab(win)) === tB, 'released outside the window: B, in front when the drag began, is back');
+  ok(show(shapesNow(win)) === shapes0, 'nothing moved, strip order as before; got ' + show(shapesNow(win)) + ' was ' + shapes0);
+  ok(show(savedShapes(win)) === saved0, 'the saved layout and front tab unchanged; got ' + show(savedShapes(win)));
+  ok(anyZone(win) === 0 && noDragLeft(win), 'no zone, no drag state');
+  // Rest, then the button goes up outside the window (next move has no button).
+  m = grabTab(win, tabById(win, tB));
+  ok(await restOver(win, m, tAel, () => tabId(activeTab(win)) === tA), 'setup: A forward again');
+  outside(win, m, true);
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(tabId(activeTab(win)) === tB && show(shapesNow(win)) === shapes0, 'button released outside: B back, nothing moved');
+  ok(show(savedShapes(win)) === saved0, 'saved layout unchanged');
+  ev.stop();
+  cleanup(env);
+});
+
+test('spring: a pointer trembling by a couple of pixels still counts as resting', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  const m = grabTab(win, tabById(win, tB));
+  const came = await restOver(win, m, tabById(win, tA), () => tabId(activeTab(win)) === tA, 2000, true);
+  ok(came, 'moving +-2 px every 100 ms over A, A still comes forward within 2 s');
+  outside(win, m);
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(tabId(activeTab(win)) === tB, 'released outside: B back');
+  cleanup(env);
+});
+
+test('spring: from one held tab to another; the drop goes into the tab shown last', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const [tA, tB, tC] = [tabOfPane(a), tabOfPane(b), tabOfPane(c)];
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  const m = grabTab(win, tabById(win, tB));
+  ok(await restOver(win, m, tabById(win, tA), () => tabId(activeTab(win)) === tA), 'held over A: A forward');
+  ok(await restOver(win, m, tabById(win, tC), () => tabId(activeTab(win)) === tC), 'then held over C: C forward');
+  const up = overEdge(m, c, 'right');
+  ok(zoneOf(c) === 'right', 'c\'s right half highlighted; got ' + show(zoneOf(c)));
+  up();
+  await until(() => tabEls(win).length === 2, 500);
+  ok(shape(win, tC) === '(h c.host b.host)' && shape(win, tA) === 'a.host', 'B went right of c; A untouched; got ' + show(shapesNow(win)));
+  ok(tabId(activeTab(win)) === tC, 'C in front');
+  cleanup(env);
+});
+
+test('spring: a pane dragged by its name and held over another tab brings it forward; dropped on a pane edge it goes there', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  const b1 = a1 && await tNewTab(win, 'b1.host');
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host');
+  if (!needTabs(win) || !b2) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b1);
+  await settled(win, b2);
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a1, b1, b2]);
+  let m = grabPane(win, b2);
+  const tAel = tabById(win, tA);
+  const [x, y] = centre(tAel);
+  m.move(tAel.querySelector('.tab-label') || tAel, x, y);
+  await sleep(250);
+  ok(tabId(activeTab(win)) === tB, 'after 250 ms over A, B is still in front');
+  ok(await until(() => tabId(activeTab(win)) === tA, 1500), 'held over A, A comes forward');
+  const up = overEdge(m, a1, 'bottom');
+  ok(zoneOf(a1) === 'bottom', 'the bottom half of a1 is highlighted before release; got ' + show(zoneOf(a1)));
+  up();
+  await until(() => panesOfTab(win, tA).length === 2, 500);
+  ok(shape(win, tA) === '(v a1.host b2.host)' && shape(win, tB) === 'b1.host', 'b2 under a1 in A, b1 alone in B; got ' + show(shapesNow(win)));
+  ok(tabId(activeTab(win)) === tA && win.activeId === b2.id, 'A in front, b2 active');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + show(spy.concat(sessionCalls(env, mark))));
+  ok(anyZone(win) === 0 && noDragLeft(win), 'no zone, no drag state left');
+  ok(show(savedShapes(win).tabs) === show(shapesNow(win)), 'saved as shown; got ' + show(savedShapes(win)));
+  // Back out: a1 (now with a bar) held over B, released outside: nothing.
+  const shapes0 = show(shapesNow(win)), saved0 = show(savedShapes(win));
+  m = grabPane(win, a1);
+  ok(await restOver(win, m, tabById(win, tB), () => tabId(activeTab(win)) === tB), 'a1 held over B: B forward');
+  outside(win, m);
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(tabId(activeTab(win)) === tA && show(shapesNow(win)) === shapes0 && show(savedShapes(win)) === saved0,
+     'released outside: A back in front, nothing moved, nothing saved; got ' + show(shapesNow(win)));
+  ok(noDragLeft(win) && anyZone(win) === 0, 'no drag state');
+  cleanup(env);
+});
+
+test('spring (break): the dragged tab closes while another is held open; the release merges nothing and leaves nothing behind', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a);
+  const m = grabTab(win, tabById(win, tabOfPane(b)));
+  ok(await restOver(win, m, tabById(win, tA), () => tabId(activeTab(win)) === tA), 'setup: A forward');
+  win.closePane(b.id);
+  await until(() => tabEls(win).length === 1, 500);
+  const up = overEdge(m, a, 'left');
+  up();
+  await sleep(50);
+  ok(tabEls(win).length === 1 && shape(win, tA) === 'a.host' && tabId(activeTab(win)) === tA, 'A alone, in front; got ' + show(shapesNow(win)));
+  ok(anyZone(win) === 0 && noDragLeft(win), 'no zone, no drag state');
+  await sleep(700);
+  ok(tabId(activeTab(win)) === tA && tabEls(win).length === 1, 'nothing switches later');
+  cleanup(env);
+});
+
+// =====================================================================
+// Feature 3b: the tab menu and a pane's "Move to tab"
+// =====================================================================
+test('tab menu: a right-click opens Rename / Move into tab / Close instead of the browser\'s menu; Escape or a click outside closes it', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b);
+  const ev = tabMenu(win, tA);
+  ok(ev.defaultPrevented, 'the browser\'s own context menu is suppressed');
+  ok(openMenus(env).length === 1, 'one menu ([role=menu]) is open; got ' + openMenus(env).length);
+  ['Rename', 'Move into tab', 'Close'].forEach(n => ok(!!findItem(env, new RegExp('^' + n, 'i')),
+    'it has "' + n + '"; items: ' + show(itemsShown(env).map(itemText))));
+  ok(activeTab(win) === tB, 'a right-click does not change the tab in front');
+  keyAt(win, 'Escape', 'Escape');
+  ok(openMenus(env).length === 0, 'Escape closes it');
+  ok(hidden($(win, 'ov')) && tabEls(win).length === 2 && !renameField(tA), 'and does nothing else');
+  tabMenu(win, tA);
+  const out = b.el.querySelector('.pane-term') || b.el;
+  fire(win, out, 'mousedown', 0); fire(win, out, 'mouseup', 0); fire(win, out, 'click', 0);
+  ok(openMenus(env).length === 0, 'a click outside closes it');
+  ok(tabEls(win).length === 2 && !renameField(tA) && shape(win, tabId(tB)) === 'b.host', 'and chooses nothing');
+  tabMenu(win, tB);
+  tabMenu(win, tA);
+  ok(openMenus(env).length === 1, 'right-clicking another tab leaves one menu open, not two; got ' + openMenus(env).length);
+  keyAt(win, 'Escape', 'Escape');
+  cleanup(env);
+});
+
+test('tab menu: "Move into tab" lists the other tabs by title and puts this tab\'s whole layout beside the chosen tab\'s active pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a1, a2] = await (async () => { const x = await tConnect(win, 'a1.host'); return [x, x && await tSplit(win, x, 'v', 'a2.host')]; })();
+  const b1 = a2 && await tNewTab(win, 'b1.host');
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host');
+  const c = b2 && await tNewTab(win, 'c.host');
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b1), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  const nameA = tabLabel(tabById(win, tA)), nameB = tabLabel(tabById(win, tB)), nameC = tabLabel(tabById(win, tC));
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a1, a2, b1, b2, c]);
+  tabMenu(win, tabById(win, tB));
+  const mv = findItem(env, /^Move into tab/i);
+  ok(!!mv, 'B\'s menu has "Move into tab"');
+  if (mv) press(win, mv);
+  await until(() => targetItems(env).length >= 2, 300);
+  const names = targetItems(env).map(itemText);
+  ok(names.some(n => n.indexOf(nameA) >= 0) && names.some(n => n.indexOf(nameC) >= 0), 'the list names A and C (' + show([nameA, nameC]) + '); got ' + show(names));
+  ok(!names.some(n => n.indexOf(nameB) >= 0), 'but not B itself; got ' + show(names));
+  const err = await chooseTarget(env, null, nameA);
+  ok(!err, 'chose A: ' + (err || 'ok'));
+  await until(() => tabEls(win).length === 2, 500);
+  ok(shape(win, tA) === '(v a1.host (h a2.host (h b1.host b2.host)))', 'B\'s layout right of a2 (A\'s active pane), kept as it was; got ' + shape(win, tA));
+  ok(!tabById(win, tB) && !tabRootById(win, tB), 'B\'s tab is gone');
+  ok(tabId(activeTab(win)) === tA, 'A is shown');
+  ok(openMenus(env).length === 0, 'the menu closed');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + show(spy.concat(sessionCalls(env, mark))));
+  ok(show(savedShapes(win).tabs) === show(shapesNow(win)), 'saved at once; got ' + show(savedShapes(win)));
+  cleanup(env);
+});
+
+test('tab menu: Rename edits that tab (also a background one); Close closes only that tab; with one tab nothing to move into', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b);
+  tabMenu(win, tA);
+  const rn = findItem(env, /^Rename/i);
+  ok(!!rn, 'A\'s menu has Rename');
+  if (rn) press(win, rn);
+  await until(() => !!renameField(tA), 300);
+  const inp = renameField(tA);
+  ok(!!inp && !renameField(tB), 'the field opens in A (not in B, the tab in front)');
+  ok(!!inp && win.document.activeElement === inp, 'with the focus');
+  ok(openMenus(env).length === 0, 'the menu closed');
+  if (inp) { typeName(win, inp, 'from menu'); keyOn(win, inp, 'Enter', 'Enter'); }
+  await until(() => !renameField(tA), 300);
+  ok(tabLabel(tA) === 'from menu', 'A renamed; got ' + show(tabLabel(tA)));
+  tabMenu(win, tA);
+  const cl = findItem(env, /^Close/i);
+  if (cl) press(win, cl);
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1 && !win.panes[a.id] && activeTab(win) === tB, 'Close closed A and its pane; B stays in front');
+  ok(openMenus(env).length === 0, 'the menu closed');
+  const shapes0 = show(shapesNow(win));
+  tabMenu(win, tB);
+  const mv = findItem(env, /^Move into tab/i);
+  if (mv) press(win, mv);
+  await sleep(50);
+  ok(targetItems(env).length === 0, 'with one tab the list is empty or "Move into tab" is disabled; got ' + show(targetItems(env).map(itemText)));
+  keyAt(win, 'Escape', 'Escape'); keyAt(win, 'Escape', 'Escape');
+  ok(show(shapesNow(win)) === shapes0 && openMenus(env).length === 0, 'nothing changed');
+  cleanup(env);
+});
+
+test('tab menu: works from the keyboard - arrows move, Enter chooses, ArrowRight opens the list of tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b);
+  const ae = () => win.document.activeElement;
+  tabMenu(win, tA);
+  if (!isItem(ae())) keyAt(win, 'ArrowDown', 'ArrowDown');
+  ok(isItem(ae()), 'a menu item has the keyboard focus (on open or after ArrowDown); focus on ' + (ae() && ae().tagName));
+  const first = ae();
+  keyAt(win, 'ArrowDown', 'ArrowDown');
+  ok(isItem(ae()) && ae() !== first, 'ArrowDown moves to another item');
+  keyAt(win, 'ArrowUp', 'ArrowUp');
+  ok(ae() === first, 'ArrowUp moves back');
+  for (let i = 0; i < 6 && isItem(ae()) && !/^Rename/i.test(itemText(ae())); i++) keyAt(win, 'ArrowDown', 'ArrowDown');
+  ok(isItem(ae()) && /^Rename/i.test(itemText(ae())), 'Rename reached with the arrows');
+  keyAt(win, 'Enter', 'Enter');
+  await until(() => !!renameField(tA), 300);
+  ok(!!renameField(tA) && openMenus(env).length === 0, 'Enter on Rename opens A\'s field and closes the menu');
+  if (renameField(tA)) keyOn(win, renameField(tA), 'Escape', 'Escape');
+  tabMenu(win, tA);
+  if (!isItem(ae())) keyAt(win, 'ArrowDown', 'ArrowDown');
+  for (let i = 0; i < 6 && isItem(ae()) && !/^Move into tab/i.test(itemText(ae())); i++) keyAt(win, 'ArrowDown', 'ArrowDown');
+  ok(isItem(ae()) && /^Move into tab/i.test(itemText(ae())), '"Move into tab" reached with the arrows');
+  const parent = ae();
+  keyAt(win, 'ArrowRight', 'ArrowRight');
+  if (ae() === parent) keyAt(win, 'Enter', 'Enter');
+  ok(isItem(ae()) && itemText(ae()).indexOf(tabLabel(tB)) >= 0, 'ArrowRight (or Enter) goes into the list, on B ' + show(tabLabel(tB)) +
+     '; focus on ' + show(ae() && itemText(ae())));
+  keyAt(win, 'Enter', 'Enter');
+  await until(() => tabEls(win).length === 1, 500);
+  ok(shape(win, tabId(tB)) === '(h b.host a.host)' && tabEls(win).length === 1, 'Enter merged A into B, right of b; got ' + show(shapesNow(win)));
+  ok(openMenus(env).length === 0, 'and the menu closed');
+  cleanup(env);
+});
+
+test('tab menu (break): names are text in the list; a tab that goes away while the list is open is not merged into', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b), tC = tabElOfPane(win, c);
+  const evil = '<img src=x onerror="window.__xss2=1">';
+  await renameTo(env, tA, evil, 'enter');
+  tabMenu(win, tC);
+  const mv = findItem(env, /^Move into tab/i);
+  if (mv) press(win, mv);
+  await until(() => targetItems(env).length >= 2, 300);
+  const items = targetItems(env);
+  ok(items.some(e => itemText(e).indexOf(evil) >= 0), 'A is listed under its name, literally; got ' + show(items.map(itemText)));
+  ok(!openMenus(env).some(m => m.querySelector('img')) && !win.__xss2, 'no element or script made from the name');
+  const itB = items.find(e => itemText(e).indexOf(tabLabel(tB)) >= 0);
+  win.closeTab(tabId(tB));
+  await until(() => tabEls(win).length === 2, 500);
+  const shapes0 = show(shapesNow(win));
+  if (itB && itB.isConnected) press(win, itB);
+  await sleep(50);
+  ok(show(shapesNow(win)) === shapes0 && tabEls(win).length === 2, 'choosing the closed tab merges nothing; got ' + show(shapesNow(win)));
+  ok(!!win.panes[c.id] && tabOfPane(c) === tabId(tC), 'C and its pane are untouched');
+  keyAt(win, 'Escape', 'Escape'); keyAt(win, 'Escape', 'Escape');
+  cleanup(env);
+});
+
+// Measured in Chromium (e2e tabbreak): a tab's menu open, the tab closed
+// by Alt+W - the menu stayed on screen with Rename / Close tab for a tab
+// that no longer exists. Its items did nothing (each re-checks), but a
+// menu about nothing is left floating until the next click elsewhere.
+test('tab menu (break): the menu of a tab that closes by another path goes with it', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tC = tabElOfPane(win, c);
+  tabMenu(win, tC);
+  ok(openMenus(env).length >= 1, 'harness: C\'s menu is open');
+  win.closeTab(tabId(tC));
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(20);
+  ok(openMenus(env).length === 0, 'C closed while its menu was open: no menu left on screen; got ' + openMenus(env).length);
+  keyAt(win, 'Escape', 'Escape');
+  cleanup(env);
+});
+
+test('pane menu: "Move to tab" in a pane bar, and in the top bar for a lone pane, moves the pane into the chosen tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  const b1 = a1 && await tNewTab(win, 'b1.host');
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host');
+  if (!needTabs(win) || !b2) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b1);
+  const nameA = tabLabel(tabById(win, tA)), nameB = tabLabel(tabById(win, tB));
+  const mark = env.log.length;
+  const spy = sessionSpy(win, [a1, b1, b2]);
+  const btn = barOf(b2) && barOf(b2).querySelector('[data-act="move-to"]');
+  ok(!!btn && !env.lay.hidden(btn) && !btn.disabled, 'b2\'s bar has a visible "Move to tab" button [data-act="move-to"]');
+  if (btn) press(win, btn);
+  await until(() => targetItems(env).length >= 1, 300);
+  const names = targetItems(env).map(itemText);
+  ok(names.some(n => n.indexOf(nameA) >= 0) && !names.some(n => n.indexOf(nameB) >= 0),
+     'its menu lists A ' + show(nameA) + ' and not B; got ' + show(names));
+  const err = btn ? await chooseTarget(env, null, nameA) : 'no button';
+  ok(!err, 'chose A: ' + (err || 'ok'));
+  await until(() => panesOfTab(win, tA).length === 2, 500);
+  ok(shape(win, tA) === '(h a1.host b2.host)' && shape(win, tB) === 'b1.host', 'b2 right of a1 in A; b1 alone in B; got ' + show(shapesNow(win)));
+  ok(tabId(activeTab(win)) === tA && win.activeId === b2.id, 'A shown, b2 active');
+  ok(openMenus(env).length === 0, 'the menu closed');
+  // The lone pane b1: its action is in the top bar.
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await sleep(30);
+  const tb = toolBtn(win, 'move-to');
+  ok(!!tb && toolsShown(env) && !env.lay.hidden(tb) && !tb.disabled, 'a lone pane has "Move to tab" in the top bar (#paneTools [data-act="move-to"])');
+  if (tb) press(win, tb);
+  const err2 = tb ? await chooseTarget(env, null, tabLabel(tabById(win, tA))) : 'no button';
+  ok(!err2, 'chose A: ' + (err2 || 'ok'));
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1 && panesOfTab(win, tA).length === 3 && !tabRootById(win, tB), 'B emptied and gone; all three panes in A; got ' + show(shapesNow(win)));
+  ok(tabId(activeTab(win)) === tA && win.activeId === b1.id, 'A shown, b1 active');
+  ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + show(spy.concat(sessionCalls(env, mark))));
+  ok(show(savedShapes(win).tabs) === show(shapesNow(win)), 'saved at once');
+  cleanup(env);
+});
+
+// =====================================================================
+// Reconnect in the pane's bar row (owner, 2026-10-05): "the Reconnect
+// button is almost right, in the middle, but it is on the terminal; it
+// must be in the row where 'persistent' is written, in the middle".
+// Written from the decided behaviour, before the change.
+//
+// DOM contract these tests rely on:
+//   [data-reconnect=ID]      pane ID's Reconnect control, as today: a
+//                            <span> message, input.reconnect-pw
+//                            [data-reconnect-pw=ID] (Enter reconnects),
+//                            a "Reconnect" button; .sev-err / .sev-warn /
+//                            .bare on it as today; hidden while connected
+//   split pane (2+ in tab)   the control is inside that pane's own
+//                            .pane-bar (not over the terminal)
+//   lone pane                the control is inside a strip at the top of
+//                            the pane: an element .reconnect-strip, or the
+//                            pane's .pane-bar itself shown as an overlay;
+//                            out of flow (position absolute/fixed on it or
+//                            an ancestor inside the pane), so the terminal
+//                            keeps its size; hidden once connected
+// Centring and overlap are geometry: tests/e2e/scenarios/reconnectbar.mjs.
+// =====================================================================
+const rcCtl = (win, p) => win.document.querySelector('[data-reconnect="' + p.id + '"]');
+const rcPw = (win, p) => win.document.querySelector('[data-reconnect-pw="' + p.id + '"]');
+const rcStrip = (win, p) => { const c = rcCtl(win, p); return c && (c.closest('.reconnect-strip') || c.closest('.pane-bar')); };
+const rcShown = (env, el) => !!el && !env.lay.hidden(el);
+// Every visible "Reconnect" button on the page that acts on pane p.
+const rcButtons = (env, p) => Array.from(env.win.document.querySelectorAll('button'))
+  .filter(b => b.textContent.trim() === 'Reconnect' && !env.lay.hidden(b) &&
+               (p.el.contains(b) || (b.getAttribute('onclick') || '').indexOf("'" + p.id + "'") >= 0 ||
+                (b.closest('[data-reconnect]') && b.closest('[data-reconnect]').getAttribute('data-reconnect') === p.id)));
+// A disconnect the way the transport ends one (transportFatal).
+function rcDrop(win, p, reason, noCreds) {
+  if (noCreds) { p.password = ''; p.key = ''; }
+  win.eval(`(() => { const p = panes['${p.id}']; endSession(p, {save: true}); showReconnectBar(p${reason ? ", '" + reason + "'" : ''}); updatePaneBadge(p); })()`);
+}
+function rcWhere(win, p) {
+  const c = rcCtl(win, p);
+  if (!c) return 'no control';
+  const parts = [];
+  for (let e = c.parentElement; e && e !== p.el.parentElement; e = e.parentElement)
+    parts.push(e.tagName.toLowerCase() + (e.className && typeof e.className === 'string' ? '.' + e.className.trim().split(/\s+/).join('.') : ''));
+  return parts.join(' < ');
+}
+
+test('reconnect in the bar: a split pane\'s Reconnect sits in its own pane bar, the bar stays whole', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host', {persistent: true});
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tSplit(win, a, 'h', 'b.host');
+  ok(!!b && tabOfPane(b) === tabOfPane(a), 'two panes in one tab');
+  if (!b) { cleanup(env); return; }
+  await settled(win, a); await settled(win, b);
+  const mark = env.log.length;
+  const sizeA = a.term.cols + 'x' + a.term.rows, nA = a.term._resizes.length;
+  rcDrop(win, a);
+  await sleep(250);
+  const c = rcCtl(win, a), bar = barOf(a);
+  ok(rcShown(env, c), 'the Reconnect control is shown');
+  ok(!!c && c.closest('.pane-bar') === bar, 'it is inside the pane\'s own .pane-bar; it is in: ' + rcWhere(win, a));
+  ok(!!c && !c.closest('.pane-term') && !c.closest('.pane-overlays'), 'not over the terminal (.pane-term / .pane-overlays)');
+  ok(barShown(env, a), 'the bar is shown');
+  const keep = [['badge', '[data-pane-badge]'], ['label', '[data-pane-label]'], ['persistent tag', '.pane-tag.persistent'],
+                ['split', '[title="Split horizontal"]'], ['close', '[title="Close pane"]'], ['move to new tab', '[data-act="to-tab"]']];
+  // (Not "Move to tab": with this one tab it is not shown at all - see hide:.)
+  const gone = keep.filter(([, sel]) => !rcShown(env, bar && bar.querySelector(sel))).map(([n]) => n);
+  ok(gone.length === 0, 'badge, label, persistent tag and the buttons stay in the bar; missing: ' + JSON.stringify(gone));
+  ok(rcButtons(env, a).length === 1, 'exactly one Reconnect button for the pane; got ' + rcButtons(env, a).length);
+  ok(!rcShown(env, rcCtl(win, b)) && rcButtons(env, b).length === 0, 'the connected neighbour shows none');
+  ok(a.term.cols + 'x' + a.term.rows === sizeA && a.term._resizes.length === nA && resizesFor(env, 'sid-a.host', mark).length === 0,
+     'the terminal keeps its size, no /api/resize; ' + sizeA + ' -> ' + a.term.cols + 'x' + a.term.rows);
+  // With a message and the password input: also in the bar.
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw) && pw.closest('.pane-bar') === bar, 'the password input is in the bar too; in: ' + (pw ? (pw.closest('.pane-bar') ? 'bar' : 'elsewhere') : 'missing'));
+  const msg = c && c.querySelector('span');
+  ok(rcShown(env, msg) && msg.closest('.pane-bar') === bar && /Authentication failed — type password/.test(msg.textContent),
+     'the message is in the bar; got ' + JSON.stringify(msg && msg.textContent));
+  ok(c.classList.contains('sev-err'), 'auth failure is still red (.sev-err)');
+  ok(win.document.activeElement === pw, 'the password input has focus');
+  // Enter with a typed password reconnects with it; the control goes.
+  pw.value = 'typed-a';
+  const kd = new win.KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true});
+  const code = pw.getAttribute('onkeydown');
+  if (code) win.eval('(function(event){' + code + '})').call(pw, kd); else pw.dispatchEvent(kd);
+  await until(() => !!a.sid, 1500);
+  const cn = env.log.slice(mark).filter(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(cn.length === 1 && cn[0].body.password === 'typed-a', 'Enter reconnects with the typed password; got ' + JSON.stringify(cn.map(e => e.body.password)));
+  ok(!rcShown(env, rcCtl(win, a)) && rcButtons(env, a).length === 0, 'the control is hidden once reconnected');
+  ok(barShown(env, a) && rcShown(env, bar.querySelector('[data-pane-label]')), 'the bar is back to its usual contents');
+  cleanup(env);
+});
+
+test('reconnect strip: a lone pane gets a strip at its top with Reconnect; the terminal keeps its size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  ok(!barShown(env, a), 'lone pane: no pane bar');
+  const mark = env.log.length;
+  const size0 = a.term.cols + 'x' + a.term.rows, n0 = a.term._resizes.length;
+  rcDrop(win, a);
+  await sleep(250);
+  const c = rcCtl(win, a), strip = rcStrip(win, a);
+  ok(rcShown(env, c), 'the Reconnect control is shown');
+  ok(!!strip && a.el.contains(strip) && rcShown(env, strip),
+     'it sits in a strip of the pane (.reconnect-strip or the pane bar as an overlay); it is in: ' + rcWhere(win, a));
+  ok(!!strip && env.lay.outOfFlow(strip, a.el), 'the strip is drawn over the terminal (position absolute/fixed), not in the pane column');
+  ok(!(c && c.classList.contains('reconnect-strip')) || !!(strip && strip !== c), 'the strip is a strip, not the card renamed');
+  ok(rcButtons(env, a).length === 1, 'exactly one Reconnect button for the pane (none in the top bar); got ' + rcButtons(env, a).length);
+  ok(a.term.cols + 'x' + a.term.rows === size0 && a.term._resizes.length === n0,
+     'the terminal keeps its size when the strip appears: ' + size0 + ' -> ' + a.term.cols + 'x' + a.term.rows);
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'no /api/resize');
+  ok(toolsShown(env), 'the pane actions (with the persistent/short-lived tag) stay in the top bar');
+  // Message and password input ride in the strip.
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw) && !!strip && strip.contains(pw), 'the password input is in the strip');
+  ok(win.document.activeElement === pw, 'and has focus');
+  const msg = c && c.querySelector('span');
+  ok(!!msg && !!strip && strip.contains(msg) && /Authentication failed — type password/.test(msg.textContent) && c.classList.contains('sev-err'),
+     'the auth message is in the strip, red; got ' + JSON.stringify(msg && msg.textContent));
+  rcDrop(win, a, 'no_vault_key');
+  ok(/Vault key missing/.test(msg.textContent) && c.classList.contains('sev-warn') && !rcShown(env, rcPw(win, a)),
+     'vault: warning, no password input');
+  // Reconnect by the button: the strip goes, the size never moved.
+  a.password = 'pw-a.host';
+  rcDrop(win, a);
+  await sleep(30);
+  win.eval(`reconnectPane('${a.id}')`);
+  await until(() => !!a.sid, 1500);
+  await sleep(250);
+  ok(!!a.sid, 'reconnected');
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)) && rcButtons(env, a).length === 0,
+     'strip and control are gone once connected');
+  ok(!barShown(env, a), 'and the lone pane still has no pane bar');
+  ok(a.term.cols + 'x' + a.term.rows === size0 && a.term._resizes.length === n0,
+     'the terminal never changed size: ' + size0 + ' -> ' + a.term.cols + 'x' + a.term.rows + ', refits ' + (a.term._resizes.length - n0));
+  const odd = sizesSent(env, 'sid-a.host', mark).filter(s => s !== size0);
+  ok(odd.length === 0, 'no other size sent to the server; got ' + JSON.stringify(odd));
+  cleanup(env);
+});
+
+test('reconnect strip <-> bar: a disconnected pane going lone / split / to a new tab keeps one control, the typed password and focus', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  const b = await tNewTab(win, 'b.host');
+  ok(!!b && tabOfPane(b) !== tA, 'b in a second tab');
+  if (!b) { cleanup(env); return; }
+  win.showTab(tA);
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw), 'lone: password input shown');
+  pw.value = 'half-typed';
+  pw.focus();
+  // 'bar': in the pane's own bar, shown in the pane column (split);
+  // 'strip': in a shown strip drawn over the terminal (lone).
+  const whereNow = () => {
+    const c = rcCtl(win, a), s = rcStrip(win, a), bar = barOf(a);
+    if (!rcShown(env, c)) return 'hidden';
+    if (s && s === bar && barShown(env, a) && !env.lay.outOfFlow(bar, a.el)) return 'bar';
+    if (s && rcShown(env, s) && env.lay.outOfFlow(s, a.el)) return 'strip';
+    return rcWhere(win, a);
+  };
+  const state = (label, wantIn) => {
+    const p = rcPw(win, a);
+    ok(whereNow() === wantIn, label + ': the control is in the ' + wantIn + '; it is in: ' + whereNow());
+    ok(rcButtons(env, a).length === 1, label + ': one Reconnect button; got ' + rcButtons(env, a).length);
+    ok(!!p && p.value === 'half-typed' && rcShown(env, p), label + ': the typed password is kept; got ' + JSON.stringify(p && p.value));
+  };
+  state('lone', 'strip');
+  // b joins a's tab: a is split now (b, the moved pane, takes focus).
+  win.movePaneToTab(b.id, tA);
+  await sleep(60);
+  ok(panesOfTab(win, tA).length === 2, 'b moved into a\'s tab');
+  state('split (b moved in)', 'bar');
+  // b closes: a is lone again; the input keeps focus.
+  rcPw(win, a).focus();
+  ok(win.document.activeElement === rcPw(win, a), '(the password input took focus before the close)');
+  win.closePane(b.id);
+  await until(() => !win.panes[b.id], 500);
+  await sleep(60);
+  state('lone again (neighbour closed)', 'strip');
+  ok(win.document.activeElement === rcPw(win, a), 'the password input still has focus; active: ' +
+     (win.document.activeElement && (win.document.activeElement.className || win.document.activeElement.tagName)));
+  // Split again, then a goes to a tab of its own.
+  const c2 = await tSplit(win, a, 'v', 'c.host');
+  ok(!!c2 && tabOfPane(c2) === tA, 'c split into a\'s tab');
+  if (!c2) { cleanup(env); return; }
+  await sleep(60);
+  state('split (new pane)', 'bar');
+  rcPw(win, a).focus();
+  win.movePaneToNewTab(a.id);
+  await sleep(60);
+  ok(tabOfPane(a) !== tA, 'a is in a new tab');
+  state('lone in a new tab', 'strip');
+  ok(win.document.activeElement === rcPw(win, a), 'the moved pane\'s password input has focus, not its dead terminal; active: ' +
+     (win.document.activeElement && (win.document.activeElement.className || win.document.activeElement.tagName)));
+  // Hidden tab: nothing of it shows.
+  const tNew = tabOfPane(a);
+  win.showTab(tA);
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)) && rcButtons(env, a).length === 0,
+     'a in a hidden tab: its Reconnect is not shown');
+  ok(visibleAll(env, '[data-reconnect], .reconnect-strip').length === 0,
+     'no Reconnect anywhere on screen; got ' + visibleAll(env, '[data-reconnect], .reconnect-strip').length);
+  win.showTab(tNew);
+  await until(() => tabId(activeTab(win)) === tNew, 500);
+  state('shown again', 'strip');
+  // And the kept password is what reconnects.
+  const mark = env.log.length;
+  win.eval(`reconnectPane('${a.id}')`);
+  await until(() => !!a.sid, 1500);
+  const cn = env.log.slice(mark).filter(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(cn.length === 1 && cn[0].body.password === 'half-typed', 'reconnects with the password typed before the moves; got ' + JSON.stringify(cn.map(e => e.body.password)));
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)), 'and the control is gone');
+  cleanup(env);
+});
+
+test('reconnect strip: a lone pane\'s transfer progress still shows next to the strip', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const st = hangingXhr(win);
+  const inp = a.el.querySelector('[data-upload-input]');
+  Object.defineProperty(inp, 'files', {value: [{name: 'f.txt', size: 4}], configurable: true});
+  fireChange(win, inp);
+  await until(() => st.xhrs.length > 0, 1000);
+  const prog = () => visibleAll(env, '.upload-progress').filter(e => a.el.contains(e));
+  ok(prog().length === 1, 'the upload progress is shown for the lone pane; got ' + prog().length);
+  rcDrop(win, a);
+  await sleep(60);
+  const strip = rcStrip(win, a);
+  ok(rcShown(env, rcCtl(win, a)) && rcShown(env, strip), 'the Reconnect strip is shown');
+  ok(prog().length === 1 || !a.upload, 'a running transfer keeps its progress visible (or the transfer was ended); progress shown: ' + prog().length + ', upload: ' + !!a.upload);
+  ok(!(strip && prog().some(e => strip.contains(e) || e.contains(strip))), 'progress and strip are separate (neither inside the other)');
+  ok(rcButtons(env, a).length === 1, 'one Reconnect button');
+  if (a.upload) win.cancelTransfer(a.id);
+  cleanup(env);
+});
+
+// =====================================================================
+// A control whose action is impossible in the current layout is not
+// shown (owner, 2026-10-06: "the Move to tab button should be removed
+// when there are no other tabs"). Rule (coordinator): structurally
+// impossible -> HIDDEN, not disabled, and back as soon as it becomes
+// possible; transiently unavailable (upload/download while disconnected
+// or during a transfer) -> stays visible and disabled.
+// Written from the request, before the change.
+//
+// Structural cases found by the audit:
+//   [data-act="move-to"] in #paneTools (a lone pane) and in every pane
+//     bar (2+ panes in a tab): "Move to tab" with no other tab.
+//   The tab menu's "Move into tab": with no other tab.
+// Hidden means: .h / [hidden] / display:none on it or an ancestor (the
+// layout model's cascade), so a CSS rule keyed on a body/strip class is
+// as good as a class on the button.
+// =====================================================================
+const moveShown = env => visibleAll(env, '[data-act="move-to"]');
+const intoItem = env => findItem(env, /^Move into tab/i);
+function noMoveAnywhere(env, what) {
+  const v = moveShown(env);
+  ok(v.length === 0, what + ': no "Move to tab" button shown anywhere; shown: ' +
+     show(v.map(b => b.closest('#paneTools') ? '#paneTools' : 'bar of ' + (b.closest('.pane') || {getAttribute: () => '?'}).getAttribute('data-pane'))));
+}
+function tabMenuHasInto(env, tEl) {
+  tabMenu(env.win, tEl);
+  const it = intoItem(env);
+  const items = itemsShown(env).map(itemText);
+  const r = {into: !!it, disabled: !!it && it.getAttribute('aria-disabled') === 'true', items};
+  closeMenusNow(env);
+  return r;
+}
+function closeMenusNow(env) {
+  keyAt(env.win, 'Escape', 'Escape');
+  if (openMenus(env).length) env.win.closeMenus(false);
+}
+
+test('hide: with one tab "Move to tab" is not shown - not in the top bar of a lone pane, not in a pane bar, not in the tab menu', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  ok(toolsShown(env), 'a lone pane: #paneTools shown');
+  const mt = toolBtn(win, 'move-to');
+  ok(!!mt, '#paneTools still has the [data-act="move-to"] button in the DOM (to come back)');
+  ok(!!mt && env.lay.hidden(mt), 'one tab: #paneTools "Move to tab" is hidden; it is ' +
+     (mt ? (mt.disabled ? 'shown, disabled' : 'shown and enabled') : 'missing'));
+  ACTS.forEach(act => ok(!env.lay.hidden(toolBtn(win, act)), 'the other pane actions stay: [data-act=' + act + '] shown'));
+  noMoveAnywhere(env, 'one tab, one pane');
+  const m1 = tabMenuHasInto(env, activeTab(win));
+  ok(!m1.into, 'one tab: the tab menu has no "Move into tab" item (not even a disabled one); items: ' + show(m1.items));
+  ok(m1.items.some(x => /^Rename/i.test(x)) && m1.items.some(x => /^Close/i.test(x)), 'Rename and Close are still in the menu; items: ' + show(m1.items));
+  // A split: two panes, still one tab.
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'split'); cleanup(env); return; }
+  await sleep(30);
+  ok(barShown(env, a) && barShown(env, b), 'two panes: both bars shown');
+  [a, b].forEach(p => {
+    const bar = barOf(p);
+    const mv = bar && bar.querySelector('[data-act="move-to"]');
+    ok(!!mv && env.lay.hidden(mv), p.host + ': the bar\'s "Move to tab" is hidden with one tab; it is ' +
+       (mv ? (env.lay.hidden(mv) ? 'hidden' : (mv.disabled ? 'shown, disabled' : 'shown and enabled')) : 'missing'));
+    const keep = [['Move to new tab', '[data-act="to-tab"]'], ['split', '[title="Split horizontal"]'],
+                  ['split v', '[title="Split vertical"]'], ['close', '[title="Close pane"]'],
+                  ['upload', '[data-upload-btn]'], ['download', '[data-download-btn]']];
+    const gone = keep.filter(([, s]) => env.lay.hidden(bar.querySelector(s))).map(([n]) => n);
+    ok(gone.length === 0, p.host + ': the other bar buttons stay shown (Move to new tab is possible: the tab has 2 panes); hidden: ' + show(gone));
+  });
+  noMoveAnywhere(env, 'one tab, two panes');
+  const m2 = tabMenuHasInto(env, activeTab(win));
+  ok(!m2.into, 'one tab with a split: no "Move into tab" in its menu; items: ' + show(m2.items));
+  // Transient stays disabled, not hidden: a dropped pane's upload/download.
+  win.closePane(b.id);
+  await until(() => paneList(win).length === 1, 500);
+  await sleep(30);
+  rcDrop(win, a);
+  await sleep(50);
+  const up = toolBtn(win, 'upload'), dn = toolBtn(win, 'download');
+  ok(toolsShown(env) && !env.lay.hidden(up) && up.disabled && !env.lay.hidden(dn) && dn.disabled,
+     'disconnected (transient): upload/download stay shown and disabled; upload ' +
+     (env.lay.hidden(up) ? 'hidden' : (up.disabled ? 'disabled' : 'enabled')) + ', download ' + (env.lay.hidden(dn) ? 'hidden' : (dn.disabled ? 'disabled' : 'enabled')));
+  noMoveAnywhere(env, 'one tab, disconnected');
+  cleanup(env);
+});
+
+test('hide: a second tab brings "Move to tab" back at once; closing it again hides it at once (x, middle click, Alt+W)', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'second tab'); cleanup(env); return; }
+  await sleep(30);
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b);
+  const mt = () => toolBtn(win, 'move-to');
+  ok(activeTab(win) === tB && !env.lay.hidden(mt()) && !mt().disabled, 'two tabs, B (lone) in front: #paneTools "Move to tab" shown and enabled');
+  const mB = tabMenuHasInto(env, tB);
+  ok(mB.into && !mB.disabled, 'two tabs: B\'s menu has an enabled "Move into tab"; items: ' + show(mB.items));
+  clickTab(win, tA);
+  await until(() => activeTab(win) === tA, 500);
+  await sleep(20);
+  ok(!env.lay.hidden(mt()), 'A (lone) in front: "Move to tab" shown');
+  // B closes in the background: A in front never changes pane or tab.
+  closeTabX(win, tB);
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && activeTab(win) === tA, 'B closed by its x; A still in front');
+  ok(env.lay.hidden(mt()), 'the other tab closed in the background: A\'s "Move to tab" is hidden at once; it is shown' +
+     (mt().disabled ? ' (disabled)' : ' and enabled'));
+  const mA = tabMenuHasInto(env, tA);
+  ok(!mA.into, 'and A\'s menu lost "Move into tab"; items: ' + show(mA.items));
+  // A split tab in front, another tab closed by a middle click.
+  const a2 = await tSplit(win, a, 'h', 'a2.host');
+  const c = a2 && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'split + third tab'); cleanup(env); return; }
+  clickTab(win, tA);
+  await until(() => activeTab(win) === tA, 500);
+  await sleep(20);
+  const barMv = p => barOf(p) && barOf(p).querySelector('[data-act="move-to"]');
+  ok([a, a2].every(p => !env.lay.hidden(barMv(p))), 'two tabs: both bars of A show "Move to tab"');
+  middleClick(win, tabElOfPane(win, c));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1, 'C closed by a middle click');
+  ok([a, a2].every(p => env.lay.hidden(barMv(p))), 'one tab left: the bars\' "Move to tab" are hidden at once; shown on: ' +
+     show([a, a2].filter(p => !env.lay.hidden(barMv(p))).map(p => p.host)));
+  // The split tab hidden behind a lone tab; the lone tab closed by Alt+W.
+  const d = await tNewTab(win, 'd.host');
+  if (!d) { ok(false, 'tab D'); cleanup(env); return; }
+  await sleep(20);
+  ok(!env.lay.hidden(mt()), 'D (lone) in front, two tabs: "Move to tab" shown');
+  typeIn(win, d, 'KeyW', 'w', {alt: true});
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && activeTab(win) === tA, 'Alt+W closed D; A (split) in front');
+  noMoveAnywhere(env, 'after Alt+W left one tab');
+  ok(!tabMenuHasInto(env, tA).into, 'and no "Move into tab" in A\'s menu');
+  cleanup(env);
+});
+
+test('hide: merging the last other tab away hides "Move to tab"; "Move to new tab" brings it back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !needTools(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  const tA = tabOfPane(a);
+  // B's lone pane by its top-bar "Move to tab" into A.
+  const tb = toolBtn(win, 'move-to');
+  ok(!!tb && !env.lay.hidden(tb), 'two tabs: "Move to tab" shown in the top bar');
+  if (tb) press(win, tb);
+  const err = await chooseTarget(env, null, tabLabel(tabById(win, tA)));
+  ok(!err, 'moved b into A: ' + (err || 'ok'));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && panesOfTab(win, tA).length === 2, 'one tab, two panes');
+  noMoveAnywhere(env, 'after the last other tab was emptied by a move');
+  // "Move to new tab" from a bar: two tabs again.
+  const toTab = barOf(a) && barOf(a).querySelector('[data-act="to-tab"]');
+  if (toTab) press(win, toTab);
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 2, '"Move to new tab": two tabs');
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'a pane moved to a new tab (lone, in front): "Move to tab" shown again');
+  clickTab(win, tabById(win, tabOfPane(b)));
+  await until(() => tabOfPane(b) === tabId(activeTab(win)), 500);
+  await sleep(20);
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'and in the other (lone) tab too');
+  // The tab menu's "Move into tab": the last merge.
+  const into = tabMenuHasInto(env, tabElOfPane(win, a));
+  ok(into.into && !into.disabled, 'two tabs: "Move into tab" in the menu; items: ' + show(into.items));
+  tabMenu(win, tabElOfPane(win, a));
+  const err2 = await chooseTarget(env, /^Move into tab/i, tabLabel(tabElOfPane(win, b)));
+  ok(!err2, 'merged a\'s tab into b\'s by the menu: ' + (err2 || 'ok'));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1, 'one tab after the merge');
+  noMoveAnywhere(env, 'after a merge by the tab menu');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'no "Move into tab" left in the menu');
+  // A tab dragged onto a pane: the hook the drag ends in.
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'tab C'); cleanup(env); return; }
+  await sleep(20);
+  ok(visibleAll(env, '[data-act="move-to"]').length >= 1, 'C opened: "Move to tab" shown');
+  win.mergeTabInto(tabOfPane(c), a.id, 'left');
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  noMoveAnywhere(env, 'after a tab was dragged into the other one (mergeTabInto)');
+  cleanup(env);
+});
+
+test('hide: after a reload "Move to tab" follows the restored tabs - hidden with one, shown with two', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S4); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { ok(false, 'setup'); cleanup(env1); return; }
+  await sleep(50);
+  const snap1 = snapshotStorage(w1);
+  const a2 = await tSplit(w1, a, 'h', 'a2.host');
+  await sleep(50);
+  const snap2 = snapshotStorage(w1);
+  const c = a2 && await tNewTab(w1, 'c.host');
+  await sleep(50);
+  const snap3 = snapshotStorage(w1);
+  cleanup(env1);
+  if (!c) { ok(false, 'setup: split and a second tab'); return; }
+  // One tab, one pane.
+  let env = await mkTabEnv(TAB_PLAN(), snap1, S4); let win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 1, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 1 && toolsShown(env), 'reload, one tab with one pane: pane actions in the top bar');
+  noMoveAnywhere(env, 'reload, one tab with one pane');
+  cleanup(env);
+  // One tab, two panes.
+  env = await mkTabEnv(TAB_PLAN(), snap2, S4); win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 2, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 1 && paneList(win).every(p => barShown(env, p)), 'reload, one tab with a split: both bars shown');
+  noMoveAnywhere(env, 'reload, one tab with a split');
+  cleanup(env);
+  // Two tabs: shown in the lone tab's top bar and in the split tab's bars.
+  env = await mkTabEnv(TAB_PLAN(), snap3, S4); win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 3, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 2, 'reload, two tabs');
+  const pc = paneList(win).find(p => p.host === 'c.host');
+  ok(!!pc && tabOfPane(pc) === tabId(activeTab(win)), 'C (lone) in front');
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'reload, two tabs: "Move to tab" shown in the top bar');
+  const pa = paneList(win).find(p => p.host === 'a.host');
+  if (pa) {
+    clickTab(win, tabElOfPane(win, pa));
+    await until(() => tabOfPane(pa) === tabId(activeTab(win)), 500);
+    await sleep(30);
+  }
+  const shownBars = paneList(win).filter(p => p.host !== 'c.host')
+    .filter(p => { const m = barOf(p) && barOf(p).querySelector('[data-act="move-to"]'); return m && !env.lay.hidden(m); });
+  ok(shownBars.length === 2, 'reload, two tabs: both bars of the split tab show "Move to tab"; shown on ' + shownBars.length);
+  cleanup(env);
+});
+
+
+test('hide: the only tab has no drag - no dimmed tab, no strip change, the press stays a click; with two tabs a drag still reorders', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const a2 = a && await tSplit(win, a, 'h', 'a2.host');
+  if (!needTabs(win) || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  const tA = activeTab(win);
+  const strip0 = $(win, 'tabs').innerHTML, shape0 = show(shapesNow(win));
+  const m = pointer(win);
+  const [x0, y0] = centre(tA);
+  let look = false;
+  const mo = new win.MutationObserver(() => {
+    if (win.document.querySelector('.tab.dragging') || win.document.body.classList.contains('pane-moving')) look = true;
+  });
+  mo.observe(win.document.body, {attributes: true, subtree: true, attributeFilter: ['class']});
+  const lab = tA.querySelector('.tab-label');
+  m.down(lab, x0, y0);
+  m.move(lab, x0 + 30, y0);
+  m.move($(win, 'tabs'), x0 + 80, y0 + 2);
+  // Over its own pane's edge, then released there.
+  const [ex, ey] = edgePoint(a.el, 'left');
+  const into = a.el.querySelector('.pane-term') || a.el;
+  m.move(into, ex, ey);
+  await sleep(700);                       // past the spring delay
+  const zone = win.document.querySelector('.drop-zone-left,.drop-zone-right,.drop-zone-top,.drop-zone-bottom');
+  m.up(into, ex, ey);
+  await sleep(30);
+  mo.disconnect();
+  ok(!look, 'the only tab, pressed and moved: no drag look at any moment (.tab.dragging / body.pane-moving)');
+  ok(!zone, 'no drop zone shown on its own pane');
+  ok($(win, 'tabs').innerHTML === strip0 || tabEls(win).length === 1, 'the strip is as it was');
+  ok(show(shapesNow(win)) === shape0 && tabEls(win).length === 1, 'the layout is unchanged; got ' + show(shapesNow(win)));
+  ok(noDragLeft(win), 'nothing left in a drag state');
+  // The press is still a click: a following click on a pane button is
+  // not swallowed (no "click after drag" block), and a double-click renames.
+  // websh swallows the first click within 400 ms after a real drag.
+  let got = false;
+  const probe = () => { got = true; };
+  lab.addEventListener('click', probe);
+  lab.dispatchEvent(new win.MouseEvent('click', {bubbles: true, cancelable: true, button: 0}));
+  lab.removeEventListener('click', probe);
+  ok(got, 'the next click right after the press-and-move is not swallowed as a "click after a drag"');
+  ok(needRename(env, tA), 'a double-click on the only tab still renames it');
+  // Two tabs: the same gesture drags and reorders.
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'second tab'); cleanup(env); return; }
+  await sleep(30);
+  const tB = tabElOfPane(win, b);
+  const m2 = pointer(win);
+  const [bx, by] = centre(tB);
+  const [ax] = centre(tA);
+  m2.down(tB.querySelector('.tab-label'), bx, by);
+  m2.move(tB.querySelector('.tab-label'), bx - 10, by);
+  const dragging = !!win.document.querySelector('.tab.dragging');
+  m2.move(tA.querySelector('.tab-label'), ax - (tA.getBoundingClientRect().width / 2) + 2, by);
+  m2.up(tA.querySelector('.tab-label'), ax - (tA.getBoundingClientRect().width / 2) + 2, by);
+  await sleep(30);
+  ok(dragging, 'two tabs: the drag look is there');
+  ok(tabEls(win)[0] === tB, 'two tabs: B dragged before A is now first; order ' + show(tabEls(win).map(t => tabLabel(t))));
+  cleanup(env);
+});
+
+test('hide (break): a "Move to tab" menu open when the last other tab goes is closed, and the button is gone', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  // b in front (lone): open its top-bar menu, then A closes by another path.
+  press(win, toolBtn(win, 'move-to'));
+  await until(() => targetItems(env).length >= 1, 300);
+  ok(targetItems(env).length === 1, 'the menu lists A');
+  win.closeTab(tabOfPane(a));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(openMenus(env).length === 0, 'A closed while the menu was open: the menu is gone (not left listing a dead tab or "No other tabs"); menus: ' + show(itemsShown(env).map(itemText)));
+  noMoveAnywhere(env, 'after the other tab closed under an open menu');
+  // The tab menu open when the other tab goes.
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'tab C'); cleanup(env); return; }
+  await sleep(20);
+  tabMenu(win, tabElOfPane(win, b));
+  ok(!!intoItem(env), 'two tabs: "Move into tab" in B\'s menu');
+  win.closeTab(tabOfPane(c));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(20);
+  ok(openMenus(env).length === 0, 'C closed while B\'s menu was open: the menu is gone');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'reopened: no "Move into tab"');
+  cleanup(env);
+});
+
+test('hide (break): "+" then Escape (and a failed connect) creates no tab and never shows "Move to tab"', async () => {
+  const plan = TAB_PLAN();
+  // The third connect fails: c.host is refused.
+  plan.splice(1, 0, {action: 'connect', match: bd => bd && bd.host === 'bad.host', response: {error: 'Authentication failed'}});
+  const env = await mkTabEnv(plan, null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  let flick = [];
+  const mt = toolBtn(win, 'move-to');
+  const watch = () => { if (mt && !env.lay.hidden(mt)) flick.push(tabEls(win).length + ' tabs'); };
+  const mo = new win.MutationObserver(watch);
+  mo.observe(win.document.body, {attributes: true, subtree: true, childList: true});
+  for (let i = 0; i < 3; i++) {
+    press(win, $(win, 'tabNew'));
+    await until(() => !hidden($(win, 'ov')), 500);
+    watch();
+    keyAt(win, 'Escape', 'Escape');
+    await until(() => hidden($(win, 'ov')), 500);
+  }
+  // Alt+T from the terminal, Escape.
+  typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  watch();
+  keyAt(win, 'Escape', 'Escape');
+  await until(() => hidden($(win, 'ov')), 500);
+  // A connect that fails.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'x';
+  win.doConnect();
+  await sleep(300);
+  watch();
+  mo.disconnect();
+  ok(tabEls(win).length === 1, 'still one tab; got ' + tabEls(win).length);
+  ok(flick.length === 0, '"Move to tab" was never shown while no second tab existed; seen with: ' + show(flick.slice(0, 5)));
+  noMoveAnywhere(env, 'after "+"/Escape, Alt+T/Escape and a failed connect');
+  if (!hidden($(win, 'ov'))) { keyAt(win, 'Escape', 'Escape'); win.cancelConnect && win.cancelConnect(); }
+  cleanup(env);
+});
+
+test('hide (break): tabs opened and closed fast, by every path - the button always matches the tab count', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const bad = [];
+  const check = (what) => {
+    const n = tabEls(win).length;
+    const shown = moveShown(env).length;
+    const t = activeTab(win), ps = t ? panesOfTab(win, tabId(t)) : [];
+    const want = n < 2 ? 0 : ps.length;      // lone: 1 in the top bar; split: one per bar
+    if (shown !== want) bad.push(what + ': ' + n + ' tabs, ' + ps.length + ' panes in front, ' + shown + ' shown (want ' + want + ')');
+    const into = tabMenuHasInto(env, t).into;
+    if (into !== (n > 1)) bad.push(what + ': "Move into tab" ' + (into ? 'listed' : 'missing') + ' with ' + n + ' tabs');
+  };
+  const HOW = ['x', 'middle', 'closeTab', 'closePane', 'Alt+W'];
+  let anchor = a;
+  for (let i = 0; i < 10; i++) {
+    const p = await tNewTab(win, 'n' + i + '.host');
+    if (!p) { bad.push('round ' + i + ': no tab'); break; }
+    check('round ' + i + ' opened');
+    if (i % 3 === 1) { await tSplit(win, p, 'v', 's' + i + '.host'); check('round ' + i + ' split'); }
+    // Even rounds close the old tab (from the new one in front), odd the new one (in front).
+    const victim = i % 2 ? tabElOfPane(win, p) : tabElOfPane(win, anchor);
+    const how = HOW[i % HOW.length];
+    if (how === 'x') closeTabX(win, victim);
+    else if (how === 'middle') middleClick(win, victim);
+    else if (how === 'closeTab') win.closeTab(tabId(victim));
+    else if (how === 'closePane') panesOfTab(win, tabId(victim)).forEach(q => win.closePane(q.id));
+    else { if (activeTab(win) !== victim) { clickTab(win, victim); await until(() => activeTab(win) === victim, 300); }
+           typeIn(win, panesOfTab(win, tabId(victim))[0], 'KeyW', 'w', {alt: true}); }
+    await until(() => tabEls(win).length === 1, 500);
+    check('round ' + i + ' closed by ' + how);
+    anchor = paneList(win).find(q => tabOfPane(q) === tabId(tabEls(win)[0]));
+    if (!anchor) { bad.push('round ' + i + ': no pane left'); break; }
+  }
+  ok(bad.length === 0, 'the button and the menu item followed the tab count at every step; wrong: ' + show(bad.slice(0, 6)));
+  cleanup(env);
+});
+
+test('hide (break): a tab dragged onto a pane of the last other tab merges, and the button goes with it', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabOfPane(a) === tabId(activeTab(win)), 500);
+  await sleep(30);
+  ok(moveShown(env).length === 1, 'two tabs, A in front: "Move to tab" in the top bar');
+  const m = grabTab(win, tabElOfPane(win, b));
+  const release = overEdge(m, a, 'right');
+  release();
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && panesOfTab(win, tabOfPane(a)).length === 2, 'B dragged onto A\'s right edge: one tab, two panes; got ' + show(shapesNow(win)));
+  noMoveAnywhere(env, 'after the second-to-last tab was dragged into the last');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'no "Move into tab" in the menu');
+  // And the merged-into tab can no longer be dragged (one tab).
+  const tA = activeTab(win);
+  const m2 = pointer(win); const [x, y] = centre(tA);
+  m2.down(tA.querySelector('.tab-label'), x, y); m2.move(tA.querySelector('.tab-label'), x + 40, y);
+  ok(!win.document.querySelector('.tab.dragging'), 'the now only tab shows no drag look');
+  m2.up(tA.querySelector('.tab-label'), x + 40, y);
+  cleanup(env);
+});
+
 
 // =====================================================================
 // A stray rejection used to take node down mid-run with no summary, so

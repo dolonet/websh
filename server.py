@@ -534,7 +534,20 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     # pane with the old limit and the Scrollback setting did nothing
     # (verified on tmux 3.4). `start-server` first, because `set -g`
     # needs a server and on first use there is none yet.
-    pre = ""
+    #
+    # `hyperlinks`: tmux re-draws each pane for the outer terminal and
+    # drops OSC 8 hyperlinks (Claude Code, `ls --hyperlink`, gcc) unless
+    # that terminal has the feature; xterm.js has it but no terminfo says
+    # so. It is a server-wide option, so it goes into one fixed array
+    # slot - `set -as` would append another copy on every connect to a
+    # long-lived server. Slot 90 is far above tmux's defaults (0-2 in
+    # 3.4) and a user's own `set -as` (which appends after the highest
+    # index, i.e. 91+). It is set before new-session, because a client
+    # takes its features when it attaches; this covers a re-attach and a
+    # tmux server started without websh too. `-q` because tmux < 3.2 has
+    # no such option: the error would abort the whole `\;` chain,
+    # new-session included, and the pane would never come up.
+    pre = ' \\; set -sq "terminal-features[90]" "xterm*:hyperlinks"'
     for opt, val in (tmux_options or ()):
         pre += " \\; set -g " + opt + " " + val
     attach = (tmux_cmd + " start-server" + pre + " \\; new-session -A -D -s " + tname
