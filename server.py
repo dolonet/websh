@@ -991,6 +991,156 @@ def format_client_diag(body):
     return ("WARN" if warn else "INFO"), text
 
 
+# ─── Input latency (/api/client_lat, input_lat) ──────────────────────
+# "What I type shows up late" needs numbers from real use, split by
+# stage. The page measures queue / rtt / echo / paint / total per input
+# batch and reports a summary every 5 minutes (websh.js "Input latency");
+# Handler._client_lat turns it into ONE log line. The server measures its
+# own part per session - handler → PTY write (`srv`) and PTY write → the
+# next PTY output (`pty`: target + ssh + tmux + the application, no
+# browser, no network) - and logs an `input_lat` line per session that
+# had input in the window. All of it is timestamps and a few bounded
+# sample lists: nothing on the input path allocates per keystroke beyond
+# one float in a list, and nothing here can delay or reorder a write.
+CLIENT_LAT_MAX = 30               # reports per IP per window
+CLIENT_LAT_WINDOW = 600
+CLIENT_LAT_KEYS = ("queue", "rtt", "echo", "paint", "total")
+LAT_ECHO_WINDOW = 2.0             # output later than this is not an echo
+LAT_SAMPLES_MAX = 2000            # samples kept per stage per window
+_client_lat_limits = {}
+_client_lat_lock = Lock()
+
+
+def _lat_interval():
+    """Seconds between input_lat summaries (WEBSH_INPUT_LAT_INTERVAL;
+    tests set it short). Default 300."""
+    try:
+        v = float(_knob("WEBSH_INPUT_LAT_INTERVAL", 300))
+    except (TypeError, ValueError):
+        v = 300.0
+    return v if v > 0 else 300.0
+
+
+INPUT_LAT_WINDOW = _lat_interval()
+_input_lat_last = time.monotonic()     # when the current window began
+_lat_create_lock = Lock()
+
+
+def _lat_word(v):
+    """A word field of a latency report: -1 when absent, else as
+    _diag_word."""
+    return "-1" if v is None else _diag_word(v)
+
+
+def _lat_triplet(d):
+    """'p50/p90/max' from a report's stage dict; -1 for what is missing."""
+    if not isinstance(d, dict):
+        d = {}
+    return "{}/{}/{}".format(_diag_int(d.get("p50")), _diag_int(d.get("p90")),
+                             _diag_int(d.get("max")))
+
+
+def format_client_lat(body):
+    """(level, text) for a client_lat report body (a dict). WARN when a
+    pane's total p90 is over 300 ms or its slowest batch over 1 s."""
+    panes = body.get("panes")
+    if not isinstance(panes, list):
+        panes = []
+    parts = []
+    warn = False
+    for d in panes[:CLIENT_DIAG_MAX_PANES]:
+        if not isinstance(d, dict):
+            continue
+        worst = d.get("worst")
+        if not isinstance(worst, dict):
+            worst = {}
+        total = d.get("total")
+        if not isinstance(total, dict):
+            total = {}
+        if (_diag_int(total.get("p90")) > 300
+                or _diag_int(worst.get("total")) > 1000):
+            warn = True
+        sealed = d.get("sealed")
+        parts.append(
+            "[sid={} mode={} sealed={} n={} n_echo={} slow={} {} "
+            "worst queue/rtt/echo/paint/total={} inflight_max={}]".format(
+                _lat_word(d.get("sid")), _lat_word(d.get("mode")),
+                _diag_int(sealed) if isinstance(sealed, bool) else -1,
+                _diag_int(d.get("n")), _diag_int(d.get("n_echo")),
+                _diag_int(d.get("slow")),
+                " ".join("{} p50/p90/max={}".format(k, _lat_triplet(d.get(k)))
+                         for k in CLIENT_LAT_KEYS),
+                "/".join(str(_diag_int(worst.get(k))) for k in CLIENT_LAT_KEYS),
+                _diag_int(d.get("inflight_max"))))
+    text = "window_ms={} vis={} panes={} {}".format(
+        _diag_int(body.get("window_ms")), _lat_word(body.get("vis")),
+        len(parts), " ".join(parts)).rstrip()
+    return ("WARN" if warn else "INFO"), text
+
+
+def _lat_add(samples, seen, v):
+    """Keep at most LAT_SAMPLES_MAX of `seen` values: a reservoir, so a
+    long burst of typing still gives a fair p50/p90 (max is kept apart)."""
+    if len(samples) < LAT_SAMPLES_MAX:
+        samples.append(v)
+    else:
+        j = int.from_bytes(os.urandom(4), "little") % seen
+        if j < LAT_SAMPLES_MAX:
+            samples[j] = v
+
+
+def _lat_pcts(samples, mx):
+    """'p50/p90/max' in integer ms; -1/-1/-1 for no samples."""
+    if not samples:
+        return "-1/-1/-1"
+    s = sorted(samples)
+    n = len(s)
+    pick = lambda q: int(round(s[min(n - 1, max(0, -(-n * q // 100) - 1))]))
+    return "{}/{}/{}".format(pick(50), pick(90), int(round(mx)))
+
+
+class _LatWindow(object):
+    """One session's input-latency samples since the last summary."""
+    __slots__ = ("lock", "n", "srv", "srv_max", "pty", "pty_n", "pty_max")
+
+    def __init__(self):
+        self.lock = Lock()
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.srv = []
+        self.srv_max = 0.0
+        self.pty = []
+        self.pty_n = 0
+        self.pty_max = 0.0
+
+
+def input_lat_flush():
+    """Log one input_lat line per session that had input since the last
+    flush, and start a new window. cleanup() calls it once
+    INPUT_LAT_WINDOW seconds have passed (so a line comes at most one
+    cleanup tick, 30 s, after the window ends)."""
+    global _input_lat_last
+    _input_lat_last = time.monotonic()
+    with sessions_lock:
+        current = list(sessions.values())
+    for s in current:
+        w = getattr(s, "_lat", None)
+        if w is None:
+            continue
+        with w.lock:
+            if not w.n:
+                continue
+            n, srv, srv_max = w.n, w.srv, w.srv_max
+            pty, pty_n, pty_max = w.pty, w.pty_n, w.pty_max
+            w.reset()
+        _log("INFO", "input_lat sid={} n={} srv p50/p90/max={} "
+             "pty p50/p90/max={} pty_n={}".format(
+                 str(getattr(s, "id", ""))[:8], n, _lat_pcts(srv, srv_max),
+                 _lat_pcts(pty, pty_max), pty_n))
+
+
 # ─── Rate limiting ──────────────────────────────────────────────────
 
 _rate_limits = {}  # IP -> list of timestamps
@@ -2076,6 +2226,11 @@ class SSHSession(object):
     # methods early-return via `if self.master_fd < 0: return` instead of
     # swallowing OSError/ValueError from a stale fd via broad try/except.
     master_fd = -1
+    # Input latency (see "Input latency" above): the samples since the
+    # last input_lat line, and when the oldest input not yet followed by
+    # PTY output was written (0.0: none waiting).
+    _lat = None
+    _lat_wait = 0.0
 
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
@@ -2481,6 +2636,8 @@ class SSHSession(object):
                         break
                     if not data:
                         break
+                    if self._lat_wait:
+                        self.lat_note_output()
                     self._record("o", data)
 
                     # Auto-type password on prompt (accumulate to handle split reads)
@@ -2991,6 +3148,59 @@ class SSHSession(object):
         except OSError:
             self.alive = False
             return False
+
+    def _lat_window(self):
+        w = self._lat
+        if w is None:
+            with _lat_create_lock:
+                w = self._lat
+                if w is None:
+                    w = self._lat = _LatWindow()
+        return w
+
+    def lat_before_write(self):
+        """Called just BEFORE an input batch goes to the PTY: the first
+        write not yet followed by output starts the `pty` clock here.
+        Not after the write - a fast echo can be read by the reader
+        thread before os.write() returns, and the clock would then wait
+        for the NEXT output and book it to this key. Under the window's
+        lock, which lat_note_output takes too."""
+        w = self._lat_window()
+        now = time.monotonic()
+        with w.lock:
+            if (not self._lat_wait
+                    or now - self._lat_wait > LAT_ECHO_WINDOW):
+                self._lat_wait = now
+
+    def lat_note_input(self, t_recv, t_written):
+        """One input batch reached the PTY: `srv` is how long the handler
+        took to get it there (monotonic seconds)."""
+        w = self._lat_window()
+        with w.lock:
+            w.n += 1
+            ms = (t_written - t_recv) * 1000.0
+            _lat_add(w.srv, w.n, ms)
+            if ms > w.srv_max:
+                w.srv_max = ms
+
+    def lat_note_output(self):
+        """The PTY produced output after an input: one `pty` sample, if
+        it came within LAT_ECHO_WINDOW (else the input had no echo)."""
+        w = self._lat
+        if w is None:
+            self._lat_wait = 0.0
+            return
+        with w.lock:
+            # The time is read under the lock: read before it, a clock
+            # started meanwhile by lat_before_write would look negative.
+            dt = time.monotonic() - self._lat_wait
+            self._lat_wait = 0.0
+            if 0 <= dt <= LAT_ECHO_WINDOW:
+                w.pty_n += 1
+                ms = dt * 1000.0
+                _lat_add(w.pty, w.pty_n, ms)
+                if ms > w.pty_max:
+                    w.pty_max = ms
 
     def resize(self, cols, rows):
         self.last_activity = time.time()
@@ -3578,7 +3788,9 @@ class SSHSession(object):
             'printf "PWD:%s\\0" "$PWD"; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '
-              'if [ -L "$f" ]; then t=l; '
+              # A link to a directory is "L" here (sent as type "l" +
+              # "dir": true): the browser lists and opens it as a folder.
+              'if [ -L "$f" ]; then if [ -d "$f" ]; then t=L; else t=l; fi; '
               'elif [ -d "$f" ]; then t=d; '
               'elif [ -f "$f" ]; then t=f; '
               'else t=o; fi; '
@@ -3615,13 +3827,17 @@ class SSHSession(object):
             if len(parts) != 4 or not parts[3]:
                 continue
             ftype, size_s, mtime_s, name = parts
-            entries.append({
+            entry = {
                 "name": name,
-                "type": ftype,
+                "type": "l" if ftype == "L" else ftype,
                 "size": int(size_s) if size_s.isdigit() else 0,
                 "mtime": int(mtime_s) if mtime_s.isdigit() else 0,
-            })
-        entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
+            }
+            if ftype == "L":
+                entry["dir"] = True     # a symlink whose target is a directory
+            entries.append(entry)
+        entries.sort(key=lambda e: (not (e["type"] == "d" or e.get("dir")),
+                                    e["name"].lower()))
         return entries, abs_path, None
 
     def remove_path(self, abs_path):
@@ -3867,12 +4083,19 @@ def cleanup():
     _prune_stale(_rate_limits, _rate_lock, now - RATE_LIMIT_WINDOW)
     _prune_stale(_client_diag_limits, _client_diag_lock,
                  now - CLIENT_DIAG_WINDOW)
+    _prune_stale(_client_lat_limits, _client_lat_lock,
+                 now - CLIENT_LAT_WINDOW)
     _prune_stale(_side_channel_rate_limits, _side_channel_rate_lock,
                  now - SIDE_CHANNEL_RATE_WINDOW)
     # Scan-pattern values are (ts, host) tuples, not bare timestamps.
     _prune_stale(_scan_pattern, _scan_pattern_lock,
                  now - SCAN_PATTERN_WINDOW, ts_of=lambda e: e[0])
     _sealed_prune()
+    if time.monotonic() - _input_lat_last >= INPUT_LAT_WINDOW:
+        try:
+            input_lat_flush()
+        except Exception as e:
+            _log("WARN", "input_lat summary failed: {}".format(e))
 
 
 def _cleanup_loop():
@@ -4524,6 +4747,7 @@ class Handler(BaseHTTPRequestHandler):
         "mv":              "_mv",
         "save":            "_save_credential",
         "client_diag":     "_client_diag",
+        "client_lat":      "_client_lat",
         "seal_open":       "_seal_open",
         "sealed":          "_sealed",
         # Compatibility with the bundled frontend in Python-only mode.
@@ -5416,6 +5640,7 @@ class Handler(BaseHTTPRequestHandler):
     # ── I/O endpoints (input / output / stream / resize) ────────────
 
     def _input(self):
+        t_recv = time.monotonic()      # input_lat `srv` starts here
         # The one JSON handler that used to parse its own body: a valid-
         # JSON non-object ([1,2], "str") reached body.get() outside the
         # try and the AttributeError dropped the connection with no
@@ -5434,7 +5659,24 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, str):
                 self._json({"error": "data must be a string"}, 400)
                 return
+            # Measurement must never fail or hold a keystroke: a session
+            # object without the hooks, or any error in them, just goes
+            # unmeasured.
+            if data:
+                before = getattr(session, "lat_before_write", None)
+                if before is not None:
+                    try:
+                        before()
+                    except Exception:
+                        pass
             ok = session.write(data.encode("utf-8"))
+            if ok and data:
+                note = getattr(session, "lat_note_input", None)
+                if note is not None:
+                    try:
+                        note(t_recv, time.monotonic())
+                    except Exception:
+                        pass
             if ok and session.alive and not session.auth_failed \
                     and data.strip():
                 # A real keystroke into a session that did not fail auth
@@ -6479,6 +6721,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         level, text = format_client_diag(body)
         _log(level, "client diag from {}: {}".format(ip, text))
+        self._json({"ok": True})
+
+    def _client_lat(self):
+        """POST /api/client_lat - a page's input-latency report (see
+        format_client_lat and websh.js "Input latency"): one bounded log
+        line. Like client_diag it reads JSON whatever the media type (the
+        report at pagehide is a sendBeacon, text/plain); it is allowed
+        inside the sealed channel, where it arrives as JSON."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = -1
+        if n < 0 or n > CLIENT_DIAG_MAX_BODY:
+            self._json({"error": "bad size"}, 413 if n > 0 else 400)
+            return
+        try:
+            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else None
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            self._json({"error": "invalid json"}, 400)
+            return
+        ip = self._client_ip()
+        if not _rate_limit_take(_client_lat_limits, _client_lat_lock, ip,
+                                CLIENT_LAT_MAX, CLIENT_LAT_WINDOW):
+            _access_log_emit("client_lat", ip, result="rate_limited")
+            self._json({"error": "rate limited"}, 429)
+            return
+        level, text = format_client_lat(body)
+        _log(level, "client_lat from {}: {}".format(ip, text))
+        _access_log_emit("client_lat", ip, result="ok")
         self._json({"ok": True})
 
     # ── Disconnect ──────────────────────────────────────────────────

@@ -4251,6 +4251,7 @@ function notePaneRendered(p) {
   p.unrenderedSince = 0;
   p.paintStage = 0;
   if (p.paintTimer) { clearTimeout(p.paintTimer); p.paintTimer = null; }
+  if (p.latPaint) latOnRender(p);      // ── Input latency
 }
 
 // xterm finished a parse slice.
@@ -4583,6 +4584,7 @@ function handleOutputPayload(p, r, sid) {
     for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i);
     p.term.write(bytes);
     notePaneWritten(p);       // ── Paint guard
+    if (p.latPend && p.latPend.length) latOnOutput(p);   // ── Input latency
     // Keep a short tail of decoded output only while we're still
     // within the tmux-death detection window on a persistent pane.
     if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
@@ -5102,7 +5104,9 @@ function queueInput(p, data) {
     if (!p.connecting || !p.persistent) return;
   }
   p.inputQueuedAt = Date.now();     // freshness of the NEWEST key
+  if (!p.inputQueue.length || !p.latKeyAt) p.latKeyAt = latNow();   // ── Input latency
   p.inputQueue.push(data);
+  latNoteDepth(p);
   if(!p.flushTimer && !p.inputInFlight) p.flushTimer = setTimeout(() => flushInput(p), 10);
 }
 
@@ -5134,8 +5138,9 @@ function flushInput(p) {
     parts = takeSealedHeld(p);
   }
   if (p.inputQueue.length) {
-    parts.push({d: p.inputQueue.join(''), at: Date.now(), sid: p.sid});
+    parts.push({d: p.inputQueue.join(''), at: Date.now(), sid: p.sid, k: p.latKeyAt || latNow()});
     p.inputQueue = [];
+    p.latKeyAt = 0;
   }
   if (!parts.length) return;
   let d = parts.map(x => x.d).join('');
@@ -5165,6 +5170,7 @@ function discardUnconfirmedInput(p, sid) {
 
 function sendInputBatch(p, sid, d, attempt, parts) {
   if (!parts) parts = [{d: d, at: Date.now(), sid: sid}];
+  let lat = latBatch(parts);   // ── Input latency: one per batch, across resends
   let token = {};
   p.inputInFlight = token;
   let settled = false;
@@ -5191,10 +5197,12 @@ function sendInputBatch(p, sid, d, attempt, parts) {
       discardUnconfirmedInput(p, sid);
     }
     if (ctl) { try { ctl.abort(); } catch (e) {} }
+    latDrop(p, lat);
     if (!sent && d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
     release();
     kickOutput(p);
   }, stallMs);
+  latSent(p, lat);
   api('input',{body:{session_id:sid,data:d}, signal: ctl ? ctl.signal : undefined}).then(r => {
     if (!settled && r && r._status === 404 && r.error) {
       // The session is gone. Someone else may have noticed first (the
@@ -5204,6 +5212,7 @@ function sendInputBatch(p, sid, d, attempt, parts) {
       // reset cannot touch them; before release().
       if (p.sid === sid) inputSaysSessionGone(p, r, sid);
       if (p.persistent && (p.connecting || p.sid)) holdInput(p, d);
+      latDrop(p, lat);
       release();
       return;
     }
@@ -5214,6 +5223,7 @@ function sendInputBatch(p, sid, d, attempt, parts) {
     if (!settled && r && r.code === 'sealed_unavailable' && p.sid === sid) {
       settled = true; clearTimeout(stall);
       if (p.inputInFlight === token) p.inputInFlight = null;
+      latDrop(p, lat);
       p.sealHeld = parts.concat(p.sealHeld || []);
       if (!p.flushTimer) p.flushTimer = setTimeout(() => flushInput(p), Math.max(250, _sealWaitMs()));
       return;
@@ -5230,12 +5240,211 @@ function sendInputBatch(p, sid, d, attempt, parts) {
       setTimeout(() => sendInputBatch(p, sid, d, attempt + 1, parts), 200 * (attempt + 1));
       return;
     }
+    if (!settled && r && !r.error) latReplied(p, lat); else latDrop(p, lat);
     release();
   }, e => {
     if (!settled && e && e.sealedDeliveryUnknown) discardUnconfirmedInput(p, sid);
+    latDrop(p, lat);
     release();
   });
 }
+
+// ── Input latency ───────────────────────────────────────────────────
+// "What I type shows up late" needs numbers from real use, by stage.
+// Per input batch (one /api/input), on performance.now():
+//   queue  first key (onData) -> the request sent (behind one in flight,
+//          held, resent)
+//   rtt    sent -> its reply
+//   echo   sent -> the first output for the pane arriving afterwards
+//          (SSE or long-poll); none within LAT_ECHO_MS = "no echo"
+//          (a password, a silent command): out of echo/paint/total
+//   paint  that arrival -> xterm's next render of the pane
+//   total  first key -> that render: what the user feels
+// Every LAT_INTERVAL_MS (window.WEBSH_LAT_INTERVAL_MS, read at load;
+// 5 min) a page that sent input reports p50/p90/max per stage per pane,
+// the slowest batch's breakdown and the deepest input queue, through
+// api() - so sealed when sealed mode is on (then only over a channel
+// that is already open: a report never opens one, never shows a toast).
+// At pagehide what is left goes as a beacon, plain mode only. Numbers
+// and short words; no keys, no output. A failed or rate-limited report
+// is dropped; a 404 (a server without the action) stops reports for the
+// page. The hot path only stores timestamps: this never delays, reorders
+// or holds a key (I1-I4). Server side: format_client_lat, input_lat.
+const LAT_ECHO_MS = 2000;
+const LAT_SLOW_MS = 300;
+const LAT_SAMPLES_MAX = 2000;
+const LAT_STAGES = ['queue', 'rtt', 'echo', 'paint', 'total'];
+const LAT_INTERVAL_MS = (() => {
+  try { let v = Number(window.WEBSH_LAT_INTERVAL_MS); if (v > 0) return v; } catch (e) {}
+  return 300000;
+})();
+let _latStats = [];          // stats objects with samples in this window
+let _latOff = false;         // the server does not know client_lat
+let _latWindowAt = Date.now();
+
+function latNow() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+function latStatsOf(p) {
+  let st = p.latStats;
+  if (!st) {
+    st = p.latStats = {pane: p, sid: '', mode: '', n: 0, n_echo: 0, slow: 0, depth: 0,
+                       s: {queue: [], rtt: [], echo: [], paint: [], total: []},
+                       mx: {queue: 0, rtt: 0, echo: 0, paint: 0, total: 0},
+                       worst: null, wkey: -1, listed: false};
+  }
+  if (!st.listed) { st.listed = true; _latStats.push(st); }
+  return st;
+}
+
+// Requests in flight or queued for this pane right now (I1: at most one
+// in flight; the queue becomes one request; batches held by sealed mode).
+function latNoteDepth(p) {
+  let depth = (p.inputInFlight ? 1 : 0) + (p.sealHeld ? p.sealHeld.length : 0) + 1;
+  let st = latStatsOf(p);
+  if (depth > st.depth) st.depth = depth;
+}
+
+function latBatch(parts) {
+  if (parts.lat) return parts.lat;
+  let k = Infinity;
+  for (let i = 0; i < parts.length; i++) if (parts[i].k && parts[i].k < k) k = parts[i].k;
+  return (parts.lat = {k: k === Infinity ? latNow() : k, s: 0, r: 0, e: 0, t: 0});
+}
+
+function latSent(p, m) {
+  m.s = latNow(); m.r = m.e = m.t = 0;
+  m.mode = paneTransport(p);
+  let q = p.latPend || (p.latPend = []);
+  if (q.indexOf(m) < 0) { q.push(m); if (q.length > 8) q.shift(); }
+  latSweep(p, m.s);
+}
+
+function latReplied(p, m) { m.r = latNow(); latSweep(p, m.r); }
+
+function latDrop(p, m) {
+  let q = p.latPend, i = q ? q.indexOf(m) : -1;
+  if (i >= 0) q.splice(i, 1);
+}
+
+// Output reached the pane (handleOutputPayload): the echo of every
+// batch sent in the last LAT_ECHO_MS that has none yet.
+function latOnOutput(p) {
+  let now = latNow(), q = p.latPend;
+  for (let i = 0; i < q.length; i++) {
+    let m = q[i];
+    if (!m.e && now - m.s <= LAT_ECHO_MS) { m.e = now; p.latPaint = true; }
+  }
+}
+
+// xterm rendered the pane with nothing left unparsed (notePaneRendered).
+function latOnRender(p) {
+  p.latPaint = false;
+  let now = latNow(), q = p.latPend || [];
+  for (let i = 0; i < q.length; i++) if (q[i].e && !q[i].t) q[i].t = now;
+  latSweep(p, now);
+}
+
+// Record the batches whose outcome is known.
+function latSweep(p, now) {
+  let q = p.latPend;
+  if (!q || !q.length) return;
+  for (let i = 0; i < q.length; ) {
+    let m = q[i], done = false;
+    if (!m.r) done = now - m.s > 60000;                 // never answered: forget
+    else if (m.t) { latRecord(p, m, true); done = true; }
+    else if (m.e) { if (now - m.e > LAT_ECHO_MS) { latRecord(p, m, false); done = true; } }
+    else if (now - m.s > LAT_ECHO_MS) { latRecord(p, m, false); done = true; }
+    if (done) q.splice(i, 1); else i++;
+  }
+}
+
+function latRecord(p, m, painted) {
+  let st = latStatsOf(p);
+  st.sid = String(p.sid || st.sid || '').slice(0, 8);
+  // The transport the pane used in this window (as each batch went
+  // out), not its state when the report goes out: at pagehide the
+  // browser has already closed the stream.
+  if (st.mode !== 'sse') st.mode = m.mode || paneTransport(p);
+  // A batch recorded at pagehide may have no reply yet (rtt -1).
+  let v = {queue: m.s - m.k, rtt: m.r ? m.r - m.s : -1, echo: m.e ? m.e - m.s : -1,
+           paint: painted ? m.t - m.e : -1, total: painted ? m.t - m.k : -1};
+  st.n++;
+  if (v.echo >= 0) st.n_echo++;
+  if (v.total > LAT_SLOW_MS) st.slow++;
+  for (let i = 0; i < LAT_STAGES.length; i++) {
+    let k = LAT_STAGES[i], x = v[k];
+    if (x < 0) continue;
+    x = Math.max(0, x);
+    let a = st.s[k];
+    if (a.length < LAT_SAMPLES_MAX) a.push(x);
+    else { let j = Math.floor(Math.random() * st.n); if (j < LAT_SAMPLES_MAX) a[j] = x; }
+    if (x > st.mx[k]) st.mx[k] = x;
+  }
+  let key = v.total >= 0 ? v.total : v.queue + v.rtt;
+  if (key > st.wkey) { st.wkey = key; st.worst = v; }
+}
+
+function latPcts(a, mx) {
+  if (!a.length) return {p50: -1, p90: -1, max: -1};
+  let s = a.slice().sort((x, y) => x - y), n = s.length;
+  let pick = q => Math.round(s[Math.min(n - 1, Math.max(0, Math.ceil(n * q / 100) - 1))]);
+  return {p50: pick(50), p90: pick(90), max: Math.round(mx)};
+}
+
+function latPaneReport(st) {
+  let d = {sid: st.sid || '-', mode: st.mode || paneTransport(st.pane), sealed: sealedOn(),
+           n: st.n, n_echo: st.n_echo, slow: st.slow, worst: {}, inflight_max: st.depth};
+  LAT_STAGES.forEach(k => {
+    d[k] = latPcts(st.s[k], st.mx[k]);
+    let w = st.worst ? st.worst[k] : -1;
+    d.worst[k] = w >= 0 ? Math.round(w) : -1;
+  });
+  return d;
+}
+
+function latReport(leaving) {
+  try {
+    if (_latOff) return;
+    let now = latNow();
+    Object.values(panes).forEach(p => {
+      if (!p || !p.latPend || !p.latPend.length) return;
+      latSweep(p, now);
+      // Leaving: the batches still waiting for their reply, echo or
+      // render will never finish here. Count them with the stages
+      // already known (n; n_echo if the echo came; total if painted).
+      if (leaving) { p.latPend.forEach(m => latRecord(p, m, !!m.t)); p.latPend = []; }
+    });
+    let list = _latStats.filter(st => st.n > 0);
+    if (!list.length) return;
+    // Sealed: only over a channel that is already open (a report never
+    // opens one or shows its toast), and never as a plain beacon.
+    if (sealedOn() && (leaving || !_seal)) return;
+    let body = {window_ms: Math.round(Date.now() - _latWindowAt),
+                vis: document.visibilityState, panes: list.slice(0, 16).map(latPaneReport)};
+    _latStats.forEach(st => {
+      st.listed = false; st.n = st.n_echo = st.slow = st.depth = 0; st.mode = '';
+      st.worst = null; st.wkey = -1;
+      LAT_STAGES.forEach(k => { st.s[k] = []; st.mx[k] = 0; });
+    });
+    _latStats = [];
+    _latWindowAt = Date.now();
+    let json = JSON.stringify(body);
+    if (leaving) {
+      let url = `${API}?action=client_lat`;
+      if (typeof navigator !== 'undefined' && navigator.sendBeacon) navigator.sendBeacon(url, json);
+      else fetch(url, {method: 'POST', body: json, keepalive: true,
+                       headers: {'Content-Type': 'application/json'}}).catch(() => {});
+      return;
+    }
+    api('client_lat', {body: body}).then(r => {
+      if (r && r._status === 404) _latOff = true;
+    }, () => {});
+  } catch (e) {}
+}
+setInterval(() => latReport(false), LAT_INTERVAL_MS);
+window.addEventListener('pagehide', () => latReport(true));
 
 // ── Unified connect ─────────────────────────────────────────────────
 // opts = { label, host, port, user, connection, auth, password, key, keyPass,
@@ -8385,7 +8594,8 @@ function renderFbEntries(entries, absPath) {
   }
   for (let e of sortFbEntries(entries)) {
     let fullPath = absPath.endsWith('/') ? absPath + e.name : absPath + '/' + e.name;
-    let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null, e.mtime);
+    let row = makeFbRow(e.type, e.name, fbIsDir(e) ? null : e.size, e.mtime,
+                        {dirLink: fbIsDir(e) && e.type === 'l'});
     // While a row is showing an inline editor (delete-confirm or rename)
     // it stops being a download/navigate target — otherwise the click
     // that lands next to the editor would act on the row underneath.
@@ -8394,7 +8604,9 @@ function renderFbEntries(entries, absPath) {
           row.classList.contains('fb-edit')) return;
       fn();
     });
-    if (e.type === 'd') {
+    if (fbIsDir(e)) {
+      // A link to a folder opens at the link's own path: the breadcrumbs
+      // show it, and Up goes back to the folder the link is in.
       activate(() => loadFbDir(fullPath));
     } else {
       activate(() => {
@@ -8443,10 +8655,23 @@ function makeFbRowKeyboardable(row) {
   });
 }
 
+// A folder, or a symlink whose target is one (the server's "dir": true;
+// the owner's ~/job/<name> -> an rclone mount was listed with the files
+// and a click downloaded it). Such a link is shown, sorted and opened as
+// a folder; delete and rename still act on the link only (type stays
+// "l"). A link to a file and a dangling link are unchanged.
+function fbIsDir(e) {
+  return e.type === 'd' || (e.type === 'l' && e.dir === true);
+}
+function fbRowIsDir(row) {
+  return row.dataset.type === 'd' || row.dataset.dirlink === '1';
+}
+
 function makeFbRow(type, name, size, mtime, o) {
   let row = document.createElement('div');
   row.className = 'fb-row';
-  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
+  let dirLink = !!(o && o.dirLink);
+  let icon = ic(type === 'd' || dirLink ? 'folder' : type === 'l' ? 'link' : 'file');
   let sizeStr = '';
   if (size !== null && size !== undefined) {
     if (size < 1024) sizeStr = size + ' B';
@@ -8458,11 +8683,14 @@ function makeFbRow(type, name, size, mtime, o) {
   // the metadata columns. The ".." row gets no buttons, but the empty
   // group keeps its width so the size/date columns stay aligned.
   row.dataset.type = type;
+  if (dirLink) { row.dataset.dirlink = '1'; row.title = 'Link to a folder'; }
   row.innerHTML =
     (o && o.noActions ? '<span class="fb-ck-sp" style="width:14px;flex-shrink:0"></span>'
                       : '<input type="checkbox" class="fb-ck" tabindex="-1">') +
     '<span class="fb-ic">' + icon + '</span>' +
-    '<span class="fb-nm">' + esc(name) + '</span>' +
+    '<span class="fb-nm">' + esc(name) +
+      (dirLink ? '<span class="fb-lnk" title="Link to a folder">' + ic('link') + '</span>' : '') +
+    '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
     '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
     '<span class="fb-act"></span>';
@@ -8524,7 +8752,7 @@ function sortFbEntries(entries) {
     mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
   }[settings.fbSort];
   return entries.slice().sort((a, b) => {
-    let ad = a.type === 'd' ? 0 : 1, bd = b.type === 'd' ? 0 : 1;
+    let ad = fbIsDir(a) ? 0 : 1, bd = fbIsDir(b) ? 0 : 1;
     if (ad !== bd) return ad - bd;
     if (!cmp) return byName(a, b) * dir;
     // Ties broken by name ascending regardless of `dir`, so equal sizes
@@ -8859,7 +9087,7 @@ function syncFbSel() {
   let files = 0, dirs = 0;
   for (let row of fbVisibleRows()) {
     if (!_fbSel.has(row.dataset.name)) continue;
-    if (row.dataset.type === 'd') dirs++; else files++;
+    if (fbRowIsDir(row)) dirs++; else files++;
   }
   let parts = [];
   if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
@@ -8934,8 +9162,7 @@ function fbSelected(kind) {
   let dir = _fbCurPath;
   return fbVisibleRows()
     .filter(r => _fbSel.has(r.dataset.name))
-    .filter(r => !kind || (kind === 'f' ? r.dataset.type !== 'd'
-                                        : r.dataset.type === 'd'))
+    .filter(r => !kind || (kind === 'f' ? !fbRowIsDir(r) : fbRowIsDir(r)))
     .map(r => ({name: r.dataset.name, type: r.dataset.type, row: r,
                 path: (dir === '/' ? '' : dir) + '/' + r.dataset.name}));
 }

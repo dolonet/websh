@@ -42,6 +42,17 @@ ssh login eats them - hence the input gate).
 Guard: frontend `input: keys …` (five tests); e2e `away`, which must
 pass repeatedly (`--repeat 10`), since every one of these was a race.
 
+**I5. Measuring input latency changes nothing about input.** The
+page times every `/api/input` batch (queue, rtt, echo, paint, total)
+and the server its own part (`srv`, `pty`) for the `client_lat` report
+and the `input_lat` log line. Measurement only stores timestamps in
+bounded lists: no key is delayed, held, reordered or resent because of
+it, and a report that fails, is rate-limited (429) or meets an old
+server (404: reports stop for the page) is dropped silently - never
+retried in a loop, never shown, never opens a sealed channel.
+Guard: backend and frontend `client_lat` / `input_lat` tests
+(`scripts/codemap.py lat`); I1-I4's guards unchanged.
+
 ## Output
 
 **O1. Output is read by cursor and never consumed by a reader.** Any
@@ -382,6 +393,18 @@ changes the width the Reconnect control must leave free (U8): its
 measurement must follow it. Guard: frontend `hide: …`, `hide (break):
 …`; e2e `tabhide` (hit-tested, 560 px), `reconnectbreak` (a second tab
 opened while a split pane is disconnected).
+
+**U11. A symlink to a folder is a folder in the file browser.** The
+owner (2026-10-23): "I don't see mounted folders" - ~/job/БЮ_ОптРеш, a
+symlink into an rclone FUSE mount, was listed as type "l", sorted among
+the 128 files of ~/job with a link icon, and a click started a download.
+What must hold: an entry `{"type": "l", "dir": true}` (the server marks a
+link whose target is a directory) is sorted with the folders, has the
+folder icon, is marked as a link, and opens on click at the LINK's path
+(".." goes back to the folder holding it); a link to a file and a
+dangling link behave as before; Delete and Rename act on the link only,
+never on its target. Guard: backend `test_fb_links.py`; frontend
+`test_fb_links.js`; e2e `fblinks` (sealed mode off and on).
 
 ## Server lifecycle
 
