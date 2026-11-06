@@ -352,6 +352,141 @@ function applyTheme(name) {
   SEARCH_OPTS.decorations = Object.assign({}, t.search);
 }
 
+// Links in the terminal. Two kinds reach a click: plain-text URLs found
+// by WebLinksAddon, and OSC 8 hyperlinks a program prints (Claude Code,
+// `ls --hyperlink`, gcc: `ESC]8;;URL ESC\ text ESC]8;; ESC\`), which
+// xterm.js hands to the Terminal's `linkHandler`. Without one, xterm
+// answers every OSC 8 click with a confirm() "WARNING" dialog and never
+// shows where the link goes - and the text of such a link can differ
+// from its target. So: hovering shows the real target (as text, never
+// HTML), and a click opens it the way plain URLs open (new tab, opener
+// cut) - but only http(s). A program on the remote host chooses the
+// target, so javascript:, data:, file: and the rest open nothing.
+// Invariant O7 in docs/invariants.md. How a link looks at rest (no
+// underline xterm adds): dropImplicitLinkUnderline, invariant O8.
+function openLinkSafely(uri) {
+  let u;
+  try { u = new URL(String(uri)); } catch (e) { return; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+  // Same as WebLinksAddon's own handler: open blank, cut the opener,
+  // then navigate - noopener in window.open's features would make it
+  // return null and lose the tab on some browsers.
+  let w = window.open();
+  if (!w) return;
+  try { w.opener = null; } catch (e) {}
+  w.location.href = u.href;
+}
+
+// What the tooltip shows is chosen by the remote program, so it is
+// made safe to read: control and bidi-override characters (which can
+// reorder or hide text) become U+FFFD, and the host that will really
+// open - parsed, as the browser sees it, punycode included - comes
+// first, on its own line, and wraps rather than being cut; the full
+// URL under it may be truncated. Otherwise `https://github.com:xxx…@evil/`
+// shows as "https://github.com:xxx…" and the real host is cut off.
+function _linkTipText(s) {
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/g, '\ufffd');
+}
+let _linkTip = null, _linkTipOwner = null, _linkTipWatch = null;
+function showLinkTip(ev, uri, term) {
+  if (!_linkTip) {
+    _linkTip = document.createElement('div');
+    _linkTip.className = 'link-tip';
+    _linkTip.style.cssText = 'position:fixed;z-index:1000;max-width:60vw;' +
+      'display:none;' +
+      'padding:3px 8px;border-radius:4px;border:1px solid var(--bd);' +
+      'background:var(--sf);color:var(--tx);font-size:12px;' +
+      'font-family:ui-monospace,Menlo,monospace;' +
+      'pointer-events:none';
+    let host = document.createElement('b');
+    host.className = 'link-tip-host';
+    host.style.cssText = 'display:block;white-space:normal;word-break:break-all';
+    let full = document.createElement('span');
+    full.className = 'link-tip-url';
+    full.style.cssText = 'display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dim)';
+    _linkTip.appendChild(host); _linkTip.appendChild(full);
+    document.body.appendChild(_linkTip);
+  }
+  let host = '';
+  try { host = new URL(String(uri)).host; } catch (e) {}
+  _linkTip.firstChild.textContent = _linkTipText(host);
+  _linkTip.firstChild.style.display = host ? 'block' : 'none';
+  _linkTip.lastChild.textContent = _linkTipText(uri);
+  let x = (ev && ev.clientX) || 0, y = (ev && ev.clientY) || 0;
+  _linkTip.style.left = Math.max(4, Math.min(x + 12, window.innerWidth - 300)) + 'px';
+  _linkTip.style.top = (y + 18 > window.innerHeight - 24 ? y - 26 : y + 18) + 'px';
+  _linkTip.style.display = 'block';
+  // xterm sends no `leave` when its pane is closed, hidden with its tab
+  // or disposed while hovered, so the box would stay with a dead link.
+  // Pane close / dispose hides it at once (see createPane); this watch
+  // covers every other way the hovered terminal disappears.
+  _linkTipOwner = term || null;
+  if (!_linkTipWatch) _linkTipWatch = setInterval(() => {
+    let o = _linkTipOwner && _linkTipOwner.element;
+    if (!o || !o.isConnected || !o.getClientRects().length) hideLinkTip();
+  }, 200);
+}
+function hideLinkTip() {
+  // Emptied as well as hidden: a dead link's target is not left in the
+  // page for anything that reads its text.
+  if (_linkTip) {
+    _linkTip.style.display = 'none';
+    _linkTip.firstChild.textContent = '';
+    _linkTip.lastChild.textContent = '';
+  }
+  _linkTipOwner = null;
+  if (_linkTipWatch) { clearInterval(_linkTipWatch); _linkTipWatch = null; }
+}
+
+function termLinkHandler(getTerm) {
+  return {
+    activate: (ev, uri) => openLinkSafely(uri),
+    hover: (ev, uri) => showLinkTip(ev, uri, getTerm()),
+    leave: () => hideLinkTip(),
+    allowNonHttpProtocols: false,
+  };
+}
+
+// A link at rest looks the way the program printed it (invariant O8:
+// the owner wants no underline under links, their colour is enough).
+// xterm.js 5.5 draws one anyway: its ExtendedAttrs `underlineStyle`
+// getter answers 5 (dashed) whenever the cell carries an OSC 8 link id,
+// so `isUnderline()` is true for every link cell and the DOM renderer
+// gives it `xterm-underline-5` - and a program's own SGR 4 / 4:3 on
+// link text comes out dashed too. There is no option for it. Hiding the
+// `xterm-underline-5` class would also hide a program's own SGR 4:5 on
+// plain text, so instead the getter itself is replaced, once, on the
+// shared prototype: it answers the style the program set (the same bits
+// the original reads), ignoring the link id. The prototype is reached
+// through the public API (`buffer.getNullCell().extended`), not by a
+// name or offset inside the bundle; and the swap happens only if the
+// getter still behaves as described (link id -> 5) - a later xterm that
+// fixed this, or changed the class, is left alone. The hover underline,
+// pointer and tooltip come from the linkifier, not from this getter.
+let _linkUnderlineFixed = false;
+function dropImplicitLinkUnderline(term) {
+  if (_linkUnderlineFixed) return;
+  _linkUnderlineFixed = true;
+  try {
+    let ext = term.buffer.active.getNullCell().extended;
+    let proto = ext && Object.getPrototypeOf(ext);
+    let d = proto && Object.getOwnPropertyDescriptor(proto, 'underlineStyle');
+    if (!d || !d.get || !d.set || typeof proto.constructor !== 'function') return;
+    let probe = new proto.constructor(0, 1);       // (_ext, _urlId): a link, no style
+    if (!('_urlId' in probe) || !('_ext' in probe) || d.get.call(probe) !== 5) return;
+    let orig = d.get;
+    Object.defineProperty(proto, 'underlineStyle', {
+      configurable: true, enumerable: d.enumerable, set: d.set,
+      get: function () {
+        if (!this._urlId) return orig.call(this);
+        let id = this._urlId;
+        this._urlId = 0;
+        try { return orig.call(this); } finally { this._urlId = id; }
+      },
+    });
+  } catch (e) {}
+}
+
 function createPane(container) {
   let id = 'p' + (++paneCounter);
   let el = document.createElement('div');
@@ -359,6 +494,7 @@ function createPane(container) {
   el.setAttribute('data-pane', id);
   el.innerHTML =
     `<div class="pane-bar">` +
+      `<div class="pane-bar-l">` +
       `<span class="pane-badge s-off" data-pane-badge="${id}"></span>` +
       `<span class="pane-label" data-pane-label="${id}"></span>` +
       `<div class="upload-progress h" data-upload-progress="${id}">` +
@@ -366,21 +502,26 @@ function createPane(container) {
         `<div class="upload-progress-text"></div></div>` +
         `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">${ic('close')}</button>` +
       `</div>` +
+      `</div>` +
+      `<div class="reconnect-bar h" data-reconnect="${id}">` +
+        `<span style="font-size:12px;color:var(--dim)"></span>` +
+        `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
+        `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+      `</div>` +
+      `<div class="pane-bar-r">` +
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
+      `<button class="pane-btn" data-act="to-tab" onclick="movePaneToNewTab('${id}')" title="Move to new tab" aria-label="Move pane to a new tab">${ic('to-tab')}</button>` +
+      `<button class="pane-btn" data-act="move-to" onclick="openPaneMoveMenu('${id}',this)" title="Move to tab" aria-label="Move pane to another tab" aria-haspopup="menu">${ic('move-to')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
-    `</div>` +
-    `<div class="pane-term">` +
-      `<div class="pane-overlays" data-overlays="${id}">` +
-        `<div class="reconnect-bar h" data-reconnect="${id}">` +
-          `<span style="font-size:12px;color:var(--dim)"></span>` +
-          `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
-          `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
-        `</div>` +
       `</div>` +
+    `</div>` +
+    `<div class="reconnect-strip h" data-reconnect-strip="${id}"></div>` +
+    `<div class="pane-term">` +
+      `<div class="pane-overlays" data-overlays="${id}"></div>` +
     `</div>` +
     `<div class="search-bar h" data-search="${id}">` +
       `<input type="text" placeholder="Search...">` +
@@ -406,10 +547,18 @@ function createPane(container) {
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
     theme: themeXterm(),
-    allowProposedApi:true, scrollback:50000
+    allowProposedApi:true, scrollback:50000,
+    linkHandler: termLinkHandler(() => term)
   });
+  dropImplicitLinkUnderline(term);   // invariant O8, see the function
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.loadAddon(new WebLinksAddon.WebLinksAddon((ev, uri) => openLinkSafely(uri)));
+  // A hovered link's tooltip goes with its terminal (see showLinkTip).
+  let _termDispose = term.dispose.bind(term);
+  term.dispose = () => {
+    if (_linkTipOwner === term) hideLinkTip();
+    _termDispose();
+  };
   let u = new Unicode11Addon.Unicode11Addon(); term.loadAddon(u);
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
@@ -613,7 +762,10 @@ function createPane(container) {
   //
   // Returning false here is the ONLY way to get that: any handling at
   // all ends in preventDefault, which kills the native paste.
-  term.attachCustomKeyEventHandler(e => !_ctrlVShouldPaste(e));
+  //
+  // The tab keys (Alt+1..9, Alt+T, Alt+W, Alt+Shift+[ / ]) are taken
+  // here too, before xterm turns Alt+x into ESC x: see tabKeyHandled().
+  term.attachCustomKeyEventHandler(e => !tabKeyHandled(e) && !_ctrlVShouldPaste(e));
 
   // Right-click paste. Also swallow button-2 mousedown at capture phase
   // so xterm.js never forwards it to the remote — otherwise tmux (with
@@ -688,6 +840,7 @@ function activatePane(id) {
   if (!p) return;
   p.el.classList.add('active');
   updatePaneBadge(p);
+  renderPaneTools();
   p.term.focus();
 }
 
@@ -721,6 +874,7 @@ function updatePaneBadge(p) {
   let db = p.el.querySelector('[data-download-btn]');
   if (db) db.disabled = !p.sid || busy;
   updatePaneTag(p);
+  if (activeId === p.id) renderPaneTools();
   // The tab's dot is the worst state of its panes, so ANY pane's change
   // must reach it - not only the active pane's (a background pane that
   // drops while the user works elsewhere has to turn its tab red).
@@ -806,30 +960,50 @@ function createTab() {
     `<button class="tab-close" title="Close tab" aria-label="Close tab">${ic('close')}</button>`;
   $('tabs').appendChild(el);
 
-  let t = {id: id, root: root, el: el, lastActive: null, activity: false, _key: null};
+  // `name`: what the user called the tab (null: the label of its active
+  // pane, the automatic title). It belongs to the tab, not to a pane:
+  // panes coming, going or switching never change it.
+  let t = {id: id, root: root, el: el, lastActive: null, activity: false, _key: null,
+           name: null};
   tabs.push(t);
   wireTab(t);
   document.body.classList.add('has-tabs');
+  renderPaneTools();   // a second tab: "Move to tab" appears
   return t;
 }
 
-// Mouse handling of one tab handle. Activation is on mousedown (as in
-// browsers), with preventDefault so the click does not move keyboard
-// focus out of the terminal showTab just focused. The close button and
-// the middle button never activate: closing a background tab must not
-// bring it to the front first.
+// Mouse handling of one tab handle. A press on the tab in front only
+// keeps the focus in its terminal; a press on another tab shows it on
+// RELEASE, if the pointer did not travel (a click): the same press may
+// become a drag of that tab onto a pane of the tab on screen, which has
+// to stay in front while it happens (see ── Moving panes between tabs).
+// preventDefault keeps keyboard focus in the terminal. The close button
+// and the middle button never activate: closing a background tab must
+// not bring it to the front first. A double-click renames the tab (the
+// first click already brought it forward); a right-click opens its menu
+// without bringing it forward.
 function wireTab(t) {
   let el = t.el;
   let closeBtn = el.querySelector('.tab-close');
   closeBtn.addEventListener('mousedown', e => { e.stopPropagation(); e.preventDefault(); });
   closeBtn.addEventListener('click', e => { e.stopPropagation(); closeTab(t.id); });
+  el.addEventListener('dblclick', e => {
+    if (!e.target || !e.target.closest || e.target.closest('.tab-close, .tab-edit')) return;
+    e.preventDefault();
+    startTabRename(t.id);
+  });
+  el.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (tabs.indexOf(t) < 0) return;
+    openTabMenu(t, e.clientX, e.clientY);
+  });
   el.addEventListener('mousedown', e => {
     if (e.button === 1) { e.preventDefault(); return; }   // no autoscroll
     if (e.button !== 0) return;
     e.preventDefault();
-    if (activeTabId !== t.id) showTab(t.id);
-    else { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (err) {} } }
-    startTabDrag(t, e.clientX);
+    if (activeTabId === t.id) { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (err) {} } }
+    startTabDrag(t, e.clientX, e.clientY);
   });
   el.addEventListener('auxclick', e => {
     if (e.button !== 1) return;
@@ -838,34 +1012,157 @@ function wireTab(t) {
   });
 }
 
-// Drag a tab along the strip to reorder. Plain mouse events, not HTML5
-// drag-and-drop: a native drag would be seen by the panes' file-drop
-// handlers, and a tab is not a file.
+// Drag a tab: along the strip to reorder, or onto an edge of a pane in
+// the tab on screen to merge its whole layout there. Plain mouse events,
+// not HTML5 drag-and-drop: a native drag would be seen by the panes'
+// file-drop handlers, and a tab is not a file - and the file drags the
+// browser does send never touch this state.
+//
+// The strip is reordered only while the pointer is not over the panes
+// or outside the window; a drag that ends there without a merge (its
+// own pane, no pane, released outside) puts the strip back as it was.
+const DRAG_START_PX = 5;
 let _tabDrag = null;
-function startTabDrag(t, x) { _tabDrag = {t: t, x0: x, moved: false}; }
+function startTabDrag(t, x, y) {
+  let order = Array.prototype.slice.call($('tabs').children);
+  _tabDrag = {t: t, x0: x, y0: y, moved: false, order: order,
+              over: 'strip', zone: null, front: activeTabId, spring: null, sprung: false,
+              slots: _tabSlots(t)};
+}
+// Where the tabs stood at the press, in strip coordinates (so a
+// sideways scroll of the strip does not shift them): see _springTrack.
+// The dragged tab's own place has id null.
+function _tabSlots(t) {
+  let strip = $('tabs');
+  let sl = strip.scrollLeft || 0, out = [];
+  Array.prototype.forEach.call(strip.children, c => {
+    if (!c.classList.contains('tab')) return;
+    let r = c.getBoundingClientRect();
+    if (r && r.width > 0) out.push({id: c === t.el ? null : c.getAttribute('data-tab'),
+                                    l: r.left + sl, r: r.right + sl});
+  });
+  return out;
+}
+// Where the pointer is during a drag: the element under it (null
+// outside the window), and whether that is in the panes area.
+function _dragPoint(e) {
+  let x = e.clientX, y = e.clientY;
+  let w = window.innerWidth || document.documentElement.clientWidth || 0;
+  let h = window.innerHeight || document.documentElement.clientHeight || 0;
+  let outside = x < 0 || y < 0 || (w && x >= w) || (h && y >= h);
+  let el = null;
+  if (!outside) {
+    try { el = document.elementFromPoint(x, y); } catch (err) { el = null; }
+    if (!el && e.target && e.target.nodeType === 1) el = e.target;
+  }
+  let panesBox = $('panes');
+  let inPanes = !!(el && panesBox && panesBox.contains(el));
+  return {el: el, outside: outside, inPanes: inPanes};
+}
+// The side of pane element `el` nearest to (x, y).
+function _dropSide(el, x, y) {
+  let r = el.getBoundingClientRect();
+  if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+  let dx = (x - r.left) / r.width, dy = (y - r.top) / r.height;
+  let best = 'left', d = dx;
+  if (1 - dx < d) { best = 'right'; d = 1 - dx; }
+  if (dy < d) { best = 'top'; d = dy; }
+  if (1 - dy < d) { best = 'bottom'; d = 1 - dy; }
+  return best;
+}
+const DROP_ZONES = ['drop-zone-left', 'drop-zone-right', 'drop-zone-top', 'drop-zone-bottom'];
+function clearDropZones() {
+  document.querySelectorAll('.drop-zone-left,.drop-zone-right,.drop-zone-top,.drop-zone-bottom')
+    .forEach(el => el.classList.remove.apply(el.classList, DROP_ZONES));
+}
+// The merge target under the pointer: a pane of the tab on screen that
+// is not one of the dragged tab's own panes, and the side.
+function _tabDropTarget(d, pt, e) {
+  if (!pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let pel = pt.el.closest('.pane');
+  let p = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!p) return null;
+  let t = tabOfPane(p);
+  if (!t || t.id !== activeTabId || t === d.t) return null;
+  let side = _dropSide(pel, e.clientX, e.clientY);
+  return side ? {p: p, side: side} : null;
+}
+function _restoreStripOrder(d) {
+  let strip = $('tabs');
+  d.order.forEach(el => { if (el.parentNode === strip) strip.appendChild(el); });
+}
 document.addEventListener('mousemove', e => {
   let d = _tabDrag;
   if (!d) return;
-  if ((e.buttons & 1) === 0) { endTabDrag(); return; }
-  if (!d.moved && Math.abs(e.clientX - d.x0) < 5) return;
+  if ((e.buttons & 1) === 0) { endTabDrag(null); return; }
+  // The only tab can go nowhere (no place in the strip, no other tab to
+  // merge into): no drag look; the release is a click, as before.
+  if (tabs.length < 2) return;
+  if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
+      && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
   if (!d.moved) { d.moved = true; d.t.el.classList.add('dragging'); }
+  let pt = _dragPoint(e);
+  d.over = pt.outside ? 'out' : (pt.inPanes ? 'panes' : 'strip');
+  let target = d.over === 'panes' ? _tabDropTarget(d, pt, e) : null;
+  let zone = target ? 'drop-zone-' + target.side : null;
+  if (!target || !d.zone || d.zone.p !== target.p || d.zone.cls !== zone) {
+    clearDropZones();
+    if (target) target.p.el.classList.add(zone);
+  }
+  d.zone = target ? {p: target.p, side: target.side, cls: zone} : null;
+  _springTrack(d, pt, e);
+  if (d.over !== 'strip') return;
   let strip = $('tabs');
   let others = Array.prototype.filter.call(strip.children,
     c => c !== d.t.el && c.classList.contains('tab'));
+  // Past the strip's edge means "to that end": in a narrow strip (the
+  // pane actions of a lone pane take width from it) the tabs scrolled
+  // out of view have midpoints the pointer can never reach - left of
+  // the logo or outside the window.
+  let sr = strip.getBoundingClientRect();
   let before = null;
-  for (let i = 0; i < others.length; i++) {
-    let r = others[i].getBoundingClientRect();
-    if (e.clientX < r.left + r.width / 2) { before = others[i]; break; }
+  if (e.clientX <= sr.left) before = others[0] || null;
+  else if (e.clientX < sr.right) {
+    for (let i = 0; i < others.length; i++) {
+      let r = others[i].getBoundingClientRect();
+      if (e.clientX < r.left + r.width / 2) { before = others[i]; break; }
+    }
   }
   if (before) { if (d.t.el.nextSibling !== before) strip.insertBefore(d.t.el, before); }
   else if (strip.lastElementChild !== d.t.el) strip.appendChild(d.t.el);
+  if (e.clientX <= sr.left || e.clientX >= sr.right) scrollTabIntoView(d.t);
 });
-document.addEventListener('mouseup', () => endTabDrag());
-function endTabDrag() {
+document.addEventListener('mouseup', e => endTabDrag(e));
+// `e` is the mouseup, or null when the button was found released
+// without one (let go outside the window): then the last position
+// decides.
+function endTabDrag(e) {
   let d = _tabDrag;
   _tabDrag = null;
-  if (!d || !d.moved) return;
+  if (!d) return;
+  _springCancel(d);
+  if (!d.moved) {
+    // A click: now it is safe to bring the tab forward.
+    if (activeTabId !== d.t.id && tabs.indexOf(d.t) >= 0) showTab(d.t.id);
+    return;
+  }
   d.t.el.classList.remove('dragging');
+  _blockClickAfterDrag();
+  // Without a mouseup (the button went up outside the window) nothing
+  // is dropped: a merge needs a release over the pane.
+  let over = d.over, zone = null;
+  if (e) {
+    let pt = _dragPoint(e);
+    over = pt.outside ? 'out' : (pt.inPanes ? 'panes' : 'strip');
+    zone = over === 'panes' ? _tabDropTarget(d, pt, e) : null;
+  }
+  clearDropZones();
+  if (over !== 'strip') {
+    _restoreStripOrder(d);
+    if (zone && panes[zone.p.id] && tabs.indexOf(d.t) >= 0) mergeTabInto(d.t.id, zone.p.id, zone.side);
+    else _springBack(d);
+    return;
+  }
   // The strip's DOM order is the truth; bring the array in line.
   let order = [];
   $('tabs').querySelectorAll('.tab').forEach(el => {
@@ -873,8 +1170,80 @@ function endTabDrag() {
     if (t) order.push(t);
   });
   if (order.length === tabs.length) { tabs.length = 0; order.forEach(t => tabs.push(t)); }
+  tabs.forEach(renderTab);   // the numbers in the tooltips follow the order
+  // As in a browser, the tab that was dragged along the strip is the
+  // one in front afterwards (it used to be activated on the press).
+  if (activeTabId !== d.t.id) showTab(d.t.id, {noSave: true});
   saveSessions();
 }
+// Spring-loaded tabs: during a tab or pane drag, resting the pointer on
+// another tab for SPRING_MS brings that tab forward (without saving),
+// and the drag goes on: its panes are now drop targets. A drag that ends
+// without dropping anything (released outside the window, on no pane,
+// on its own panes) puts the tab that was in front at the press back;
+// nothing was saved, so the saved layout is as it was.
+//
+// A timer, not mousemove: a resting pointer sends no events. The count
+// starts when the pointer reaches a tab and restarts only when it
+// reaches ANOTHER tab, so a trembling hand still counts as resting and
+// a pass across a tab (it leaves before the timer) never switches. The
+// dragged tab itself is no target: the strip reorders under the pointer
+// while a tab is dragged along it (the dragged tab takes the place of
+// the one it passes), so the pointer resting where A was is over the
+// dragged tab a moment later. Over the dragged tab, the tab that stood
+// there at the press is meant (checked in Chromium: a pass over A that
+// went on and came back to A's place found only the dragged tab there
+// and never switched); elsewhere on it the count goes on.
+// Released, or the dragged tab gone, the timer does nothing.
+const SPRING_MS = 500;
+function _springCancel(d) {
+  if (d && d.spring) { clearTimeout(d.spring.timer); d.spring = null; }
+}
+function _springTrack(d, pt, e) {
+  let tabEl = pt.el && pt.el.closest ? pt.el.closest('#tabs .tab') : null;
+  let id = tabEl ? tabEl.getAttribute('data-tab') : null;
+  if (tabEl && d.t && tabEl === d.t.el) {
+    // Only where the dragged tab now really sits (after a reorder): the
+    // pointer must be inside its box as laid out now.
+    let br = d.t.el.getBoundingClientRect();
+    if (!br || !(e.clientX >= br.left && e.clientX < br.right)) return;
+    let x = e.clientX + ($('tabs').scrollLeft || 0);
+    let at = (d.slots || []).filter(sl => x >= sl.l && x < sl.r);
+    // Its own place at the press is no other tab's, whatever overlaps it.
+    if (at.length !== 1 || !at[0].id) return;
+    id = at[0].id;
+  }
+  if (id === activeTabId) id = null;
+  if (d.spring && d.spring.id === id) return;
+  _springCancel(d);
+  if (!id) return;
+  d.spring = {id: id, timer: setTimeout(() => {
+    if (d.spring && d.spring.id === id) d.spring = null;
+    if (_tabDrag !== d && _paneDrag !== d) return;        // released meanwhile
+    if (d.t && tabs.indexOf(d.t) < 0) return;             // the dragged tab closed
+    if (d.p && !panes[d.p.id]) return;                    // the dragged pane closed
+    if (!tabById(id) || activeTabId === id) return;
+    d.sprung = true;
+    showTab(id, {noSave: true});
+  }, SPRING_MS)};
+}
+function _springBack(d) {
+  if (!d.sprung || !d.front || activeTabId === d.front || !tabById(d.front)) return;
+  showTab(d.front, {noSave: true});
+}
+
+// A drag that ends over a button (the "+", a tab's close) must not
+// also click it: a pane dropped on "+" makes a tab, it does not open
+// the login form.
+let _clickBlockUntil = 0;
+function _blockClickAfterDrag() { _clickBlockUntil = Date.now() + 400; }
+document.addEventListener('click', e => {
+  if (!_clickBlockUntil) return;
+  if (Date.now() > _clickBlockUntil) { _clickBlockUntil = 0; return; }
+  _clickBlockUntil = 0;
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
 
 // Show tab `id`: hide every other root, show this one, fit its panes to
 // their real box, and focus the pane that was last active in it.
@@ -901,23 +1270,43 @@ function showTab(id, o) {
   // Now that the root is laid out again: fit each pane once to its real
   // size. The settle loop ends in flushPaneResize, which posts only a
   // size the server does not already have.
+  // Once fitted, its scrollbar is put back where xterm shows the
+  // buffer (_resyncScroll, ── Moving panes): xterm measured the viewport
+  // while it was display:none, or the pane was re-parented.
   ps.forEach(q => {
     q._fitDeferred = false;
     applyTermSettings(q);        // a zoom or font change made while hidden
-    fitPaneWhenStable(q);
+    fitPaneWhenStable(q, {onSettled: _resyncScrollSoon});
   });
   tabs.forEach(renderTab);
+  renderPaneTools();
   scrollTabIntoView(t);
   if (changed && !(o && o.noSave)) saveSessions();
 }
 
+// The strip's width follows the window and the pane actions beside it
+// (#paneTools changes with the active pane): whenever it changes, the tab
+// in front is brought back into view - not during a drag, where the
+// pointer decides what is shown.
+(function () {
+  let strip = $('tabs');
+  if (!strip || typeof ResizeObserver === 'undefined') return;
+  new ResizeObserver(() => {
+    if (_tabDrag || _paneDrag) return;
+    let t = activeTab();
+    if (t) scrollTabIntoView(t);
+  }).observe(strip);
+})();
 function scrollTabIntoView(t) {
   let strip = $('tabs');
   if (!strip || !t) return;
-  let el = t.el;
-  let left = el.offsetLeft, right = left + el.offsetWidth;
-  if (left < strip.scrollLeft) strip.scrollLeft = left;
-  else if (right > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = right - strip.clientWidth;
+  // Measured in fractional pixels: the strip's width is whatever the
+  // top bar leaves it, usually not a whole number, and offsetWidth /
+  // clientWidth round it - which left the last tab half a pixel outside
+  // the strip. Overshoot by rounding up; the browser clamps scrollLeft.
+  let sr = strip.getBoundingClientRect(), r = t.el.getBoundingClientRect();
+  if (r.left < sr.left) strip.scrollLeft -= Math.ceil(sr.left - r.left);
+  else if (r.right > sr.right) strip.scrollLeft += Math.ceil(r.right - sr.right);
 }
 
 // Remove an (emptied) tab. If it was the active one, the tab to its
@@ -925,12 +1314,14 @@ function scrollTabIntoView(t) {
 function removeTab(t) {
   let idx = tabs.indexOf(t);
   if (idx < 0) return;
+  closeMenus(false);    // its menu, or a list of tabs that now names a gone one
   tabs.splice(idx, 1);
   t.root.remove();
   t.el.remove();
   if (!tabs.length) {
     activeTabId = null;
     document.body.classList.remove('has-tabs');
+    renderPaneTools();
     return;
   }
   if (activeTabId === t.id) {
@@ -938,20 +1329,29 @@ function removeTab(t) {
     activeTabId = null;
     showTab(next.id);
   }
+  tabs.forEach(renderTab);   // the numbers in the tooltips shift
+  renderPaneTools();         // back to one tab: "Move to tab" goes
 }
 
 function removeAllTabs() {
+  closeMenus(false);
   tabs.slice().forEach(t => { t.root.remove(); t.el.remove(); });
   tabs.length = 0;
   activeTabId = null;
   $('panes').innerHTML = '';
   $('tabs').innerHTML = '';
   document.body.classList.remove('has-tabs');
+  renderPaneTools();
 }
 
-// Dot (worst pane state), label (the tab's active pane), split marker
-// and activity mark. Memoized: it runs from updatePaneBadge, which runs
-// on every output frame.
+// Dot (worst pane state), label (the tab's name, else its active pane's
+// label), split marker and activity mark. Memoized: it runs from
+// updatePaneBadge, which runs on every output frame - the key holds only
+// strings that are cheap to build (the split marker's key is a walk of
+// the split wrappers and their inline flex values, not of the terminals,
+// and holds whole-pixel boxes, so a drag that does not move a box by a
+// pixel and a window resize leave it equal), so an output frame changes
+// no DOM here.
 function _paneDotState(p) {
   if (p.sid) return p.reconnecting ? 'wait' : 'on';
   return p.connecting ? 'wait' : 'off';
@@ -959,27 +1359,466 @@ function _paneDotState(p) {
 function renderTab(t) {
   if (!t) return;
   let ps = panesInTab(t);
+  syncTabSolo(t, ps);
   let rank = {on: 0, wait: 1, off: 2};
   let worst = 'on';
   ps.forEach(p => { let s = _paneDotState(p); if (rank[s] > rank[worst]) worst = s; });
   if (!ps.length) worst = 'off';
   let ap = panes[t.lastActive];
   if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
-  let label = ap ? (ap.label || '') : '';
+  let label = t.name || (ap ? (ap.label || '') : '');
+  let shape = ps.length > 1 ? _miniKey(_layoutNode(t.root)) : '';
   let active = t.id === activeTabId;
   let act = !!t.activity && !active;
-  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0].join('\u0001');
+  // Tabs 1..8 carry their shortcut; the number follows the strip order,
+  // so every path that reorders or removes a tab re-renders them all.
+  let num = tabs.indexOf(t) + 1;
+  let hint = num >= 1 && num <= 8 ? 'Alt+' + num : '';
+  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0, hint,
+             shape, shape && ap ? ap.id : ''].join('\u0001');
   if (t._key === key) return;
+  let shapeKey = shape + '\u0001' + (shape && ap ? ap.id : '');
   t._key = key;
   t.el.querySelector('.tab-dot').className = 'tab-dot s-' + worst;
   t.el.querySelector('.tab-label').textContent = label;
   let sp = t.el.querySelector('.tab-split');
-  sp.textContent = ps.length > 1 ? '▥' + ps.length : '';
+  if (sp._shape !== shapeKey) {
+    sp._shape = shapeKey;
+    _drawSplitMarker(sp, shape ? _layoutNode(t.root) : null, ap);
+  }
   sp.classList.toggle('h', ps.length < 2);
   sp.title = ps.length > 1 ? ps.length + ' panes' : '';
   t.el.classList.toggle('activity', act);
-  t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '');
+  t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '')
+    + (hint ? (label ? ' - ' : '') + hint : '');
+  if (active) renderPaneTools();
 }
+
+// The split marker: a 16x12 miniature of the tab's layout, one box per
+// pane, side by side or stacked as the real splits are, in the splits'
+// proportions, the tab's active pane lit. The proportion is read from the
+// flex-grow of the split's two children - what the handle drag and the
+// restore write, empty meaning 1 (index.html: `.pane`, `.split-*` are
+// flex:1) - never measured: a hidden tab has no boxes, and measuring
+// would redraw on every window resize. Whole-pixel boxes with a 1px gap, so it is
+// sharp at 1x and 2x; colours come from the theme through CSS
+// (index.html `.tab-split`), none are written here.
+const MINI_W = 16, MINI_H = 12;
+// The top node of a tab's layout: its pane, or its outer split wrapper.
+function _layoutNode(rootEl) {
+  if (!rootEl) return null;
+  for (let i = 0; i < rootEl.children.length; i++) {
+    let ch = rootEl.children[i];
+    if (ch.classList.contains('pane') || ch.classList.contains('split-h')
+        || ch.classList.contains('split-v')) return ch;
+  }
+  return null;
+}
+function _splitKids(el) {
+  let out = [];
+  for (let i = 0; i < el.children.length; i++) {
+    let c = el.children[i];
+    if (c.classList.contains('pane') || c.classList.contains('split-h')
+        || c.classList.contains('split-v')) out.push(c);
+  }
+  return out;
+}
+// The arrangement as a short string: "p3", "h(p1,v(p2,p4))".
+function _splitShape(el) {
+  if (!el) return '';
+  if (el.classList.contains('pane')) return el.getAttribute('data-pane') || '';
+  return (el.classList.contains('split-h') ? 'h(' : 'v(')
+    + _splitKids(el).map(_splitShape).join(',') + ')';
+}
+// An element's share in its split: its inline flex-grow (style.flex may
+// read back as "0.7 1 0%"), 1 when none is set.
+function _flexGrow(el) {
+  let st = el && el.style;
+  if (!st) return 1;
+  let g = st.flexGrow;
+  if (g === undefined || g === null || g === '') g = st.flex;
+  let v = parseFloat(g);
+  return v > 0 ? v : 1;
+}
+// The first part takes ratio x (size - 1) whole pixels, the second the
+// rest after a 1px gap; each keeps at least 1px while there is room.
+function _miniSplit(size, ratio) {
+  let n = size - 1;
+  if (n < 2) return Math.max(1, Math.floor(n / 2));
+  return Math.max(1, Math.min(n - 1, Math.round(ratio * n)));
+}
+function _miniRects(el, x, y, w, h, out) {
+  if (!el) return;
+  if (el.classList.contains('pane')) {
+    out.push({id: el.getAttribute('data-pane'), x: x, y: y, w: Math.max(1, w), h: Math.max(1, h)});
+    return;
+  }
+  let kids = _splitKids(el);
+  if (kids.length < 2) { _miniRects(kids[0], x, y, w, h, out); return; }
+  let ga = _flexGrow(kids[0]), gb = _flexGrow(kids[1]);
+  let ratio = ga / (ga + gb);
+  if (el.classList.contains('split-h')) {
+    let w1 = _miniSplit(w, ratio);
+    _miniRects(kids[0], x, y, w1, h, out);
+    _miniRects(kids[1], x + w1 + 1, y, Math.max(1, w - w1 - 1), h, out);
+  } else {
+    let h1 = _miniSplit(h, ratio);
+    _miniRects(kids[0], x, y, w, h1, out);
+    _miniRects(kids[1], x, y + h1 + 1, w, Math.max(1, h - h1 - 1), out);
+  }
+}
+// renderTab's memo for the marker: the arrangement and every box in
+// whole pixels - it changes exactly when the drawing would.
+function _miniKey(node) {
+  if (!node) return '';
+  let rects = [];
+  _miniRects(node, 0, 0, MINI_W, MINI_H, rects);
+  return _splitShape(node) + '|' + rects.map(r => r.x + ',' + r.y + ',' + r.w + ',' + r.h).join(';');
+}
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function _drawSplitMarker(sp, node, ap) {
+  while (sp.firstChild) sp.removeChild(sp.firstChild);
+  if (!node) return;
+  let rects = [];
+  _miniRects(node, 0, 0, MINI_W, MINI_H, rects);
+  let svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + MINI_W + ' ' + MINI_H);
+  svg.setAttribute('width', String(MINI_W));
+  svg.setAttribute('height', String(MINI_H));
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  rects.forEach(r => {
+    let el = document.createElementNS(SVG_NS, 'rect');
+    el.setAttribute('data-pane', r.id);
+    el.setAttribute('x', String(r.x));
+    el.setAttribute('y', String(r.y));
+    el.setAttribute('width', String(r.w));
+    el.setAttribute('height', String(r.h));
+    if (ap && r.id === ap.id) el.setAttribute('class', 'on');
+    svg.appendChild(el);
+  });
+  sp.appendChild(svg);
+}
+
+// ── Tab names ──
+// A double-click on a tab (or "Rename" in its menu) edits its name in
+// place: an <input> over the label, all selected. Enter or leaving the
+// field saves, Escape cancels; an empty name gives the automatic title
+// (the active pane's label) back. The name is text (textContent, never
+// HTML), cut to TAB_NAME_MAX characters here, not only by maxlength,
+// and saved with the layout at once (saveSessions, `name` per tab).
+// While the field is open its keys are its own: they stop at the field,
+// so none reaches the shell, the login form's Enter or the tab keys
+// (U7); a press in it starts no tab drag and leaves the focus there.
+// renderTab never touches the field (it writes the hidden label), so
+// output or a state change does not lose what is being typed.
+const TAB_NAME_MAX = 60;
+function _cleanTabName(v) {
+  let s = String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  let cs = Array.from(s);
+  if (cs.length > TAB_NAME_MAX) s = cs.slice(0, TAB_NAME_MAX).join('').trim();
+  return s || null;
+}
+// What a tab is called on screen.
+function tabTitle(t) {
+  if (!t) return '';
+  if (t.name) return t.name;
+  let ps = panesInTab(t);
+  let ap = panes[t.lastActive];
+  if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
+  return ap ? (ap.label || '') : '';
+}
+function setTabName(id, v) {
+  let t = tabById(id);
+  if (!t) return;
+  let n = _cleanTabName(v);
+  if (n === (t.name || null)) return;
+  t.name = n;
+  renderTab(t);
+  saveSessions();
+}
+function startTabRename(id) {
+  let t = tabById(id);
+  if (!t) return;
+  closeMenus(false);
+  if (_tabDrag && _tabDrag.t === t && !_tabDrag.moved) _tabDrag = null;
+  if (activeTabId !== t.id) showTab(t.id);
+  if (t._edit) { try { t._edit.focus(); t._edit.select(); } catch (e) {} return; }
+  let lab = t.el.querySelector('.tab-label');
+  let inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'tab-edit';
+  inp.maxLength = TAB_NAME_MAX;
+  inp.spellcheck = false;
+  inp.autocomplete = 'off';
+  inp.setAttribute('aria-label', 'Tab name');
+  inp.setAttribute('data-lpignore', 'true');
+  inp.setAttribute('data-1p-ignore', 'true');
+  inp.value = tabTitle(t);
+  lab.classList.add('h');
+  lab.parentNode.insertBefore(inp, lab.nextSibling);
+  t._edit = inp;
+  let done = false;
+  let finish = (save, refocus) => {
+    if (done) return;
+    done = true;
+    if (t._edit === inp) t._edit = null;
+    let v = inp.value;
+    if (inp.parentNode) inp.parentNode.removeChild(inp);
+    lab.classList.remove('h');
+    if (save) setTabName(t.id, v);
+    if (refocus && activeTabId === t.id) {
+      let p = panes[activeId];
+      if (p) { try { p.term.focus(); } catch (e) {} }
+    }
+  };
+  inp.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.isComposing) return;
+    if (e.key === 'Enter') { e.preventDefault(); finish(true, true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false, true); }
+  });
+  ['keyup', 'keypress', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']
+    .forEach(ev => inp.addEventListener(ev, e => e.stopPropagation()));
+  inp.addEventListener('blur', () => finish(true, false));
+  try { inp.focus(); inp.select(); } catch (e) {}
+}
+
+// ── A lone pane has no bar of its own ──
+// A tab with exactly one pane is "solo" (.tab-root.solo): the pane's bar
+// is hidden by CSS and the terminal gets its height; the tab already
+// shows the label and state, and the pane actions are in the top bar
+// (#paneTools, acting on the active pane). With 2+ panes every pane
+// shows its bar again, so the user can tell them apart.
+//
+// Runs from renderTab, which every path that changes a tab's pane count
+// calls (materialize, close, a dismissed split, restore) - a path that
+// moves a pane between tabs must call renderTab on BOTH tabs. It is
+// recomputed on every call, not only when the count changes: a pane can
+// arrive while another leaves.
+//
+// The refit after the bar appears or goes is left to the pane's
+// ResizeObserver (the terminal box changes height): one fit, and the
+// resize reaches the server once, debounced in onResize and deduped
+// against lastSent. A pane in a hidden tab is skipped there as
+// everywhere (U1); showTab fits it.
+//
+// A transfer's progress lives in the bar; for a lone pane it is moved
+// into the pane's overlay stack (a card over the terminal) so it and its
+// cancel button stay visible, and only while that tab is on screen.
+//
+// The Reconnect control lives in the bar too, centred between the
+// label side and the buttons; for a lone pane it moves into the pane's
+// reconnect strip (placeReconnect).
+function syncTabSolo(t, ps) {
+  let solo = ps.length === 1;
+  if (t.root.classList.contains('solo') !== solo) t.root.classList.toggle('solo', solo);
+  ps.forEach(p => {
+    if (p._progSolo !== solo) placeTransferProgress(p, solo);
+    placeReconnect(p);
+  });
+}
+function placeTransferProgress(p, solo) {
+  let prog = p.el.querySelector('[data-upload-progress]');
+  let side = p.el.querySelector('.pane-bar-l');
+  let ovl = p.el.querySelector('.pane-overlays');
+  if (!prog || !side || !ovl) return;
+  p._progSolo = solo;
+  if (solo) { if (prog.parentNode !== ovl) ovl.appendChild(prog); }
+  else if (prog.parentNode !== side) side.appendChild(prog);
+}
+// Where a pane's Reconnect control is, and whether it shows. The owner
+// wants it in the row that carries the pane's name and its persistent /
+// short-lived tag, in the middle - not as a card over the terminal.
+//   - Pane with its own bar (2+ panes in the tab): in the bar, between
+//     .pane-bar-l (badge, label, tag, progress) and .pane-bar-r (the
+//     buttons). .has-rc gives both sides the same flex share, which
+//     centres the control; on a narrow pane the sides keep their
+//     content and the control's message ellipsizes first, so it never
+//     covers a button and the Reconnect button stays in view.
+//   - Lone pane (bar hidden, see syncTabSolo): in .reconnect-strip, a
+//     bar-high strip at the top of the pane, shown only while the
+//     control is. It is position:absolute over the terminal, NOT in the
+//     pane's flex column: in the column it would shrink the terminal,
+//     refit it and resize the PTY on every disconnect and again on
+//     reconnect (the reason the status bars live in .pane-overlays).
+//     The overlay stack moves down below it in CSS.
+// Called from syncTabSolo (every renderTab) and from show/hide. The
+// control is one element moved between the two places, so a typed
+// password stays; moving a focused input blurs it, so focus is put
+// back when it was there.
+function placeReconnect(p) {
+  let ctrl = p.el.querySelector('[data-reconnect]');
+  let strip = p.el.querySelector('.reconnect-strip');
+  let bar = p.el.querySelector('.pane-bar');
+  if (!ctrl || !strip || !bar) return;
+  let root = p.el.closest('.tab-root');
+  let solo = !!root && root.classList.contains('solo');
+  let shown = !ctrl.classList.contains('h');
+  if (solo) {
+    if (ctrl.parentNode !== strip) _keepRcFocus(() => strip.appendChild(ctrl));
+  } else if (ctrl.parentNode !== bar) {
+    _keepRcFocus(() => bar.insertBefore(ctrl, bar.querySelector('.pane-bar-r')));
+  }
+  if (strip.classList.contains('h') !== !(solo && shown)) strip.classList.toggle('h', !(solo && shown));
+  if (bar.classList.contains('has-rc') !== (!solo && shown)) bar.classList.toggle('has-rc', !solo && shown);
+  if (shown && !solo) _measureReconnect(p, ctrl, bar);
+}
+// The widths the bar's CSS (.has-rc) needs to centre the control and
+// still fit a narrow pane, as custom properties: --rc-lc the name side's
+// badge + tag (--rc-lf: the least they take shrunk), --rc-rc the buttons, --rc-cc the least the control can
+// be (its button, plus a short password input when one shows). The
+// message has no floor: it is what gives way. Content widths only - they
+// do not depend on the pane's width, so a resize needs no JS; they are
+// measured again when what is shown changes (key), not on every call
+// (syncTabSolo runs on every output frame of the tab). Only while the
+// control is in the bar: a lone pane's bar is hidden and measures 0, as
+// does a pane in a hidden tab - nothing is stored then, and it is
+// measured when the bar is on screen.
+function _measureReconnect(p, ctrl, bar) {
+  let L = bar.querySelector('.pane-bar-l'), R = bar.querySelector('.pane-bar-r');
+  let btn = ctrl.querySelector('.btn'), pw = ctrl.querySelector('input');
+  let msg = ctrl.querySelector('span');
+  let tag = L && L.querySelector('.pane-tag');
+  let badge = L && L.querySelector('.pane-badge');
+  // one-tab: the bar's "Move to tab" button comes and goes with it.
+  let key = [ctrl.className, pw && pw.className, msg && msg.textContent,
+             badge && badge.textContent, tag && tag.className,
+             document.body.classList.contains('one-tab') ? 1 : 0].join('\u0001');
+  if (p._rcMeasured === key) return;
+  if (!btn || !btn.offsetWidth) return;
+  // Natural widths: .has-rc lets badge and tag shrink, so measure
+  // without it (one extra layout, only when the key changed).
+  let had = bar.classList.contains('has-rc');
+  if (had) bar.classList.remove('has-rc');
+  let px = el => { let cs = getComputedStyle(el); return el.offsetWidth + (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0); };
+  // The least a shrunk badge or tag still takes: the badge its dot, the
+  // tag its padding.
+  let floor = el => {
+    if (el.classList.contains('pane-badge')) return 6;
+    let cs = getComputedStyle(el);
+    return (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0) +
+           (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.borderRightWidth) || 0);
+  };
+  let side = (box, skip, least) => {
+    let w = 0, n = 0;
+    if (!box) return 0;
+    for (let i = 0; i < box.children.length; i++) {
+      let ch = box.children[i];
+      if (!ch.getClientRects().length) continue;
+      n++;
+      if (skip(ch)) continue;
+      w += least ? floor(ch) + px(ch) - ch.offsetWidth : px(ch);
+    }
+    return w + Math.max(0, n - 1) * 6;
+  };
+  // Label and a transfer's progress stretch; they have no floor either.
+  let stretch = ch => ch.classList.contains('pane-label') || ch.classList.contains('upload-progress');
+  let lc = side(L, stretch, false);
+  let lf = side(L, stretch, true);
+  let rc = side(R, () => false, false);
+  let cs = getComputedStyle(ctrl);
+  let cc = btn.offsetWidth + (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.borderLeftWidth) || 0) +
+           (parseFloat(cs.paddingRight) || 0) + (parseFloat(cs.borderRightWidth) || 0);
+  if (pw && !pw.classList.contains('h')) cc += 48 + 6;
+  if (msg && msg.textContent) cc += 6;
+  if (had) bar.classList.add('has-rc');
+  bar.style.setProperty('--rc-lc', lc + 'px');
+  bar.style.setProperty('--rc-lf', lf + 'px');
+  bar.style.setProperty('--rc-rc', rc + 'px');
+  bar.style.setProperty('--rc-cc', cc + 'px');
+  ctrl.style.setProperty('--rc-cc', cc + 'px');
+  p._rcMeasured = key;
+}
+// The reconnect password input that has the focus, if one has.
+function _focusedRcInput() {
+  let a = document.activeElement;
+  return (a && a.hasAttribute && a.hasAttribute('data-reconnect-pw')) ? a : null;
+}
+// Run fn (which moves panes or the control around) and give the focus
+// back to the reconnect password input that had it before, if that
+// input is still in the page and shown. Re-parenting an element drops
+// its focus to <body>, and the pane moves end in term.focus(). `had`
+// names that input when it was taken before the DOM changed
+// (_destroyPane).
+function _keepRcFocus(fn, had) {
+  let inp = had || _focusedRcInput();
+  try { return fn(); }
+  finally {
+    let ctrl = inp && inp.closest('[data-reconnect]');
+    if (inp && document.body.contains(inp) && document.activeElement !== inp &&
+        !inp.classList.contains('h') && ctrl && !ctrl.classList.contains('h')) {
+      try { inp.focus(); } catch (e) {}
+    }
+  }
+}
+
+// The top-bar copy of the pane actions, for the active pane of the
+// active tab when that tab is solo. Hidden with 2+ panes (each pane has
+// its bar) and with no tab at all. Upload/download are disabled by the
+// same rule as the pane's own buttons (updatePaneBadge).
+//
+// It also keeps body.one-tab, which hides every "Move to tab" button
+// (here and in all pane bars, by CSS): with one tab there is nowhere to
+// move to, and an impossible action is hidden, not disabled. So it must
+// run whenever the number of tabs changes: createTab, removeTab,
+// removeAllTabs (and showTab, which every move ends in).
+function renderPaneTools() {
+  let box = $('paneTools');
+  if (!box) return;
+  let t = activeTab();
+  let p = activeId ? panes[activeId] : null;
+  let show = !!(t && p && tabOfPane(p) === t && panesInTab(t).length === 1);
+  let busy = !!(p && (p.upload || p.download));
+  let tag = p && (p.host || p.connection) ? (p.persistent ? 'persistent' : 'ephemeral') : '';
+  let one = tabs.length < 2;
+  let key = (one ? '1' : '2') + '\u0002'
+    + (show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag].join('\u0001') : '');
+  if (box._key === key) return;
+  box._key = key;
+  // The group takes width from the tab strip, and its width changes
+  // after showTab scrolled the active tab into view (a new tab is shown
+  // before its pane exists; the marker appears at connect). Scroll again
+  // when it did. Runs only when the key changes, so the reflow is rare.
+  let w0 = box.offsetWidth;
+  let flip = document.body.classList.contains('one-tab') !== one;
+  document.body.classList.toggle('one-tab', one);
+  box.classList.toggle('h', !show);
+  if (show) fillPaneTools(box, p, busy, tag);
+  if (t && box.offsetWidth !== w0) scrollTabIntoView(t);
+  // The pane bars lost or gained a button: a Reconnect control centred
+  // in a bar on screen is measured again (_measureReconnect keys on
+  // one-tab); the hidden tabs' bars are measured when shown.
+  if (flip && t) panesInTab(t).forEach(placeReconnect);
+}
+function fillPaneTools(box, p, busy, tag) {
+  let off = !p.sid || busy;
+  box.querySelector('[data-act="upload"]').disabled = off;
+  box.querySelector('[data-act="download"]').disabled = off;
+  let tg = box.querySelector('.pane-tag');
+  tg.className = 'pane-tag ' + tag + (tag ? '' : ' h');
+  // The same words as a pane's own bar (updatePaneTag); the tooltip
+  // says what they mean.
+  tg.textContent = tag === 'persistent' ? 'persistent' : 'short-lived';
+  tg.title = tag === 'persistent'
+    ? 'This pane is wrapped in remote tmux and will survive browser refresh.'
+    : 'This pane is NOT persistent — it will be lost on refresh.';
+}
+(function () {
+  let box = $('paneTools');
+  if (!box) return;
+  box.addEventListener('click', e => {
+    let b = e.target.closest && e.target.closest('[data-act]');
+    if (!b || b.disabled || !activeId || !panes[activeId]) return;
+    let id = activeId, act = b.getAttribute('data-act');
+    if (act === 'upload') triggerUpload(id);
+    else if (act === 'download') triggerDownload(id);
+    else if (act === 'split-h') splitPane(id, 'h');
+    else if (act === 'split-v') splitPane(id, 'v');
+    else if (act === 'close') closePane(id);
+    else if (act === 'move-to') openPaneMoveMenu(id, b);
+  });
+})();
 
 // Output reached a pane whose tab is not on screen: mark the tab.
 function noteTabActivity(p) {
@@ -1023,6 +1862,337 @@ function closeTab(id) {
   }, title);
 }
 
+// ── Moving panes between tabs ──────────────────────────────────────
+// A pane moves by moving its element: out of its split (the sibling
+// takes the space, as on close) and into another tab's root or split.
+// Nothing else about the pane is touched - no connect or disconnect,
+// no stream restart, no term.reset/dispose/open, the input queue and an
+// upload in progress stay on `p` - because which tab a pane is in is
+// read from the DOM (see ── Tabs). xterm keeps working in a re-parented
+// element as long as it is not disposed. docs/invariants.md U5.
+//
+// Every move is synchronous from the first DOM change to saveSessions():
+// the layout in localStorage never shows a half-done move, and the
+// ResizeObserver only sees the final boxes (one fit, one resize per
+// pane whose size changed; a pane left in a hidden tab is skipped, U1).
+// renderTab runs for BOTH tabs (via showTab), so the solo state and the
+// bars are right on each side (U4).
+
+// Moving an element out of the document and back resets the scroll
+// position of everything inside it - xterm's viewport jumps to 0 (the
+// top of the scrollback) while xterm still shows, and believes it
+// shows, the bottom; it does not put it back by itself (it caches the
+// last value it set), so the scrollbar lied and the first wheel or
+// drag on it threw the view to the top. Put it where xterm's buffer
+// says it is. A pane in a hidden tab cannot be scrolled (display:none
+// keeps a scroll position but cannot take one): showTab does it.
+// Checked in Chromium 2026-10-01: display:none and back keeps the
+// position; removeChild + appendChild loses it.
+//
+// The same lie comes from a display:none tab without any move: xterm
+// 5.5's Viewport._innerRefresh (run on any output or resize) records
+// the viewport's offsetHeight - 0 while hidden - and sizes the scroll
+// area to rows*rowHeight + (offsetHeight - canvas height), i.e. one
+// screen too short. Shown again (after a window resize or a merge)
+// nothing may call it again before the first wheel: scrollTop is
+// clamped a screen above the bottom, the first notch is eaten by the
+// gap or jumps a screen. So the viewport's own refresh is re-run here,
+// with the pane on screen and fitted (it re-reads offsetHeight, resizes
+// the scroll area and sets scrollTop from the buffer); the arithmetic
+// below is the fallback if that private method is gone. No PTY resize.
+function _resyncScroll(p) {
+  if (!p || !p.term || !p.term.element) return;
+  if (paneHidden(p)) return;    // showTab resyncs every pane it shows
+  try {
+    let core = p.term._core && p.term._core.viewport;
+    if (core && typeof core._innerRefresh === 'function') core._innerRefresh();
+  } catch (e) {}
+  try {
+    let vp = p.term.element.querySelector('.xterm-viewport');
+    let area = vp && vp.querySelector('.xterm-scroll-area');
+    let buf = p.term.buffer && p.term.buffer.active;
+    if (!vp || !area || !buf || !buf.length) return;
+    let core = p.term._core && p.term._core.viewport;
+    let rowH = (core && core._currentRowHeight) || (area.offsetHeight / buf.length);
+    if (!(rowH > 0)) return;
+    let top = Math.round(buf.viewportY * rowH);
+    if (Math.abs(vp.scrollTop - top) > 1) vp.scrollTop = top;
+  } catch (e) {}
+}
+// After a fit: now, and once more on the next frame - the renderer
+// takes the new canvas size on its own frame, and the scroll area's
+// height depends on it.
+function _resyncScrollSoon(p) {
+  _resyncScroll(p);
+  requestAnimationFrame(() => { if (panes[p.id] === p) _resyncScroll(p); });
+}
+
+// Take a pane out of its layout: its split wrapper is replaced by the
+// sibling, as _destroyPane does. Returns the tab it was in.
+function _detachPane(p) {
+  let t = tabOfPane(p);
+  let wrap = p.el.parentNode;
+  if (wrap && !wrap.classList.contains('tab-root')) {
+    let sibling = null;
+    for (let i = 0; i < wrap.children.length; i++) {
+      let ch = wrap.children[i];
+      if (ch !== p.el && !ch.classList.contains('split-handle')) { sibling = ch; break; }
+    }
+    if (sibling && wrap.parentNode) {
+      _unwrapSplit(wrap, sibling);
+      _panesUnder(sibling).forEach(_resyncScroll);
+    }
+  }
+  if (p.el.parentNode) p.el.parentNode.removeChild(p.el);
+  p.el.style.flex = '';
+  if (t && t.lastActive === p.id) {
+    let ps = panesInTab(t);
+    t.lastActive = ps.length ? ps[0].id : null;
+  }
+  return t;
+}
+// The panes in (or being) element `el`.
+function _panesUnder(el) {
+  let out = [];
+  if (!el) return out;
+  let list = el.classList.contains('pane') ? [el] : Array.prototype.slice.call(el.querySelectorAll('.pane'));
+  list.forEach(e => { let p = panes[e.getAttribute('data-pane')]; if (p) out.push(p); });
+  return out;
+}
+// The two halves of "a split or a close moves no other divider"
+// (docs/invariants.md U9), shared by split, close, cancel and moves.
+// A split wrapper replacing `anchor` takes the anchor's place and its
+// share of the parent (inline flex); the anchor starts at an even half
+// inside it. Returns the wrapper holding the anchor and the handle; the
+// caller adds the other child.
+function _wrapInSplit(anchor, dir) {
+  let wrap = document.createElement('div');
+  wrap.className = 'split-' + dir;
+  wrap.style.flex = anchor.style.flex || '';
+  anchor.style.flex = '';
+  let handle = document.createElement('div');
+  handle.className = 'split-handle';
+  anchor.parentNode.replaceChild(wrap, anchor);
+  wrap.appendChild(anchor);
+  wrap.appendChild(handle);
+  return wrap;
+}
+// A split collapsing to one child: the child takes the wrapper's place
+// and inherits the wrapper's share of ITS parent.
+function _unwrapSplit(wrap, sibling) {
+  sibling.style.flex = wrap.style.flex || '';
+  wrap.parentNode.replaceChild(sibling, wrap);
+}
+// Put `el` beside `anchor` in a new split ('h' or 'v'); `first` puts it
+// before the anchor (left / top). The wrapper takes the anchor's place
+// and its share of the parent.
+function _placeBeside(anchor, el, dir, first) {
+  let wrap = _wrapInSplit(anchor, dir);
+  el.style.flex = '';
+  if (first) wrap.insertBefore(el, wrap.firstChild);
+  else wrap.appendChild(el);
+}
+// Show `t` with pane `id` active; the moved pane takes the focus. The
+// element was out of the document for a moment, which blurs a focused
+// terminal, so focus it even when it already was the active pane.
+function _showAfterMove(t, id, moved) {
+  if (panes[id]) t.lastActive = id;
+  showTab(t.id, {noSave: true});
+  let p = panes[id];
+  if (p) {
+    if (activeId !== id) activatePane(id);
+    try { p.term.focus(); } catch (e) {}
+  }
+  (moved || []).forEach(_resyncScroll);
+}
+function _dropEmptyTab(t) {
+  if (!t || tabs.indexOf(t) < 0 || panesInTab(t).length) return;
+  if (activeTabId === t.id) activeTabId = null;   // the caller shows another
+  removeTab(t);
+}
+
+// "Move to new tab": the pane leaves its split and becomes a tab of its
+// own, shown. A pane alone in its tab already is one: nothing to do.
+function movePaneToNewTab(id) {
+  let p = panes[id];
+  if (!p) return;
+  let from = tabOfPane(p);
+  if (!from || panesInTab(from).length < 2) return;
+  _keepRcFocus(() => {
+    _detachPane(p);
+    let t = createTab();
+    t.root.appendChild(p.el);
+    _showAfterMove(t, id, [p]);
+  });
+  saveSessions();
+}
+
+// Where something joining tab `t` goes by default: beside its active
+// pane (the last one if that is unknown).
+function _tabAnchor(t) {
+  let ps = panesInTab(t);
+  let a = panes[t.lastActive];
+  if (!a || ps.indexOf(a) < 0) a = ps[ps.length - 1] || null;
+  return a;
+}
+// The pane joins tab `tabId`, split to the right of that tab's active
+// pane - or, given `anchorId` (a pane of that tab) and `side`, on that
+// side of that pane (a pane dragged onto a pane edge); that tab is shown
+// with the moved pane active. A tab emptied by the move goes. The tab's
+// name stays; the emptied tab's goes with it.
+function movePaneToTab(id, tabId, anchorId, side) {
+  let p = panes[id];
+  let to = tabById(tabId);
+  if (!p || !to) return;
+  let from = tabOfPane(p);
+  if (!from || from === to) return;
+  let anchor = anchorId ? panes[anchorId] : null;
+  if (!anchor || tabOfPane(anchor) !== to) anchor = _tabAnchor(to);
+  if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) side = 'right';
+  _keepRcFocus(() => {
+    _detachPane(p);
+    if (anchor) _placeBeside(anchor.el, p.el, (side === 'left' || side === 'right') ? 'h' : 'v',
+                             side === 'left' || side === 'top');
+    else to.root.appendChild(p.el);
+    _dropEmptyTab(from);
+    _showAfterMove(to, id, [p].concat(_panesUnder(anchor ? anchor.el : null)));
+  });
+  saveSessions();
+}
+
+// Tab `tabId`'s whole layout goes beside pane `paneId` (of another tab):
+// side 'left'/'right' split horizontally, 'top'/'bottom' vertically;
+// left/top put the merged layout first. The merged tab's handle and
+// root go; its inner layout is kept as it was. The pane's tab is shown,
+// with the merged tab's active pane active.
+function mergeTabInto(tabId, paneId, side) {
+  let src = tabById(tabId);
+  let q = panes[paneId];
+  if (!src || !q) return;
+  let dst = tabOfPane(q);
+  if (!dst || dst === src) return;
+  if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) return;
+  let node = _layoutNode(src.root);
+  if (!node) return;
+  let srcPanes = panesInTab(src);
+  let focusId = (src.lastActive && srcPanes.indexOf(panes[src.lastActive]) >= 0)
+    ? src.lastActive : (srcPanes[0] ? srcPanes[0].id : q.id);
+  _keepRcFocus(() => {
+    src.root.removeChild(node);
+    _placeBeside(q.el, node, (side === 'left' || side === 'right') ? 'h' : 'v',
+                 side === 'left' || side === 'top');
+    _dropEmptyTab(src);
+    _showAfterMove(dst, focusId, _panesUnder(node).concat([q]));
+  });
+  saveSessions();
+}
+// Tab `srcId`'s whole layout joins tab `dstId`, to the right of its
+// active pane (where movePaneToTab puts a pane): "Move into tab" in a
+// tab's menu. Nothing if either tab has gone meanwhile.
+function mergeTabIntoTab(srcId, dstId) {
+  let src = tabById(srcId), dst = tabById(dstId);
+  if (!src || !dst || src === dst) return;
+  let anchor = _tabAnchor(dst);
+  if (anchor) mergeTabInto(src.id, anchor.id, 'right');
+}
+
+// Dragging a pane by its bar's label onto the strip: onto a tab - the
+// pane joins it; onto the strip around the tabs or "+" - a new tab.
+// Resting on a tab brings it forward (spring-loaded, see endTabDrag);
+// then an edge of one of its panes takes the pane on that side, with
+// the same half highlighted as for a tab drag. Its own tab's panes are
+// no target. Anywhere else (outside the window) nothing happens, and the
+// tab that was in front at the press comes back. Mouse events only, as for tabs: an HTML5 drag would look
+// like a file to wirePaneDrop, and an OS file drag never starts this.
+let _paneDrag = null;
+function _paneDropTarget(pt) {
+  if (pt.outside || pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let tabEl = pt.el.closest('#tabs .tab');
+  if (tabEl) return {kind: 'tab', el: tabEl, tabId: tabEl.getAttribute('data-tab')};
+  let nb = pt.el.closest('#tabNew');
+  if (nb) return {kind: 'new', el: nb};
+  let strip = pt.el.closest('#tabs');
+  if (strip) return {kind: 'new', el: strip};
+  // The free room of the top bar after "+" belongs to the strip too.
+  if (pt.el.classList && pt.el.classList.contains('top')) return {kind: 'new', el: $('tabs')};
+  return null;
+}
+function _clearPaneDropMarks() {
+  document.querySelectorAll('.tab.drop-into,.drop-new')
+    .forEach(el => el.classList.remove('drop-into', 'drop-new'));
+}
+document.addEventListener('mousedown', e => {
+  if (e.button !== 0 || !e.target || !e.target.closest) return;
+  let label = e.target.closest('.pane-label');
+  if (!label) return;
+  let pel = label.closest('.pane');
+  let p = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!p) return;
+  e.preventDefault();          // no text selection of the label
+  _paneDrag = {p: p, x0: e.clientX, y0: e.clientY, moved: false,
+               front: activeTabId, spring: null, sprung: false, zone: null};
+}, true);
+// A pane of the tab on screen, not of the dragged pane's own tab, and
+// the side of it under the pointer.
+function _panePaneTarget(d, pt, e) {
+  if (!pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let pel = pt.el.closest('.pane');
+  let q = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!q || q === d.p) return null;
+  let tq = tabOfPane(q);
+  if (!tq || tq.id !== activeTabId || tq === tabOfPane(d.p)) return null;
+  let side = _dropSide(pel, e.clientX, e.clientY);
+  return side ? {p: q, side: side} : null;
+}
+document.addEventListener('mousemove', e => {
+  let d = _paneDrag;
+  if (!d) return;
+  if ((e.buttons & 1) === 0) { _endPaneDrag(null); return; }
+  if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
+      && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
+  if (!d.moved) { d.moved = true; document.body.classList.add('pane-moving'); }
+  let pt = _dragPoint(e);
+  let tg = _paneDropTarget(pt);
+  _clearPaneDropMarks();
+  if (tg && tg.kind === 'tab') {
+    let own = tabOfPane(d.p);
+    if (!own || own.id !== tg.tabId) tg.el.classList.add('drop-into');
+  } else if (tg) tg.el.classList.add('drop-new');
+  let zt = _panePaneTarget(d, pt, e);
+  let cls = zt ? 'drop-zone-' + zt.side : null;
+  if (!zt || !d.zone || d.zone.p !== zt.p || d.zone.cls !== cls) {
+    clearDropZones();
+    if (zt) zt.p.el.classList.add(cls);
+  }
+  d.zone = zt ? {p: zt.p, cls: cls} : null;
+  _springTrack(d, pt, e);
+});
+document.addEventListener('mouseup', e => _endPaneDrag(e));
+function _endPaneDrag(e) {
+  let d = _paneDrag;
+  _paneDrag = null;
+  if (!d) return;
+  _springCancel(d);
+  _clearPaneDropMarks();
+  clearDropZones();
+  if (!d.moved) return;
+  document.body.classList.remove('pane-moving');
+  _blockClickAfterDrag();
+  if (!e || !panes[d.p.id]) { _springBack(d); return; }
+  let pt = _dragPoint(e);
+  let tg = _paneDropTarget(pt);
+  let zt = tg ? null : _panePaneTarget(d, pt, e);
+  let own = tabOfPane(d.p);
+  if (tg && tg.kind === 'tab') {
+    if (own && own.id === tg.tabId) _springBack(d);
+    else movePaneToTab(d.p.id, tg.tabId);
+  } else if (tg) {
+    if (own && panesInTab(own).length < 2) _springBack(d);   // already a tab of its own
+    else movePaneToNewTab(d.p.id);
+  } else if (zt) movePaneToTab(d.p.id, tabOfPane(zt.p).id, zt.p.id, zt.side);
+  else _springBack(d);
+}
+
 // Strip: a vertical wheel scrolls it sideways when it overflows.
 (function () {
   let strip = $('tabs');
@@ -1033,6 +2203,178 @@ function closeTab(id) {
     e.preventDefault();
   }, {passive: false});
 })();
+
+// ── Menus: a tab's context menu, a pane's "Move to tab" ──
+// One menu at a time ([role=menu] of [role=menuitem] buttons), plus at
+// most one submenu beside it. Opened by a right-click on a tab or the
+// pane's move button; the first item takes the focus, so the keys go to
+// the menu, not the shell: arrows move, Enter/Space choose, ArrowRight
+// opens a submenu and ArrowLeft leaves it, Escape or Tab closes, as
+// does a press anywhere outside. Items are text (textContent): a tab
+// title is shown as typed. Every action re-checks that its tab and pane
+// still exist - the menu may have been open while they closed.
+let _menus = [];
+function closeMenus(refocus) {
+  if (!_menus.length) return;
+  _menus.forEach(m => { if (m.parentNode) m.parentNode.removeChild(m); });
+  _menus = [];
+  if (refocus) { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (e) {} } }
+}
+function _menuItemsOf(m) {
+  return Array.prototype.slice.call(m.querySelectorAll('[role="menuitem"]'));
+}
+function _buildMenu(items, label, level) {
+  let m = document.createElement('div');
+  m.className = 'ws-menu';
+  m.setAttribute('role', 'menu');
+  if (label) m.setAttribute('aria-label', label);
+  m._level = level;
+  items.forEach(it => {
+    let b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitem');
+    b.tabIndex = -1;
+    if (it.icon) b.insertAdjacentHTML('beforeend', ic(it.icon));
+    let s = document.createElement('span');
+    s.className = 'mi-label';
+    s.textContent = it.label;
+    b.appendChild(s);
+    if (it.sub) {
+      b.setAttribute('aria-haspopup', 'menu');
+      b.setAttribute('aria-expanded', 'false');
+      b.insertAdjacentHTML('beforeend', '<span class="mi-sub" aria-hidden="true">\u203a</span>');
+    }
+    if (it.disabled) b.setAttribute('aria-disabled', 'true');
+    if (it.danger) b.classList.add('danger');
+    b._mi = it;
+    m.appendChild(b);
+  });
+  m.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); });
+  m.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+  m.addEventListener('click', e => {
+    e.stopPropagation();
+    let b = e.target.closest && e.target.closest('[role="menuitem"]');
+    if (b) _menuChoose(b);
+  });
+  m.addEventListener('mouseover', e => {
+    let b = e.target.closest && e.target.closest('[role="menuitem"]');
+    if (!b) return;
+    try { b.focus(); } catch (err) {}
+    if (m._level !== 0) return;
+    if (b._mi.sub && !b._mi.disabled) { if (!_menus[1] || _menus[1]._parentItem !== b) _openSubmenu(b, false); }
+    else _closeSubmenu();
+  });
+  m.addEventListener('keydown', _menuKey);
+  document.body.appendChild(m);
+  return m;
+}
+function _placeMenu(m, x, y, altX) {
+  let w = window.innerWidth || document.documentElement.clientWidth || 0;
+  let h = window.innerHeight || document.documentElement.clientHeight || 0;
+  let r = m.getBoundingClientRect();
+  if (w && x + r.width > w - 4) x = (altX != null) ? altX - r.width : w - 4 - r.width;
+  if (h && y + r.height > h - 4) y = h - 4 - r.height;
+  m.style.left = Math.max(4, Math.round(x)) + 'px';
+  m.style.top = Math.max(4, Math.round(y)) + 'px';
+}
+function _focusItem(m, i) {
+  let its = _menuItemsOf(m);
+  if (!its.length) return;
+  i = ((i % its.length) + its.length) % its.length;
+  try { its[i].focus(); } catch (e) {}
+}
+function openMenu(items, x, y, label) {
+  closeMenus(false);
+  let m = _buildMenu(items, label, 0);
+  _menus = [m];
+  _placeMenu(m, x, y);
+  let its = _menuItemsOf(m);
+  let first = its.findIndex(b => !b._mi.disabled);
+  _focusItem(m, first < 0 ? 0 : first);
+  return m;
+}
+function _closeSubmenu() {
+  let sub = _menus[1];
+  if (!sub) return;
+  if (sub.parentNode) sub.parentNode.removeChild(sub);
+  if (sub._parentItem) sub._parentItem.setAttribute('aria-expanded', 'false');
+  _menus.length = 1;
+}
+function _openSubmenu(b, focus) {
+  _closeSubmenu();
+  let items = b._mi.sub() || [];
+  if (!items.length) items = [{label: 'No other tabs', disabled: true}];
+  let sub = _buildMenu(items, b._mi.label, 1);
+  sub._parentItem = b;
+  b.setAttribute('aria-expanded', 'true');
+  _menus[1] = sub;
+  let r = b.getBoundingClientRect();
+  _placeMenu(sub, r.right + 2, r.top - 5, r.left - 2);
+  if (focus) _focusItem(sub, 0);
+}
+function _menuChoose(b) {
+  let it = b._mi;
+  if (!it || it.disabled) return;
+  if (it.sub) { _openSubmenu(b, true); return; }
+  closeMenus(false);
+  if (it.act) it.act();
+}
+function _menuKey(e) {
+  let m = e.currentTarget;
+  let its = _menuItemsOf(m);
+  let i = its.indexOf(document.activeElement);
+  let k = e.key;
+  let handled = true;
+  if (k === 'ArrowDown') _focusItem(m, i + 1);
+  else if (k === 'ArrowUp') _focusItem(m, i < 0 ? -1 : i - 1);
+  else if (k === 'Home') _focusItem(m, 0);
+  else if (k === 'End') _focusItem(m, -1);
+  else if (k === 'Enter' || k === ' ') { if (its[i]) _menuChoose(its[i]); }
+  else if (k === 'ArrowRight') { if (its[i] && its[i]._mi.sub && !its[i]._mi.disabled) _openSubmenu(its[i], true); }
+  else if (k === 'ArrowLeft') {
+    if (m._level === 1) { let pb = m._parentItem; _closeSubmenu(); if (pb) { try { pb.focus(); } catch (err) {} } }
+  }
+  else if (k === 'Escape' || k === 'Tab') closeMenus(true);
+  else handled = false;
+  if (handled) { e.preventDefault(); e.stopPropagation(); }
+}
+document.addEventListener('mousedown', e => {
+  if (!_menus.length) return;
+  for (let i = 0; i < _menus.length; i++) if (_menus[i].contains(e.target)) return;
+  closeMenus(false);
+}, true);
+window.addEventListener('resize', () => closeMenus(false));
+window.addEventListener('blur', () => closeMenus(false));
+
+// A tab's menu: rename it, put its whole layout into another tab (to
+// the right of that tab's active pane, as the pane move does), close it.
+function openTabMenu(t, x, y) {
+  // With one tab there is no tab to move into: the item is left out.
+  let items = [{label: 'Rename', icon: 'pencil', act: () => startTabRename(t.id)}];
+  if (tabs.length > 1) items.push(
+    {label: 'Move into tab', icon: 'move-to',
+     sub: () => tabs.filter(o => o !== t).map(o => ({
+       label: tabTitle(o) || 'Tab ' + (tabs.indexOf(o) + 1),
+       act: () => { if (tabs.indexOf(t) >= 0) mergeTabIntoTab(t.id, o.id); }}))});
+  items.push({label: 'Close tab', icon: 'close', danger: true,
+     act: () => { if (tabs.indexOf(t) >= 0) closeTab(t.id); }});
+  openMenu(items, x, y, 'Tab');
+}
+// The pane's move button (its bar, or #paneTools for a lone pane): the
+// other tabs; the pane goes to the right of the chosen tab's active pane.
+// The button is hidden with one tab (body.one-tab, renderPaneTools);
+// "No other tabs" is only a guard.
+function openPaneMoveMenu(id, btn) {
+  let p = panes[id];
+  if (!p) return;
+  let own = tabOfPane(p);
+  let items = tabs.filter(o => o !== own).map(o => ({
+    label: tabTitle(o) || 'Tab ' + (tabs.indexOf(o) + 1),
+    act: () => { if (panes[id] && tabs.indexOf(o) >= 0) movePaneToTab(id, o.id); }}));
+  if (!items.length) items = [{label: 'No other tabs', disabled: true}];
+  let r = btn && btn.getBoundingClientRect ? btn.getBoundingClientRect() : {left: 0, bottom: 0};
+  openMenu(items, r.left, r.bottom + 2, 'Move to tab')._pane = id;
+}
 
 // ── Split / Close ───────────────────────────────────────────────────
 // Split does NOT mutate the DOM. It records the intent and opens the
@@ -1086,15 +2428,8 @@ function materializeTarget() {
   if (overlayMode === 'split' && pendingSplit) {
     let from = panes[pendingSplit.fromId];
     if (!from) { pendingSplit = null; return targetPane(); }
-    let dir = pendingSplit.dir;
-    let parent = from.el.parentNode;
-    let wrap = document.createElement('div');
-    wrap.className = 'split-' + dir;
-    let handle = document.createElement('div');
-    handle.className = 'split-handle';
-    parent.replaceChild(wrap, from.el);
-    wrap.appendChild(from.el);
-    wrap.appendChild(handle);
+    // The new split keeps the pane's share of its parent (U9).
+    let wrap = _wrapInSplit(from.el, pendingSplit.dir);
     let np = createPane(wrap);
     activatePane(np.id);
     connectingFor = np.id;
@@ -1132,6 +2467,7 @@ function cancelConnect() {
       if (t && !panesInTab(t).length) removeTab(t);
     } else if (wrap) {
       // Split case: unwrap and restore the sibling.
+      let t = tabOfPane(np);
       let parent = wrap.parentNode;
       let sibling = null;
       for (let i=0; i<wrap.children.length; i++) {
@@ -1141,10 +2477,8 @@ function cancelConnect() {
       }
       np.term.dispose();
       delete panes[np.id];
-      if (sibling && parent) {
-        sibling.style.flex = '';
-        parent.replaceChild(sibling, wrap);
-      }
+      if (sibling && parent) _unwrapSplit(wrap, sibling);   // keeps its share (U9)
+      renderTab(t);   // back to one pane: its bar goes again
     }
     saveSessions();
   }
@@ -1182,6 +2516,7 @@ function closePane(id) {
 function _destroyPane(id, terminate) {
   let p = panes[id];
   if (!p) return;
+  if (_menus[0] && _menus[0]._pane === id) closeMenus(false);   // its "Move to tab" menu
   // Drop any sessionStorage secrets first — the pane is going away,
   // and so should its plaintext SSH credentials. Vault panes have no
   // entry here; the call is a no-op for them.
@@ -1248,15 +2583,17 @@ function _destroyPane(id, terminate) {
     return;
   }
 
-  // Unwrap: replace split container with the remaining child
+  // Unwrap: replace split container with the remaining child. The
+  // remaining pane is re-parented: a focused reconnect password input
+  // in it would drop its focus to <body> (_keepRcFocus puts it back).
+  let rcInp = _focusedRcInput();
   let sibling = null;
   for (let i=0; i<wrap.children.length; i++) {
     let ch = wrap.children[i];
     if (ch !== p.el && !ch.classList.contains('split-handle')) { sibling = ch; break; }
   }
   if (sibling && wrap.parentNode) {
-    sibling.style.flex = '';
-    wrap.parentNode.replaceChild(sibling, wrap);
+    _unwrapSplit(wrap, sibling);   // takes the split's share (U9)
   } else {
     p.el.remove();
   }
@@ -1275,6 +2612,7 @@ function _destroyPane(id, terminate) {
 
   // Refit the terminals on screen after the layout change
   fitVisiblePanes();
+  if (rcInp) _keepRcFocus(() => {}, rcInp);
   saveSessions();
 }
 
@@ -1349,7 +2687,8 @@ function _deletePaneSecret(uuid) {
 // For manual / named panes whose in-memory password was lost (fresh-tab
 // F5 with empty sessionStorage, or _maybeAutoDropLegacy on the source
 // saved card before they cliked reconnect), we expose an inline password
-// input on the bar so the user can recover in place without opening the
+// input in the Reconnect control (in the pane's bar, or a lone pane's
+// strip - placeReconnect) so the user can recover in place without opening the
 // full connect form. Vault-backed panes follow the "no_vault_key" path
 // instead (their fix is sign-in, not a typed password). Key-auth panes
 // fall back to "Reconnect" only (a multi-line key blob doesn't fit a bar
@@ -1367,7 +2706,7 @@ function showReconnectBar(p, reason) {
   let msg = bar.querySelector('span');
   let pwInput = bar.querySelector('input[type=password]');
   let showInput = _needsReconnectPwInput(p, reason);
-  // Severity drives the card's coloured edge; a plain drop gets none.
+  // Severity drives the control's coloured edge; a plain drop gets none.
   bar.classList.remove('sev-err', 'sev-warn');
   if (msg) {
     if (reason === 'auth_failed') {
@@ -1385,8 +2724,8 @@ function showReconnectBar(p, reason) {
       bar.classList.add('sev-warn');
     } else {
       // The pane badge already says "Disconnected"; repeating it here in
-      // red just doubled the alarm. Say only what the card adds - what to
-      // do next - and let the lone Reconnect button speak for itself.
+      // red just doubled the alarm. Say only what the control adds - what
+      // to do next - and let the lone Reconnect button speak for itself.
       msg.textContent = showInput ? 'Type the password to reconnect' : '';
       msg.style.color = 'var(--dim)';
     }
@@ -1400,17 +2739,18 @@ function showReconnectBar(p, reason) {
       setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
-  // Nothing but the button left? Then the card is a box drawn around a
-  // button that already has its own edges - drop the chrome and show
-  // the button alone. The card comes back as soon as it has to carry
-  // text or the password input.
+  // Nothing but the button left? Then it is the bare button (.bare);
+  // the message and the password input come back as soon as there is
+  // something to say or type. Then put the control where it belongs
+  // (bar or strip) - after the classes, which decide its width.
   bar.classList.toggle('bare',
     !(msg && msg.textContent) && !(pwInput && !pwInput.classList.contains('h')));
   bar.classList.remove('h');
+  placeReconnect(p);
 }
 function hideReconnectBar(p) {
   let bar = p.el.querySelector('[data-reconnect]');
-  if (bar) bar.classList.add('h');
+  if (bar) { bar.classList.add('h'); placeReconnect(p); }
 }
 function reconnectPane(id) {
   let p = panes[id]; if (!p || (!p.host && !p.connection)) return;
@@ -1439,8 +2779,9 @@ function reconnectPane(id) {
 //   2  {version, layout, panes}: one layout, no tabs.
 //   3  {version, tabs: [{layout, active}], active, panes}: one layout per
 //      tab in strip order; `active` is the index of the tab in front,
-//      a tab's `active` the id of its last active pane. Version 2 (and
-//      1) load as one tab holding that layout.
+//      a tab's `active` the id of its last active pane, its optional
+//      `name` what the user called it (absent: the automatic title).
+//      Version 2 (and 1) load as one tab holding that layout.
 const PANES_KEY = 'websh_panes';
 const PANES_VERSION = 3;
 
@@ -1566,13 +2907,7 @@ function buildConnectBody(rec, termCols, termRows) {
 
 function serializeLayout(rootEl) {
   // rootEl is a tab's root; walk its single child (pane or split wrapper).
-  let first = null;
-  for (let i = 0; i < rootEl.children.length; i++) {
-    let ch = rootEl.children[i];
-    if (ch.classList.contains('pane') || ch.classList.contains('split-h') || ch.classList.contains('split-v')) {
-      first = ch; break;
-    }
-  }
+  let first = _layoutNode(rootEl);
   return first ? serializeNode(first) : null;
 }
 function serializeNode(el) {
@@ -1602,7 +2937,9 @@ function saveSessions() {
     let layout = serializeLayout(t.root);
     if (!layout) return;
     if (t.id === activeTabId) activeIdx = tabList.length;
-    tabList.push({layout: layout, active: t.lastActive || null});
+    let rec = {layout: layout, active: t.lastActive || null};
+    if (t.name) rec.name = t.name;
+    tabList.push(rec);
   });
   let manifest = {
     version: PANES_VERSION,
@@ -7070,13 +8407,22 @@ function toggleFullscreen(){
     dragging.a.style.flex=ratio+'';
     dragging.b.style.flex=(1-ratio)+'';
     fitVisiblePanes();
+    // The tab's miniature follows the proportion; renderTab's memo holds
+    // whole-pixel boxes, so only a move that changes one redraws it.
+    renderTab(dragTab());
+  }
+  function dragTab() {
+    let root=dragging&&dragging.wrap.closest?dragging.wrap.closest('.tab-root'):null;
+    return root?tabById(root.getAttribute('data-tab')):null;
   }
   function endDrag() {
     if(!dragging) return;
     dragging.handle.classList.remove('dragging');
     document.body.classList.remove('resizing','resizing-v');
+    let t=dragTab();
     dragging=null;
     fitVisiblePanes();
+    renderTab(t);
     saveSessions();
   }
   // Mouse events
@@ -7135,6 +8481,84 @@ window.addEventListener('blur', () => {
 });
 
 // ── Keyboard shortcuts ──────────────────────────────────────────────
+// Tab keys: Alt+1..Alt+8 go to tab N, Alt+9 to the last tab, Alt+T is
+// the "+" button, Alt+W closes the tab on screen (closeTab: the same
+// confirm as its x), Alt+Shift+[ / Alt+Shift+] go to the previous /
+// next tab, wrapping. Not Alt+Left/Right: Option+arrows move by word in
+// the shell on a Mac.
+//
+// Matched by e.code, never e.key: a Cyrillic layout gives key 'е' for
+// Alt+T, and macOS Option gives a symbol ('¡' for Option+1, '’' for
+// Option+Shift+]). Plain Alt only: Ctrl+Alt is AltGr on Windows (it
+// types characters on many layouts), and Meta/Ctrl combos belong to the
+// browser. Any other Alt combo is not ours and reaches the shell as
+// before (readline's Alt+B/F/./D, Alt+[ ...).
+//
+// Two entry points, one rule:
+//  - the terminal: xterm's attachCustomKeyEventHandler sees the key
+//    before xterm sends ESC+x and stops it, so a document listener never
+//    would. Returning false there leaves the event alone; we also
+//    preventDefault, or macOS would type the Option symbol into xterm's
+//    textarea and it would reach the shell through the input event.
+//  - the page outside a terminal (tab strip, body): the document
+//    listener below. A key handled in the terminal bubbles on to it, so
+//    the event is marked and acted on once.
+// While any dialog is up (login form, options, confirm, file browser:
+// every .ov) the keys do nothing and are not taken. In a text field
+// that is not a terminal (search box, a pane's reconnect password,
+// any contenteditable) they are not ours either: every Alt/Option
+// character must type there (a Mac password with ¡ or ™ in it).
+// During a tab or pane drag (from the press on) they are taken but do
+// nothing: switching or closing a tab under the pointer would change
+// what the release drops onto.
+function _tabKeyAction(e) {
+  if (!e || !e.altKey || e.ctrlKey || e.metaKey) return null;
+  if (e.getModifierState && e.getModifierState('AltGraph')) return null;
+  let c = e.code || '';
+  if (e.shiftKey) {
+    if (c === 'BracketLeft') return 'prev';
+    if (c === 'BracketRight') return 'next';
+    return null;
+  }
+  let m = /^Digit([1-9])$/.exec(c);
+  if (m) return m[1];
+  if (c === 'KeyT') return 'new';
+  if (c === 'KeyW') return 'close';
+  return null;
+}
+function _isPageTextField(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.classList && el.classList.contains('xterm-helper-textarea')) return false;
+  let tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!el.isContentEditable
+    || (el.getAttribute && /^(|true|plaintext-only)$/i.test(el.getAttribute('contenteditable') || 'x'));
+}
+function tabKeyHandled(e) {
+  let act = _tabKeyAction(e);
+  if (!act || !tabs.length || document.querySelector('.ov:not(.h)')) return false;
+  if (_isPageTextField(e.target)) return false;
+  if (e.type === 'keydown' && !e._wsTabKey && !_tabDrag && !_paneDrag) {
+    e._wsTabKey = true;
+    let idx = tabs.indexOf(activeTab());
+    if (act === 'new') newTab();
+    else if (act === 'close') { if (activeTabId) closeTab(activeTabId); }
+    else if (act === 'prev' || act === 'next') {
+      let n = tabs.length;
+      let i = idx < 0 ? 0 : (idx + (act === 'next' ? 1 : n - 1)) % n;
+      if (tabs[i].id !== activeTabId) showTab(tabs[i].id);
+    } else {
+      let i = act === '9' ? tabs.length - 1 : Number(act) - 1;
+      if (tabs[i] && tabs[i].id !== activeTabId) showTab(tabs[i].id);
+    }
+  }
+  try { e.preventDefault(); } catch (err) {}
+  return true;
+}
+document.addEventListener('keydown', e => {
+  if (e._wsTabKey) return;
+  tabKeyHandled(e);
+});
+
 function cyclePanes(reverse) {
   // Within the tab on screen: a pane in a hidden tab is not a target.
   let ids = panesInTab(activeTab()).map(p => p.id);
@@ -7251,10 +8675,12 @@ function tryRestoreSessions() {
   m.tabs.forEach((tm, idx) => {
     if (!tm || !tm.layout) return;
     let t = createTab();
+    t.name = _cleanTabName(tm.name);
     tabs.forEach(o => o.root.classList.toggle('h', o !== t));
     let before = Object.keys(restored).length;
     build(t.root, tm.layout);
     if (Object.keys(restored).length === before) { removeTab(t); return; }
+    renderTab(t);    // solo or not BEFORE the fit below: a lone pane has no bar
     panesInTab(t).forEach(q => { try { q.fitAddon.fit(); } catch (e) {} });
     t.lastActive = (tm.active && restored[tm.active]) ? restored[tm.active].id
                                                       : panesInTab(t)[0].id;

@@ -63,6 +63,16 @@ for i in $(seq 1 $FRONT_RUNS); do
   else bad "${line:-no summary - the run crashed}"; show_frontend_failures "$LOG/fe$i"; fi
 done
 
+# Other frontend suites (one file each, same summary format).
+for f in tests/frontend/test_*.js; do
+  n=$(basename "$f" .js); [ "$n" = test_connect ] && continue
+  step "frontend ${n#test_}"
+  (cd tests/frontend && node "$n.js" >"$LOG/$n" 2>&1)
+  line=$(grep 'passed:' "$LOG/$n" | tail -1)
+  if echo "$line" | grep -q 'failed: 0$'; then ok "$(echo $line)"
+  else bad "${line:-no summary - the run crashed}"; show_frontend_failures "$LOG/$n"; fi
+done
+
 if [ "$MODE" != --quick ]; then
   step "php proxy"
   if command -v php >/dev/null; then
@@ -80,6 +90,12 @@ if [ "$MODE" = --full ]; then
     if docker run --rm -v "$PWD":/w -w /w "python:$1-slim" sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq openssh-client >/dev/null 2>&1; $pre; python -m unittest discover -s tests/backend -t ." >"$LOG/m" 2>&1
     then ok "$(tail -1 "$LOG/m")"; else bad "$(tail -1 "$LOG/m")"; grep -E '^(FAIL|ERROR):' "$LOG/m" | head; fi
   done
+  # An old tmux on the target (Debian 11: 3.1c, no terminal-features):
+  # websh's attach chain must still bring the pane up. Only this machine
+  # has no such tmux; CI has none either.
+  step "tmux 3.1c attach chain"
+  if docker run --rm -v "$PWD":/w -w /w python:3.9-slim-bullseye sh -c "apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq tmux >/dev/null 2>&1; tmux -V | grep -q '^tmux 3.1' || { echo 'not tmux 3.1'; exit 1; }; python -m unittest tests.backend.test_tmux_links" >"$LOG/m" 2>&1
+  then ok "$(tail -1 "$LOG/m")"; else bad "$(tail -1 "$LOG/m")"; grep -E '^(FAIL|ERROR):' "$LOG/m" | head; fi
 fi
 
 echo

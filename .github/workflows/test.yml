@@ -39,7 +39,7 @@ jobs:
         run: npm install --no-audit --no-fund
       - name: Run frontend tests
         working-directory: tests/frontend
-        run: node test_connect.js
+        run: for f in test_*.js; do node "$f" || exit 1; done
 
   php-lint:
     # The PHP proxy shipped untested — not even syntax-checked. The

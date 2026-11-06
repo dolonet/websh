@@ -1079,13 +1079,20 @@ class TestBuildRemoteCommand(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         return r.returncode == 0, r.stderr
 
+    def _assert_attach(self, line):
+        # One tmux invocation that creates-or-attaches websh-alice with a
+        # login shell, mouse on, status bar off. Other options may sit in
+        # the same chain (e.g. terminal features for the outer terminal);
+        # what is pinned is what the user sees, not the exact string.
+        self.assertTrue(line.startswith("exec tmux start-server"), line)
+        self.assertEqual(line.count("\n"), 0, line)
+        self.assertIn(' \\; new-session -A -D -s websh-alice -- "$SHELL" -l', line)
+        self.assertIn(' \\; set -g mouse on', line)
+        self.assertIn(' \\; set -g status off', line)
+
     def test_ttl_zero_returns_plain_exec(self):
         cmd = server._build_remote_command("alice", "tmux", 0)
-        self.assertEqual(
-            cmd,
-            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
-            ' \\; set -g mouse on'
-            ' \\; set -g status off')
+        self._assert_attach(cmd)
 
     def test_ttl_negative_treated_as_disabled(self):
         # The _build function is called with TMUX_IDLE_TTL which is
@@ -1102,10 +1109,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertIn("kill-session -t websh-alice", cmd)
         self.assertIn("-ge 3600", cmd)  # the TTL comparison
         # Ends with the exec so the login shell doesn't linger.
-        self.assertTrue(cmd.rstrip().endswith(
-            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
-            ' \\; set -g mouse on'
-            ' \\; set -g status off'))
+        self._assert_attach(cmd.rstrip().rsplit("\n", 1)[-1])
 
     def test_status_off_baked_into_command(self):
         """tmux's status bar is hidden by default — every command must
@@ -1212,14 +1216,18 @@ class TestBuildRemoteCommand(unittest.TestCase):
             "ok", "tmux", 0,
             tmux_options=[("set-clipboard", "on"),
                           ("history-limit", "100000")])
-        self.assertIn(
-            'tmux start-server'
-            ' \\; set -g set-clipboard on'
-            ' \\; set -g history-limit 100000'
-            ' \\; new-session -A -D -s websh-ok -- "$SHELL" -l'
-            ' \\; set -g mouse on'
-            ' \\; set -g status off',
-            cmd)
+        # The order is what matters; other baked-in options may sit
+        # between these in the same chain.
+        parts = ['tmux start-server',
+                 ' \\; set -g set-clipboard on',
+                 ' \\; set -g history-limit 100000',
+                 ' \\; new-session -A -D -s websh-ok -- "$SHELL" -l',
+                 ' \\; set -g mouse on',
+                 ' \\; set -g status off']
+        at = [cmd.find(x) for x in parts]
+        self.assertNotIn(-1, at, cmd)
+        self.assertEqual(at, sorted(at), cmd)
+        self.assertNotIn("\n", cmd[at[0]:], cmd)
 
     def test_mouse_on_baked_into_command(self):
         """Mouse is hardcoded on the server side — every command must

@@ -536,14 +536,27 @@ class TestHTTPApi(LiveServerCase):
         # second one. The handler only releases _stream_active in the
         # outer try/finally, so the slot remains held the whole time.
         gate = _threading.Event()
+        # Set once the holder is inside read(). The 200 and the primer go
+        # out BEFORE the stream loop checks its generation and reads, so
+        # "headers received" does not mean "holder blocked": a second
+        # stream arriving in that gap is a legitimate takeover (the holder
+        # steps aside, the newcomer gets 200 - newest wins), and that is
+        # what a slow CI runner hit (run 36905155244). Wait for this
+        # instead, so the second request meets a holder that really
+        # cannot step aside.
+        in_read = _threading.Event()
 
         class Sess(_FakeNotifyMixin):
             def __init__(self):
                 self.alive = True
                 self.auth_failed = False
             def read(self):
+                in_read.set()
                 if not gate.is_set():
-                    gate.wait(timeout=5)
+                    # Long bound: the finally below always sets the gate,
+                    # and a short one would let a slow runner's holder
+                    # leave read() before the 2 s takeover deadline ends.
+                    gate.wait(timeout=30)
                 self.alive = False
                 return b""
 
@@ -571,6 +584,8 @@ class TestHTTPApi(LiveServerCase):
                     pass
             self.assertIn(b"HTTP/1.0 200", buf,
                 "first stream must respond 200; got: " + repr(buf[:80]))
+            self.assertTrue(in_read.wait(timeout=10),
+                "first stream never reached session.read()")
             # First handler is now parked in read()/wait; _stream_active=True.
 
             # Second stream: rejected with 409 once the deadline passes.
