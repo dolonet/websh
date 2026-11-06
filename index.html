@@ -237,9 +237,29 @@
     .opt-btn.primary:hover{background:var(--ach);border-color:var(--ach)}
 
     /* ── File browser modal ── */
-    .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:560px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+    .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:680px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
     .fb-hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
-    .fb-path{flex:1;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+    /* Breadcrumb path. Scrolls horizontally on a deep path rather than
+       ellipsising, so every segment stays clickable; min-width:0 keeps
+       it from shoving the close button off the row. */
+    .fb-path{flex:1;min-width:0;display:flex;align-items:center;overflow-x:auto;white-space:nowrap;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;scrollbar-width:thin}
+    .fb-crumb{background:none;border:none;color:var(--dim);cursor:pointer;padding:2px 3px;font:inherit;border-radius:3px;flex-shrink:0}
+    .fb-crumb:hover{color:var(--tx);background:rgba(255,255,255,.06)}
+    .fb-crumb.cur{color:var(--tx);cursor:default}
+    .fb-crumb.cur:hover{background:none}
+    .fb-crumb-sep{color:var(--dim);opacity:.5;flex-shrink:0;padding:0 1px}
+    /* Toolbar row: create/hidden/filter on the left, sort on the right. */
+    .fb-tools{display:flex;align-items:center;gap:6px;padding:7px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
+    .fb-tool{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 9px;border-radius:4px;font-size:11px;font-family:inherit;white-space:nowrap;flex-shrink:0;transition:.15s}
+    .fb-tool:hover{color:var(--tx);border-color:var(--dim)}
+    .fb-tool.on{color:var(--ac);border-color:var(--ac)}
+    .fb-filter{flex:1;min-width:60px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:3px 8px;font-size:12px;font-family:'JetBrains Mono',ui-monospace,monospace}
+    .fb-filter:focus{outline:none;border-color:var(--ac)}
+    .fb-filter::placeholder{color:var(--dim);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+    .fb-sort{display:flex;gap:2px;flex-shrink:0}
+    .fb-sort button{background:none;border:1px solid transparent;color:var(--dim);cursor:pointer;padding:3px 7px;border-radius:4px;font-size:11px;font-family:inherit;white-space:nowrap;transition:.15s}
+    .fb-sort button:hover{color:var(--tx);border-color:var(--bd)}
+    .fb-sort button.on{color:var(--ac);border-color:var(--bd);background:rgba(255,255,255,.04)}
     .fb-up{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 10px;border-radius:4px;font-size:14px;flex-shrink:0;transition:.15s}
     .fb-up:hover{color:var(--tx);border-color:var(--dim)}
     .fb-list{flex:1;overflow-y:auto;padding:4px 0;min-height:180px}
@@ -248,12 +268,50 @@
     .fb-ic{font-size:14px;flex-shrink:0;width:20px;text-align:center}
     .fb-nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .fb-sz{font-size:11px;color:var(--dim);flex-shrink:0;min-width:64px;text-align:right;font-family:'JetBrains Mono',ui-monospace,monospace}
+    .fb-dt{font-size:11px;color:var(--dim);flex-shrink:0;min-width:92px;text-align:right;font-family:'JetBrains Mono',ui-monospace,monospace;white-space:pre}
+    /* Row actions (rename, delete) sit in a fixed-width group at the far
+       right so the size/date columns don't reflow between rows that have
+       actions and the ".." row that doesn't. Dim until the row is
+       hovered — a list of 200 files shouldn't be a wall of icons — but
+       never display:none: they must stay reachable by keyboard and
+       visible on touch, where there is no hover. */
+    .fb-act{display:inline-flex;gap:2px;justify-content:flex-end;flex-shrink:0;min-width:42px;margin-left:4px}
+    .fb-act button{background:none;border:none;color:var(--dim);opacity:.4;cursor:pointer;padding:0 2px;font-size:14px;line-height:1;width:18px;border-radius:3px;transition:.12s}
+    .fb-row:hover .fb-act button{opacity:.75}
+    .fb-ren:hover,.fb-ren:focus-visible{color:var(--ac)!important;opacity:1!important;outline:none}
+    .fb-del:hover,.fb-del:focus-visible{color:var(--dg)!important;opacity:1!important;outline:none}
+    /* Inline rename / new-folder editor — swaps into a row. */
+    .fb-row.fb-edit{cursor:default;gap:6px}
+    .fb-ed-inp{flex:1;min-width:0;background:var(--bg);color:var(--tx);border:1px solid var(--ac);border-radius:4px;padding:3px 8px;font-size:13px;font-family:'JetBrains Mono',ui-monospace,monospace}
+    .fb-ed-inp:focus{outline:none}
+    .fb-row.fb-edit button{border:1px solid var(--bd);background:none;color:var(--dim);cursor:pointer;padding:3px 10px;border-radius:4px;font-size:11px;font-family:inherit;flex-shrink:0;transition:.15s}
+    .fb-ed-ok{color:var(--ac)!important;border-color:var(--ac)!important}
+    .fb-ed-ok:hover{background:var(--ac)!important;color:#fff!important}
+    .fb-ed-no:hover{color:var(--tx);border-color:var(--dim)}
+    /* Inline delete confirmation — replaces the row's contents so the
+       filename stays visible next to the choice. */
+    .fb-row.fb-confirm{cursor:default;background:rgba(255,80,80,.08);gap:6px}
+    .fb-cf-q{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--tx)}
+    .fb-row.fb-confirm button{border:1px solid var(--bd);background:none;color:var(--dim);cursor:pointer;padding:3px 10px;border-radius:4px;font-size:11px;font-family:inherit;flex-shrink:0;transition:.15s}
+    .fb-cf-no:hover{color:var(--tx);border-color:var(--dim)}
+    .fb-cf-yes{color:var(--dg)!important;border-color:var(--dg)!important}
+    .fb-cf-yes:hover{background:var(--dg)!important;color:#fff!important}
+    /* Hidden by the name filter or the dotfile toggle. */
+    .fb-row.fb-hide{display:none}
     .fb-msg{padding:20px;text-align:center;color:var(--dim);font-size:13px}
     .fb-msg.err{color:var(--dg)}
     .fb-ft{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bd);flex-shrink:0}
     .fb-inp{flex:1;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:13px;font-family:'JetBrains Mono',ui-monospace,monospace}
     .fb-inp:focus{outline:none;border-color:var(--ac)}
     .fb-inp::placeholder{color:var(--dim);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+    /* Phones: the filename is what matters, so the date column is the
+       first thing to go. Sorting BY date still works — the buttons stay. */
+    @media (max-width:520px){
+      .fb-dt{display:none}
+      .fb-sz{min-width:52px}
+      .fb-sort button{padding:3px 5px}
+      .fb-tool{padding:3px 6px}
+    }
   </style>
 </head>
 <body>
@@ -510,8 +568,28 @@
   <div class="fb-panel">
     <div class="fb-hd">
       <button class="fb-up" onclick="fbUp()" title="Parent directory">&#x2191;</button>
-      <span class="fb-path" id="fbPath"></span>
+      <!-- Clickable path segments (breadcrumbs), rendered by renderFbCrumbs.
+           data-path carries the full resolved path for scripts/tests. -->
+      <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
       <button class="panel-close" onclick="closeFb()">&#x00D7;</button>
+    </div>
+    <div class="fb-tools">
+      <button type="button" class="fb-tool" onclick="fbNewFolder()" title="Create a folder here">&#x002B; Folder</button>
+      <button type="button" class="fb-tool" id="fbHidden" aria-pressed="false"
+              onclick="toggleFbHidden()" title="Show dotfiles">Hidden</button>
+      <input type="text" id="fbFilter" class="fb-filter" placeholder="Filter&hellip;"
+             aria-label="Filter files by name" oninput="applyFbFilter()"
+             onkeydown="if(event.key==='Escape'){this.value='';applyFbFilter();event.stopPropagation()}">
+      <!-- Sort controls. Labels live in data-label because syncFbSortUi
+           rewrites textContent to append the active column's arrow. -->
+      <span class="fb-sort" role="group" aria-label="Sort files by">
+        <button type="button" id="fbSort-name"  data-label="Name" aria-pressed="false"
+                onclick="setFbSort('name')"  title="Sort by name">Name</button>
+        <button type="button" id="fbSort-size"  data-label="Size" aria-pressed="false"
+                onclick="setFbSort('size')"  title="Sort by size">Size</button>
+        <button type="button" id="fbSort-mtime" data-label="Date" aria-pressed="false"
+                onclick="setFbSort('mtime')" title="Sort by modification date">Date</button>
+      </span>
     </div>
     <div class="fb-list" id="fbList"></div>
     <div class="fb-ft">

@@ -27,6 +27,22 @@ from tests.backend._base import (  # noqa: F401
 import server
 
 
+def _pipe_stdout(*chunks):
+    """A real pipe pre-filled with `chunks` (writer closed after), wrapped
+    like Popen.stdout. _download reads the raw fd under select(), so a
+    MagicMock with read.side_effect no longer models it."""
+    r, w = os.pipe()
+    data = b"".join(chunks)
+
+    def feed():
+        try:
+            os.write(w, data)
+        finally:
+            os.close(w)
+    threading.Thread(target=feed, daemon=True).start()
+    return os.fdopen(r, "rb", buffering=0)
+
+
 class TestAccessLogEmit(unittest.TestCase):
     """Unit tests for _access_log_emit (the JSON-line writer)."""
 
@@ -568,14 +584,38 @@ class TestTransferAccessLog(LiveServerCase):
                 return hits
             time.sleep(0.02)
 
+    def test_rm_mkdir_mv_emit_access_log(self):
+        """Keystroke-free deletes/renames appear in neither the session
+        recording nor the scrollback; the access log is the only audit
+        surface they have. Both outcomes are recorded."""
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake._host = "h.example"
+        fake.remove_path.return_value = (True, "")
+        fake.make_dir.return_value = (False, "name already exists")
+        fake.rename_entry.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            self._post("/api/rm", {"session_id": sid, "path": "/srv/a"})
+            self._post("/api/mkdir", {"session_id": sid, "path": "/srv/d"})
+            self._post("/api/mv", {"session_id": sid, "path": "/srv/a",
+                                   "name": "b"})
+        rm = self._records("rm")[0]
+        self.assertEqual((rm["result"], rm["path"], rm["target_host"]),
+                         ("ok", "/srv/a", "h.example"))
+        mk = self._records("mkdir")[0]
+        self.assertEqual(mk["result"], "error")
+        self.assertIn("exists", mk["error"])
+        mv = self._records("mv")[0]
+        self.assertEqual((mv["path"], mv["name"], mv["result"]),
+                         ("/srv/a", "b", "ok"))
+
     def test_download_emits_access_log(self):
         from urllib.request import urlopen
         sid = str(uuid.uuid4())
         payload = b"secret-data-1234"
         header = "OK\t{}\n".format(len(payload)).encode()
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] + [b"\n"] + [payload, b""])
+        fake_proc.stdout = _pipe_stdout(header, payload)
         fake_session = unittest.mock.MagicMock()
         fake_session._host = "h.example"
         fake_session.download_file.return_value = (fake_proc, None)

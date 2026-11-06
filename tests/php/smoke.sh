@@ -17,6 +17,8 @@ WORK=$(mktemp -d)
 STUB_OUT=$WORK/stub.out
 UNKNOWN_OUT=$WORK/unknown.out
 STUB_SOCK=$WORK/stub.sock
+STUB_MARK=$WORK/stream.closed
+export STUB_MARK
 python3 tests/php/stub_backend.py "$STUB_SOCK" > "$STUB_OUT" &
 STUB_PID=$!
 PHP_PID=
@@ -26,7 +28,7 @@ SHARED_PID=
 BACKEND_PID_FILE=$WORK/backend.pid
 cleanup() {
   kill $STUB_PID $PHP_PID $AUTO_PID $PLANTED_PID $SHARED_PID 2>/dev/null || true
-  # The private launcher records the exact PID before exec, including
+  # The private launcher records the exact PID before loading the backend, including
   # when auto-start fails before its first response. Never kill by pattern.
   if [ -s "$BACKEND_PID_FILE" ]; then
     backend_pid=$(cat "$BACKEND_PID_FILE")
@@ -105,12 +107,20 @@ echo "$r" | grep -q 'vault_id=v1' || fail "save_delete vault_id query passthroug
 echo "$r" | grep -q 'conn_id=c1' || fail "save_delete conn_id query passthrough" "$r"
 json_ok save_delete "$r"
 
-# 5. Unknown action handled by api.php itself with a JSON 404.
+
+# 5. A well-formed but UNKNOWN action forwards to the backend (this is
+#    the zero-PHP-edits contract for new endpoints — the backend owns
+#    the 404). The echo stub answers 200 with the request description.
+r=$(curl -fsS "http://127.0.0.1:$PHP_PORT/api.php?action=brand_new_endpoint&x=1")
+echo "$r" | grep -q '"path": "/api/brand_new_endpoint"' \
+  || fail "unknown action not forwarded generically" "$r"
+echo "$r" | grep -q 'x=1' || fail "unknown action query passthrough" "$r"
+
+# 6. A MALFORMED action (regex gate) is rejected locally with JSON 404.
 code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' \
-     "http://127.0.0.1:$PHP_PORT/api.php?action=nope")
-[ "$code" = "404" ] || fail "unknown action status" "$code"
-grep -q 'unknown action' "$UNKNOWN_OUT" || fail "unknown action body" "$(cat "$UNKNOWN_OUT")"
-json_ok "unknown action" "$(cat "$UNKNOWN_OUT")"
+     "http://127.0.0.1:$PHP_PORT/api.php?action=No.Such%2FAction")
+[ "$code" = "404" ] || fail "malformed action status" "$code"
+grep -q 'unknown action' "$UNKNOWN_OUT" || fail "malformed action body" "$(cat "$UNKNOWN_OUT")"
 
 # 6. A backend error status reaches the browser unchanged (the stub
 #    answers session_id=gone with 404, like an expired session).
@@ -218,5 +228,46 @@ SHARED_PID=
 [ "$code" = "500" ] || fail "socket in a shared dir was used" "$code $(cat "$UNKNOWN_OUT")"
 grep -q 'writable only by it' "$UNKNOWN_OUT" || fail "shared-dir refusal reason" "$(cat "$UNKNOWN_OUT")"
 json_ok "shared-dir refusal" "$(cat "$UNKNOWN_OUT")"
+# 7. CSRF gate: a POST whose Origin host differs from the Host header
+#    is refused at the shim (the backend never sees browser headers
+#    through here). Same-origin and no-Origin (curl) both pass.
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H 'Origin: https://evil.example' \
+     -d '{"session_id":"s1","data":"x"}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "403" ] || fail "cross-site POST not refused" "$code $(cat "$UNKNOWN_OUT")"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$PHP_PORT" \
+     -d '{"session_id":"s1","data":"x"}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "200" ] || fail "same-origin POST refused" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H 'Origin: null' \
+     -d '{}' "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "403" ] || fail "Origin: null not refused" "$code"
+
+# 8. save_delete is POST-only (destructive; a GET is <img>/prefetch bait),
+#    and array-shaped query params never reach preg_match/urlencode.
+code=$(curl -s -o /dev/null -w '%{http_code}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=save_delete&vault_id=v1&conn_id=c1")
+[ "$code" = "405" ] || fail "GET save_delete not refused" "$code"
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action[]=ping")
+[ "$code" = "404" ] || fail "array action status" "$code $(cat "$UNKNOWN_OUT")"
+grep -q 'unknown action' "$UNKNOWN_OUT" || fail "array action body" "$(cat "$UNKNOWN_OUT")"
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' -X POST \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=save_delete&vault_id[]=v1&conn_id=c1")
+[ "$code" != "500" ] || fail "array vault_id fatals" "$(cat "$UNKNOWN_OUT")"
+grep -q 'Fatal' "$UNKNOWN_OUT" && fail "array vault_id leaks a fatal" "$(cat "$UNKNOWN_OUT")"
+
+# 9. A browser that drops an SSE stream must make the proxy close its
+#    backend connection (it used to stay open in the worker forever:
+#    409 on every reconnect, terminal output lost into a dead socket).
+#    The stub records EPIPE on its side in $STUB_MARK.
+rm -f "$STUB_MARK"
+curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$PHP_PORT/api.php?action=stream&session_id=stream_probe" || true
+closed=
+for i in $(seq 1 40); do [ -f "$STUB_MARK" ] && { closed=1; break; }; sleep 0.1; done
+[ -n "$closed" ] || fail "backend stream connection not closed after client abort" "no EPIPE seen by the stub within 4s"
 
 echo "PHP proxy smoke: all assertions passed"

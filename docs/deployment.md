@@ -212,6 +212,16 @@ same `systemctl edit` override; saved credentials then persist (encrypted)
 under `/var/lib/websh/websh.creds.json`. See
 [`encryption.md`](encryption.md).
 
+The unit is hardened with `ProtectSystem=strict`: the only writable
+paths are `/var/lib/websh` (`StateDirectory=`, the credential vault)
+and `/var/log/websh` (`LogsDirectory=`). Put `WEBSH_ACCESS_LOG` and
+`WEBSH_RECORD_DIR` under one of those, e.g.
+`Environment=WEBSH_ACCESS_LOG=/var/log/websh/access.log` — anywhere
+else the server refuses to start (access log) or disables recording
+per session. `StrictHostKeyChecking=yes` profiles need the host keys
+in `/etc/ssh/ssh_known_hosts`: the service user has no writable
+`~/.ssh` under `ProtectHome=read-only`.
+
 ### Multiple instances
 
 Run several isolated websh instances on one box (per team, per

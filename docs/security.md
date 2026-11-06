@@ -92,7 +92,12 @@ abuse-relevant event. Records are stable single-line JSON suitable for
 `fail2ban` filters and ad-hoc `jq` pipelines. The value is normalised
 at startup: `~` expands and a relative path resolves against the
 server's cwd. The resolved path is logged once at startup
-(`access log: <abs-path>`).
+(`access log: <abs-path>`), and the server **refuses to start** if
+the file cannot be opened for append — a security log that silently
+is not written is worse than a server that does not come up. Under
+the bundled systemd units (`ProtectSystem=strict`) the writable homes
+are `/var/log/websh*` (`LogsDirectory=`) and `/var/lib/websh*`
+(`StateDirectory=`); the same applies to `WEBSH_RECORD_DIR`.
 
 ```json
 {"ts":"2026-05-07T12:34:56.789012Z","event":"connect","ip":"203.0.113.7","result":"deny_blocked","target_host":"10.5.6.7","target_user":"root"}
@@ -105,13 +110,22 @@ Common `result` values on `connect` events:
 
 | `result` | Meaning |
 |---|---|
-| `ok` | Session created. Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
+| `ok` | ssh was spawned (not: authenticated — see the `auth_failed` event). Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
 | `rate_limited` | Caller exceeded `RATE_LIMIT_MAX` for the window. |
 | `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
 | `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
 | `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
-| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. ANY successful connect from the same IP clears state, so a power user touching many real servers never accumulates here. |
+| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. The first real keystroke into a session whose authentication did not fail clears the IP's state (a spawn alone does not — a scanner that also connects to a non-denied host and fails auth there must not reset its own counter), so a power user touching many real servers never accumulates here. |
 | `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
+
+Other events:
+
+| `event` | When |
+|---|---|
+| `auth_failed` | The read loop saw ssh reject the credentials (or re-prompt) after the auto-typed password. Fields: `sid`, `target_host`, `target_user`. This — not `connect result=ok` — is the brute-force signal: every password attempt relayed through websh produces one. |
+| `upload`, `download` | One record per transfer with `path` and `bytes`; download `result` is `ok`, `partial` (known size not reached), `over_cap`, `timeout` or `client_gone`. |
+| `rm`, `mkdir`, `mv` | Every file-browser mutation, on both outcomes (`result` `ok`/`error`, plus `error`). These are keystroke-free, so they appear in neither the session recording nor the scrollback — the access log is their only audit surface. `mv` carries `name`. |
+| `save` | Vault write, with `target_host` / `target_user` / `target_port` of the entry (so a re-bound or mass-created entry is visible). |
 
 Common `result` values on `disconnect` events:
 
@@ -126,6 +140,7 @@ Common `result` values on `disconnect` events:
 ```ini
 [Definition]
 failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|session_cap_per_ip|scan_pattern)".*$
+            ^.*"event":\s*"auth_failed".*"ip":\s*"<HOST>".*$
 ignoreregex =
 ```
 
@@ -160,8 +175,15 @@ in one `write(2)` call and stays safe to view in a terminal.
 
 ## Input validation
 
-- Host and username values starting with `-` are rejected (prevents SSH flag injection)
+- Host must be a plain hostname/alias (`[A-Za-z0-9._-]`) or an IP literal, username a plain login (`[A-Za-z0-9._@-]`); neither may start with `-`. This rejects SSH flags and the `user@host` / `ssh://` destination forms that `getaddrinfo()` cannot resolve — those used to slip past `denied_hosts`, which falls open on resolution failure by design
 - Session IDs are validated as UUID format
+
+## Cross-site request forgery
+
+State-changing methods (`POST`, `DELETE`) are gated twice:
+
+- **Origin.** A browser sends `Origin` on every cross-site request. If its host is not the `Host` this request was addressed to (or the first `X-Forwarded-Host` from a `TRUSTED_PROXIES` peer), the reply is `403 {"error":"cross-site request refused"}`; so is `Origin: null` and `Sec-Fetch-Site: cross-site`/`same-site`. A request with neither header comes from a non-browser client (curl, monitoring) and passes — those are not CSRF victims. The PHP shim enforces the same rule itself, because it forwards no browser headers to the backend.
+- **Media type.** JSON endpoints require `Content-Type: application/json` (`415` otherwise). A cross-site `<form>` can only produce `text/plain`, urlencoded or multipart bodies, so a forged form post never reaches a handler even without the Origin check.
 - Terminal dimensions are clamped to safe ranges
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
 - `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots

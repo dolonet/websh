@@ -27,6 +27,22 @@ from tests.backend._base import (  # noqa: F401
 import server
 
 
+def _pipe_stdout(*chunks):
+    """A real pipe pre-filled with `chunks` (writer closed after), wrapped
+    like Popen.stdout. _download reads the raw fd under select(), so a
+    MagicMock with read.side_effect no longer models it."""
+    r, w = os.pipe()
+    data = b"".join(chunks)
+
+    def feed():
+        try:
+            os.write(w, data)
+        finally:
+            os.close(w)
+    threading.Thread(target=feed, daemon=True).start()
+    return os.fdopen(r, "rb", buffering=0)
+
+
 class TestSideChannelRateLimit(unittest.TestCase):
     """The side-channel endpoints (ls/download/upload/tmux_capture) each
     spawn an ssh subprocess; they get their own, higher per-IP limit so an
@@ -88,6 +104,112 @@ class TestSideChannelRateLimit(unittest.TestCase):
             httpd.server_close()
             server.SIDE_CHANNEL_RATE_MAX = orig
             server._side_channel_rate_limits.clear()
+
+    # Every route that spawns a side-channel ssh, with a request that
+    # passes the body/query parsing that precedes the session lookup.
+    SIDE_CHANNEL_ROUTES = [
+        ("GET",  "/api/ls?session_id={sid}&path=~", None),
+        ("GET",  "/api/download?session_id={sid}&path=/x", None),
+        ("GET",  "/api/tmux_capture?session_id={sid}", None),
+        ("POST", "/api/upload?session_id={sid}&path=x", b"data"),
+        ("POST", "/api/upload_finalize", b'{"session_id":"{sid}","tmp":"x","final":"y"}'),
+        ("POST", "/api/upload_cancel", b'{"session_id":"{sid}","tmp":"x"}'),
+        ("POST", "/api/tmux_options", b'{"session_id":"{sid}"}'),
+        ("POST", "/api/rm", b'{"session_id":"{sid}","path":"/x"}'),
+        ("POST", "/api/mkdir", b'{"session_id":"{sid}","path":"/x"}'),
+        ("POST", "/api/mv", b'{"session_id":"{sid}","path":"/x","name":"y"}'),
+    ]
+
+    def _hit(self, port, method, path, body, sid, headers=None):
+        import http.client
+        h = {"Content-Type": "application/octet-stream" if path.startswith("/api/upload?")
+             else "application/json"}
+        h.update(headers or {})
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request(method, path.replace("{sid}", sid),
+                  body=None if body is None else body.replace(b"{sid}", sid.encode()),
+                  headers=h)
+        r = c.getresponse(); data = r.read(); c.close()
+        return r.status, data
+
+    def test_every_side_channel_route_is_throttled(self):
+        """Mutation guard: dropping the _side_channel_throttled() call from
+        6 of the 10 routes left the suite green. MAX=0 -> the first hit
+        on EVERY route must be a 429, before any session lookup."""
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 0
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            for method, path, body in self.SIDE_CHANNEL_ROUTES:
+                code, _ = self._hit(port, method, path, body, str(uuid.uuid4()))
+                self.assertEqual(code, 429, "%s %s not throttled (got %d)"
+                                 % (method, path, code))
+        finally:
+            httpd.shutdown(); httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+    def test_every_side_channel_route_enforces_ownership(self):
+        """Mutation guard: bypassing the owner check on rm/mkdir/mv (and
+        ls/download/upload, which had no ownership test at all) left the
+        suite green. Under header-trust auth, mallory gets 403 on alice's
+        session from every route."""
+        orig_hdr = server.WEBSH_AUTH_HEADER
+        server.WEBSH_AUTH_HEADER = "Remote-User"
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="alice")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+                for method, path, body in self.SIDE_CHANNEL_ROUTES:
+                    code, data = self._hit(port, method, path, body, sid,
+                                           {"Remote-User": "mallory"})
+                    self.assertEqual(code, 403, "%s %s: mallory got %d %r"
+                                     % (method, path, code, data[:80]))
+            # None of them touched the session.
+            for m in ("list_dir", "download_file", "upload_file", "remove_path",
+                      "make_dir", "rename_entry", "tmux_capture"):
+                self.assertFalse(getattr(fake, m).called, m)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+            server.WEBSH_AUTH_HEADER = orig_hdr
+
+    def test_upload_size_cap_and_empty_body(self):
+        """Mutation guard: MAX_UPLOAD_SIZE appeared in no test - deleting
+        the 413 check left the suite green - and the 400 on an empty body
+        was untested."""
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="")
+        fake.upload_file.return_value = (True, "")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}), \
+                 unittest.mock.patch.object(server, "MAX_UPLOAD_SIZE", 16):
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"x" * 17, sid)
+                self.assertEqual(code, 413, data)
+                self.assertFalse(fake.upload_file.called)
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"", sid)
+                self.assertEqual(code, 400, data)
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 200, data)
+                self.assertTrue(fake.upload_file.called)
+        finally:
+            httpd.shutdown(); httpd.server_close()
 
     def test_post_side_channel_endpoints_are_throttled(self):
         # tmux_options / upload_finalize / upload_cancel each spawn an ssh
@@ -1100,7 +1222,7 @@ class TestListDir(unittest.TestCase):
         # PWD line is \n-terminated; entry rows are \0-terminated so a
         # filename containing \n can't split a row in half.
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"d\t4096\t1700000000\tdocs\0"
             b"f\t12345\t1700000001\tfile.txt\0"
             b"l\t0\t1700000002\tlink\0"
@@ -1147,7 +1269,7 @@ class TestListDir(unittest.TestCase):
         s = self._fake_session(control_path="/tmp/fake.sock")
         weird = "weird\nname.txt"
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"f\t10\t1700000000\t" + weird.encode() + b"\0"
             b"f\t20\t1700000001\tnext.txt\0"
         )
@@ -1173,7 +1295,7 @@ class TestListDir(unittest.TestCase):
             captured["remote"] = cmd[-1]
             r = unittest.mock.MagicMock()
             r.returncode = 0
-            r.stdout = b"PWD:/home/alice\n"
+            r.stdout = b"PWD:/home/alice\0"
             return r
         with unittest.mock.patch("os.path.exists", return_value=True), \
              unittest.mock.patch("subprocess.run", side_effect=fake_run):
@@ -1189,7 +1311,7 @@ class TestListDir(unittest.TestCase):
     def test_dirs_sorted_before_files(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"f\t100\t1700000000\taardvark.txt\0"
             b"d\t4096\t1700000000\tzebra_dir\0"
             b"f\t200\t1700000000\tbeta.py\0"
@@ -1305,6 +1427,429 @@ class TestLsHTTPDispatch(LiveServerCase):
         self.assertIn("error", r)
 
 
+class TestListDirPaneCwd(unittest.TestCase):
+    """list_dir(pane_cwd=True) — start the listing where the pane is."""
+
+    def _session(self, persistent=True, slot_id="ok"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-cwd"
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = True
+        s._control_path = "/tmp/fake.sock"
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = "tmux"
+        return s
+
+    def _run_and_capture(self, session, **kw):
+        """Return the remote command string list_dir handed to ssh."""
+        seen = {}
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = b"PWD:/srv/app\0"
+
+        def fake_run(argv, **_):
+            seen["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            entries, abs_path, err = session.list_dir("~", **kw)
+        return seen["argv"][-1], entries, abs_path, err
+
+    def test_persistent_asks_tmux_for_pane_path(self):
+        s = self._session()
+        cmd, entries, abs_path, err = self._run_and_capture(s, pane_cwd=True)
+        self.assertIsNone(err)
+        self.assertIn("pane_current_path", cmd)
+        self.assertIn("websh-ok", cmd)
+        # $HOME remains the fallback when tmux answers with nothing.
+        self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
+        # The requested path is ignored in this mode — no case/esac
+        # expansion of $P into $D.
+        self.assertNotIn('"~/"*) D=', cmd)
+        self.assertEqual(abs_path, "/srv/app")
+
+    def test_non_persistent_falls_back_to_home(self):
+        """No tmux means no pane path to ask for; the command must still
+        be valid and must land on $HOME rather than cd'ing to ""."""
+        s = self._session(persistent=False, slot_id=None)
+        cmd, _entries, _abs, err = self._run_and_capture(s, pane_cwd=True)
+        self.assertIsNone(err)
+        self.assertNotIn("pane_current_path", cmd)
+        self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
+        # An inherited $D from the remote profile must not survive to
+        # become the start directory.
+        self.assertTrue(cmd.startswith("D=; "), "cmd=" + cmd[:60])
+
+    def test_default_still_resolves_the_requested_path(self):
+        s = self._session()
+        cmd, _entries, _abs, err = self._run_and_capture(s)
+        self.assertIsNone(err)
+        self.assertNotIn("pane_current_path", cmd)
+        self.assertIn('"~/"*) D=', cmd)
+
+
+class TestRemovePath(unittest.TestCase):
+    """SSHSession.remove_path() — single-entry delete, non-recursive."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-rm"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = b""
+        result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.remove_path("/home/alice/file.txt")
+
+    def test_no_socket_errors(self):
+        s = self._session(control_path="/nonexistent/mux.sock")
+        ok, err = s.remove_path("/home/alice/f")
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exit_codes_map_to_distinct_messages(self):
+        """Each failure mode gets its own message — a bare "exit 1"
+        leaves the user unable to tell "already gone" from "not empty"
+        from "not yours"."""
+        seen = set()
+        for code, needle in ((3, "no such file"),
+                             (4, "not empty"),
+                             (5, "permission")):
+            ok, err = self._run(code)
+            self.assertFalse(ok)
+            self.assertIn(needle, err)
+            seen.add(err)
+        self.assertEqual(len(seen), 3, "messages must be distinguishable")
+
+    def test_unknown_exit_code_still_reports(self):
+        ok, err = self._run(9)
+        self.assertFalse(ok)
+        self.assertIn("9", err)
+
+    def test_timeout_returns_error(self):
+        s = self._session()
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run",
+                                 side_effect=subprocess.TimeoutExpired("ssh", 10)):
+            ok, err = s.remove_path("/home/alice/f")
+        self.assertFalse(ok)
+        self.assertEqual(err, "rm timeout")
+
+    def test_command_is_non_recursive_and_symlink_safe(self):
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        # rmdir, never `rm -r`: a mis-click must not be able to take a
+        # populated tree with it.
+        self.assertIn("rmdir --", cmd)
+        self.assertNotIn("-r", cmd.replace("printf", ""))
+        # `[ ! -L ]` keeps a symlink-to-a-directory on the rm branch, so
+        # we unlink the link instead of rmdir'ing its target.
+        self.assertIn('[ ! -L "$P" ]', cmd)
+        # The path travels base64-encoded, never interpolated into the
+        # command text.
+        self.assertNotIn("/home/alice/file.txt", cmd)
+
+    def test_shell_metacharacters_are_not_interpolated(self):
+        s = self._session()
+        cap = {}
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            cap["argv"] = argv
+            return result
+
+        nasty = '/home/alice/"; rm -rf / #'
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            s.remove_path(nasty)
+        self.assertNotIn("rm -rf /", cap["argv"][-1])
+
+
+class TestRmHTTPDispatch(LiveServerCase):
+    """HTTP-level tests for POST /api/rm."""
+
+    def _post_rm(self, body):
+        payload, _code = LiveServerCase._post(self, "/api/rm", body)
+        return payload
+
+    def test_relative_path_rejected(self):
+        """Absolute-only: a relative name would be resolved against
+        whatever $HOME the side channel lands in, which is not what the
+        caller pointed at."""
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "notes.txt"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_bare_root_rejected(self):
+        for p in ("/", "//", "///"):
+            r = self._post_rm({"session_id": str(uuid.uuid4()), "path": p})
+            self.assertIn("error", r)
+            self.assertIn("invalid path", r["error"])
+
+    def test_nul_in_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "/home/alice/a\x00b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_missing_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4())})
+        self.assertIn("error", r)
+
+    def test_non_string_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()), "path": 42})
+        self.assertIn("error", r)
+
+    def test_unknown_session_id(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "/home/alice/f"})
+        self.assertIn("error", r)
+
+    def test_dispatches_to_session(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.remove_path.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._post_rm({"session_id": sid, "path": "/home/alice/f"})
+        self.assertTrue(r.get("ok"))
+        fake_session.remove_path.assert_called_once_with("/home/alice/f")
+
+    def test_session_error_propagated(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.remove_path.return_value = (False, "permission denied")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._post_rm({"session_id": sid, "path": "/home/alice/f"})
+        self.assertIn("error", r)
+        self.assertIn("permission denied", r["error"])
+
+
+class TestMakeDir(unittest.TestCase):
+    """SSHSession.make_dir() — single non-recursive mkdir."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-mkdir"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.make_dir("/home/alice/newdir")
+
+    def test_no_socket_errors(self):
+        s = self._session(control_path="/nonexistent/mux.sock")
+        ok, err = s.make_dir("/home/alice/d")
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exists_and_perm_map_distinctly(self):
+        ok4, err4 = self._run(4)
+        ok5, err5 = self._run(5)
+        self.assertFalse(ok4)
+        self.assertFalse(ok5)
+        self.assertIn("exists", err4)
+        self.assertNotEqual(err4, err5)
+
+    def test_command_is_non_recursive(self):
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        # Plain mkdir, never `mkdir -p`: a typo'd path must fail loudly,
+        # not silently create a chain of directories.
+        self.assertIn("mkdir --", cmd)
+        self.assertNotIn("-p", cmd)
+        # The name travels base64-encoded, never interpolated.
+        self.assertNotIn("/home/alice/newdir", cmd)
+
+
+class TestRenameEntry(unittest.TestCase):
+    """SSHSession.rename_entry() — same-directory mv."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-mv"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.rename_entry("/home/alice/old.txt", "new.txt")
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exit_codes_distinct(self):
+        seen = set()
+        for code, needle in ((3, "no such"), (4, "already exists"),
+                             (5, "permission")):
+            ok, err = self._run(code)
+            self.assertFalse(ok)
+            self.assertIn(needle, err)
+            seen.add(err)
+        self.assertEqual(len(seen), 3)
+
+    def test_destination_is_a_sibling(self):
+        """The new name is joined onto dirname(src) inside the shell, so
+        the destination can never escape the source's directory."""
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        self.assertIn('D=${S%/*}; [ -n "$D" ] || D=/', cmd)
+        self.assertIn('mv -- "$S" "$D/$N"', cmd)
+        # Refuses to clobber an existing target.
+        self.assertIn('[ -e "$D/$N" ]', cmd)
+        # Both operands travel base64-encoded, never interpolated.
+        self.assertNotIn("old.txt", cmd)
+        self.assertNotIn("new.txt", cmd)
+
+
+class TestMkdirMvHTTPDispatch(LiveServerCase):
+    """HTTP-level tests for POST /api/mkdir and /api/mv."""
+
+    def _post(self, action, body):
+        payload, _code = LiveServerCase._post(self, "/api/" + action, body)
+        return payload
+
+    def test_mkdir_relative_rejected(self):
+        r = self._post("mkdir", {"session_id": str(uuid.uuid4()),
+                                "path": "sub"})
+        self.assertIn("error", r)
+
+    def test_mkdir_dotdot_name_rejected(self):
+        """A path whose final segment is . or .. is a navigation, not a
+        new directory name."""
+        for p in ("/home/alice/..", "/home/alice/."):
+            r = self._post("mkdir", {"session_id": str(uuid.uuid4()),
+                                    "path": p})
+            self.assertIn("error", r)
+
+    def test_mkdir_dispatches(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.make_dir.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mkdir", {"session_id": sid,
+                                    "path": "/home/alice/newdir"})
+        self.assertTrue(r.get("ok"))
+        fake.make_dir.assert_called_once_with("/home/alice/newdir")
+
+    def test_mv_rejects_slash_in_name(self):
+        """A name with '/' would move the entry to another directory —
+        the endpoint only renames in place."""
+        r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                              "path": "/home/alice/a", "name": "sub/b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid name", r["error"])
+
+    def test_mv_rejects_dotdot_name(self):
+        for n in ("..", ".", "", "a\x00b"):
+            r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                                  "path": "/home/alice/a", "name": n})
+            self.assertIn("error", r)
+
+    def test_mv_rejects_relative_source(self):
+        r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                              "path": "a", "name": "b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_mv_dispatches(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.rename_entry.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mv", {"session_id": sid,
+                                  "path": "/home/alice/old.txt",
+                                  "name": "new.txt"})
+        self.assertTrue(r.get("ok"))
+        fake.rename_entry.assert_called_once_with(
+            "/home/alice/old.txt", "new.txt")
+
+    def test_mv_error_propagated(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.rename_entry.return_value = (False, "a file with that name already exists")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mv", {"session_id": sid,
+                                  "path": "/home/alice/old.txt",
+                                  "name": "new.txt"})
+        self.assertIn("error", r)
+        self.assertIn("already exists", r["error"])
+
+
 class TestDownloadHTTPDispatch(LiveServerCase):
     """HTTP-level tests for GET /api/download."""
 
@@ -1338,11 +1883,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
     def test_file_not_found_returns_error(self):
         sid = str(uuid.uuid4())
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = [b"E", b"R", b"R", b"\t",
-                                              b"F", b"i", b"l", b"e",
-                                              b" ", b"n", b"o", b"t",
-                                              b" ", b"f", b"o", b"u",
-                                              b"n", b"d", b"\n"]
+        fake_proc.stdout = _pipe_stdout(b"ERR\tFile not found\n")
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1363,7 +1904,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         oversize = server.MAX_DOWNLOAD_SIZE + 1
         header = "OK\t{}\n".format(oversize).encode()
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = [bytes([b]) for b in header]
+        fake_proc.stdout = _pipe_stdout(header)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1379,12 +1920,39 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         side-channel ssh child is reaped, not leaked as a zombie."""
         sid = str(uuid.uuid4())
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = OSError("pipe broken")
+        fake_proc.stdout.fileno.side_effect = OSError("pipe broken")
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
             r = self._get_json("session_id={}&path=/tmp/x".format(sid))
         self.assertIn("error", r)
+        self.assertTrue(fake_proc.kill.called)
+        self.assertTrue(fake_proc.wait.called)
+
+    def test_silent_side_channel_times_out_with_504(self):
+        """Regression: a side-channel ssh that connects but never writes
+        the protocol header pinned the worker thread (and a MAX_THREADS
+        permit) until the master session died - there was no bound on
+        the pipe read at all. Now the header read is gated by
+        TRANSFER_IDLE_TIMEOUT and answers 504."""
+        sid = str(uuid.uuid4())
+        r, w = os.pipe()                 # writer never writes
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout = os.fdopen(r, "rb", buffering=0)
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        t0 = time.time()
+        try:
+            with unittest.mock.patch.object(server, "TRANSFER_IDLE_TIMEOUT", 1), \
+                 unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+                code, body = self._request_raw(
+                    "/api/download?session_id={}&path=/tmp/stall".format(sid),
+                    timeout=10)
+        finally:
+            os.close(w)
+        self.assertEqual(code, 504, body)
+        self.assertIn(b"timeout", body)
+        self.assertLess(time.time() - t0, 8)
         self.assertTrue(fake_proc.kill.called)
         self.assertTrue(fake_proc.wait.called)
 
@@ -1408,12 +1976,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
             pos[0] += len(chunk)
             return chunk
         fake_proc = unittest.mock.MagicMock()
-        # read(1) calls consume header byte by byte; read(BUF) reads body
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] +  # all header bytes except \n
-            [b"\n"] +                              # \n terminates header
-            [payload, b""]                         # body then EOF
-        )
+        fake_proc.stdout = _pipe_stdout(header, payload)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1447,10 +2010,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         header = b"OK\t-1\n"          # stat failed -> unknown size
         big_chunk = b"Z" * 4096
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] + [b"\n"] +
-            [big_chunk, big_chunk, b""]
-        )
+        fake_proc.stdout = _pipe_stdout(header, big_chunk, big_chunk)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.object(server, "MAX_DOWNLOAD_SIZE", 1000), \
@@ -1524,6 +2084,40 @@ class TestUploadFileNoDeadlock(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("ssh exit 7", err)
         self.assertIn("E", err)  # stderr text preserved for the user
+
+    def test_remote_that_stops_reading_is_bounded_by_idle_timeout(self):
+        """Regression: the deadline was checked only at the top of the
+        loop, and the buffered proc.stdin.write() blocked without bound
+        once the remote stopped reading - a stalled `cat >` pinned the
+        worker for the life of the master session. The raw write is now
+        gated by select() with TRANSFER_IDLE_TIMEOUT."""
+        s = self._fake_session("/tmp/fake.sock")
+        # A child that never reads stdin: the pipe fills (64 KB) and every
+        # further write would block forever.
+        child = [sys.executable, "-c", "import time; time.sleep(30)"]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen(child, **kw)
+
+        body = io.BytesIO(b"D" * (1024 * 1024))
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen), \
+                 unittest.mock.patch.object(server, "TRANSFER_IDLE_TIMEOUT", 1):
+                result["v"] = s.upload_file("dest", body, 1024 * 1024, timeout=1)
+
+        t0 = time.time()
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(12)
+        self.assertFalse(t.is_alive(), "upload_file still blocked after 12s")
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("stalled", err)
+        self.assertLess(time.time() - t0, 10)
 
     def test_broken_pipe_surfaces_remote_stderr(self):
         # Remote `cat >` dies mid-upload (disk full): ssh exits and tears down
@@ -1768,6 +2362,92 @@ class TestTmuxCapture(unittest.TestCase):
         data, err = s.tmux_capture()
         self.assertIsNone(data)
         self.assertIn("not a persistent", err)
+
+
+
+class TestSideChannelSnippetsExecuted(unittest.TestCase):
+    """Run the real remote_cmd strings through a local POSIX shell against
+    a temp directory. Every other test in this file only substring-matches
+    the command text; these pin what the shell actually does with hostile
+    names — in particular that a trailing newline survives the base64
+    decode (command substitution used to strip it, so `rm foo\n` deleted
+    `foo` and reported success)."""
+
+    SHELLS = [sh for sh in ("dash", "bash", "busybox") if shutil.which(sh)]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        if not self.SHELLS:
+            self.skipTest("no POSIX shell available")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _session(self, shell):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "exec"; s.persistent = False; s.slot_id = None
+        s.alive = True; s._control_path = "/tmp/fake.sock"
+        s._host = "h"; s._port = 22; s._username = "u"
+        s._mux_ready = lambda: True
+        argv = ["busybox", "sh", "-c"] if shell == "busybox" else [shell, "-c"]
+
+        def run(remote_cmd, timeout, msg, err_prefix=None):
+            return subprocess.run(argv + [remote_cmd], capture_output=True,
+                                  timeout=timeout), None
+        s._mux_run = run
+        return s
+
+    def _touch(self, *names):
+        for n in names:
+            with open(os.path.join(self.tmp, n), "w") as f:
+                f.write("data")
+
+    def test_trailing_newline_name_targets_the_right_entry(self):
+        for sh in self.SHELLS:
+            self._touch("foo", "foo\n")
+            s = self._session(sh)
+            ok, err = s.remove_path(os.path.join(self.tmp, "foo\n"))
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertEqual(sorted(os.listdir(self.tmp)), ["foo"], sh)
+            os.remove(os.path.join(self.tmp, "foo"))
+
+    def test_rename_and_mkdir_keep_trailing_newline(self):
+        for sh in self.SHELLS:
+            self._touch("src")
+            s = self._session(sh)
+            ok, err = s.rename_entry(os.path.join(self.tmp, "src"), "dst\n")
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertIn("dst\n", os.listdir(self.tmp), sh)
+            ok, err = s.make_dir(os.path.join(self.tmp, "d\n"))
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertTrue(os.path.isdir(os.path.join(self.tmp, "d\n")), sh)
+            shutil.rmtree(self.tmp); os.makedirs(self.tmp)
+
+    def test_list_dir_reports_exact_path_and_hostile_names(self):
+        weird = ["a b", "-rf", "*", "tab\there", "nl\nname", "trail ", "ünï"]
+        for sh in self.SHELLS:
+            d = os.path.join(self.tmp, "proj ")           # trailing space
+            os.makedirs(d, exist_ok=True)
+            for n in weird:
+                with open(os.path.join(d, n), "w") as f:
+                    f.write("x")
+            s = self._session(sh)
+            entries, path, err = s.list_dir(d)
+            self.assertIsNone(err, sh)
+            self.assertEqual(path, d, sh)              # no .strip()
+            self.assertEqual(sorted(e["name"] for e in entries),
+                             sorted(weird), sh)
+            shutil.rmtree(d)
+
+    def test_rename_refuses_to_clobber_and_stays_in_dir(self):
+        for sh in self.SHELLS:
+            self._touch("a", "b")
+            s = self._session(sh)
+            ok, err = s.rename_entry(os.path.join(self.tmp, "a"), "b")
+            self.assertFalse(ok, sh)
+            self.assertIn("already exists", err, sh)
+            for n in ("a", "b"):
+                os.remove(os.path.join(self.tmp, n))
 
 
 if __name__ == "__main__":

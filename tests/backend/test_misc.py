@@ -369,6 +369,11 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
     frontend can call."""
 
     def test_frontend_actions_are_routed_by_php_proxy(self):
+        """The proxy forwards ANY well-formed action generically (the
+        regex gate + proxy_pass default), so per-action coverage now
+        means: every action the frontend emits must satisfy the gate
+        regex, and the transfer modes that need special curl plumbing
+        must keep their explicit cases."""
         root = REPO_ROOT  # api.php/websh.js live at the repo root
         with open(os.path.join(root, "api.php"), "r") as f:
             php = f.read()
@@ -376,32 +381,36 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
             js = f.read()
         actions = set(re.findall(r"action=([A-Za-z0-9_]+)", js))
         actions.update(re.findall(r"api\('([A-Za-z0-9_]+)'", js))
-        # config is built by loadServerConfig via api('config'), and
-        # ping is used by the PHP proxy itself rather than the browser.
         actions.update(["config", "ping"])
-        missing = sorted(
-            action for action in actions
-            if "case '{}':".format(action) not in php
-        )
-        self.assertEqual(missing, [])
+        gate = re.compile(r"^[a-z_]{1,32}$")
+        bad = sorted(a for a in actions if not gate.match(a))
+        self.assertEqual(bad, [],
+                         "frontend action(s) the PHP regex gate would 404")
+        self.assertIn("proxy_pass($URL)", php,
+                      "generic passthrough default missing")
+        for special in ("stream", "download", "upload", "save_delete"):
+            self.assertIn("case '{}':".format(special), php,
+                          special + " must keep its explicit case")
 
     def test_server_routes_are_routed_by_php_proxy(self):
-        """Every action server.py dispatches must have a case in api.php's
-        switch — otherwise the endpoint silently 404s on shared hosting
-        only. The route tables make the server-side action set machine-
-        readable; keep the PHP shim in lockstep."""
+        """The PHP shim forwards ANY well-formed action generically, so
+        the lockstep contract is now: every server-side route key must
+        satisfy the shim's gate regex (the route tables make the action
+        set machine-readable), and the transfer modes with their own
+        curl plumbing must keep explicit cases."""
         root = REPO_ROOT  # api.php lives at the repo root
         with open(os.path.join(root, "api.php"), "r") as f:
             php = f.read()
         actions = set(server.Handler._POST_ROUTES)
         actions.update(server.Handler._GET_ROUTES)
-        # DELETE /api/save reaches the shim as POST ?action=save_delete,
-        # which the POST table already carries.
-        missing = sorted(
-            action for action in actions
-            if "case '{}':".format(action) not in php
-        )
-        self.assertEqual(missing, [])
+        actions.update(server.Handler._DELETE_ROUTES)
+        gate = re.compile(r"^[a-z_]{1,32}$")
+        bad = sorted(a for a in actions if not gate.match(a))
+        self.assertEqual(bad, [],
+                         "server route(s) the PHP gate would 404")
+        self.assertIn("proxy_pass($URL)", php)
+        for special in ("stream", "download", "upload", "save_delete"):
+            self.assertIn("case '{}':".format(special), php)
 
 
 class TestMainSigtermSubprocess(unittest.TestCase):
@@ -449,6 +458,7 @@ class TestMainSigtermSubprocess(unittest.TestCase):
             b"MAIN_RETURNED_CLEANLY", proc.stdout,
             "main() did not return cleanly; stderr={!r}".format(
                 proc.stderr.decode("utf-8", "replace")))
+
 
 
 class TestInstanceTemplateUnit(unittest.TestCase):
@@ -504,6 +514,58 @@ class TestInstanceTemplateUnit(unittest.TestCase):
         self.assertEqual(d.get("StateDirectory"), ["websh"])
 
 
+class TestStartupRefusals(unittest.TestCase):
+    """main() must fail loudly, once, on a bind collision and on an
+    unwritable WEBSH_ACCESS_LOG - both used to be a raw traceback (or a
+    per-event WARN behind a reassuring startup line) under a 5 s
+    systemd restart loop."""
+
+    def _main(self, **env_extra):
+        env = dict(os.environ)
+        for k in ("WEBSH_AUTH_HEADER", "WEBSH_VAULT_ENABLE", "WEBSH_CONFIG",
+                  "WEBSH_ACCESS_LOG"):
+            env.pop(k, None)
+        env["HOST"] = "127.0.0.1"
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "-c", "import server; server.main()"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+
+    def test_port_collision_is_a_clean_error(self):
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            proc = self._main(PORT=str(port))
+        finally:
+            s.close()
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"cannot bind 127.0.0.1:%d" % port, proc.stderr)
+        self.assertNotIn(b"Traceback", proc.stderr)
+
+    def test_unwritable_access_log_refuses_to_start(self):
+        d = tempfile.mkdtemp()
+        try:
+            proc = self._main(PORT="0",
+                              WEBSH_ACCESS_LOG=os.path.join(d, "no", "such",
+                                                            "dir", "a.log"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"WEBSH_ACCESS_LOG", proc.stderr)
+        self.assertIn(b"not writable", proc.stderr)
+
+    def test_units_grant_a_writable_log_directory(self):
+        # ProtectSystem=strict + no LogsDirectory made WEBSH_ACCESS_LOG and
+        # WEBSH_RECORD_DIR silently unwritable under the bundled units.
+        for unit, name in (("websh.service", "websh"),
+                           ("websh@.service", "websh-%i")):
+            with open(os.path.join(REPO_ROOT, unit), encoding="utf-8") as f:
+                body = f.read()
+            self.assertRegex(body, r"(?m)^LogsDirectory=" + re.escape(name) + "$",
+                             unit)
+
+
 class TestAuthVaultStartupGuard(unittest.TestCase):
     """main() refuses to start when WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE
     are both set: the vault is keyed by client-supplied vault_id, not by the
@@ -526,6 +588,58 @@ class TestAuthVaultStartupGuard(unittest.TestCase):
             % proc.stderr.decode("utf-8", "replace"))
         self.assertIn(b"refusing to start", proc.stderr)
         self.assertIn(b"WEBSH_AUTH_HEADER", proc.stderr)
+
+
+class TestRequireVaultStartupGuard(unittest.TestCase):
+    """WEBSH_REQUIRE_VAULT=1 + plaintext credentials in websh.json must be
+    a STARTUP failure (exit 1 before binding), not a per-request one."""
+
+    def test_plaintext_config_refuses_to_start(self):
+        d = tempfile.mkdtemp()
+        try:
+            cfg = os.path.join(d, "websh.json")
+            with open(cfg, "w") as f:
+                json.dump({"connections": [
+                    {"name": "legacy", "host": "h", "username": "u",
+                     "password": "plain"}]}, f)
+            env = dict(os.environ)
+            env.pop("WEBSH_AUTH_HEADER", None)
+            env.pop("WEBSH_VAULT_ENABLE", None)
+            env["PORT"] = "0"
+            env["WEBSH_CONFIG"] = cfg
+            env["WEBSH_REQUIRE_VAULT"] = "1"
+            env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+            proc = subprocess.run(
+                [sys.executable, "-c", "import server; server.main()"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=20)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(b"refusing to start", proc.stderr)
+            self.assertIn(b"legacy", proc.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+
+class TestListenBacklog(unittest.TestCase):
+    """The accept backlog must not be socketserver's default of 5: with
+    one TCP connection per request (HTTP/1.0, Connection: close) that
+    queue overflowed under a few concurrent typists and every overflow
+    cost the client a 1-3 s SYN retransmit."""
+
+    def test_request_queue_size_is_raised(self):
+        self.assertGreaterEqual(server.Server.request_queue_size, 128)
+
+    def test_bound_socket_reports_the_backlog(self):
+        srv = server.Server(("127.0.0.1", 0), server.Handler)
+        try:
+            # Linux exposes the effective backlog via TCP_INFO/ss; the
+            # portable check is that listen() accepted the value.
+            self.assertEqual(srv.request_queue_size,
+                             server.Server.request_queue_size)
+            self.assertTrue(srv.socket.fileno() > 0)
+        finally:
+            srv.server_close()
 
 
 if __name__ == "__main__":
