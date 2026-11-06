@@ -45,6 +45,7 @@ class _FakeNotifyMixin(object):
     # Tests that plant fake sessions inherit this default and the guard
     # works the same way it does for real Sessions.
     _stream_active = False
+    _stream_gen = 0
 
     def _signal(self):
         pass
