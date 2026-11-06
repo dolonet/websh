@@ -173,6 +173,8 @@ const EXPOSE = `
   Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
   Object.defineProperty(window, 'OUTPUT_LAG_MS', {get: () => OUTPUT_LAG_MS, set: v => { OUTPUT_LAG_MS = v; }, configurable: true});
   Object.defineProperty(window, 'watchdogLastTick', {get: () => _watchdogLastTick, set: v => { _watchdogLastTick = v; }, configurable: true});
+  for (const k of ['UPLOAD_CHUNK_BYTES', 'UPLOAD_CHUNK_TIMEOUT_MS', 'UPLOAD_RETRY_BASE_MS'])
+    Object.defineProperty(window, k, {get: () => eval(k), set: v => { eval(k + ' = v'); }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
@@ -1162,6 +1164,30 @@ test('input reply ahead of the pane\'s cursor restarts a channel that is not del
   await sleep(120);
   ok(sources.length === 2 && sources[0].closed, 'dead stream replaced; sources=' + sources.length);
   ok(/since=100/.test(sources[1].url), 'from the cursor; url=' + sources[1].url);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('input reply: a pane that is behind but still receiving is left alone', async () => {
+  // A slow link catching up on a burst: the cursor moves, the channel
+  // is alive - restarting it would only resend what is in flight.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'slowlink');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 5000000})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'x');
+  await sleep(20);
+  sources[0].l.data({data: JSON.stringify({data: Buffer.from('abc').toString('base64'), alive: true, cursor: 103})});   // far behind, but moving
+  await sleep(100);
+  ok(sources.length === 1 && !sources[0].closed, 'stream kept; sources=' + sources.length);
   sseStop(win, p);
   cleanup(env);
 });
@@ -5713,6 +5739,203 @@ test('upload mid-stream drop reports the percentage reached (onprogress chain)',
 // finalize succeeded the upload (200) but the move into cwd failed — the
 // banner must say bytes landed, not bare "Upload failed", and must not
 // leak "$HOME" or the raw server string.
+// ── Upload in pieces ─────────────────────────────────────────────────
+// A corporate proxy / VPN cut one long POST mid-body every time; the
+// file now goes up in pieces, each retried on its own, resumed from the
+// size the server reports.
+function pieceServer(win, script) {
+  // script(offset, len, n) -> {status, body} | 'neterr' | 'timeout'
+  const st = {calls: [], file: [], finalized: 0};
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; }
+    open(m, url) { this.url = url; }
+    setRequestHeader() {}
+    abort() { this.aborted = true; }
+    send(blob) {
+      const m = this.url.match(/offset=(\d+)/);
+      const offset = m ? +m[1] : null;
+      const len = blob.size;
+      const n = st.calls.length;
+      const target = new URL(this.url, 'https://websh.test/').searchParams.get('path');
+      st.calls.push({offset, len, path: target});
+      const r = script(offset, len, n, target);
+      setTimeout(() => {
+        if (this.aborted) return;
+        if (r === 'neterr') { if (this.onerror) this.onerror(); return; }
+        if (r === 'timeout') { if (this.ontimeout) this.ontimeout(); return; }
+        if (r.status === 200) {
+          if (offset === null) st.file = [[0, len]];
+          else { if (offset === 0) st.file = []; st.file.push([offset, len]); }
+        }
+        this.status = r.status; this.responseText = JSON.stringify(r.body);
+        if (this.onload) this.onload();
+      }, 2);
+    }
+  };
+  return st;
+}
+const bigFile = (name, size) => ({name, size, slice: (a, b) => ({size: b - a, start: a})});
+const assembled = st => {   // contiguous, no gaps, no overlaps -> total
+  let pos = 0;
+  for (const [o, l] of st.file) { if (o !== pos) return -1; pos += l; }
+  return pos;
+};
+async function pieceEnv(extraPlan) {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [], upload_chunks: true}},
+    {action: 'upload_finalize', response: {ok: true, path: '/home/u/big.bin'}},
+  ].concat(extraPlan || []));
+  const win = env.win;
+  win.UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024; win.UPLOAD_CHUNK_TIMEOUT_MS = 50; win.UPLOAD_RETRY_BASE_MS = 2;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 's1'; p.host = 'h'; p.persistent = true; p.cwd = '/home/u';
+  return {env, win, p};
+}
+const bannerOf = p => (p.el.querySelector('[data-upload-progress] .upload-progress-text') || {}).textContent || '';
+async function uploadSettles(p, log) {
+  for (let i = 0; i < 800; i++) { await sleep(10); if (/Upload (complete|failed|cancelled)|Uploaded|Saved to/i.test(bannerOf(p))) return; }
+}
+
+test('upload in pieces: a 10 MB file goes up as three offsets, once each', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, (offset, len) => ({status: 200, body: {ok: true, size: offset + len}}));
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.map(c => c.offset).join(',') === '0,4194304,8388608', 'offsets 0, 4M, 8M; got ' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'every byte once, in order');
+  ok(env.log.filter(e => e.action === 'upload_finalize').length === 1, 'finalized once');
+  ok(/Saved to \/home\/u\/big.bin/.test(bannerOf(p)), 'banner says done; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: a piece cut by the network is retried, then in smaller pieces', async () => {
+  const {env, win, p} = await pieceEnv();
+  let fails = 0;
+  const st = pieceServer(win, (offset, len, n) => {
+    if (offset === 4194304 && fails < 3) { fails++; return 'neterr'; }   // the 2nd piece dies three times
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(assembled(st) === 10 * 1024 * 1024, 'file complete despite three failures; pieces=' + JSON.stringify(st.file));
+  const sizes = st.calls.filter(c => c.offset === 4194304).map(c => c.len);
+  ok(sizes[0] === 4194304 && sizes[sizes.length - 1] < 4194304, 'retries shrink the piece; sizes at 4M: ' + sizes.join(','));
+  ok(/Saved to/.test(bannerOf(p)), 'done; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: 409 with the real size resumes from there, nothing doubled', async () => {
+  const {env, win, p} = await pieceEnv();
+  let refused = false;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 4194304 && !refused) {
+      refused = true;
+      // The previous attempt landed 1000 bytes of this piece before dying.
+      st.file.push([4194304, 1000]);
+      return {status: 409, body: {error: 'offset mismatch', size: 4194304 + 1000}};
+    }
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.some(c => c.offset === 4194304 + 1000), 'resumed at the reported size; offsets=' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'contiguous, complete');
+  cleanup(env);
+});
+
+test('upload in pieces: an oversized staging file is not retried or finalized under the same name', async () => {
+  const {env, win, p} = await pieceEnv();
+  const size = 10 * 1024 * 1024;
+  let occupied = null;
+  const st = pieceServer(win, (offset, len, n, target) => {
+    if (occupied === null) occupied = target;
+    if (target === occupied) return {status: 409, body: {error: 'offset mismatch', size: size + 1}};
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  try {
+    win.handleUpload(p.id, {files: [bigFile('big.bin', size)], value: ''});
+    await uploadSettles(p, env.log);
+    ok(st.calls.filter(c => c.path === occupied).length === 1,
+       'an oversized staging file is left alone after the mismatch; calls=' + st.calls.length);
+    ok(st.calls.length <= 8, 'recovery finishes within a bounded request count');
+    ok(/Upload failed|Saved to/.test(bannerOf(p)), 'a clear terminal result is shown; got ' + JSON.stringify(bannerOf(p)));
+    ok(!env.log.some(e => e.action === 'upload_finalize' && e.body && e.body.tmp === occupied),
+       'the unrelated staged file is never finalized as the selected file');
+  } finally { cleanup(env); }
+});
+
+test('upload in pieces: 429 (rate limit) waits and keeps the piece size', async () => {
+  const {env, win, p} = await pieceEnv();
+  const realST = win.setTimeout;
+  const waits = [];
+  win.setTimeout = (fn, ms) => realST(fn, ms >= 3000 ? (waits.push(ms), 5) : ms);
+  let limited = 0;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 4194304 && limited < 2) { limited++; return {status: 429, body: {error: 'rate_limited', code: 'rate_limited'}}; }
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  win.setTimeout = realST;
+  ok(waits.filter(x => x === 3000).length === 2, 'waited 3 s twice; got ' + JSON.stringify(waits));
+  const sizes = st.calls.filter(c => c.offset === 4194304).map(c => c.len);
+  ok(sizes.every(x => x === 4194304), 'piece size unchanged; got ' + sizes.join(','));
+  ok(assembled(st) === 10 * 1024 * 1024 && /Saved to/.test(bannerOf(p)), 'complete');
+  cleanup(env);
+});
+
+test('upload in pieces: the last piece landed but its reply was lost - finalized, not failed', async () => {
+  const {env, win, p} = await pieceEnv();
+  let lost = false;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 8388608 && !lost) { lost = true; st.file.push([offset, len]); return 'neterr'; }   // landed, reply lost
+    if (offset === 8388608) return {status: 409, body: {error: 'offset mismatch', size: 10 * 1024 * 1024}};
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(/Saved to/.test(bannerOf(p)), 'finalized; got ' + JSON.stringify(bannerOf(p)));
+  ok(!st.calls.some(c => c.offset === 10 * 1024 * 1024), 'no empty piece at the end; offsets=' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'complete');
+  cleanup(env);
+});
+
+test('upload in pieces: a final answer (413) stops the upload, no retries', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, () => ({status: 413, body: {error: 'file too large'}}));
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length === 1, 'one request; got ' + st.calls.length);
+  ok(/larger than the server allows/.test(bannerOf(p)), 'reason shown; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: eight failures in a row give up with the reason', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, () => 'timeout');
+  win.UPLOAD_CHUNK_TIMEOUT_MS = 5;
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  for (let i = 0; i < 2000 && !/failed/i.test(bannerOf(p)); i++) await sleep(10);
+  ok(/Upload failed: no answer from the server/.test(bannerOf(p)), 'gave up with the reason; got ' + JSON.stringify(bannerOf(p)));
+  ok(st.calls.length === 8, 'eight tries; got ' + st.calls.length);
+  cleanup(env);
+});
+
+test('upload: an older server (no upload_chunks) still gets the whole file in one request', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'upload_finalize', response: {ok: true, path: '/home/u/big.bin'}},
+  ]);
+  const win = env.win;
+  const st = pieceServer(win, (offset, len) => ({status: 200, body: {ok: true}}));
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 's1'; p.host = 'h'; p.persistent = true; p.cwd = '/home/u';
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length === 1 && st.calls[0].offset === null, 'one request, no offset; got ' + JSON.stringify(st.calls));
+  cleanup(env);
+});
+
 test('upload finalize failure reports bytes-landed without jargon', async () => {
   const env = await mkEnv([
     {action: 'config', response: {restrict_hosts: false, connections: []}},
@@ -6484,6 +6707,26 @@ test('input: typing on a disconnected pane is dropped, not sent after a later re
   p.persistent = true;
   win.queueInput(p, 'typed at a dead pane');
   ok(p.inputQueue.length === 0, 'not queued; got ' + JSON.stringify(p.inputQueue));
+  cleanup(env);
+});
+
+test('input: a recent key keeps the held queue alive even if an older one is stale', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-mix'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.host = 'h'; p.user = 'u'; p.persistent = true; p.sid = null; p.connecting = true;
+  const st = goneThenOk(win, 'sid-mix');
+  win.queueInput(p, '\r');
+  p.inputQueuedAt = Date.now() - 25000;        // pressed 25 s ago
+  win.queueInput(p, 'ls');                      // typed just now
+  p.sid = 'sid-mix'; p.connecting = false;
+  win.beginSessionIO(p);
+  win.openInputGate(p);
+  for (let i = 0; i < 50 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === '\rls', 'nothing recent was thrown away; got ' + JSON.stringify(st.sent));
+  p.polling = false;
   cleanup(env);
 });
 

@@ -144,6 +144,25 @@ Raw request body = file bytes (`Content-Length` required, capped by
 Streams into `$HOME/<path>` over the ControlMaster. Reply
 `{"ok": true, "bytes": n, "path": "$HOME/<path>"}` / `{"error": ...}`.
 
+With `&offset=N` the body is one piece of the file. Use a unique staging
+path for each new file, and reuse that path only for pieces and retries
+of the same immutable file. Every offset, including zero, requires the
+remote file to be exactly N bytes long; an absent file counts as empty.
+Otherwise the reply is `409 {"error": "offset mismatch",
+"size": <actual>}` and the client resumes from `size`. `size` in the
+`ok` reply is the end of the written piece. Writes use fixed positions
+without truncation, so overlapping retries write identical bytes into
+the same positions instead of appending them twice. A repeated first
+piece cannot erase later pieces. To start over, use a fresh staging
+path. The client stops with an error if the existing file is larger
+than the selected file, without reusing or finalizing that path.
+Without `offset`, the legacy whole-file request still overwrites its
+destination. The client sends
+pieces (4 MB, smaller after failures, each retried on its own) only
+when `/api/config` says `upload_chunks: true`, because an older server
+would overwrite the file with every piece. Pieces are what let an
+upload cross a proxy or VPN that cuts long or large requests.
+
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
 to its destination with collision auto-increment (`a.txt` → `a(1).txt`).

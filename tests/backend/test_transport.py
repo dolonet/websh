@@ -470,6 +470,56 @@ class TestHTTPApi(LiveServerCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_second_takeover_within_the_gap_is_refused(self):
+        """Two live tabs on one session must not evict each other for
+        ever: after a takeover, the next entrant inside
+        STREAM_TAKEOVER_MIN_GAP gets 409 (and settles on long-poll)."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class Sess(_FakeNotifyMixin):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self.last_activity = 0
+            def read(self):
+                return b""
+
+        sess = Sess()
+        with server.sessions_lock:
+            server.sessions[sid] = sess
+        conns = []
+        try:
+            def open_stream():
+                c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                c.request("GET", "/api/stream?session_id=" + sid)
+                r = c.getresponse()
+                conns.append(c)
+                return r
+            r1 = open_stream()
+            self.assertEqual(r1.status, 200)
+            r1.read(20)
+            r2 = open_stream()                       # takes over
+            self.assertEqual(r2.status, 200)
+            r2.read(20)
+            with unittest.mock.patch.object(server, "STREAM_TAKEOVER_MIN_GAP", 60):
+                t0 = time.time()
+                r3 = open_stream()                   # too soon: refused
+                self.assertEqual(r3.status, 409)
+                self.assertLess(time.time() - t0, 4)
+                sess._stream_taken_at = 0            # the gap has passed
+                r4 = open_stream()
+                self.assertEqual(r4.status, 200)
+        finally:
+            sess.alive = False
+            for c in conns:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_stream_rejects_duplicate_with_409(self):
         """A holder that cannot step aside (blocked inside the session,
         here a read() that waits on a gate) keeps the slot: after the

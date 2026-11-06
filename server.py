@@ -349,6 +349,7 @@ MIN_ROWS = 2
 # Timing
 CONNECT_SETTLE_TIME = 0.5     # seconds to wait after spawning SSH
 POLL_TIMEOUT = 10             # seconds to long-poll for output
+STREAM_TAKEOVER_MIN_GAP = 15  # seconds between takeovers of one session's stream
 POLL_INTERVAL = 0.01          # seconds between buffer checks
 PTY_DRAIN_ROUNDS = 50         # max iterations to drain PTY on exit
 PTY_DRAIN_INTERVAL = 0.01    # seconds per drain round
@@ -1670,6 +1671,10 @@ def config_public():
         "version": __version__,
         "proto": PROTO_VERSION,
         "vault_enabled": _vault_available(),
+        # The client sends files in pieces (?offset=) only to a server
+        # that appends them; an older one would overwrite the file with
+        # each piece.
+        "upload_chunks": True,
     }
     # Optional connect-form prefill (websh.json "form_defaults"): lets a
     # deployment seed host/port/username in the manual form without
@@ -1949,6 +1954,7 @@ class SSHSession(object):
     # Bumped by a new /api/stream that finds the slot held: the holder
     # sees its generation is stale and steps aside (see _stream).
     _stream_gen = 0
+    _stream_taken_at = 0.0
     # Invariant: master_fd ∈ {a valid open fd, -1}. The sentinel -1 (rather
     # than None) means "closed / never opened" and lets master_fd-touching
     # methods early-return via `if self.master_fd < 0: return` instead of
@@ -3053,11 +3059,24 @@ class SSHSession(object):
 
     # ── File transfer (ControlMaster side-channel) ──────────────────
 
+    # Chunked upload: a piece that does not start where the file on the
+    # remote host ends is refused with this exit status, and the actual
+    # size is printed, so the client resumes from there. Concurrent
+    # retries can both pass that size check: positional writes keep their
+    # identical bytes at the same offset instead of appending them twice.
+    UPLOAD_EXIT_OFFSET = 7
+
     def upload_file(self, rel_path, body_stream, length,
-                    timeout=UPLOAD_TIMEOUT):
+                    timeout=UPLOAD_TIMEOUT, offset=None):
         """Stream `length` bytes from body_stream into $HOME/<rel_path> on the
         remote host, riding on the existing ControlMaster channel — so no
-        re-auth and no PTY overhead. Returns (ok, error)."""
+        re-auth and no PTY overhead. Returns (ok, error).
+
+        offset=None writes the whole file in one go (older clients).
+        A chunk writes at `offset` only if the file is exactly that long
+        (an absent file counts as empty), otherwise (False, "offset
+        mismatch size=<n>"). Chunked uploads use a unique path per file;
+        a repeated first piece must never truncate later pieces."""
         if not self.alive:
             return False, "session is dead"
         if not self._mux_ready():
@@ -3068,18 +3087,38 @@ class SSHSession(object):
         # wrong upstream.
         b64name = base64.b64encode(
             rel_path.encode("utf-8")).decode("ascii")
-        remote_cmd = (
-            _sh_b64('n', b64name) + ' && '
-            'cat > "$HOME/$n"'
-        )
+        if offset is None:
+            body = 'cat > "$HOME/$n"'
+        else:
+            # $(( )) strips the leading blanks some `wc` print, which
+            # `test -eq` would reject.
+            # Use portable dd rather than append: two requests may both
+            # pass the size check before either writes. Retries carry
+            # bytes from the same immutable file, so overlapping writes
+            # at fixed positions are safe, including a delayed offset 0.
+            # An unaligned seek consumes at most 4095 bytes with bs=1
+            # before switching to 4 KiB blocks. The first dd cannot read
+            # ahead into the second one's input; && preserves failures.
+            block = 4096
+            prefix = (-offset) % block
+            write = ('dd of="$HOME/$n" bs=%d seek=%d conv=notrunc'
+                     % (block, (offset + prefix) // block))
+            if prefix:
+                write = ('dd of="$HOME/$n" bs=1 count=%d seek=%d '
+                         'conv=notrunc && ' % (prefix, offset)) + write
+            body = ('sz=0; [ -e "$HOME/$n" ] && sz=$(( $(wc -c < "$HOME/$n") )); '
+                    '[ "$sz" -eq %d ] || { echo "$sz"; exit %d; }; '
+                    % (offset, self.UPLOAD_EXIT_OFFSET)) + write
+        remote_cmd = _sh_b64('n', b64name) + ' && ' + body
 
         proc = subprocess.Popen(
             self._mux_argv(remote_cmd),
             stdin=subprocess.PIPE,
-            # `cat >` produces no stdout; discard it. stderr is kept (for the
-            # "ssh exit N: <msg>" error below) but MUST be drained while we
-            # write stdin — see _drain below.
-            stdout=subprocess.DEVNULL,
+            # `cat >` produces no stdout except the size a refused chunk
+            # reports; the pipe is tiny and read after exit. stderr is
+            # kept (for the "ssh exit N: <msg>" error below) but MUST be
+            # drained while we write stdin — see _drain below.
+            stdout=subprocess.PIPE if offset is not None else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
 
@@ -3089,31 +3128,51 @@ class SSHSession(object):
         # stops reading our stdin, and proc.stdin.write() below deadlocks.
         # We keep at most 64 KB of the text for the error message but keep
         # reading to EOF so the pipe never backs up.
-        _err_buf = []
-        _err_len = [0]
-
-        def _drain_stderr():
+        def _drain_pipe(pipe, buf, cap):
+            # Read to EOF, keeping at most `cap` bytes.
+            kept = 0
             try:
                 while True:
-                    chunk = proc.stderr.read(4096)
+                    chunk = pipe.read(4096)
                     if not chunk:
                         break
-                    if _err_len[0] < 65536:
-                        _err_buf.append(chunk)
-                        _err_len[0] += len(chunk)
+                    if kept < cap:
+                        buf.append(chunk)
+                        kept += len(chunk)
             except Exception:
                 pass
             finally:
                 try:
-                    proc.stderr.close()
+                    pipe.close()
                 except Exception:
                     pass
 
-        _drain = Thread(target=_drain_stderr, daemon=True)
+        _err_buf = []
+        _drain = Thread(target=_drain_pipe, args=(proc.stderr, _err_buf, 65536),
+                        daemon=True)
         _drain.start()
+        _out_buf = []
+        _drain_out = None
+        if proc.stdout is not None:
+            _drain_out = Thread(target=_drain_pipe, args=(proc.stdout, _out_buf, 4096),
+                                daemon=True)
+            _drain_out.start()
+
+        def _refused():
+            # The size the remote printed before refusing the piece.
+            _drain.join(timeout=5)
+            if _drain_out is not None:
+                _drain_out.join(timeout=5)
+            out = b"".join(_out_buf).decode("ascii", "replace").strip()
+            try:
+                size = int(out.split()[0])
+            except (ValueError, IndexError):
+                size = -1
+            return False, "offset mismatch size=%d" % size
 
         BUF = 256 * 1024
         remaining = length
+        chunk = b""
         deadline = time.time() + max(60, timeout)
         in_fd = proc.stdin.fileno()
         # Non-blocking so a write never sleeps past the select() below:
@@ -3158,6 +3217,24 @@ class SSHSession(object):
                 proc.stdin.close()
             except Exception:
                 pass
+            if offset is not None and isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                # A refused piece: the remote exited before reading stdin.
+                # Swallow the rest of the body first, so the reply goes
+                # out on a request that was received whole (a proxy that
+                # is still sending the body may otherwise drop the 409).
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                if proc.returncode == self.UPLOAD_EXIT_OFFSET:
+                    left = remaining - len(chunk)   # the chunk itself was read already
+                    end = time.time() + 30
+                    while left > 0 and time.time() < end:
+                        piece = body_stream.read(min(BUF, left))
+                        if not piece:
+                            break
+                        left -= len(piece)
+                    return _refused()
             _kill_reap(proc)
             _drain.join(timeout=5)
             # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
@@ -3184,6 +3261,10 @@ class SSHSession(object):
         # proc has exited, so stderr is at EOF and the drain thread is
         # finishing; join it to collect the captured text.
         _drain.join(timeout=5)
+        if _drain_out is not None:
+            _drain_out.join(timeout=5)
+        if proc.returncode == self.UPLOAD_EXIT_OFFSET and offset is not None:
+            return _refused()
         if proc.returncode != 0:
             msg = b"".join(_err_buf).decode("utf-8", "replace").strip()[:300]
             return False, "ssh exit %d: %s" % (proc.returncode, msg)
@@ -4881,7 +4962,8 @@ class Handler(BaseHTTPRequestHandler):
         deadline = time.time() + 2.0
         session = None
         duplicate = False
-        took_over = False
+        bumped_to = None
+        bumped_at = 0.0
         my_gen = 0
         while True:
             with sessions_lock:
@@ -4899,10 +4981,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not session._stream_active:
                     session._stream_active = True
                     my_gen = getattr(session, "_stream_gen", 0)
+                    if bumped_to is not None:
+                        session._stream_taken_at = time.time()
                     break
-                if not took_over:
-                    session._stream_gen = getattr(session, "_stream_gen", 0) + 1
-                    took_over = True
+                gen = getattr(session, "_stream_gen", 0)
+                # A takeover only once in a while per session: two live
+                # tabs on the same session (both restored it from
+                # localStorage) would otherwise evict each other every
+                # few seconds for ever. The second one gets the 409 and
+                # settles on long-poll, as before; a holder that is
+                # really dead is taken over on the first try.
+                may_take = (time.time() - getattr(session, "_stream_taken_at", 0.0)
+                            >= STREAM_TAKEOVER_MIN_GAP)
+                if may_take and (bumped_to is None or
+                                 # The slot changed hands to someone who
+                                 # acquired with our generation (an entrant
+                                 # racing us) - ask again, once they have
+                                 # had time to step aside.
+                                 (gen == bumped_to and
+                                  time.time() - bumped_at > 0.3)):
+                    session._stream_gen = gen + 1
+                    bumped_to = gen + 1
+                    bumped_at = time.time()
                     session._signal()
             if time.time() >= deadline:
                 duplicate = True
@@ -5217,7 +5317,22 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             self._json({"error": "empty body"}, 400)
             return
-        if length > MAX_UPLOAD_SIZE:
+        # `offset`: this body is one piece of the file, to be appended at
+        # that position (see SSHSession.upload_file). Pieces are how an
+        # upload survives a network that cuts long or large requests - a
+        # corporate proxy, a VPN - and how a dropped piece is retried
+        # without resending the file.
+        offset = None
+        raw_off = params.get("offset", [None])[0]
+        if raw_off is not None:
+            try:
+                offset = int(raw_off)
+            except ValueError:
+                offset = -1
+            if offset < 0 or offset > MAX_UPLOAD_SIZE:
+                self._json({"error": "invalid offset"}, 400)
+                return
+        if length + (offset or 0) > MAX_UPLOAD_SIZE:
             self._json({"error": "file too large"}, 413)
             return
 
@@ -5225,8 +5340,15 @@ class Handler(BaseHTTPRequestHandler):
         if session is None:
             return
 
-        ok, err = session.upload_file(rel_path, self.rfile, length)
+        ok, err = session.upload_file(rel_path, self.rfile, length,
+                                      offset=offset)
         host_for_log = getattr(session, "_host", "")
+        if not ok and err.startswith("offset mismatch size="):
+            # Not a failure of this request: the client resumes from the
+            # size the remote file really has.
+            self._json({"error": "offset mismatch",
+                        "size": int(err.rsplit("=", 1)[1])}, 409)
+            return
         if not ok:
             _log("WARN", "upload failed sid={} path={} err={}".format(
                 sid, rel_path, err))
@@ -5242,7 +5364,10 @@ class Handler(BaseHTTPRequestHandler):
         _access_log_emit("upload", self._client_ip(), sid=sid,
                          target_host=host_for_log, path=rel_path,
                          bytes=length, result="ok")
-        self._json({"ok": True, "bytes": length, "path": "$HOME/" + rel_path})
+        reply = {"ok": True, "bytes": length, "path": "$HOME/" + rel_path}
+        if offset is not None:
+            reply["size"] = offset + length
+        self._json(reply)
 
     def _upload_finalize(self):
         """POST /api/upload_finalize — for persistent sessions, move
