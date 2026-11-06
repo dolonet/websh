@@ -8,7 +8,14 @@ function storageKey(name) { return storagePrefix + name; }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function $(id){ return document.getElementById(id) }
-function esc(s){ let d=document.createElement('div'); d.textContent=s; return d.innerHTML }
+// HTML-escape for BOTH text and attribute context. The old
+// textContent->innerHTML trick only covered & < > - a remote filename
+// containing a double quote could then close an attribute and add its
+// own (onmouseover=...) when esc() output was interpolated into one.
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+}
 
 const API = location.pathname.replace(/\/[^/]*$/, '') + '/api.php';
 function api(action, opts) {
@@ -68,7 +75,13 @@ const DEFAULT_SETTINGS = {
   // is no longer user-configurable — the server hardcodes `set -g mouse
   // on` so wheel-scroll-history and click-in-vim work out of the box
   // without ever needing to toggle in /options.
-  tmuxClipboard: true, tmuxHistory: 100000
+  tmuxClipboard: true, tmuxHistory: 100000,
+  // File-browser sort. Newest-first by default: the reason to open the
+  // browser is usually a file that was just written, and alphabetical
+  // order buries it. 'name' | 'size' | 'mtime'; dir -1 = descending.
+  fbSort: 'mtime', fbSortDir: -1,
+  // Dotfiles hidden by default, as in every file manager and `ls`.
+  fbShowHidden: false
 };
 // id → [label, webfont-name-or-null, fallback-stack, google-weights]
 // webfont-name is the family loaded via Google Fonts; null = system
@@ -289,6 +302,10 @@ function createPane(container) {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
+    // Remote working directory, learned from OSC 7 when the shell emits
+    // it. '' means unknown — the file browser then asks the server,
+    // which can answer for tmux panes. See the OSC 7 handler below.
+    cwd:'',
     label:'', resizeTimer:null, upload:null, download:null,
     // Last (cols,rows) we POSTed to the server — used to skip duplicate
     // /api/resize calls when several refit triggers fire in the same
@@ -404,6 +421,33 @@ function createPane(container) {
           Uint8Array.from(text, c => c.charCodeAt(0)));
       } catch (e) {}
       copyText(text);
+      return true;
+    });
+    // OSC 7 — "here is my working directory", emitted on every prompt
+    // by fish, by zsh/bash with the usual vte/starship hooks, and by
+    // most modern shells' default configs. It is the only way a
+    // non-persistent pane can know where the remote shell is: that
+    // shell is a child of sshd on the far side, so nothing local can
+    // introspect it. Persistent panes have tmux as a second source
+    // (the server reads #{pane_current_path}), which is why the file
+    // browser treats this as an optimisation, not a requirement.
+    //
+    // Format: file://<host>/<percent-encoded-path>. The host is
+    // whatever the remote claims and is not something we can verify,
+    // so we ignore it and keep only the path.
+    term.parser.registerOscHandler(7, data => {
+      // A hostile or broken remote can emit anything here. The value
+      // only ever seeds a directory listing the user then sees, so the
+      // exposure is low, but cap the length and demand a plausible
+      // absolute path rather than storing arbitrary junk.
+      if (!data || data.length > 4096 || data.slice(0, 7) !== 'file://') return false;
+      let slash = data.indexOf('/', 7);
+      if (slash < 0) return false;
+      let path;
+      try { path = decodeURIComponent(data.slice(slash)); }
+      catch (e) { return false; }
+      if (path.charAt(0) !== '/' || path.indexOf('\x00') >= 0) return false;
+      p.cwd = path;
       return true;
     });
   }
@@ -1196,7 +1240,8 @@ async function commitVaultSave(entry) {
   // key clears it. Plain `delete` is also fine, used here for symmetry
   // with the previous shape.
   try { delete entry.__ephemeralSecrets; } catch (e) {}
-  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id);
+  let dest = vaultDestination(entry.host, entry.port, entry.user);
+  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id, dest);
   // Post-encrypt re-check: subtle.encrypt yielded the event loop, and a
   // sibling tab's BroadcastChannel signed_out handler may have wiped
   // IDB + invalidateVaultCache() during that gap. Bypass the in-memory
@@ -1222,8 +1267,10 @@ async function commitVaultSave(entry) {
   }
   let body = {
     vault_id, conn_id,
-    host: entry.host, port: entry.port, username: entry.user,
-    iv, ct,
+    // Exactly the values bound into the AAD, so the server derives the
+    // same bytes from the stored record at connect time.
+    host: dest.host, port: dest.port, username: dest.username,
+    iv, ct, aad_v: VAULT_AAD_VERSION,
     // ssh_options is part of the /api/save wire contract (server filters
     // through _filter_ssh_options and persists what survives). The
     // browser has no UI for arbitrary SSH options yet, so we send an
@@ -1323,6 +1370,9 @@ function endSession(p, o) {
   p.polling = false;
   p.connecting = false;
   p.sid = null;
+  // The tracked cwd belongs to the shell that just went away; a
+  // reconnect starts somewhere else and must re-learn it.
+  p.cwd = '';
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
   if (o.disconnect && sid) {
@@ -2606,20 +2656,41 @@ function _b64ToBytes(b64) {
   return bytes;
 }
 
-async function encryptCredentials(plaintext, conn_id) {
+// AAD version 2: the blob is bound to its slot AND its destination.
+// Server-side the record's host/port/username are plaintext metadata,
+// and /api/save needs no proof of key possession - so with the old
+// slot-only AAD, anyone who could read websh.creds.json could re-POST a
+// blob under the same ids with a different host and have the server
+// decrypt it (with the victim's key) into the attacker's machine.
+// The canonical form must match server.py's _credential_aad() byte for
+// byte: trimmed host, integer port (1-65535, else 22), trimmed user.
+const VAULT_AAD_VERSION = 2;
+function vaultDestination(host, port, username) {
+  let p = parseInt(port, 10);
+  if (!(p >= 1 && p <= 65535)) p = 22;
+  return {host: String(host || '').trim(), port: p,
+          username: String(username || '').trim()};
+}
+function vaultAad(vault_id, conn_id, dest) {
+  return new TextEncoder().encode(
+    vault_id + ':' + conn_id + ':' + dest.host + ':' + dest.port + ':' +
+    dest.username);
+}
+
+async function encryptCredentials(plaintext, conn_id, dest) {
   let vault_id = await ensureVaultId();
   let key = await ensureVaultKey();
   // GCM IV reuse under the same key is catastrophic; draw a fresh
   // 12-byte IV on every encrypt. See docs/encryption.md.
   let iv = crypto.getRandomValues(new Uint8Array(12));
-  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let aad = vaultAad(vault_id, conn_id, dest);
   let pt = new TextEncoder().encode(JSON.stringify(plaintext));
   let ct = await crypto.subtle.encrypt(
     {name: 'AES-GCM', iv, additionalData: aad}, key, pt);
   return {iv: _bufToB64(iv), ct: _bufToB64(ct), vault_id};
 }
 
-async function decryptCredentials(iv_b64, ct_b64, conn_id) {
+async function decryptCredentials(iv_b64, ct_b64, conn_id, dest) {
   // Non-minting: silently minting a fresh vault_id / K here would just
   // guarantee a decrypt failure with extra garbage left in IDB. Raise
   // a clear error so the caller can surface a useful diagnostic
@@ -2627,7 +2698,10 @@ async function decryptCredentials(iv_b64, ct_b64, conn_id) {
   let vault_id = await ensureVaultIdIfPresent();
   let key = await ensureVaultKeyIfPresent();
   if (!vault_id || !key) throw new Error('no_vault_key');
-  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  // `dest` selects the v2 (destination-bound) AAD; without it the v1
+  // slot-only binding is used, for blobs saved before aad_v existed.
+  let aad = dest ? vaultAad(vault_id, conn_id, dest)
+                 : new TextEncoder().encode(vault_id + ':' + conn_id);
   let pt = await crypto.subtle.decrypt(
     {name: 'AES-GCM', iv: _b64ToBytes(iv_b64), additionalData: aad},
     key, _b64ToBytes(ct_b64));
@@ -3229,20 +3303,6 @@ function doConnect() {
 }
 
 // ── Server config ───────────────────────────────────────────────────
-// Wire-protocol version this client speaks; the server ships its own in
-// /api/config ("proto"). A mismatch at page load means the browser is
-// running a stale CACHED websh.js against an upgraded server - surface
-// a reload prompt instead of letting requests fail obscurely. An absent
-// field (older server) stays silent.
-const CLIENT_PROTO = 1;
-
-function checkProtoVersion(cfg) {
-  if (cfg && cfg.proto !== undefined && cfg.proto !== CLIENT_PROTO) {
-    showToast('websh was updated on the server \u2014 reload the page ' +
-              '(Ctrl+Shift+R) to get the matching client.', 'warn');
-  }
-}
-
 // Prefill the manual connect form from websh.json "form_defaults"
 // (shipped via /api/config). Only fields the user hasn't already typed
 // into are touched, and the port only when it still shows the markup
@@ -3258,11 +3318,25 @@ function applyFormDefaults(cfg) {
   if (fd.username && u && !u.value) u.value = fd.username;
 }
 
+// Wire-protocol version this client speaks; the server ships its own in
+// /api/config ("proto"). A mismatch at page load means the browser is
+// running a stale CACHED websh.js against an upgraded server - surface
+// a reload prompt instead of letting requests fail obscurely. An absent
+// field (older server) stays silent.
+const CLIENT_PROTO = 1;
+
+function checkProtoVersion(cfg) {
+  if (cfg && cfg.proto !== undefined && cfg.proto !== CLIENT_PROTO) {
+    showToast('websh was updated on the server \u2014 reload the page ' +
+              '(Ctrl+Shift+R) to get the matching client.', 'warn');
+  }
+}
+
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
-    checkProtoVersion(cfg);
     applyFormDefaults(cfg);
+    checkProtoVersion(cfg);
     if(cfg.isolate_storage) {
       storagePrefix = location.pathname.replace(/[^/]*$/, '');
       // `settings`/`fontSize` were loaded at module init under the empty
@@ -3849,75 +3923,232 @@ function cancelDownload(id) {
 
 // ── File browser ─────────────────────────────────────────────────────
 let _fbId = null;
+// The directory the browser is currently showing (absolute, server-
+// resolved). Breadcrumbs, "up", reload, and new-folder all read it
+// rather than scraping it back out of the DOM.
+let _fbCurPath = '';
+// Request generation for /api/ls. Only the newest request may paint:
+// a slow reply from an earlier directory (or an earlier pane) used to
+// overwrite a newer listing - and the breadcrumbs with it, so nothing
+// looked wrong while rm/mv/mkdir then targeted the wrong directory, or
+// the wrong HOST when the browser had been reopened on another pane.
+let _fbSeq = 0;
+// The session id whose listing is on screen. Every mutating action is
+// checked against it so a row from pane A can never be deleted through
+// pane B's session.
+let _fbListedSid = null;
 
-const _fbTrap = makeModalTrap('fbOv', () => closeFb());
+// The `done` closure of the row currently showing an inline editor — a
+// delete confirmation, a rename field, or the new-folder input — or
+// null. At most one is open at a time: opening a second runs this to
+// dismiss the first, so the list never shows two competing editors.
+let _fbConfirm = null;
+
+// Escape while an inline editor is open dismisses it ("no") instead of
+// closing the whole browser, which is what the user means and saves
+// re-navigating to the directory they were in.
+function cancelFbConfirm() {
+  if (!_fbConfirm) return false;
+  let done = _fbConfirm;
+  _fbConfirm = null;
+  done();
+  return true;
+}
+
+const _fbTrap = makeModalTrap('fbOv', () => {
+  if (cancelFbConfirm()) return;
+  closeFb();
+});
 function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
+  // A fresh open never shows another pane's rows: clear the previous
+  // listing (and invalidate its in-flight request) before the first
+  // load, so the keep-while-loading logic has nothing stale to keep.
+  _fbSeq++;
+  _fbListedSid = null;
+  $('fbList').innerHTML = '';
+  setFbPath('');
   $('fbManual').value = '';
   // Escape now closes the browser and Tab cycles inside it (previously
   // neither worked); focus starts in the manual-path input.
   _fbTrap.open(() => $('fbManual'));
-  loadFbDir('~');
+  syncFbSortUi();
+  syncFbHiddenUi();
+  let f = $('fbFilter'); if (f) f.value = '';
+  // Open where the user is standing, not at $HOME. Three sources, best
+  // first: OSC 7 told us directly; the server can ask tmux; otherwise
+  // fall back to the historical ~.
+  if (p.cwd) loadFbDir(p.cwd);
+  else loadFbDir('~', {paneCwd: true});
+}
+
+// Store the resolved directory and repaint the breadcrumb trail. The
+// full path also lands in data-path on the <nav> so scripts and tests
+// have one unambiguous place to read it.
+function setFbPath(path) {
+  _fbCurPath = path || '';
+  let nav = $('fbPath');
+  if (!nav) return;
+  nav.innerHTML = '';
+  nav.setAttribute('data-path', _fbCurPath);
+  if (!_fbCurPath) return;               // loading (pane-cwd not resolved yet)
+  let parts = _fbCurPath.split('/').filter(s => s.length);
+  let crumb = (label, full, cur) => {
+    let b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'fb-crumb' + (cur ? ' cur' : '');
+    b.textContent = label;
+    if (!cur) b.addEventListener('click', () => loadFbDir(full));
+    return b;
+  };
+  // Root "/" first; its trailing slash doubles as the separator before
+  // the first segment, so separators are only drawn between segments.
+  nav.appendChild(crumb('/', '/', parts.length === 0));
+  let acc = '';
+  parts.forEach((seg, i) => {
+    if (i > 0) {
+      let sep = document.createElement('span');
+      sep.className = 'fb-crumb-sep'; sep.textContent = '/';
+      nav.appendChild(sep);
+    }
+    acc += '/' + seg;
+    nav.appendChild(crumb(seg, acc, i === parts.length - 1));
+  });
+  // Keep the deepest crumb in view on a long path.
+  nav.scrollLeft = nav.scrollWidth;
 }
 
 function closeFb() {
+  // Drop any armed confirmation without running its DOM restore — the
+  // list is about to be discarded, and a stale closure would otherwise
+  // keep a detached row alive.
+  _fbConfirm = null;
   _fbTrap.close();
   _fbId = null;
+  _fbSeq++;              // a reply still in flight must not paint a closed browser
+  _fbListedSid = null;
 }
 
 function fbUp() {
-  let cur = $('fbPath').textContent;
+  let cur = _fbCurPath;
   if (!cur || cur === '/') return;
   let parent = cur.lastIndexOf('/') > 0 ? cur.substring(0, cur.lastIndexOf('/')) : '/';
   loadFbDir(parent);
 }
 
-function loadFbDir(path) {
+// o.paneCwd: ignore `path` and let the server start from the pane's
+// working directory (it can resolve one for tmux-backed sessions, and
+// falls back to $HOME otherwise). The response's `path` is always the
+// directory we actually landed in, so the header stays truthful either
+// way.
+function loadFbDir(path, o) {
   let p = _fbId && panes[_fbId];
-  if (!p) return;
+  if (!p || !p.sid) return;
   let list = $('fbList');
-  list.innerHTML = '<div class="fb-msg">Loading…</div>';
-  $('fbPath').textContent = path;
-  fetch(API + '?action=ls&session_id=' + encodeURIComponent(p.sid) +
-        '&path=' + encodeURIComponent(path))
+  let req = ++_fbSeq, reqPane = _fbId, reqSid = p.sid;
+  // Keep the current listing on screen until the new one arrives, then
+  // swap path + rows in one go. Replacing the list with a "Loading…"
+  // line made the panel collapse and repaint on every navigation,
+  // delete and rename; the only time a placeholder is shown is when
+  // there is nothing to keep (first open).
+  if (!list.querySelector('.fb-row')) {
+    list.innerHTML = '<div class="fb-msg">Loading…</div>';
+  }
+  list.setAttribute('aria-busy', 'true');
+  let stale = () => req !== _fbSeq || _fbId !== reqPane ||
+                    !panes[reqPane] || panes[reqPane].sid !== reqSid;
+  fetch(API + '?action=ls&session_id=' + encodeURIComponent(reqSid) +
+        '&path=' + encodeURIComponent(path) +
+        ((o && o.paneCwd) ? '&cwd=1' : ''))
     .then(r => r.json())
     .then(r => {
+      if (stale()) return;
+      list.removeAttribute('aria-busy');
       if (r.error) {
         list.innerHTML = '<div class="fb-msg err">' + esc(r.error) + '</div>';
         return;
       }
-      $('fbPath').textContent = r.path;
+      // A response with no resolved path is not a listing we can render:
+      // every downstream path is built by joining onto r.path, so an
+      // absent one would produce "undefined/name" download targets.
+      if (!r.path || !Array.isArray(r.entries)) {
+        list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+        return;
+      }
+      // A fresh directory starts unfiltered — a filter left over from
+      // the previous listing would silently hide most of the new one.
+      // A re-list of the SAME directory (after rm/mv/mkdir) keeps it.
+      if (r.path !== _fbCurPath) {
+        let f = $('fbFilter'); if (f) f.value = '';
+      }
+      setFbPath(r.path);
+      _fbListedSid = reqSid;
       renderFbEntries(r.entries, r.path);
     })
     .catch(() => {
+      if (stale()) return;
+      list.removeAttribute('aria-busy');
       list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
     });
 }
 
+// The pane whose listing is on screen - or null (with a reload kicked
+// off) when the session has changed underneath the rows, so a queued
+// rm/mv/mkdir can never run against a different host than the one the
+// user was looking at.
+function fbSessionForAction() {
+  let p = _fbId && panes[_fbId];
+  if (p && p.sid && p.sid === _fbListedSid) return p;
+  showToast('Listing is out of date — reloading', 'warn');
+  reloadFbDir();
+  return null;
+}
+
+// Re-list the current directory. Used after a create/rename/delete so
+// the view reflects the remote rather than a locally patched guess.
+function reloadFbDir() {
+  if (_fbCurPath) loadFbDir(_fbCurPath);
+}
+
 function renderFbEntries(entries, absPath) {
   let list = $('fbList');
+  // Every row here is about to be replaced, so an armed confirmation
+  // from the previous listing no longer refers to anything on screen.
+  _fbConfirm = null;
   list.innerHTML = '';
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
       ? absPath.substring(0, absPath.lastIndexOf('/')) : '/';
-    let row = makeFbRow('d', '..', null);
+    let row = makeFbRow('d', '..', null, null, {noActions: true});
+    // Marked so the dotfile/filter visibility pass never hides it — ".."
+    // both starts with a dot and matches no filter term.
+    row.dataset.parent = '1';
     row.addEventListener('click', () => loadFbDir(parent));
     list.appendChild(row);
   }
-  for (let e of entries) {
+  for (let e of sortFbEntries(entries)) {
     let fullPath = absPath.endsWith('/') ? absPath + e.name : absPath + '/' + e.name;
-    let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null);
+    let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null, e.mtime);
+    // While a row is showing an inline editor (delete-confirm or rename)
+    // it stops being a download/navigate target — otherwise the click
+    // that lands next to the editor would act on the row underneath.
+    let activate = fn => row.addEventListener('click', () => {
+      if (row.classList.contains('fb-confirm') ||
+          row.classList.contains('fb-edit')) return;
+      fn();
+    });
     if (e.type === 'd') {
-      row.addEventListener('click', () => loadFbDir(fullPath));
+      activate(() => loadFbDir(fullPath));
     } else {
-      row.addEventListener('click', () => {
+      activate(() => {
         let id = _fbId;
         closeFb();
         if (id) startFastDownload(id, fullPath);
       });
     }
+    wireFbRow(row, fullPath, e.name, e.type);
     list.appendChild(row);
   }
   if (!entries.length) {
@@ -3925,9 +4156,11 @@ function renderFbEntries(entries, absPath) {
     m.className = 'fb-msg'; m.textContent = 'Empty directory';
     list.appendChild(m);
   }
+  // Apply the dotfile toggle and any active name filter to the fresh rows.
+  applyFbVisibility();
 }
 
-function makeFbRow(type, name, size) {
+function makeFbRow(type, name, size, mtime, o) {
   let row = document.createElement('div');
   row.className = 'fb-row';
   let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
@@ -3938,10 +4171,352 @@ function makeFbRow(type, name, size) {
     else if (size < 1073741824) sizeStr = (size / 1048576).toFixed(1) + ' MB';
     else sizeStr = (size / 1073741824).toFixed(1) + ' GB';
   }
-  row.innerHTML = '<span class="fb-ic">' + icon + '</span>' +
+  // Rename + delete live in a fixed-width group at the far right, after
+  // the metadata columns. The ".." row gets no buttons, but the empty
+  // group keeps its width so the size/date columns stay aligned.
+  row.innerHTML =
+    '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
-    '<span class="fb-sz">' + esc(sizeStr) + '</span>';
+    '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
+    '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
+    '<span class="fb-act"></span>';
+  // The action buttons carry the (remote-controlled) filename in an
+  // attribute, so they are built with the DOM API: setAttribute never
+  // parses markup, whatever the name contains.
+  if (!(o && o.noActions)) {
+    let acts = row.querySelector('.fb-act');
+    for (let [cls, attr, title, glyph] of [
+        ['fb-ren', 'data-fb-ren', 'Rename', '\u270E'],
+        ['fb-del', 'data-fb-del', 'Delete', '\u00D7']]) {
+      let b = document.createElement('button');
+      b.type = 'button'; b.className = cls;
+      b.setAttribute(attr, '');
+      b.title = title;
+      b.setAttribute('aria-label', title + ' ' + name);
+      b.textContent = glyph;
+      acts.appendChild(b);
+    }
+  }
+  // The visibility pass (dotfile toggle + name filter) reads the name here.
+  row.dataset.name = name;
   return row;
+}
+
+// "3 Feb 14:05" within the last ~6 months, "3 Feb 2024" beyond it —
+// the same trade-off `ls -l` makes: recent files are the ones where
+// the time of day disambiguates, older ones need the year.
+function fbDate(mtime) {
+  if (!mtime) return '';
+  let d = new Date(mtime * 1000);
+  if (isNaN(d.getTime())) return '';
+  let recent = Math.abs(Date.now() - d.getTime()) < 15778800000;
+  let mon = ['Jan','Feb','Mar','Apr','May','Jun',
+             'Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
+  let day = String(d.getDate()).padStart(2, ' ');
+  if (!recent) return day + ' ' + mon + '  ' + d.getFullYear();
+  return day + ' ' + mon + ' ' + String(d.getHours()).padStart(2, '0') +
+         ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+// Directories stay pinned above files in every sort mode. That's the
+// convention in every file manager, and it keeps navigation stable:
+// switching to size- or date-order shouldn't scatter the folders you
+// are trying to click through into the middle of the list.
+function sortFbEntries(entries) {
+  let dir = settings.fbSortDir < 0 ? -1 : 1;
+  let byName = (a, b) => {
+    let x = a.name.toLowerCase(), y = b.name.toLowerCase();
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+  // 'name' is handled by the byName branch below; anything unrecognised
+  // (a settings blob from a future build, say) degrades to name order
+  // rather than throwing.
+  let cmp = {
+    size: (a, b) => (a.size || 0) - (b.size || 0),
+    mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
+  }[settings.fbSort];
+  return entries.slice().sort((a, b) => {
+    let ad = a.type === 'd' ? 0 : 1, bd = b.type === 'd' ? 0 : 1;
+    if (ad !== bd) return ad - bd;
+    if (!cmp) return byName(a, b) * dir;
+    // Ties broken by name ascending regardless of `dir`, so equal sizes
+    // or identical mtimes (common — a tarball unpacked in one second)
+    // still come out in a stable, readable order.
+    return cmp(a, b) * dir || byName(a, b);
+  });
+}
+
+function setFbSort(key) {
+  // Clicking the active column flips direction; switching column starts
+  // from the direction that's useful for it — Z-to-A is never what you
+  // want from a name, newest/largest usually is.
+  if (settings.fbSort === key) settings.fbSortDir = -settings.fbSortDir;
+  else { settings.fbSort = key; settings.fbSortDir = key === 'name' ? 1 : -1; }
+  saveSettings();
+  syncFbSortUi();
+  reloadFbDir();
+}
+
+// Paint the active column and its arrow. Called on open as well as on
+// change, so a browser reopened in a later session shows the choice
+// that was persisted to settings.
+function syncFbSortUi() {
+  let arrow = settings.fbSortDir < 0 ? '↓' : '↑';
+  for (let key of ['name', 'size', 'mtime']) {
+    let b = $('fbSort-' + key);
+    if (!b) continue;
+    let active = settings.fbSort === key;
+    b.classList.toggle('on', active);
+    b.setAttribute('aria-pressed', active ? 'true' : 'false');
+    b.textContent = b.getAttribute('data-label') + (active ? ' ' + arrow : '');
+  }
+}
+
+// Two-step confirm, inline in the row. A nested modal would have to
+// fight the file browser's own focus trap for Escape and Tab, and a
+// window.confirm() blocks the SSE pump; swapping the row's contents
+// costs neither and keeps the target filename in front of the user.
+// Both inline editors (delete confirm, rename) swap the row's innerHTML
+// out and back, which drops every listener on the buttons - so every
+// restore must re-wire BOTH. One helper, so neither `done()` can forget
+// one: the delete editor used to re-wire only its own button, and the
+// orphaned Rename click then bubbled to the row and downloaded the file.
+function wireFbRow(row, fullPath, name, type) {
+  wireFbDelete(row, fullPath, name, type);
+  wireFbRename(row, fullPath, name, type);
+}
+
+function wireFbDelete(row, fullPath, name, type) {
+  let btn = row.querySelector('[data-fb-del]');
+  if (!btn) return;
+  btn.addEventListener('click', ev => {
+    // Without this the row's own handler would start a download of the
+    // very file we are asking about.
+    ev.stopPropagation();
+    askFbDelete(row, fullPath, name, type);
+  });
+}
+
+function askFbDelete(row, fullPath, name, type) {
+  if (row.classList.contains('fb-confirm')) return;
+  cancelFbConfirm();
+  let restore = row.innerHTML;
+  row.classList.add('fb-confirm');
+  row.innerHTML =
+    '<span class="fb-cf-q">Delete <b>' + esc(name) + '</b>?</span>' +
+    '<button type="button" class="fb-cf-no">Cancel</button>' +
+    '<button type="button" class="fb-cf-yes">Delete</button>';
+  let done = () => {
+    _fbConfirm = null;
+    row.classList.remove('fb-confirm');
+    row.innerHTML = restore;
+    wireFbRow(row, fullPath, name, type);
+  };
+  _fbConfirm = done;
+  row.querySelector('.fb-cf-no').addEventListener('click', ev => {
+    ev.stopPropagation(); done();
+  });
+  row.querySelector('.fb-cf-yes').addEventListener('click', ev => {
+    ev.stopPropagation();
+    _fbConfirm = null;
+    doFbDelete(row, fullPath, name, done);
+  });
+  // The button that opened this strip was just destroyed by the
+  // innerHTML swap, so a keyboard user's focus would fall to <body> and
+  // Tab would restart from the top of the modal. Land it on Cancel —
+  // the safe half of the choice.
+  try { row.querySelector('.fb-cf-no').focus(); } catch (e) {}
+}
+
+function doFbDelete(row, fullPath, name, undo) {
+  let p = fbSessionForAction();
+  if (!p) return;
+  row.innerHTML = '<span class="fb-cf-q">Deleting ' + esc(name) + '…</span>';
+  api('rm', {body: {session_id: p.sid, path: fullPath}})
+    .then(r => {
+      if (r && r.error) throw new Error(r.error);
+      showToast('Deleted ' + name, 'ok');
+      // Re-list rather than dropping the row locally: the directory may
+      // have changed for other reasons, and a delete already costs one
+      // roundtrip.
+      reloadFbDir();
+    })
+    .catch(e => {
+      showToast('Delete failed: ' + (e.message || 'error'), 'err');
+      undo();
+    });
+}
+
+// ── File browser: dotfile toggle + name filter ──────────────────────
+// Both are pure client-side view state layered on the already-fetched
+// rows: no roundtrip, so typing in the filter or flipping "Hidden" is
+// instant even on a directory of hundreds of entries.
+function applyFbVisibility() {
+  let list = $('fbList'); if (!list) return;
+  let fInp = $('fbFilter');
+  let filt = (fInp && fInp.value || '').trim().toLowerCase();
+  let showHidden = !!settings.fbShowHidden;
+  for (let row of list.querySelectorAll('.fb-row')) {
+    // ".." and an open editor row are always shown.
+    if (row.dataset.parent === '1' || row.classList.contains('fb-edit')) {
+      row.classList.remove('fb-hide'); continue;
+    }
+    let name = row.dataset.name || '';
+    let hideDot = !showHidden && name.charAt(0) === '.';
+    let hideFilt = filt && name.toLowerCase().indexOf(filt) < 0;
+    row.classList.toggle('fb-hide', !!(hideDot || hideFilt));
+  }
+}
+function applyFbFilter() { applyFbVisibility(); }
+
+function toggleFbHidden() {
+  settings.fbShowHidden = !settings.fbShowHidden;
+  saveSettings();
+  syncFbHiddenUi();
+  applyFbVisibility();
+}
+function syncFbHiddenUi() {
+  let b = $('fbHidden'); if (!b) return;
+  let on = !!settings.fbShowHidden;
+  b.classList.toggle('on', on);
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+// ── File browser: rename (mv) ───────────────────────────────────────
+function wireFbRename(row, fullPath, name, type) {
+  let btn = row.querySelector('[data-fb-ren]');
+  if (!btn) return;
+  btn.addEventListener('click', ev => {
+    ev.stopPropagation();               // don't navigate/download the row
+    askFbRename(row, fullPath, name, type);
+  });
+}
+
+function askFbRename(row, fullPath, name, type) {
+  if (row.classList.contains('fb-edit')) return;
+  cancelFbConfirm();                    // close any other open editor
+  let restore = row.innerHTML;
+  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  row.classList.add('fb-edit');
+  row.innerHTML =
+    '<span class="fb-ic">' + icon + '</span>' +
+    '<input type="text" class="fb-ed-inp" aria-label="New name">' +
+    '<button type="button" class="fb-ed-no">Cancel</button>' +
+    '<button type="button" class="fb-ed-ok">Save</button>';
+  let inp = row.querySelector('.fb-ed-inp');
+  inp.value = name;
+  let done = () => {
+    _fbConfirm = null;
+    row.classList.remove('fb-edit');
+    row.innerHTML = restore;
+    wireFbRow(row, fullPath, name, type);
+  };
+  _fbConfirm = done;
+  let commit = () => {
+    let next = inp.value.trim();
+    // Nothing to do if the name is empty or unchanged.
+    if (!next || next === name) { done(); return; }
+    if (next.indexOf('/') >= 0) {
+      showToast('Name cannot contain "/"', 'err'); return;
+    }
+    doFbRename(row, fullPath, next, done);
+  };
+  row.querySelector('.fb-ed-no').addEventListener('click', ev => {
+    ev.stopPropagation(); done();
+  });
+  row.querySelector('.fb-ed-ok').addEventListener('click', ev => {
+    ev.stopPropagation(); commit();
+  });
+  inp.addEventListener('keydown', ev => {
+    ev.stopPropagation();               // keep Escape/Enter out of the modal trap
+    if (ev.key === 'Enter') commit();
+    else if (ev.key === 'Escape') done();
+  });
+  // Select the basename (name minus extension) so a quick retype keeps
+  // the suffix — the common case is fixing the stem, not the ".txt".
+  try {
+    inp.focus();
+    let dot = name.lastIndexOf('.');
+    inp.setSelectionRange(0, dot > 0 ? dot : name.length);
+  } catch (e) {}
+}
+
+function doFbRename(row, fullPath, newName, undo) {
+  let p = fbSessionForAction();
+  if (!p) return;
+  row.innerHTML = '<span class="fb-cf-q">Renaming…</span>';
+  api('mv', {body: {session_id: p.sid, path: fullPath, name: newName}})
+    .then(r => {
+      if (r && r.error) throw new Error(r.error);
+      showToast('Renamed to ' + newName, 'ok');
+      reloadFbDir();
+    })
+    .catch(e => {
+      showToast('Rename failed: ' + (e.message || 'error'), 'err');
+      undo();
+    });
+}
+
+// ── File browser: new folder (mkdir) ────────────────────────────────
+// An editor row inserted at the top of the list, above the entries.
+function fbNewFolder() {
+  let list = $('fbList');
+  if (!list || !_fbCurPath) return;
+  cancelFbConfirm();
+  let row = document.createElement('div');
+  row.className = 'fb-row fb-edit';
+  row.innerHTML =
+    '<span class="fb-ic">📁</span>' +
+    '<input type="text" class="fb-ed-inp" placeholder="Folder name" aria-label="Folder name">' +
+    '<button type="button" class="fb-ed-no">Cancel</button>' +
+    '<button type="button" class="fb-ed-ok">Create</button>';
+  // Above everything, including "..", so it's where the eye already is.
+  list.insertBefore(row, list.firstChild);
+  let inp = row.querySelector('.fb-ed-inp');
+  let done = () => {
+    _fbConfirm = null;
+    if (row.parentNode) row.parentNode.removeChild(row);
+  };
+  _fbConfirm = done;
+  let commit = () => {
+    let name = inp.value.trim();
+    if (!name) { done(); return; }
+    if (name.indexOf('/') >= 0) {
+      showToast('Name cannot contain "/"', 'err'); return;
+    }
+    doFbMkdir(row, name, done);
+  };
+  row.querySelector('.fb-ed-no').addEventListener('click', ev => {
+    ev.stopPropagation(); done();
+  });
+  row.querySelector('.fb-ed-ok').addEventListener('click', ev => {
+    ev.stopPropagation(); commit();
+  });
+  inp.addEventListener('keydown', ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') commit();
+    else if (ev.key === 'Escape') done();
+  });
+  try { inp.focus(); } catch (e) {}
+}
+
+function doFbMkdir(row, name, undo) {
+  let p = fbSessionForAction();
+  if (!p) return;
+  // Join onto the current directory; avoid a double slash at the root.
+  let base = _fbCurPath === '/' ? '' : _fbCurPath;
+  let full = base + '/' + name;
+  row.innerHTML = '<span class="fb-ic">📁</span><span class="fb-cf-q">Creating…</span>';
+  api('mkdir', {body: {session_id: p.sid, path: full}})
+    .then(r => {
+      if (r && r.error) throw new Error(r.error);
+      showToast('Created ' + name, 'ok');
+      reloadFbDir();
+    })
+    .catch(e => {
+      showToast('Create failed: ' + (e.message || 'error'), 'err');
+      undo();
+    });
 }
 
 function fbDownloadManual() {

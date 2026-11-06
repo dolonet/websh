@@ -37,6 +37,14 @@ EnvironmentFile=/etc/websh/%i.env
 # the vault is enabled. It is per-instance, so instances never share a
 # credential store.
 StateDirectory=websh-%i
+# Writable log home for the optional access log and session recordings:
+# ProtectSystem=strict makes everything else read-only, and the server
+# only WARNs on a write failure - so an operator who set
+# WEBSH_ACCESS_LOG=/var/log/websh-%i/access.log got the reassuring startup
+# line and no log at all. Point WEBSH_ACCESS_LOG / WEBSH_RECORD_DIR
+# under /var/log/websh-%i (or /var/lib/websh-%i) when using this unit.
+LogsDirectory=websh-%i
+LogsDirectoryMode=0750
 
 # The encrypted credential vault is available but OFF by default. To turn
 # it on, `systemctl edit websh@<instance>` and add

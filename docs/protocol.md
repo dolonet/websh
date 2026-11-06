@@ -102,8 +102,8 @@ allow-list as connect). Reply `{"ok": true, "applied": [names]}`.
 
 ## File-transfer endpoints
 
-All side-channel endpoints (`upload*`, `ls`, `download`,
-`tmux_capture`, `tmux_options`) share a per-IP rate limit →
+All side-channel endpoints (`upload*`, `ls`, `rm`, `mkdir`, `mv`,
+`download`, `tmux_capture`, `tmux_options`) share a per-IP rate limit →
 `429 {"error": "rate_limited"}`.
 
 ### POST /api/upload?session_id=&path=
@@ -122,9 +122,54 @@ foreground tmux pane's cwd with collision auto-increment. Reply
 Body: `session_id`, `tmp`. Best-effort `rm` of the staged file.
 Reply `{"ok": true}`.
 
-### GET /api/ls?session_id=&path=
+### GET /api/ls?session_id=&path=[&cwd=1]
 Remote directory listing. Reply: `{"path": abs, "entries":
 [{"name", "type": "d|f|l|o", "size", "mtime"}, ...]}`.
+
+`cwd=1` ignores `path` and lists the pane's current working directory
+instead, so "where am I" and "what is there" stay one ssh roundtrip.
+Only tmux-backed sessions can resolve one (via `#{pane_current_path}`);
+everything else falls back to `$HOME`. `path` is still required as the
+fallback value and must be present. The reply's `path` is always the
+directory actually listed — clients should read their position back
+from it rather than assuming the request was honoured.
+
+Entries arrive sorted directories-first by name. Clients are free to
+re-sort (the bundled one sorts by `mtime` descending by default).
+
+### POST /api/rm
+Body: `session_id`, `path` (absolute). Deletes exactly one entry over
+the ControlMaster side channel: `rm -f` for files and symlinks,
+`rmdir` for directories. **Never recursive** — deleting a populated
+directory fails rather than taking the tree with it. Symlinks are
+unlinked, never followed.
+
+Reply `{"ok": true}`, or `502 {"error": msg}` where msg distinguishes
+"no such file or directory", "directory not empty or not writable",
+and "permission denied". `400` for a relative path, bare `/`, an
+embedded NUL, or a non-string.
+
+Grants no privilege the session lacks — the user has an interactive
+shell on that host as that account. The reason it exists is that the
+delete is keystroke-free, so it cannot disturb a full-screen program
+running in the foreground PTY.
+
+### POST /api/mkdir
+Body: `session_id`, `path` (absolute). Creates one directory,
+**non-recursive** (`mkdir`, not `mkdir -p`) — a mistyped path fails
+rather than silently building a chain. The final path segment may not
+be `.` or `..`. Reply `{"ok": true}`, or `502 {"error": msg}` ("name
+already exists" / "could not create …"); `400` for a bad path.
+
+### POST /api/mv
+Body: `session_id`, `path` (absolute source), `name` (bare filename).
+Renames the entry to a **sibling** in the same directory — the
+destination is always `dirname(path)/name`, so it cannot move an entry
+elsewhere; `name` is rejected if it contains `/`, is `.`/`..`, is
+empty, holds a NUL, or exceeds 255 bytes. Refuses to overwrite an
+existing target. Reply `{"ok": true}`, or `502 {"error": msg}` ("a
+file with that name already exists" / "permission denied" / "no such
+file"); `400` for a bad path or name.
 
 ### GET /api/download?session_id=&path=
 Streams the file as `application/octet-stream` with

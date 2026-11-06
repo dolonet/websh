@@ -197,9 +197,20 @@ free-form save.
   first save** of an entry; the value is stable for the entry's
   lifetime. Renaming or editing metadata reuses the same `conn_id` so
   decryption keeps working.
-- Encryption uses `AAD = vault_id:conn_id` (UTF-8 bytes), so a blob
-  copied to a different `conn_id` (or different vault) fails
-  decryption with an auth-tag mismatch — the server returns
+- Encryption uses `AAD = vault_id:conn_id:host:port:username`
+  (UTF-8 bytes; `aad_v: 2` on the record; trimmed host and user,
+  integer port), so a blob copied to a different `conn_id`/vault — or
+  re-posted under the same ids with a **different destination** —
+  fails decryption with an auth-tag mismatch. The destination binding
+  matters because the record's host/port/username are plaintext
+  metadata next to the blob and `/api/save` needs no proof of key
+  possession: without it, anyone who could read `websh.creds.json`
+  could rebind a victim's blob to their own host and have the server
+  decrypt it (with the victim's key) on the victim's next click.
+  Records saved before `aad_v` existed use the slot-only AAD and keep
+  working; `/api/save` refuses to write anything but v2, so a legacy
+  record can be read and deleted but never modified or re-created
+  through the API. Re-save an entry to bind it. The mismatch — the server returns
   `400 Bad Request` with `{"error":"vault_decrypt_failed"}`, the UI
   prompts the user to re-enter and re-save. Input-shape failures
   (malformed base64, IV not 12 bytes, ct shorter than the GCM tag,
@@ -229,7 +240,9 @@ entries even though the origin is shared.
 - `websh.json` filesystem leak (no creds in there post-migration; only
   metadata).
 - `websh.creds.json` filesystem leak (blobs without the browser-side key
-  are unrecoverable AES-256-GCM).
+  are unrecoverable AES-256-GCM; and with `aad_v: 2` a leaked blob can't
+  be rebound to another host through `/api/save` either — a v1 record,
+  saved before the binding existed, can be, until it is re-saved).
 - Browser profile or IndexedDB exfil (extension, file-stealer malware,
   profile sync to a compromised cloud, forensics on a stolen unlocked
   device): attacker has `vault_key` but no blobs (they're on the

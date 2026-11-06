@@ -44,6 +44,9 @@ class TestHTTPApi(LiveServerCase):
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
         self.assertIn("version", body)
+        # Wire-protocol version: the client decides "reload the page"
+        # from this field; both meta endpoints must carry it.
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
 
     def test_config_returns_no_secrets(self):
         body, code = self._get("/api/config")
@@ -51,6 +54,7 @@ class TestHTTPApi(LiveServerCase):
         self.assertTrue(body["restrict_hosts"])
         self.assertIn("session_timeout", body)
         self.assertIn("version", body)
+        self.assertEqual(body["proto"], 1)  # literal: a bump must be conscious
         self.assertEqual(len(body["connections"]), 1)
         conn = body["connections"][0]
         self.assertEqual(conn["name"], "allowed")
@@ -122,6 +126,102 @@ class TestHTTPApi(LiveServerCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def _post_hdr(self, path, body, headers):
+        h = {"Content-Type": "application/json"}
+        h.update(headers)
+        return self._request_json(path, data=json.dumps(body).encode(),
+                                  headers=h)
+
+    def test_cross_site_origin_is_refused(self):
+        """CSRF layer 1: a browser sends Origin on every cross-site POST.
+        An Origin host that is not the Host this request was addressed
+        to is a forged request - 403 before any handler runs."""
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Origin": "https://evil.example"})
+        self.assertEqual(code, 403)
+        self.assertIn("cross-site", body["error"])
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Origin": "null"})
+        self.assertEqual(code, 403)
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(code, 403)
+        code, _ = self._request_raw("/api/save?vault_id=A&conn_id=B",
+                                    method="DELETE",
+                                    headers={"Origin": "https://evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_same_origin_and_non_browser_posts_pass_the_csrf_gate(self):
+        host = "127.0.0.1:%d" % self.port
+        for hdrs in ({"Origin": "http://" + host},
+                     {"Origin": "HTTP://" + host.upper()},
+                     {"Sec-Fetch-Site": "same-origin"},
+                     {}):
+            body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                        hdrs)
+            self.assertNotEqual(code, 403, hdrs)
+
+    def test_forwarded_host_from_trusted_proxy_counts_as_origin(self):
+        body, code = self._post_hdr(
+            "/api/resize", {"session_id": "x"},
+            {"Origin": "https://websh.example",
+             "X-Forwarded-Host": "websh.example"})
+        # 127.0.0.1 is a trusted proxy by default.
+        self.assertNotEqual(code, 403, body)
+
+    def test_json_endpoints_require_json_content_type(self):
+        """CSRF layer 2: a cross-site <form enctype=text/plain> can carry
+        a JSON-looking body but never the application/json media type."""
+        body, code = self._request_json(
+            "/api/resize", data=b'{"session_id":"x"}',
+            headers={"Content-Type": "text/plain"})
+        self.assertEqual(code, 415)
+        body, code = self._request_json(
+            "/api/resize", data=b'{"session_id":"x"}',
+            headers={"Content-Type": "application/json; charset=utf-8"})
+        self.assertNotEqual(code, 415)
+
+    def test_unhandled_handler_exception_is_a_json_500(self):
+        """Regression: an exception escaping a handler reached the worker's
+        handle_error - traceback on stderr, socket closed, no status. The
+        _dispatch backstop now answers 500 {"error":"internal error"}."""
+        def boom(self_):
+            raise RuntimeError("kaboom")
+        with unittest.mock.patch.object(server.Handler, "_boom", boom, create=True), \
+             unittest.mock.patch.dict(server.Handler._POST_ROUTES, {"boom": "_boom"}), \
+             unittest.mock.patch.object(server, "_log") as log:
+            body, code = self._post("/api/boom", {"x": 1})
+        self.assertEqual(code, 500)
+        self.assertEqual(body.get("error"), "internal error")
+        self.assertTrue(any("kaboom" in str(c) for c in log.call_args_list))
+
+    def test_infinite_numeric_field_does_not_drop_the_connection(self):
+        # JSON 1e400 -> float('inf'); int(inf) raises OverflowError, which
+        # clamp() did not catch: unhandled traceback, empty reply.
+        for path, extra in (("/api/resize", {"cols": 1e400, "rows": 24}),
+                            ("/api/connect", {"host": "h.example", "username": "u",
+                                              "password": "p", "port": 1e400,
+                                              "cols": 80, "rows": 24})):
+            body, code = self._post(path, dict(session_id="nope", **extra))
+            self.assertIn(code, (200, 400, 403, 404, 429, 500), (path, code, body))
+            self.assertIsInstance(body, dict)
+
+    def test_non_dict_json_body_returns_400(self):
+        """_json_body must reject valid-JSON-but-not-an-object bodies
+        (bare list/string/number) with the same 400 malformed JSON gets.
+        Previously body.get() raised AttributeError and the client saw a
+        dropped connection with no response at all."""
+        for payload in ([1, 2, 3], "just a string", 42, None, True):
+            for path in ("/api/resize", "/api/input"):
+                body, code = self._post(path, payload)
+                self.assertEqual(code, 400, "%s payload %r" % (path, payload))
+                self.assertEqual(body.get("error"), "invalid json")
+        # And a non-string `data` is a 400, not a 500 from .encode().
+        body, code = self._post("/api/input",
+                                {"session_id": "x", "data": [1]})
+        self.assertIn(code, (400, 404))
+
+
     def test_stream_on_placeholder_session_404s_not_500(self):
         """During the connect window the registry holds a _SessionPlaceholder
         (no _stream_active slot). /api/stream must treat it as not-ready and
@@ -137,6 +237,35 @@ class TestHTTPApi(LiveServerCase):
                 server.sessions.pop(sid, None)
         self.assertEqual(code, 404)
         self.assertIn("error", body)
+
+    def test_placeholder_session_404s_on_plain_endpoints(self):
+        """_require_session must reject _SessionPlaceholder slots on every
+        endpoint, not just /api/stream. Before the helper, hitting input/
+        output/resize inside the connect window dereferenced attributes the
+        placeholder's __slots__ omit — an AttributeError surfacing as a 500
+        from /api/input (its write is wrapped in try/except) and as a
+        dropped connection with no response from the other endpoints. /api/ls
+        rides along to pin one side-channel-throttled endpoint too."""
+        sid = str(uuid.uuid4())
+        placeholder = server._SessionPlaceholder("1.2.3.4", False)
+        with server.sessions_lock:
+            server.sessions[sid] = placeholder
+        try:
+            for fetch in (
+                lambda: self._get("/api/output?session_id=" + sid),
+                lambda: self._post("/api/input",
+                                   {"session_id": sid, "data": "x"}),
+                lambda: self._post("/api/resize",
+                                   {"session_id": sid, "cols": 80, "rows": 24}),
+                lambda: self._get("/api/ls?session_id=" + sid),
+            ):
+                body, code = fetch()
+                self.assertEqual(code, 404)
+                self.assertIn("error", body)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
 
     def test_stream_happy_path(self):
         """Plant a fake session that emits one chunk then dies.
@@ -511,6 +640,55 @@ class TestHTTPApi(LiveServerCase):
         finally:
             a.close(); b.close()
 
+    def test_unsolicited_bytes_do_not_spin_the_wait_loop(self):
+        """Regression: one stray byte from the peer made the client socket
+        permanently readable. Both wait_for_data() wake paths treat that
+        as a wake reason and _client_gone() only reported EOF, so
+        /api/stream returned instantly from every wait - 97% of a core
+        per connection for the life of the session. _client_gone() now
+        consumes the bytes; the next wait must block for its full
+        timeout again."""
+        import socket as _socket
+        import selectors as _sel
+        a, b = _socket.socketpair()
+        sel = _sel.DefaultSelector()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            s = server.SSHSession.__new__(server.SSHSession)
+            s._data_event = threading.Event()
+            s._waiters = set()
+            s._waiters_lock = threading.Lock()
+            sel.register(a, _sel.EVENT_READ)
+            b.send(b"X")
+            time.sleep(0.02)
+            self.assertFalse(h._client_gone(), "a stray byte is not a FIN")
+            t0 = time.time(); n = 0
+            while time.time() - t0 < 0.3:
+                s.wait_for_data(a, 0.3, selector=sel)
+                n += 1
+            self.assertLessEqual(
+                n, 3, "wait_for_data returned %d times in 0.3s: spinning" % n)
+        finally:
+            sel.close(); a.close(); b.close()
+
+    def test_unsolicited_bytes_over_budget_end_the_request(self):
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            h.client_address = ("127.0.0.1", 1)
+            h.headers = {}
+            h._client_ip = lambda: "127.0.0.1"
+            h._unsolicited_seen = server.Handler._UNSOLICITED_MAX
+            b.send(b"Y")
+            time.sleep(0.02)
+            self.assertTrue(h._client_gone(),
+                            "peer past the unsolicited-byte budget must be gone")
+        finally:
+            a.close(); b.close()
+
     def test_session_unread_prepends(self):
         """Session.unread() must push bytes back to the FRONT of the
         buffer so they're delivered in original order on the next read."""
@@ -579,43 +757,7 @@ class TestHTTPApi(LiveServerCase):
             code = e.code
         self.assertEqual(code, 400)
 
-    def test_non_dict_json_body_returns_400(self):
-        """_json_body must reject valid-JSON-but-not-an-object bodies
-        (bare list/string/number) with the same 400 malformed JSON gets.
-        Previously body.get() raised AttributeError and the client saw a
-        dropped connection with no response at all."""
-        for payload in ([1, 2, 3], "just a string", 42, None, True):
-            body, code = self._post("/api/resize", payload)
-            self.assertEqual(code, 400, "payload %r" % (payload,))
-            self.assertEqual(body.get("error"), "invalid json")
 
-    def test_placeholder_session_404s_on_plain_endpoints(self):
-        """_require_session must reject _SessionPlaceholder slots on every
-        endpoint, not just /api/stream. Before the helper, hitting input/
-        output/resize inside the connect window dereferenced attributes the
-        placeholder's __slots__ omit — an AttributeError surfacing as a 500
-        from /api/input (its write is wrapped in try/except) and as a
-        dropped connection with no response from the other endpoints. /api/ls
-        rides along to pin one side-channel-throttled endpoint too."""
-        sid = str(uuid.uuid4())
-        placeholder = server._SessionPlaceholder("1.2.3.4", False)
-        with server.sessions_lock:
-            server.sessions[sid] = placeholder
-        try:
-            for fetch in (
-                lambda: self._get("/api/output?session_id=" + sid),
-                lambda: self._post("/api/input",
-                                   {"session_id": sid, "data": "x"}),
-                lambda: self._post("/api/resize",
-                                   {"session_id": sid, "cols": 80, "rows": 24}),
-                lambda: self._get("/api/ls?session_id=" + sid),
-            ):
-                body, code = fetch()
-                self.assertEqual(code, 404)
-                self.assertIn("error", body)
-        finally:
-            with server.sessions_lock:
-                server.sessions.pop(sid, None)
 
 
 class TestIdleTimer(unittest.TestCase):
@@ -1613,13 +1755,22 @@ class TestReapChild(unittest.TestCase):
         s._reap_lock = threading.Lock()
         s._child_reaped = False
         s._signal = lambda: None  # isolate: we assert on reaping, not signaling
+        s.client_ip = "203.0.113.9"
+        s._host = "target.example"; s._username = "alice"
         try:
-            t = threading.Thread(target=s._read_loop, daemon=True)
-            t.start()
-            t.join(15)
+            with unittest.mock.patch.object(server, "_access_log_emit") as emit:
+                t = threading.Thread(target=s._read_loop, daemon=True)
+                t.start()
+                t.join(15)
             self.assertFalse(t.is_alive(),
                              "_read_loop did not exit on auth fail")
             self.assertTrue(s.auth_failed, "auth failure was not detected")
+            # The auth failure is an access-log event of its own (the
+            # connect record already said result=ok when ssh spawned).
+            calls = [c for c in emit.call_args_list if c.args[0] == "auth_failed"]
+            self.assertEqual(len(calls), 1, emit.call_args_list)
+            self.assertEqual(calls[0].args[1], "203.0.113.9")
+            self.assertEqual(calls[0].kwargs.get("target_host"), "target.example")
             self.assertIsNotNone(s._exit_status,
                                  "child was not reaped (zombie leak)")
             with self.assertRaises(ChildProcessError):
@@ -1821,133 +1972,6 @@ class TestRequestTimeout(unittest.TestCase):
             httpd.server_close()
             server.Handler.timeout = orig
 
-
-class TestParkedWaiterWake(unittest.TestCase):
-    """The per-wait socketpair path: instant wake from _signal while
-    parked in ONE blocking select, FIN wake via the client socket, and
-    teardown while a waiter is parked."""
-
-    def _session(self):
-        s = server.SSHSession.__new__(server.SSHSession)
-        s._data_event = threading.Event()
-        s._waiters = set()
-        s._waiters_lock = threading.Lock()
-        return s
-
-    def test_signal_wakes_parked_waiter_fast(self):
-        s = self._session()
-        woke = []
-        def waiter():
-            t0 = time.time()
-            s.wait_for_data(None, timeout=5)
-            woke.append(time.time() - t0)
-        th = threading.Thread(target=waiter, daemon=True)
-        th.start()
-        time.sleep(0.1)            # let it park
-        t0 = time.time()
-        s._signal()
-        th.join(2)
-        self.assertTrue(woke, "waiter never returned")
-        self.assertLess(time.time() - t0, 0.5,
-                        "signal wake took too long")
-        with s._waiters_lock:
-            self.assertEqual(len(s._waiters), 0, "wake socket leaked")
-
-    def test_client_fin_wakes_parked_waiter(self):
-        import socket as _socket
-        s = self._session()
-        a, b = _socket.socketpair()
-        woke = []
-        def waiter():
-            t0 = time.time()
-            s.wait_for_data(a, timeout=5)
-            woke.append(time.time() - t0)
-        th = threading.Thread(target=waiter, daemon=True)
-        th.start()
-        time.sleep(0.1)
-        b.close()                  # FIN
-        th.join(2)
-        a.close()
-        self.assertTrue(woke and woke[0] < 1.0,
-                        "FIN did not wake the parked waiter; %r" % woke)
-
-    def test_close_while_parked_does_not_hang_or_crash(self):
-        s = self._session()
-        s.alive = True
-        s.master_fd = -1
-        s.pid = None
-        s._reap_lock = threading.Lock()
-        s._child_reaped = True
-        s._exit_status = 0
-        s._key_file = None
-        s._control_path = None
-        s.persistent = False
-        s.slot_id = None
-        done = []
-        def waiter():
-            s.wait_for_data(None, timeout=5)
-            done.append(1)
-        th = threading.Thread(target=waiter, daemon=True)
-        th.start()
-        time.sleep(0.1)
-        s.close()                  # signals via _signal()
-        th.join(2)
-        self.assertTrue(done, "waiter did not return after close()")
-        with s._waiters_lock:
-            self.assertEqual(len(s._waiters), 0)
-
-    def test_signal_in_registration_window_is_not_lost(self):
-        # The lost-wakeup window: a signal that lands AFTER the first
-        # is_set() check but BEFORE the wake socket is registered gets
-        # no byte — the post-registration re-check must catch it.
-        # Deterministic: fire the signal from inside socketpair(),
-        # which runs exactly inside that window.
-        s = self._session()
-        import socket as _socket
-        real_pair = _socket.socketpair
-        def evil_pair(*a, **kw):
-            s._data_event.set()      # the signal, mid-window
-            return real_pair(*a, **kw)
-        orig = server.socket.socketpair
-        server.socket.socketpair = evil_pair
-        try:
-            t0 = time.time()
-            s.wait_for_data(None, timeout=5)
-            self.assertLess(time.time() - t0, 0.5,
-                            "mid-window signal was lost")
-            self.assertFalse(s._data_event.is_set())
-        finally:
-            server.socket.socketpair = orig
-
-    def test_socketpair_exhaustion_falls_back_to_slice_loop(self):
-        s = self._session()
-        orig = server.socket.socketpair
-        server.socket.socketpair = unittest.mock.Mock(
-            side_effect=OSError("EMFILE"))
-        try:
-            woke = []
-            def waiter():
-                t0 = time.time()
-                s.wait_for_data(None, timeout=5)
-                woke.append(time.time() - t0)
-            th = threading.Thread(target=waiter, daemon=True)
-            th.start()
-            time.sleep(0.1)
-            s._signal()
-            th.join(2)
-            self.assertTrue(woke, "fallback waiter never returned")
-            self.assertLess(woke[0], 1.0,
-                            "slice-loop fallback did not wake on signal")
-        finally:
-            server.socket.socketpair = orig
-
-    def test_pre_set_event_returns_immediately_without_socketpair(self):
-        s = self._session()
-        s._data_event.set()
-        t0 = time.time()
-        s.wait_for_data(None, timeout=5)
-        self.assertLess(time.time() - t0, 0.1)
-        self.assertFalse(s._data_event.is_set(), "event consumed")
 
 
 class TestSessionRecording(unittest.TestCase):
@@ -2197,6 +2221,28 @@ class TestUnixSocketServer(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_browser_origin_checks_work_over_unix_socket(self):
+        # Unix peers have client_address == ''. Origin checks must use
+        # the same trusted-peer rules as auth and forwarded client IPs.
+        self._start()
+        for headers, expected in (
+            ({"Origin": "http://localhost"}, 404),
+            ({"Origin": "https://websh.example",
+              "X-Forwarded-Host": "websh.example"}, 404),
+            ({"Origin": "https://evil.example"}, 403),
+        ):
+            with self.subTest(headers=headers):
+                client = _UnixHTTPConnection(self.path)
+                try:
+                    client.request("POST", "/api/resize",
+                                   json.dumps({"session_id": "missing"}),
+                                   dict(headers, **{"Content-Type": "application/json"}))
+                    response = client.getresponse()
+                    body = json.loads(response.read())
+                    self.assertEqual(response.status, expected, body)
+                finally:
+                    client.close()
+
     def test_close_removes_socket_file(self):
         self._start()
         self.httpd.shutdown()
@@ -2290,6 +2336,241 @@ class TestUnixSocketServer(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, err)
         self.assertIn(b"listening on unix:" + self.path.encode(), err)
         self.assertFalse(os.path.exists(self.path))
+
+
+class TestParkedWaiterWake(unittest.TestCase):
+    """The per-wait socketpair path: instant wake from _signal while
+    parked in ONE blocking select, FIN wake via the client socket, and
+    teardown while a waiter is parked."""
+
+    def _session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._data_event = threading.Event()
+        s._waiters = set()
+        s._waiters_lock = threading.Lock()
+        return s
+
+    def test_signal_wakes_parked_waiter_fast(self):
+        s = self._session()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)            # let it park
+        t0 = time.time()
+        s._signal()
+        th.join(2)
+        self.assertTrue(woke, "waiter never returned")
+        self.assertLess(time.time() - t0, 0.5,
+                        "signal wake took too long")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0, "wake socket leaked")
+
+    def test_client_fin_wakes_parked_waiter(self):
+        import socket as _socket
+        s = self._session()
+        a, b = _socket.socketpair()
+        woke = []
+        def waiter():
+            t0 = time.time()
+            s.wait_for_data(a, timeout=5)
+            woke.append(time.time() - t0)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        b.close()                  # FIN
+        th.join(2)
+        a.close()
+        self.assertTrue(woke and woke[0] < 1.0,
+                        "FIN did not wake the parked waiter; %r" % woke)
+
+    def test_close_while_parked_does_not_hang_or_crash(self):
+        s = self._session()
+        s.alive = True
+        s.master_fd = -1
+        s.pid = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = True
+        s._exit_status = 0
+        s._key_file = None
+        s._control_path = None
+        s.persistent = False
+        s.slot_id = None
+        done = []
+        def waiter():
+            s.wait_for_data(None, timeout=5)
+            done.append(1)
+        th = threading.Thread(target=waiter, daemon=True)
+        th.start()
+        time.sleep(0.1)
+        s.close()                  # signals via _signal()
+        th.join(2)
+        self.assertTrue(done, "waiter did not return after close()")
+        with s._waiters_lock:
+            self.assertEqual(len(s._waiters), 0)
+
+    def test_signal_in_registration_window_is_not_lost(self):
+        # The lost-wakeup window: a signal that lands AFTER the first
+        # is_set() check but BEFORE the wake socket is registered gets
+        # no byte — the post-registration re-check must catch it.
+        # Deterministic: fire the signal from inside socketpair(),
+        # which runs exactly inside that window.
+        s = self._session()
+        import socket as _socket
+        real_pair = _socket.socketpair
+        def evil_pair(*a, **kw):
+            s._data_event.set()      # the signal, mid-window
+            return real_pair(*a, **kw)
+        orig = server.socket.socketpair
+        server.socket.socketpair = evil_pair
+        try:
+            t0 = time.time()
+            s.wait_for_data(None, timeout=5)
+            self.assertLess(time.time() - t0, 0.5,
+                            "mid-window signal was lost")
+            self.assertFalse(s._data_event.is_set())
+        finally:
+            server.socket.socketpair = orig
+
+    def test_socketpair_exhaustion_falls_back_to_slice_loop(self):
+        s = self._session()
+        orig = server.socket.socketpair
+        server.socket.socketpair = unittest.mock.Mock(
+            side_effect=OSError("EMFILE"))
+        try:
+            woke = []
+            def waiter():
+                t0 = time.time()
+                s.wait_for_data(None, timeout=5)
+                woke.append(time.time() - t0)
+            th = threading.Thread(target=waiter, daemon=True)
+            th.start()
+            time.sleep(0.1)
+            s._signal()
+            th.join(2)
+            self.assertTrue(woke, "fallback waiter never returned")
+            self.assertLess(woke[0], 1.0,
+                            "slice-loop fallback did not wake on signal")
+        finally:
+            server.socket.socketpair = orig
+
+    def test_pre_set_event_returns_immediately_without_socketpair(self):
+        s = self._session()
+        s._data_event.set()
+        t0 = time.time()
+        s.wait_for_data(None, timeout=5)
+        self.assertLess(time.time() - t0, 0.1)
+        self.assertFalse(s._data_event.is_set(), "event consumed")
+
+
+
+class TestPasswordAutoTypeWindow(unittest.TestCase):
+    """The stored password is typed only at ssh's own login prompt. It
+    used to stay armed for the whole session when auth completed
+    without prompting, and the first later "password:" on screen (sudo,
+    a nested ssh, `cat` of a file containing the word) got it typed
+    into the shell. Now: bounded by output bytes / seconds without a
+    prompt, and by any real keystroke from the user."""
+
+    def _session(self, master, pid):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.master_fd = master; s.pid = pid; s.id = "pw-window"
+        s.alive = True; s.is_background = False
+        s._password = "S3cret"; s._password_sent = False; s._pw_buf = b""
+        s._pw_armed_at = time.time(); s._pw_bytes_seen = 0
+        s.auth_failed = False; s._auth_buf = b""; s._auth_bytes_seen = 0
+        s.output_buf = b""; s.buf_lock = threading.Lock()
+        s._exit_status = None; s._reap_lock = threading.Lock()
+        s._child_reaped = False; s._signal = lambda: None
+        s._record = lambda *a: None
+        s.last_activity = time.time()
+        return s
+
+    def _run(self, child_script, user_input=None, timeout=8):
+        """Fork a child on a pty that runs `child_script(slave_fd)` and
+        echoes everything it reads back to us prefixed with GOT:. Returns
+        the bytes the parent read (what the child printed + echoes)."""
+        import pty, select
+        master, slave = pty.openpty()
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            try:
+                child_script(slave)
+                # Echo any input the parent typed, then linger briefly.
+                end = time.time() + 3
+                while time.time() < end:
+                    r, _, _ = select.select([slave], [], [], 0.2)
+                    if r:
+                        d = os.read(slave, 4096)
+                        if not d:
+                            break
+                        os.write(slave, b"GOT:" + d)
+            finally:
+                os._exit(0)
+        os.close(slave)
+        s = self._session(master, pid)
+        t = threading.Thread(target=s._read_loop, daemon=True)
+        t.start()
+        if user_input is not None:
+            time.sleep(0.3)
+            s.write(user_input)
+        t.join(timeout)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        with s.buf_lock:
+            return s, s.output_buf
+
+    def test_prompt_at_login_is_answered(self):
+        def child(fd):
+            os.write(fd, b"alice@host's password: ")
+            time.sleep(0.5)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertIn(b"GOT:S3cret", out)
+
+    def test_prompt_after_lots_of_output_is_not_answered(self):
+        def child(fd):
+            for _ in range(40):                       # 20 KB, no prompt
+                os.write(fd, b"x" * 512 + b"\r\n")
+                time.sleep(0.01)
+            time.sleep(0.3)
+            os.write(fd, b"[sudo] password for alice: ")  # too late
+            time.sleep(0.5)
+        s, out = self._run(child)
+        self.assertFalse(s._password_sent)
+        self.assertIsNone(s._password, "password must be dropped, not kept")
+        self.assertNotIn(b"S3cret", out)
+
+    def test_user_keystroke_disarms(self):
+        def child(fd):
+            os.write(fd, b"Welcome. $ ")              # shell, no prompt
+            time.sleep(1.0)
+            os.write(fd, b"Password: ")               # nested ssh / sudo
+            time.sleep(0.5)
+        s, out = self._run(child, user_input=b"sudo ls\r")
+        self.assertFalse(s._password_sent)
+        self.assertNotIn(b"S3cret", out)
+        self.assertIn(b"GOT:sudo ls", out)
+
+    def test_bare_enter_does_not_disarm(self):
+        # Pressing Enter while ssh is still connecting is common; it must
+        # not cost the user the auto-type when the prompt then appears.
+        def child(fd):
+            time.sleep(0.6)
+            os.write(fd, b"alice@host's password: ")
+            time.sleep(0.5)
+        s, out = self._run(child, user_input=b"\r")
+        self.assertTrue(s._password_sent)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,14 @@ Environment=MAX_SESSIONS=50
 # the moment the vault is enabled.
 Environment=WEBSH_CREDS_PATH=/var/lib/websh/websh.creds.json
 StateDirectory=websh
+# Writable log home for the optional access log and session recordings:
+# ProtectSystem=strict makes everything else read-only, and the server
+# only WARNs on a write failure - so an operator who set
+# WEBSH_ACCESS_LOG=/var/log/websh/access.log got the reassuring startup
+# line and no log at all. Point WEBSH_ACCESS_LOG / WEBSH_RECORD_DIR
+# under /var/log/websh (or /var/lib/websh) when using this unit.
+LogsDirectory=websh
+LogsDirectoryMode=0750
 
 User=websh
 Group=websh

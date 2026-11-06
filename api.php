@@ -18,7 +18,11 @@ if ($proto === 'http') {
     exit;
 }
 
-$action  = isset($_GET['action']) ? $_GET['action'] : '';
+// `?action[]=x` arrives as an array; PHP 8's preg_match() then throws
+// a TypeError - an uncaught fatal that, with display_errors on, prints
+// this file's absolute path to the client. Non-strings are simply "no
+// such action" (the regex gate below turns '' into a 404).
+$action  = (isset($_GET['action']) && is_string($_GET['action'])) ? $_GET['action'] : '';
 
 // SSE stream needs a longer execution window than the JSON endpoints.
 // Some shared hosts cap this hard, in which case the stream is killed
@@ -43,6 +47,42 @@ if ($action !== 'stream') {
 
 // Path to config file (must be OUTSIDE the web root for security).
 $WEBSH_CONFIG = getenv('WEBSH_CONFIG') ?: dirname(__FILE__) . '/../../websh.json';
+
+// Action gate: lowercase identifiers only, so the action can never
+// smuggle path segments or query metacharacters into the backend URL.
+// /D pins $ to the very end — without it PCRE's $ matches before a
+// trailing \n, letting action=config%0a smuggle a raw LF into the
+// request line on old libcurl. Gate sits BEFORE ensure_backend so
+// garbage requests can't trigger the ping/auto-start machinery.
+if (!preg_match('/^[a-z_]{1,32}$/D', $action)) {
+    header('HTTP/1.1 404 Not Found');
+    echo '{"error":"unknown action"}';
+    exit;
+}
+
+// CSRF gate for state-changing methods. The shim forwards no browser
+// headers to the backend, so the backend's own Origin check never sees
+// a cross-site request that came through here - it must be enforced at
+// this hop. A browser sends Origin on every cross-site POST/DELETE; an
+// Origin whose host is not the host this request was addressed to is a
+// forged request. No Origin at all means a non-browser client (not a
+// CSRF victim) and passes; `Origin: null` never legitimately posts here.
+$method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+if (($method === 'POST' || $method === 'DELETE') && isset($_SERVER['HTTP_ORIGIN'])) {
+    $o_host = strtolower((string) parse_url(trim($_SERVER['HTTP_ORIGIN']), PHP_URL_HOST));
+    $o_port = parse_url(trim($_SERVER['HTTP_ORIGIN']), PHP_URL_PORT);
+    if ($o_port) { $o_host .= ':' . $o_port; }
+    $allowed = array(strtolower(isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : ''));
+    if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+        $fwd = explode(',', $_SERVER['HTTP_X_FORWARDED_HOST']);
+        $allowed[] = strtolower(trim($fwd[0]));
+    }
+    if ($o_host === '' || !in_array($o_host, $allowed, true)) {
+        header('HTTP/1.1 403 Forbidden');
+        echo '{"error":"cross-site request refused"}';
+        exit;
+    }
+}
 
 // The backend listens on a Unix socket, not a TCP port: on shared
 // hosting 127.0.0.1 is common to every account, so any co-tenant could
@@ -76,67 +116,41 @@ $BACKEND = 'http://localhost';
 // Auto-start: launch server.py if it's not running.
 ensure_backend($BACKEND, $WEBSH_CONFIG, $WEBSH_SOCKET);
 
+// Forward the browser's full query string (the backend ignores the
+// redundant `action` parameter). Rebuilding per-action parameter lists
+// here is what used to make every new endpoint require a PHP edit.
+$QS  = isset($_SERVER['QUERY_STRING']) ? $_SERVER['QUERY_STRING'] : '';
+$URL = $BACKEND . '/api/' . $action . ($QS !== '' ? '?' . $QS : '');
+
 switch ($action) {
-    case 'config':     proxy_get($BACKEND . '/api/config');     break;
-    case 'connect':    proxy_post($BACKEND . '/api/connect');    break;
-    case 'input':      proxy_post($BACKEND . '/api/input');      break;
-    case 'resize':     proxy_post($BACKEND . '/api/resize');     break;
-    case 'disconnect': proxy_post($BACKEND . '/api/disconnect'); break;
-    case 'save':       proxy_post($BACKEND . '/api/save');       break;
-    case 'tmux_options':
-        proxy_post($BACKEND . '/api/tmux_options');
-        break;
-    case 'upload_finalize':
-        proxy_post($BACKEND . '/api/upload_finalize');
-        break;
-    case 'upload_cancel':
-        proxy_post($BACKEND . '/api/upload_cancel');
-        break;
+    // Transfer modes with their own curl plumbing (streaming, raw
+    // bodies, delayed header commit) keep explicit cases:
+    case 'stream':   proxy_stream($URL);   break;
+    case 'download': proxy_download($URL); break;
+    case 'upload':   proxy_upload($URL);   break;
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
-        $vault = isset($_GET['vault_id']) ? $_GET['vault_id'] : '';
-        $conn  = isset($_GET['conn_id'])  ? $_GET['conn_id']  : '';
+        // POST only: this is destructive, and a GET would make it
+        // reachable from an <img src>, a link prefetch or a scanner.
+        if ($method !== 'POST') {
+            header('HTTP/1.1 405 Method Not Allowed');
+            header('Allow: POST');
+            echo '{"error":"method not allowed"}';
+            break;
+        }
+        $vault = (isset($_GET['vault_id']) && is_string($_GET['vault_id'])) ? $_GET['vault_id'] : '';
+        $conn  = (isset($_GET['conn_id'])  && is_string($_GET['conn_id']))  ? $_GET['conn_id']  : '';
         proxy_delete($BACKEND . '/api/save'
             . '?vault_id=' . urlencode($vault)
             . '&conn_id='  . urlencode($conn));
         break;
-    case 'output':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_get($BACKEND . '/api/output?session_id=' . urlencode($sid));
-        break;
-    case 'stream':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_stream($BACKEND . '/api/stream?session_id=' . urlencode($sid));
-        break;
-    case 'ping':
-        proxy_get($BACKEND . '/api/ping');
-        break;
-    case 'tmux_capture':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_get($BACKEND . '/api/tmux_capture?session_id=' . urlencode($sid));
-        break;
-    case 'ls':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '~';
-        proxy_get($BACKEND . '/api/ls?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
-    case 'download':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '';
-        proxy_download($BACKEND . '/api/download?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
-    case 'upload':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '';
-        proxy_upload($BACKEND . '/api/upload?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
     default:
-        header('HTTP/1.1 404 Not Found');
-        echo '{"error":"unknown action"}';
+        // Everything else is a JSON endpoint: forward the method, the
+        // query string and (for POST) the body verbatim. A new backend
+        // endpoint needs NO change here — an unknown action is the
+        // backend's 404 to give.
+        proxy_pass($URL);
         break;
 }
 
@@ -259,33 +273,35 @@ function ping_backend($backend) {
     return $ok;
 }
 
-function proxy_post($url) {
-    $body = file_get_contents('php://input');
-    $ch = backend_curl($url);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array('Content-Type: application/json')));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    $err  = curl_error($ch);
-    release_curl($ch);
-    if ($resp === false) {
-        header('HTTP/1.1 502 Bad Gateway');
-        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+// Generic JSON-endpoint passthrough. Forwards REQUEST_METHOD, the full
+// query string (already in $url) and, for POST, the raw body. Timeouts
+// match the old per-mode helpers: GET 50s (the /api/output long-poll
+// parks up to ~10s and proxies may add latency), POST 30s, DELETE 10s.
+function proxy_pass($url) {
+    $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+    if ($method !== 'GET' && $method !== 'POST' && $method !== 'DELETE') {
+        // Old proxy_post silently coerced e.g. PUT into a backend POST;
+        // answer 405 instead of guessing.
+        header('HTTP/1.1 405 Method Not Allowed');
+        echo '{"error":"method not allowed"}';
         return;
     }
-    if ($code) http_response_code($code);
-    echo $resp;
-}
-
-function proxy_get($url) {
     $ch = backend_curl($url);
+    $extra = array();
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents('php://input'));
+        $extra[] = 'Content-Type: application/json';
+        $timeout = 30;
+    } elseif ($method === 'DELETE') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+        $timeout = 10;
+    } else {
+        $timeout = 50;
+    }
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
-    curl_setopt($ch, CURLOPT_TIMEOUT, 50);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers($extra));
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -336,6 +352,7 @@ function proxy_upload($url) {
 }
 
 function proxy_download($url) {
+    ignore_user_abort(true);   // see proxy_stream
     while (ob_get_level() > 0) { ob_end_clean(); }
     @ob_implicit_flush(true);
 
@@ -417,6 +434,16 @@ function proxy_delete($url) {
 // a JSON error baked in, which EventSource sees as a healthy stream
 // with zero events.
 function proxy_stream($url) {
+    // With the default ignore_user_abort=0 PHP terminates the script the
+    // moment an echo hits a closed browser connection - INSIDE curl's
+    // write callback, before the `connection_aborted()` check below can
+    // return 0. libcurl never gets to close the backend socket, which
+    // then stays open in this worker for the rest of its life: the
+    // backend keeps the session's stream slot (409 on every reconnect),
+    // drains terminal output into the dead socket, and holds a worker
+    // thread. Keep running so the callback returns 0 and curl tears the
+    // connection down cleanly.
+    ignore_user_abort(true);
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
     @ini_set('implicit_flush', '1');

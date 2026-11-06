@@ -23,6 +23,12 @@ REPO_ROOT = os.path.dirname(
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# The knob layer reads websh.json's "server" object ONCE at import via
+# WEBSH_CONFIG. A developer shell with WEBSH_CONFIG exported would leak
+# that file's knobs into every test (and could write an access log
+# outside the repo) — sanitize before the import.
+os.environ.pop("WEBSH_CONFIG", None)
+
 import server
 
 

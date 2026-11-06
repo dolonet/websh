@@ -161,7 +161,15 @@ class TestConfigLoading(unittest.TestCase):
                      and "plaintext credentials" in c.args[1]]
             self.assertEqual(warns, [])
 
-    def test_require_vault_makes_plaintext_a_startup_error(self):
+    def test_require_vault_rejects_plaintext_without_killing_the_caller(self):
+        # WEBSH_REQUIRE_VAULT used to `raise SystemExit(1)` inside
+        # load_config(). main() never called load_config(), so the exit
+        # fired on a request thread: /api/ping stayed green while every
+        # config-touching endpoint dropped the connection, and the ERROR
+        # re-fired on each request. Now load_config() records the
+        # rejection, serves an empty config and logs once per file
+        # version; main() turns the flag into a real startup refusal
+        # (covered by TestRequireVaultStartupGuard in test_misc).
         self._write_config({
             "connections": [
                 {"name": "Production", "host": "p", "username": "u",
@@ -175,11 +183,19 @@ class TestConfigLoading(unittest.TestCase):
                                                        "websh.json")
             server._config_cache = None
             server._config_mtime = 0
-            with self.assertRaises(SystemExit) as ctx:
-                server.load_config()
-            self.assertEqual(ctx.exception.code, 1)
+            server._config_rejected = None
+            with unittest.mock.patch.object(server, "_log") as log:
+                cfg = server.load_config()
+                cfg2 = server.load_config()   # same mtime: cached, no relog
+            self.assertEqual(cfg["connections"], [])
+            self.assertEqual(cfg2["connections"], [])
+            self.assertIn("Production", server._config_rejected)
+            errors = [c for c in log.call_args_list
+                      if c.args[0] == "ERROR" and "rejected" in c.args[1]]
+            self.assertEqual(len(errors), 1, log.call_args_list)
         finally:
             server.WEBSH_REQUIRE_VAULT = original
+            server._config_rejected = None
 
 
 class TestFindConfigConnection(unittest.TestCase):
@@ -698,6 +714,19 @@ class TestDeniedHosts(unittest.TestCase):
         with self._patched_resolve("127.5.5.5"):
             self.assertFalse(server.is_host_allowed("loopback.example", 22, "u"))
 
+    def test_userinfo_prefix_cannot_bypass_deny_list(self):
+        """Regression: `bob@127.0.0.1` made getaddrinfo() fail, the
+        resolver returned [] and _is_denied_host fell open while ssh
+        happily parsed the user@ form. The HTTP layer now rejects such
+        syntax outright; this pins that the validator itself is what
+        stands in the way (the deny-list alone still falls open)."""
+        self.assertFalse(server._valid_host("bob@127.0.0.1"))
+        self.assertFalse(server._valid_host("ssh://bob@127.0.0.1"))
+        self.assertTrue(server._valid_host("127.0.0.1"))
+        self.assertTrue(server._valid_host("[::1]"))
+        self.assertFalse(server._valid_host("[]"))
+        self.assertFalse(server._valid_host(""))
+
     def test_dns_resolves_to_denied_range_blocked(self):
         """The whole point: hostname looks innocent, but A record points
         into a denied range → blocked."""
@@ -1057,6 +1086,26 @@ class TestKnobResolution(unittest.TestCase):
         server._SERVER_KNOBS["WEBSH_CREDS_PATH"] = "/tmp/evil.creds.json"
         self.assertIsNone(server._knob("WEBSH_ACCESS_LOG", None))
         self.assertIsNone(server._knob("WEBSH_CREDS_PATH", None))
+        # ...and the auth header / recording dir, which used to bypass
+        # _knob() entirely (bare os.environ.get) while the docs listed
+        # them as JSON-settable: an operator got a silent no-auth server.
+        server._SERVER_KNOBS["WEBSH_AUTH_HEADER"] = "Remote-User"
+        server._SERVER_KNOBS["WEBSH_RECORD_DIR"] = "/tmp/rec"
+        self.assertEqual(server._knob("WEBSH_AUTH_HEADER", ""), "")
+        self.assertEqual(server._knob("WEBSH_RECORD_DIR", ""), "")
+
+    def test_ignored_server_keys_are_warned_at_startup(self):
+        server._SERVER_KNOBS["WEBSH_AUTH_HEADER"] = "Remote-User"
+        server._SERVER_KNOBS["SESION_TIMEOUT"] = 5       # typo
+        server._SERVER_KNOBS["SESSION_TIMEOUT"] = 5      # legit: no warn
+        with unittest.mock.patch.object(server, "_log") as log:
+            server._warn_ignored_server_knobs()
+        msgs = [c.args[1] for c in log.call_args_list if c.args[0] == "WARN"]
+        self.assertTrue(any("WEBSH_AUTH_HEADER" in m and "env-only" in m
+                            for m in msgs), msgs)
+        self.assertTrue(any("SESION_TIMEOUT" in m and "no such knob" in m
+                            for m in msgs), msgs)
+        self.assertFalse(any("\"server\".SESSION_TIMEOUT" in m for m in msgs), msgs)
 
     def test_server_knobs_reader(self):
         d = tempfile.mkdtemp()

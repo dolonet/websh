@@ -5,6 +5,7 @@ Split from the original test_server.py; class bodies are verbatim.
 """
 
 import base64
+import inspect
 import io
 import json
 import os
@@ -407,6 +408,38 @@ class TestScanPatternDetection(unittest.TestCase):
         server.SCAN_PATTERN_THRESHOLD = 1
         self.assertFalse(server._record_deny_for_scan("", "h"))
         self.assertFalse(server._record_deny_for_scan(None, "h"))
+
+    def test_spawn_does_not_forgive_but_a_keystroke_does(self):
+        """Regression: forgiveness fired on spawn, before auth ran, so a
+        scanner interleaving one connect to any non-denied host (auth
+        failing is fine) reset its own deny-list counter. Now the
+        forgiving signal is the first real keystroke into a session
+        whose auth did not fail - /api/input."""
+        ip = "198.51.100.7"
+        with server._scan_pattern_lock:
+            server._scan_pattern[ip] = [time.time()] * 3
+        # The connect success path: _forgive_scan_for_ip must NOT be
+        # called from there any more.
+        src = inspect.getsource(server.Handler._connect)
+        self.assertNotIn("_forgive_scan_for_ip(ip)", src)
+        # /api/input on a healthy session forgives.
+        h = server.Handler.__new__(server.Handler)
+        h._client_ip = lambda: ip
+        h._json = lambda *a, **k: None
+        h._json_body = lambda: {"session_id": "s", "data": "ls\n"}
+        sess = unittest.mock.MagicMock(alive=True, auth_failed=False)
+        sess.write.return_value = True
+        h._require_session = lambda sid: sess
+        h._input()
+        with server._scan_pattern_lock:
+            self.assertNotIn(ip, server._scan_pattern)
+        # ...but not when auth failed.
+        with server._scan_pattern_lock:
+            server._scan_pattern[ip] = [time.time()] * 3
+        sess.auth_failed = True
+        h._input()
+        with server._scan_pattern_lock:
+            self.assertIn(ip, server._scan_pattern)
 
     def test_forgive_no_op_on_empty_ip(self):
         # Should not raise
@@ -977,6 +1010,33 @@ class TestConnectValidation(LiveServerCase):
         # Connect may fail downstream (no real ssh target), but must NOT
         # fail validation.
         self.assertNotEqual(code, 400)
+
+    def test_destination_syntax_in_host_rejected(self):
+        """`user@host` / `ssh://...` are what ssh parses as a destination
+        but getaddrinfo() cannot resolve - the deny-list used to fall
+        open on exactly these. They must be a 400 before any policy."""
+        for host in ("bob@127.0.0.1", "ssh://bob@127.0.0.1",
+                     "host:22", "a b", "x$(id)y", "h/path", "-oFoo=bar"):
+            body, code = self._post("/api/connect", {
+                "host": host, "username": "u", "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertEqual(code, 400, host)
+            self.assertIn("invalid host", body["error"])
+
+    def test_username_with_shell_or_space_rejected(self):
+        for user in ("a b", "a$(id)", "-l", "a\\b", "u\nx"):
+            body, code = self._post("/api/connect", {
+                "host": "example.com", "username": user, "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertEqual(code, 400, repr(user))
+
+    def test_plain_hosts_and_ip_literals_pass_validation(self):
+        for host in ("example.com", "my_alias", "10.0.0.1", "[::1]", "::1",
+                     "fe80::1%eth0"):
+            body, code = self._post("/api/connect", {
+                "host": host, "username": "alice@corp", "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertNotEqual(code, 400, (host, body))
 
     def test_non_persistent_ignores_slot_id(self):
         """Without persistent flag, any slot_id value is ignored."""
@@ -1556,6 +1616,45 @@ class TestHeaderTrustAuth(unittest.TestCase):
         with server.sessions_lock:
             self.assertTrue(server.sessions[sid]._stream_active,
                             "non-owner must not touch the stream slot")
+
+    def test_real_connect_stamps_the_caller_as_owner(self):
+        """Mutation guard: every other ownership test plants a MagicMock
+        with .owner preset, so `session.owner = self.headers.get("X-Owner")
+        or ...` (attacker-chosen owner) and `session.owner = ""` both
+        survived the suite. Drive a real /api/connect (SSHSession stubbed
+        so nothing forks) and check who ends up owning the session."""
+        server._rate_limits.clear()
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            inst = unittest.mock.MagicMock(alive=True, auth_failed=False,
+                                            tmux_cmd="tmux", _fake=True)
+            inst.write.return_value = True
+            MockSSH.return_value = inst
+            code, body = self._req("/api/connect", method="POST", user="alice",
+                                   body={"host": "h.example", "username": "u",
+                                         "password": "p", "cols": 80, "rows": 24})
+        self.assertEqual(code, 200, body)
+        sid = body["session_id"]
+        with server.sessions_lock:
+            self.assertEqual(server.sessions[sid].owner, "alice")
+        # alice may use it; mallory may not - and an X-Owner header from
+        # mallory must not change that.
+        code, _ = self._req("/api/input", method="POST", user="alice",
+                            body={"session_id": sid, "data": "x"})
+        self.assertEqual(code, 200)
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/input", body=json.dumps({"session_id": sid, "data": "x"}),
+                  headers={"Content-Type": "application/json",
+                           "Remote-User": "mallory", "X-Owner": "alice"})
+        r = c.getresponse(); r.read(); c.close()
+        self.assertEqual(r.status, 403)
+
+    def test_delete_without_identity_is_401(self):
+        # do_DELETE's auth gate was unproven: `if False:` there left the
+        # suite green.
+        code, body = self._req("/api/save?vault_id=A&conn_id=B", method="DELETE")
+        self.assertEqual(code, 401, body)
+        self.assertEqual(body.get("error"), "unauthorized")
 
     def test_cross_user_probe_is_audit_logged(self):
         import tempfile as _tf

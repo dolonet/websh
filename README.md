@@ -72,6 +72,7 @@ Upload and download without `scp`.
 
 - **Upload.** Pick files; the browser streams the bytes through a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>`, no PTY, no base64, one HTTP POST per file). On persistent (tmux) panes the file is moved into `pane_current_path` automatically — vim/less/htop in the foreground stay untouched. Non-persistent panes type the `mv` into the foreground shell with an alt-screen guard. Auto-increment on name conflicts. Native xhr.upload progress, multi-file queue, cancel mid-flight.
 - **Download.** Select a filename in the terminal, click Download.
+- **Browse.** The file browser opens in the directory the pane is actually sitting in, not at `$HOME` — read from the shell's OSC 7 signal, or from `pane_current_path` on tmux panes. Clickable breadcrumb path, live name filter, and a dotfile toggle. Sort by name, size, or date (newest-first by default; the choice is remembered). Per-row **rename** (✎) and **delete** (✕, two-step confirm, never recursive), plus **New folder** — all keystroke-free over the SSH side channel, so a full-screen program in the foreground pane stays untouched.
 - **Export scrollback.** Save the current buffer as a text file. Persistent panes pull the real tmux scrollback via `tmux capture-pane`.
 
 ### 🔐 Connection profiles

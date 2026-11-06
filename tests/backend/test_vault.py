@@ -506,9 +506,24 @@ class TestApiSave(LiveServerCase):
             "username": "deploy",
             "iv": base64.b64encode(bytes(12)).decode(),
             "ct": base64.b64encode(b"x" * 32).decode(),
+            "aad_v": 2,
         }
         body.update(overrides)
         return body
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_save_without_destination_binding_is_rejected(self):
+        """aad_v 2 (the blob's AAD includes host:port:username) is
+        mandatory on write. A v1 (slot-only) body is what an attacker
+        holding a copy of websh.creds.json would re-POST with a changed
+        host; refusing it keeps legacy v1 records read-only."""
+        for override in ({"aad_v": None}, {"aad_v": 1}, {"aad_v": "2"}):
+            body = self._valid_body(**override)
+            if body["aad_v"] is None:
+                del body["aad_v"]
+            resp, code = self._post("/api/save", body)
+            self.assertEqual(code, 400, override)
+            self.assertIn("aad_v", resp.get("detail", ""))
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_valid_save_persists_record(self):
@@ -799,19 +814,22 @@ class TestApiConnectSaved(LiveServerCase):
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             self.key = AESGCM.generate_key(bit_length=256)
             self.iv = os.urandom(12)
-            aad = "{}:{}".format(self.VAULT, self.CONN).encode()
+            self.aad_v = getattr(self, "AAD_V", 2)
+            aad = server._credential_aad(self.VAULT, self.CONN, self.aad_v,
+                                         "h.example.com", 22, "u")
             self.ct = AESGCM(self.key).encrypt(
                 self.iv,
                 b'{"password":"hunter2","key":null,"key_pass":null}',
                 aad)
+            rec = {
+                "host": "h.example.com", "port": 22, "username": "u",
+                "iv": base64.b64encode(self.iv).decode(),
+                "ct": base64.b64encode(self.ct).decode(),
+            }
+            if self.aad_v == 2:
+                rec["aad_v"] = 2
             server._save_creds_atomic({
-                "version": 1,
-                "vaults": {self.VAULT: {self.CONN: {
-                    "host": "h.example.com", "port": 22, "username": "u",
-                    "iv": base64.b64encode(self.iv).decode(),
-                    "ct": base64.b64encode(self.ct).decode(),
-                }}},
-            })
+                "version": 1, "vaults": {self.VAULT: {self.CONN: rec}}})
 
     def _post(self, body):
         return LiveServerCase._post(self, "/api/connect", body)
@@ -834,6 +852,26 @@ class TestApiConnectSaved(LiveServerCase):
             self.assertEqual(kwargs.get("host"), "h.example.com")
             self.assertEqual(kwargs.get("username"), "u")
             self.assertEqual(kwargs.get("password"), "hunter2")
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_rebound_host_fails_decrypt(self):
+        """The attack the v2 AAD closes: same vault_id/conn_id/iv/ct, but
+        the plaintext host in the record points elsewhere. The GCM tag
+        must fail, so the victim's key never types the password into
+        the attacker's host."""
+        data = server._load_creds()
+        data["vaults"][self.VAULT][self.CONN]["host"] = "evil.example"
+        server._save_creds_atomic(data)
+        server._creds_cache = None
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            body, code = self._post({
+                "vault_id": self.VAULT, "conn_id": self.CONN,
+                "vault_key": base64.b64encode(self.key).decode(),
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 400, body)
+            self.assertEqual(body.get("error"), "vault_decrypt_failed")
+            MockSSH.assert_not_called()
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_wrong_vault_key_returns_400_decrypt_failed(self):
@@ -1056,6 +1094,21 @@ class TestApiConnectSaved(LiveServerCase):
                       "userknownhostsfile"):
                 self.assertNotIn(k, opts)
             self.assertIn("StrictHostKeyChecking", opts)
+
+
+
+class TestApiConnectSavedLegacyV1(TestApiConnectSaved):
+    """Records saved before aad_v existed (slot-only AAD) must keep
+    working at connect time - there is nothing server-side that could
+    migrate them - but they are read-only: see TestApiSave."""
+    AAD_V = 1
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_rebound_host_fails_decrypt(self):
+        # Not bound: a v1 record CAN be rebound by a creds-file writer.
+        # That is exactly why /api/save refuses to write v1 - the file
+        # itself is the only place such a record can be changed.
+        self.skipTest("v1 records are slot-bound only, by definition")
 
 
 if __name__ == "__main__":
