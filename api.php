@@ -6,7 +6,9 @@
  * running on 127.0.0.1. This allows all traffic to flow through
  * the hosting provider's HTTPS — no exposed ports, no WebSocket.
  *
- * Compatible with PHP 5.3+ and requires only the curl extension.
+ * Requires the curl extension, plus exec() and python3 for auto-start.
+ * Run it on a PHP release that still gets security fixes — see
+ * "Keep PHP patched" in docs/deployment.md.
  */
 
 // HTTPS enforcement via reverse proxy headers.

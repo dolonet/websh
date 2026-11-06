@@ -42,7 +42,10 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 - **Optional persistent sessions.** `tmux` on the target host — any
   reasonably recent version. See
   [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
-- **Optional shared-hosting proxy.** PHP 5.3+ with the `curl` extension.
+- **Optional shared-hosting proxy.** PHP with the `curl` extension, from a
+  [supported branch](https://www.php.net/supported-versions.php) or a
+  vendor package that still gets security fixes — see
+  [`docs/deployment.md`](docs/deployment.md#keep-php-patched).
 - **Optional reverse proxy.** nginx, Caddy, or Apache.
 
 ## Highlights
@@ -117,6 +120,10 @@ Requires Python 3.9+ and `ssh` in your PATH. The server binds to
 `server.py`, and the `assets/` folder into a folder in your web root.
 Open it in a browser. `api.php` starts `server.py` automatically on the
 first request.
+
+Run it on a PHP version that still gets security fixes — most control
+panels let you pick it per site; see
+[`docs/deployment.md`](docs/deployment.md#keep-php-patched).
 
 `websh.json` (optional, for server-side connections) lives **outside**
 the web root — `api.php` looks two directories up from itself by
