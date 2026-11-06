@@ -19,7 +19,7 @@ const url = take('--url');
 const repeat = +(take('--repeat') || 1);
 const list = has('--list');
 
-const ORDER = ['smoke', 'typing', 'offline', 'drop', 'silent', 'restart', 'away'];
+const ORDER = ['smoke', 'typing', 'offline', 'drop', 'silent', 'restart', 'away', 'upload'];
 const all = {};
 for (const f of fs.readdirSync(path.join(HERE, 'scenarios')).filter(f => f.endsWith('.mjs')))
   all[f.replace(/\.mjs$/, '')] = await import('./scenarios/' + f);

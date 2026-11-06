@@ -200,7 +200,7 @@ even if we already wrote the closed-banner. The terminal-state
 branches all null `p.sid` on the first call, so subsequent frames
 hit the guard and exit cleanly.
 
-## At most one `/api/stream` per session
+## At most one `/api/stream` per session (the newest wins, not too often)
 
 `SSHSession.read()` is destructive. Two concurrent SSE consumers for
 the same session would race for bytes — each wakeup drains a fragment
@@ -223,11 +223,13 @@ requests against it.
 
 ## Known limitations
 
-- **Long-poll fallback is per-pane, sticky for the session.** Once a
-  pane decides SSE doesn't work, it doesn't try again. A user who
-  changes networks (e.g. moves off a buffering corp proxy onto LTE)
-  has to reload the tab to get SSE back. Acceptable; the alternative
-  is flapping detection that can't really tell signal from noise.
+- **Two tabs on one session share it badly.** Panes are restored from
+  `localStorage`, so a second tab (or two restored windows) attaches to
+  the same session. One tab streams, the other gets `409` and
+  long-polls; a stream takeover is allowed once per
+  `STREAM_TAKEOVER_MIN_GAP` (15 s) per session, so they cannot evict
+  each other continuously, but the polling tab's background probe may
+  swap the roles now and then. Use one tab per session.
 - **`api.php` SSE passthrough is best-effort.** Some shared hosts
   force `output_buffering` on at the SAPI level so PHP can't flush.
   In that case the frontend's first-message timer fires, fallback

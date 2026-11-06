@@ -252,6 +252,42 @@ class TestSideChannelRateLimit(unittest.TestCase):
         finally:
             httpd.shutdown(); httpd.server_close()
 
+    def test_upload_offset_param_reaches_the_session_and_409_carries_the_size(self):
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="")
+        fake.upload_file.return_value = (True, "")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x&offset=4096",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 200, data)
+                self.assertEqual(fake.upload_file.call_args.kwargs.get("offset"), 4096)
+                self.assertEqual(json.loads(data)["size"], 4096 + 16)
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 200, data)
+                self.assertIsNone(fake.upload_file.call_args.kwargs.get("offset"))
+                self.assertNotIn("size", json.loads(data))
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x&offset=-1",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 400, data)
+                fake.upload_file.return_value = (False, "offset mismatch size=777")
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x&offset=4096",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 409, data)
+                self.assertEqual(json.loads(data), {"error": "offset mismatch", "size": 777})
+                with unittest.mock.patch.object(server, "MAX_UPLOAD_SIZE", 100):
+                    code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x&offset=90",
+                                           b"x" * 16, sid)
+                    self.assertEqual(code, 413, data)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+
     def test_post_side_channel_endpoints_are_throttled(self):
         # tmux_options / upload_finalize / upload_cancel each spawn an ssh
         # subprocess too, so they share the same per-IP throttle — the guard
@@ -2795,6 +2831,155 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
         proc, err = s.download_file(empty)
         out, _ = proc.communicate(timeout=10)
         self.assertEqual(out, b"OK\t-1\n")
+
+    def _upload_session(self, sh):
+        # $HOME is the temp dir, so $HOME/<name> lands where we can look.
+        s = self._session(sh)
+        argv0 = ["busybox", "sh", "-c"] if sh == "busybox" else [sh, "-c"]
+        s._mux_argv = lambda cmd, a=argv0: ["env", "HOME=" + self.tmp] + a + [cmd]
+        return s
+
+    def test_upload_in_pieces_appends_at_the_right_offset(self):
+        # A network that cuts long or large POSTs (a corporate proxy, a
+        # VPN) gets the file in pieces; each must land exactly after the
+        # previous one; a repeated first piece must preserve later bytes.
+        for sh in self.SHELLS:
+            s = self._upload_session(sh)
+            name = "part.bin-" + sh
+            ok, err = s.upload_file(name, io.BytesIO(b"AAAA"), 4, offset=0)
+            self.assertEqual((ok, err), (True, ""), sh)
+            ok, err = s.upload_file(name, io.BytesIO(b"BBBBBB"), 6, offset=4)
+            self.assertEqual((ok, err), (True, ""), sh)
+            with open(os.path.join(self.tmp, name), "rb") as f:
+                self.assertEqual(f.read(), b"AAAABBBBBB", sh)
+            s.upload_file(name, io.BytesIO(b"AAAA"), 4, offset=0)
+            with open(os.path.join(self.tmp, name), "rb") as f:
+                self.assertEqual(f.read(), b"AAAABBBBBB",
+                                 sh + ": an immutable first-piece retry preserves data")
+
+    def test_repeated_first_upload_piece_preserves_later_bytes(self):
+        # A retried request retains the same temporary path and immutable
+        # offset. It may arrive after later pieces have already landed.
+        # Local shells execute the real command; no SSH or server is used.
+        for sh in self.SHELLS:
+            with self.subTest(shell=sh):
+                s = self._upload_session(sh)
+                name = "late-first-" + sh
+                self.assertEqual(s.upload_file(name, io.BytesIO(b"AAAA"),
+                                               4, offset=0), (True, ""))
+                self.assertEqual(s.upload_file(name, io.BytesIO(b"BBBB"),
+                                               4, offset=4), (True, ""))
+                s.upload_file(name, io.BytesIO(b"AAAA"), 4, offset=0)
+                with open(os.path.join(self.tmp, name), "rb") as f:
+                    self.assertEqual(f.read(), b"AAAABBBB",
+                                     "a first-piece retry erased later bytes")
+
+    def test_overlapping_upload_retries_never_duplicate_bytes(self):
+        # Separate session objects model reconnect: both requests retain
+        # the same staged filename and immutable offset. Barrier-started
+        # workers use only local shells and private files, never real SSH.
+        # Repeat to cover process ordering without fixed scheduling sleeps.
+        payload = bytes(range(251)) * 33
+        for sh in self.SHELLS:
+            for attempt in range(12):
+                with self.subTest(shell=sh, attempt=attempt):
+                    name = "overlap-%s-%d" % (sh, attempt)
+                    path = os.path.join(self.tmp, name)
+                    with open(path, "wb") as f:
+                        f.write(b"PRE")
+                    start = threading.Barrier(3)
+                    results = []
+                    workers = []
+                    children = []
+                    real_popen = subprocess.Popen
+
+                    def local_child(*args, _popen=real_popen,
+                                    _children=children, **kwargs):
+                        kwargs["start_new_session"] = True
+                        proc = _popen(*args, **kwargs)
+                        _children.append(proc)
+                        return proc
+
+                    def send(_start=start, _results=results, _sh=sh, _name=name):
+                        _start.wait(timeout=10)
+                        _results.append(self._upload_session(_sh).upload_file(
+                            _name, io.BytesIO(payload), len(payload), offset=3))
+
+                    patch = unittest.mock.patch.object(
+                        server.subprocess, "Popen", side_effect=local_child)
+                    patch.start()
+                    try:
+                        for _ in range(2):
+                            worker = threading.Thread(target=send, daemon=True)
+                            workers.append(worker)
+                            worker.start()
+                        start.wait(timeout=10)
+                        for worker in workers:
+                            worker.join(timeout=15)
+                        self.assertFalse(any(w.is_alive() for w in workers),
+                                         "overlapping retries did not finish")
+                        self.assertEqual(len(results), 2)
+                        self.assertTrue(any(ok for ok, _ in results), results)
+                        with open(path, "rb") as f:
+                            self.assertEqual(f.read(), b"PRE" + payload,
+                                             "a retry duplicated or lost bytes")
+                    finally:
+                        start.abort()
+                        for proc in children:
+                            if proc.poll() is None:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                proc.wait(timeout=5)
+                        for worker in workers:
+                            worker.join(timeout=5)
+                        patch.stop()
+
+    def test_upload_unaligned_offsets_and_legacy_overwrite(self):
+        for sh in self.SHELLS:
+            with self.subTest(shell=sh):
+                s = self._upload_session(sh)
+                name = "unaligned-" + sh
+                pieces = (b"abc", bytes(range(251)) * 3, b"tail!")
+                expected = b""
+                for piece in pieces:
+                    result = s.upload_file(name, io.BytesIO(piece), len(piece),
+                                           offset=len(expected))
+                    self.assertEqual(result, (True, ""))
+                    expected += piece
+                with open(os.path.join(self.tmp, name), "rb") as f:
+                    self.assertEqual(f.read(), expected)
+                self.assertEqual(s.upload_file(name, io.BytesIO(b"new"), 3),
+                                 (True, ""))
+                with open(os.path.join(self.tmp, name), "rb") as f:
+                    self.assertEqual(f.read(), b"new",
+                                     "legacy whole-file mode must overwrite")
+
+    def test_upload_piece_at_the_wrong_offset_is_refused_with_the_real_size(self):
+        # After a piece died mid-body the remote file may hold part of it;
+        # the client learns the real size and resumes from there. The
+        # body of the refused request is still read to the end, so the
+        # 409 is delivered rather than the connection cut.
+        for sh in self.SHELLS:
+            s = self._upload_session(sh)
+            name = "r.bin-" + sh
+            self.assertTrue(s.upload_file(name, io.BytesIO(b"x" * 10), 10, offset=0)[0])
+            body = io.BytesIO(b"y" * 300000)
+            ok, err = s.upload_file(name, body, 300000, offset=4)
+            self.assertFalse(ok, sh)
+            self.assertEqual(err, "offset mismatch size=10", sh)
+            self.assertEqual(body.tell(), 300000, sh + ": body drained")
+            with open(os.path.join(self.tmp, name), "rb") as f:
+                self.assertEqual(f.read(), b"x" * 10, sh + ": file untouched")
+            ok, err = s.upload_file(name, io.BytesIO(b"z" * 5), 5, offset=10)
+            self.assertEqual((ok, err), (True, ""), sh)
+            with open(os.path.join(self.tmp, name), "rb") as f:
+                self.assertEqual(f.read(), b"x" * 10 + b"z" * 5, sh)
+            # Whole-file mode (older clients) is unchanged: overwrite.
+            self.assertTrue(s.upload_file(name, io.BytesIO(b"w"), 1)[0])
+            with open(os.path.join(self.tmp, name), "rb") as f:
+                self.assertEqual(f.read(), b"w", sh)
 
     def _finalize_in(self, sh, dest, tmp_name, final_name):
         """Run finalize_upload against a real directory. $HOME is the

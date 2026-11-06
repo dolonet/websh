@@ -195,7 +195,8 @@ export class Browser {
   }
   network(o) {
     return this.send('Network.emulateNetworkConditions',
-      { offline: !!o.offline, latency: o.latency || 0, downloadThroughput: -1, uploadThroughput: -1 });
+      { offline: !!o.offline, latency: o.latency || 0, downloadThroughput: -1,
+        uploadThroughput: o.upload || -1 });   // bytes/s
   }
   freeze() { return this.send('Page.setWebLifecycleState', { state: 'frozen' }); }
   unfreeze() { return this.send('Page.setWebLifecycleState', { state: 'active' }); }

@@ -20,6 +20,7 @@ and on the network, and unit tests passed while they were live.
 | `silent` | the connection dies without FIN/RST (Wi-Fi switch): output returns by itself |
 | `restart` | websh restarts: a persistent pane re-attaches to the same tmux shell |
 | `away` | two panes, tab frozen 75 s, server session expired: both back, first keys delivered |
+| `upload` | 12 MB upload with the connection reset twice under it: arrives whole and identical |
 
 ## Needs
 
