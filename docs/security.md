@@ -264,9 +264,9 @@ version 1 and existing server identity pins stay unchanged.
 
 A server restart forgets every channel. An outer 410 can also be forged
 after a request already executed, so it is never evidence that resending
-a command is safe. Read-only GET calls can reopen and retry; POST calls
-with an unverified outcome are not resent by the sealed boundary. The
-user is told that the request may have completed and to check before
+a command is safe. Read-only GET calls and POST `output_many` can reopen
+and retry; every other POST with an unverified outcome is not resent by
+the sealed boundary. The user is told that the request may have completed and to check before
 trying again. Queued input behind an uncertain batch for the same
 session is dropped, while later fresh typing can open a new channel.
 Only authenticated inner API replies can supply refusal codes such as

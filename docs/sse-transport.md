@@ -10,6 +10,14 @@ Output from the SSH PTY reaches the browser through two transports
 that share one wire format. Input always goes up as short POSTs to
 `/api/input`.
 
+On a server advertising `output_batch: true`, a page opens at most
+three SSE connections, counting probes, and one shared long-poll for
+all other panes. Six idle SSE connections otherwise exhaust a
+HTTP/1.x browser's per-origin pool: keys and new connections cannot
+reach the server. The shared poll wakes as soon as ANY listed session
+has output, so adding panes does not add a round-robin delay to echo.
+Older clients and servers keep their original endpoints.
+
 ### Primary: Server-Sent Events (`GET /api/stream`)
 
 `server.py:_stream` opens a long-lived response with
@@ -39,6 +47,19 @@ long-poll). A healthy channel — including a session that has nothing
 to print yet — flushes it instantly.
 
 ### Fallback: long-poll (`GET /api/output`)
+
+The current client coalesces these per-pane calls into a single
+`POST /api/output_many` when the server supports it. The body lists
+session ids and cursors, and the reply supplies one status and payload
+per entry. A pane keeps its own retry budget and handles its own error;
+one expired session does not discard output from its neighbours. A new
+or removed waiter cancels and rebuilds the shared request with all
+remaining cursors, so a new pane never waits behind an idle ten-second
+poll. A late reply from the cancelled request is ignored. The server
+registers one private wake socket with every listed session BEFORE any
+cursor read, then waits for that socket or the client to close. A wake
+cannot be cleared by another page's poll. Registrations are removed
+under each session's lock before the socket closes.
 
 The pre-existing 10-second long-poll. Same JSON payload; no
 multi-message framing. The frontend uses this when SSE doesn't reach
@@ -82,8 +103,10 @@ timer, the stall detector and the cursor logic are the same code.
 
 Sealed wire 2 authenticates each response against its request seq and
 frame index. A lost channel can be reopened automatically for these
-read-only output requests. It cannot authorize replaying a POST: an
-unverified outer 410/503 or damaged reply may follow successful execution.
+read-only output requests, including POST `output_many`. Cancelling that
+shared read leaves the channel usable. This exception does not authorize
+replaying any other POST: an unverified outer 410/503 or damaged reply
+may follow successful execution.
 Such input reports an uncertain outcome and drops its already queued
 same-session suffix; only later fresh typing starts a new request. A
 local handshake failure still holds unsent input safely. Cached sealed
@@ -118,11 +141,18 @@ One `/api/input` per pane is in flight at a time; keys typed meanwhile
 form the next batch. Requests fired without waiting overtook each
 other (HTTP/2 multiplexing, then one backend thread per request) and
 text arrived scrambled. A reply that proves the bytes never reached
-the PTY (503, 429, 502) resends the same batch first; a network error
-is not retried - the write may have landed, and a doubled key is worse
-than a lost one. `404` means the session is gone: the pane reconnects,
+the PTY resends the same batch first: a 503 with `code: busy` or
+`code: restarting` (also the exact legacy `error: busy` reply), or a
+429 with `code: rate_limited`. A generic 502, 503 or 429 and a network
+error are not retried: the write may have landed, and a doubled key is
+worse than a lost one. `404` means the session is gone: the pane reconnects,
 and for a persistent pane the batch is held for the re-attach (see
 `docs/persistent-sessions.md`, "Coming back after an absence").
+
+In sealed mode, when a held command prefix expires, all keys queued
+behind it are dropped together. Sending only the fresh suffix could
+execute a different command. Input typed after this drop is accepted
+normally.
 
 ### Paint guard
 
@@ -297,6 +327,12 @@ requests against it.
 
 ## Known limitations
 
+- **The connection budget belongs to one page.** The three-stream and
+  one-shared-poll limit does not coordinate independent browser tabs
+  or windows. Over HTTP/1.x those pages share the origin's connection
+  pool and together can still exhaust it. Use websh's tabs and panes
+  inside one page, or an HTTP/2 proxy, for several simultaneous panes.
+  The `connections` browser scenario verifies eight panes in one page.
 - **Two tabs on one session share it badly.** Panes are restored from
   `localStorage`, so a second tab (or two restored windows) attaches to
   the same session. One tab streams, the other gets `409` and

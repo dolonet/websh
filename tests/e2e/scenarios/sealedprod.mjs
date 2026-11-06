@@ -17,6 +17,7 @@ export const meta = { about: `sealed mode on behind a production-like front (ngi
 export async function run({ b, t, front }) {
   const reqs = new Map(), all = new Map();
   let tOn = 0;
+  const protocols = new Set(), orderedFiles = [];
   const open = at => [...all.values()].filter(r => r.at <= at && (!r.end || r.end > at)).map(r => r.a + '/' + r.type);
   const orig = b._on.bind(b);
   b._on = d => {
@@ -28,6 +29,7 @@ export async function run({ b, t, front }) {
     if (d.method === 'Network.responseReceived' && reqs.has(p.requestId)) { const r = reqs.get(p.requestId); r.status = p.response.status; r.proto = p.response.protocol; }
     if (d.method === 'Network.loadingFailed' && reqs.has(p.requestId)) { const r = reqs.get(p.requestId); r.fail = p.errorText + (p.canceled ? ' (canceled)' : ''); }
     if (d.method === 'Network.loadingFinished' && reqs.has(p.requestId)) reqs.get(p.requestId).done = true;
+    if (d.method === 'Network.responseReceived' && /action=/.test(p.response.url)) protocols.add(p.response.protocol);
     orig(d);
   };
   try {
@@ -74,6 +76,47 @@ export async function run({ b, t, front }) {
       if (cfg.host === '127.0.0.1' || fs.existsSync(path.dirname(marks[i]))) t.ok(local, `pane ${i}: the typed command ran (its file exists)`);
       try { fs.unlinkSync(marks[i]); } catch (e) {}
     }
+    // Optional repeated matrix probe: exact shell-side command order and
+    // observed echo delay, independently for every pane. These files live
+    // only on the private local SSH fixture and are removed even on failure.
+    const rounds = +(process.env.E2E_SEALEDPROD_ORDER_ROUNDS || 0);
+    if (rounds) {
+      if (cfg.host !== '127.0.0.1') throw new Error('ordered probe requires the private local SSH fixture');
+      const expected = new Map(), delays = [];
+      for (const i of panes) {
+        orderedFiles.push(path.join(os.homedir(), `.websh-e2e-order-${tag}-${i}`));
+        expected.set(i, '');
+      }
+      for (let round = 0; round < rounds; round++) {
+        const sent = new Map(), seen = new Map();
+        for (const i of panes) {
+          const token = `${round}:${i};`;
+          expected.set(i, expected.get(i) + token);
+          sent.set(i, Date.now());
+          // Split each command across two real terminal input events. The
+          // computed marker cannot be mistaken for the echoed command line.
+          const cmd = `printf '${token}' >> ~/.websh-e2e-order-${tag}-${i}; echo Q${tag}$((${900 + round * 20}+${i}))\r`;
+          await b.type(i, cmd.slice(0, 9));
+          await b.type(i, cmd.slice(9));
+        }
+        await until(async () => {
+          for (const i of panes) {
+            if (!seen.has(i) && (await b.screen(i)).replace(/\n/g, '').includes('Q' + tag + (900 + round * 20 + i))) seen.set(i, Date.now() - sent.get(i));
+          }
+          return seen.size === N;
+        }, 5000);
+        for (const i of panes) {
+          const file = path.join(os.homedir(), `.websh-e2e-order-${tag}-${i}`);
+          const actual = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+          t.ok(actual === expected.get(i), `ordered round ${round} pane ${i}: exact executed bytes ${JSON.stringify(actual)}`);
+          t.ok(seen.has(i) && seen.get(i) <= 5000, `ordered round ${round} pane ${i}: echo ${seen.get(i) ?? 'missing'} ms`);
+          if (seen.has(i)) delays.push(seen.get(i));
+        }
+      }
+      t.note('ordered matrix: ' + JSON.stringify({panes: N, mode: plainOnly ? 'plain' : 'sealed', protocols: [...protocols], rounds, echoMs: delays, maxEchoMs: Math.max(...delays)}));
+      const wantProtocol = process.env.E2E_PROD_H1 === '1' ? 'http/1.1' : 'h2';
+      t.ok(protocols.has(wantProtocol), `browser used ${wantProtocol}`);
+    }
     t.note('pane transports: ' + JSON.stringify(await b.state()));
     t.note('requests by action (inner actions too under E2E_SEALED=1): ' + JSON.stringify(b.requests));
     const errs = await b.ev(`Object.values(panes).map(p => { const t = p.term.buffer.active; let s = ''; for (let y = 0; y < t.length; y++) { const l = t.getLine(y); if (l) s += l.translateToString(true) + '\\n'; } return (s.match(/\\[websh:[^\\]]*\\]/g) || []).slice(-2); })`);
@@ -90,5 +133,8 @@ export async function run({ b, t, front }) {
     if (!plainOnly) t.ok(log.some(l => /" 200 /.test(l)), 'nginx saw at least one sealed 200');
     const bad = log.filter(l => /" (400|499) /.test(l));
     t.ok(bad.length === 0, `no sealed 400/499 at nginx (${bad.length})` + (bad.length ? ': ' + bad.slice(0, 2).join(' | ') : ''));
-  } finally { b._on = orig; }
+  } finally {
+    b._on = orig;
+    for (const file of orderedFiles) { try { fs.unlinkSync(file); } catch (e) {} }
+  }
 }

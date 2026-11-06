@@ -33,6 +33,7 @@ function esc(s){
 const API = location.pathname.replace(/\/[^/]*$/, '') + '/api.php';
 function api(action, opts) {
   opts = opts || {};
+  if (action === 'output' && outputBatchAvailable()) return batchOutput(opts);
   let url = `${API}?action=${action}${opts.query || ''}`;
   let init = {};
   if (opts.body) { init.method='POST'; init.body=JSON.stringify(opts.body); init.headers={'Content-Type':'application/json'} }
@@ -462,9 +463,12 @@ async function _sealResponse(ch, raw, requestSeq, failure) {
 // Only authenticated inner replies describe an API outcome. An outer
 // 410/503 can be forged after execution: renew for future requests, but
 // never resend a mutation or expose an unverified busy/restarting code.
-// Read-only GET requests may safely reopen a lost channel and retry.
+// GET and the explicitly read-only POST output_many may reopen and retry.
 async function sealedFetch(method, action, query, body, opts) {
   opts = opts || {};
+  // output_many uses POST only to carry the cursor list. No other POST
+  // is granted read-only recovery or cancellation semantics.
+  let readOnlyBatch = method === 'POST' && action === 'output_many';
   let asked = Date.now();
   for (let attempt = 0; ; attempt++) {
     let ch;
@@ -487,15 +491,26 @@ async function sealedFetch(method, action, query, body, opts) {
     let hdr = Object.assign({seq: ++ch.seq, method: method, action: action, query: query || {}},
                             opts.extra || {});
     let frame = await _sealFrame(ch, hdr, body || new Uint8Array(0));
-    let mutation = method !== 'GET';
+    let mutation = method !== 'GET' && !readOnlyBatch;
     let context = {ch: ch, error: null};
+    let replyError = () => {
+      // Joining/leaving panes rebuilds the batch routinely. Cancelling
+      // that read must not invalidate a healthy shared encrypted channel.
+      if (readOnlyBatch && opts.signal && opts.signal.aborted)
+        return new DOMException('aborted', 'AbortError');
+      return _sealReplyError(ch, mutation, context);
+    };
     if (mutation && opts.signal) _sealSentRequests.set(opts.signal, context);
     let r;
     try {
       r = await fetch(`${API}?action=sealed&c=${ch.id}`, {method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: '{"f":"' + _b64enc(frame) + '"}', signal: opts.signal});
-    } catch (e) { throw _sealReplyError(ch, mutation, context); }
+    } catch (e) { throw replyError(); }
+    if (readOnlyBatch && opts.signal && opts.signal.aborted) {
+      _quietCancel(r.body);
+      throw replyError();
+    }
     if (r.status === 410 && !mutation) {
       if (attempt > 0) return _sealUnavailableResponse(_sealLostAgain());
       if (_seal === ch) { _seal = null; renderSealedState(); }
@@ -503,10 +518,10 @@ async function sealedFetch(method, action, query, body, opts) {
     }
     if (r.status !== 200) {
       _quietCancel(r.body);
-      throw _sealReplyError(ch, mutation, context);
+      throw replyError();
     }
     _sealLost = 0;
-    return await _sealResponse(ch, r, hdr.seq, () => _sealReplyError(ch, mutation, context));
+    return await _sealResponse(ch, r, hdr.seq, replyError);
   }
 }
 
@@ -3315,6 +3330,8 @@ function _destroyPane(id, terminate) {
     p.polling = false;
     stopKeepalive(p);
     closeStream(p);
+    abortPoll(p);
+    p.outGen = (p.outGen || 0) + 1;
     let body = {session_id: p.sid};
     if (terminate) body.terminate = true;
     api('disconnect', {body: body}).catch(() => {});
@@ -4020,6 +4037,114 @@ async function commitVaultSave(entry) {
 }
 
 // ── Output transport ────────────────────────────────────────────────
+// HTTP/1.x browsers have only six connections per origin. Limit this
+// page to three streams (probes included) plus ONE shared long-poll,
+// leaving room for keys and connect/resize even with many quiet panes.
+// The old endpoints remain available to cached clients/older servers.
+const OUTPUT_STREAM_LIMIT = 3;
+let _outputWaiters = [];
+let _outputBatchCtl = null;
+let _outputBatchScheduled = false;
+
+function outputBatchAvailable() {
+  return !!(serverConfig && serverConfig.output_batch);
+}
+
+function outputStreamRoom() {
+  if (!outputBatchAvailable()) return true;
+  let used = 0;
+  Object.values(panes).forEach(p => {
+    if (p.eventSource) used++;
+    if (p.sseProbe) used++;
+  });
+  return used < OUTPUT_STREAM_LIMIT;
+}
+
+// Each pane keeps its own loop, cursor, timeout and retry budget.
+// Only its waiting request is shared. New/cancelled waiters restart the
+// batch with the remaining cursors, never resolve or reject neighbours.
+// In particular a newly connected pane does not wait for an idle batch's
+// ten-second deadline before its first screen can arrive.
+function batchOutput(opts) {
+  let query = new URLSearchParams(opts.query || '');
+  return new Promise((resolve, reject) => {
+    let waiter = {session_id: query.get('session_id') || '',
+                  since: Number(query.get('since')) || 0,
+                  signal: opts.signal, resolve: resolve, reject: reject};
+    waiter.abort = () => {
+      let i = _outputWaiters.indexOf(waiter);
+      if (i < 0) return;
+      _outputWaiters.splice(i, 1);
+      if (waiter.signal) waiter.signal.removeEventListener('abort', waiter.abort);
+      reject(new DOMException('aborted', 'AbortError'));
+      restartOutputBatch();
+    };
+    if (waiter.signal && waiter.signal.aborted) {
+      reject(new DOMException('aborted', 'AbortError'));
+      return;
+    }
+    _outputWaiters.push(waiter);
+    if (waiter.signal) waiter.signal.addEventListener('abort', waiter.abort, {once: true});
+    restartOutputBatch();
+  });
+}
+
+function restartOutputBatch() {
+  if (_outputBatchCtl) {
+    let ctl = _outputBatchCtl;
+    _outputBatchCtl = null;       // late replies belong to the old batch
+    ctl.abort();
+  }
+  if (!_outputWaiters.length || _outputBatchScheduled) return;
+  _outputBatchScheduled = true;
+  // Promise callbacks collect the panes resolved by the same reply
+  // without a timer: hidden-page timer throttling must never delay
+  // reading their output, or fast output can outrun the replay log.
+  Promise.resolve().then(runOutputBatch);
+}
+
+function runOutputBatch() {
+  _outputBatchScheduled = false;
+  if (!_outputWaiters.length || _outputBatchCtl) return;
+  let batch = _outputWaiters.slice();
+  let ctl = _outputBatchCtl = new AbortController();
+  // A restored duplicate pane can wait on the same server session.
+  // Read its oldest requested cursor once; each terminal already trims
+  // replayed bytes below its own cursor in handleOutputPayload.
+  let sessions = [], indices = new Map();
+  batch.forEach(w => {
+    let i = indices.get(w.session_id);
+    if (i === undefined) {
+      indices.set(w.session_id, sessions.length);
+      sessions.push({session_id: w.session_id, since: w.since});
+    } else sessions[i].since = Math.min(sessions[i].since, w.since);
+  });
+  let finish = (reply, error) => {
+    if (_outputBatchCtl !== ctl) return;
+    _outputBatchCtl = null;
+    batch.forEach(w => {
+      let i = _outputWaiters.indexOf(w);
+      if (i < 0) return;
+      _outputWaiters.splice(i, 1);
+      if (w.signal) w.signal.removeEventListener('abort', w.abort);
+      if (error) { w.reject(error); return; }
+      if (reply && reply.error) { w.resolve(reply); return; }
+      let item = reply && Array.isArray(reply.outputs) && reply.outputs[indices.get(w.session_id)];
+      if (!item || !item.payload || typeof item.payload !== 'object' ||
+          !Number.isInteger(item.status) || item.status < 200 || item.status > 599) {
+        w.reject(new Error('Invalid shared output reply'));
+        return;
+      }
+      let payload = Object.assign({}, item.payload);
+      Object.defineProperty(payload, '_status', {value: item.status});
+      w.resolve(payload);
+    });
+    if (_outputWaiters.length) restartOutputBatch();
+  };
+  api('output_many', {body: {sessions: sessions}, signal: ctl.signal})
+    .then(r => finish(r, null), e => finish(null, e));
+}
+
 // Two transports share one payload shape ({data, alive, auth_failed}).
 // Primary: SSE via /api/stream, opened with EventSource. Falls back to
 // long-poll automatically if (a) EventSource is missing, (b) the first
@@ -4802,7 +4927,7 @@ document.addEventListener('resume', () => kickAllOutputs(true));
 // arrived. Each failure doubles the wait.
 function maybeProbeSse(p, sid) {
   if (!p.sseDisabled || p.sseDisabledReason === 'unsupported' || p.sseProbe ||
-      typeof EventSource === 'undefined') return;
+      typeof EventSource === 'undefined' || !outputStreamRoom()) return;
   let wait = p.sseProbeWait || SSE_RETRY_MS;
   if (Date.now() - (p.sseDisabledAt || 0) < wait) return;
   let es;
@@ -4841,6 +4966,7 @@ function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
   abortPoll(p);
+  if (!outputStreamRoom()) { pollOutput(p); return; }
   let gen = p.outGen = (p.outGen || 0) + 1;   // supersedes any poll loop
   let mySid = p.sid;
   // since= our output cursor: a reconnect resumes exactly where this
@@ -4987,6 +5113,12 @@ function pollOutput(p, gen) {
     if (gen === p.outGen) clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
     if (!p.polling || p.sid !== mySid || gen !== p.outGen) return;
+    // A capacity-limited pane can take a stream freed by another pane.
+    // Real fallback panes still use the existing explicit probe path.
+    if (!p.sseDisabled && typeof EventSource !== 'undefined' && outputStreamRoom()) {
+      streamOutput(p);
+      return;
+    }
     maybeProbeSse(p, mySid);
     pollOutput(p, gen);
   }).catch(e => {
@@ -5103,6 +5235,10 @@ function queueInput(p, data) {
     // Disconnected and nobody is reconnecting: nothing will read this.
     if (!p.connecting || !p.persistent) return;
   }
+  // Expiry is a boundary BEFORE this new keystroke. Otherwise a stale
+  // held batch waiting for backoff could later discard fresh input
+  // typed after the channel recovered along with its old backlog.
+  discardExpiredSealedInput(p);
   p.inputQueuedAt = Date.now();     // freshness of the NEWEST key
   if (!p.inputQueue.length || !p.latKeyAt) p.latKeyAt = latNow();   // ── Input latency
   p.inputQueue.push(data);
@@ -5116,19 +5252,35 @@ function queueInput(p, data) {
 // tried again. Never late (I3): if the oldest of them is older than
 // INPUT_HOLD_MS, all of them are dropped, with a notice - never a
 // suffix of a command without its start.
+function discardExpiredSealedInput(p) {
+  let held = p.sealHeld || [];
+  if (held.length &&
+      (Date.now() - held[0].at > INPUT_HOLD_MS || held[0].sid !== p.sid)) {
+    p.sealHeld = [];
+    // A suffix queued for the SAME session belongs to its blocked
+    // prefix: dropping only the prefix could execute another command.
+    // After a session change, queued fresh keys belong to the new
+    // session and must survive disposal of the old held batch.
+    if (held[0].sid === p.sid) {
+      p.inputQueue = [];
+      p.latKeyAt = 0;
+    }
+    showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
+  }
+}
+
 function takeSealedHeld(p) {
+  discardExpiredSealedInput(p);
   let held = p.sealHeld || [];
   p.sealHeld = [];
-  if (!held.length) return [];
-  if (Date.now() - held[0].at > INPUT_HOLD_MS || held[0].sid !== p.sid) {
-    showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
-    return [];
-  }
   return held;
 }
 
 function flushInput(p) {
   p.flushTimer = null;
+  // Drop an already queued suffix with its expired prefix even while
+  // the channel is still in backoff; it must never become a request.
+  discardExpiredSealedInput(p);
   let held = p.sealHeld && p.sealHeld.length;
   if(p.inputInFlight || !p.sid || p.inputGate || (!p.inputQueue.length && !held)) return;
   let parts = [];
@@ -5228,13 +5380,15 @@ function sendInputBatch(p, sid, d, attempt, parts) {
       if (!p.flushTimer) p.flushTimer = setTimeout(() => flushInput(p), Math.max(250, _sealWaitMs()));
       return;
     }
-    // Replies that prove the bytes never reached the PTY (the worker
-    // pool was full, a rate limit, the proxy could not reach the
-    // backend): resend the same batch, ahead of anything typed since.
-    // A network error is NOT retried - the write may have happened and
-    // only the reply was lost, and a doubled keystroke is worse.
+    // Only websh's explicit before-write refusals prove that resending
+    // is safe. A proxy's generic 502/503/429 can follow a successful
+    // PTY write whose reply was lost, so status alone cannot authorize
+    // a resend. Keep the exact legacy busy reply for cached servers.
     let st = r && r.error && r._status;
-    if (!settled && (st === 503 || st === 429 || st === 502) &&
+    let safeRetry = (st === 503 && (r.code === 'busy' || r.code === 'restarting' ||
+                                  r.error === 'busy')) ||
+                    (st === 429 && r.code === 'rate_limited');
+    if (!settled && safeRetry &&
         attempt < INPUT_RETRIES && p.sid === sid) {
       settled = true; clearTimeout(stall);
       setTimeout(() => sendInputBatch(p, sid, d, attempt + 1, parts), 200 * (attempt + 1));

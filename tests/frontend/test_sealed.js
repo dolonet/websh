@@ -373,6 +373,83 @@ test('sealed input queue: a late old-session failure preserves fresh-session que
   } finally { if (release) release(); cleanup(env); }
 });
 
+function outputBatchReply(req, srv) {
+  const entries = JSON.parse(dec.decode(req.body)).sessions;
+  return {status: 200, headers: {'Content-Type': 'application/json'}, body: enc.encode(JSON.stringify({outputs: entries.map(entry => {
+    const session = srv.sessions[entry.session_id];
+    return {status: 200, payload: {data: b64(enc.encode(session.out.slice(entry.since || 0))), cursor: session.out.length, alive: true, auth_failed: false}};
+  })}))};
+}
+
+test('sealed batch output: an expired channel recovers six read cursors without mutation warnings', async () => {
+  const env = await mkEnv({sealed: true}); const {win, srv} = env;
+  const sids = Array.from({length: 6}, (_, i) => { const sid = srv.newSession(); srv.emit(sid, 'OUT' + i); return sid; });
+  srv.hooks.output_many = req => outputBatchReply(req, srv);
+  const messages = [], toast = win.showToast;
+  win.showToast = function(message) { messages.push(String(message)); return toast.apply(this, arguments); };
+  try {
+    await win.api('tmux_capture', {query: '&session_id=' + sids[0]});
+    const opens = srv.wire.filter(r => r.action === 'seal_open').length;
+    srv.restart();
+    let result, failure;
+    try { result = await win.api('output_many', {body: {sessions: sids.map(session_id => ({session_id, since: 0}))}}); }
+    catch (error) { failure = error; }
+    ok(!failure && result && result.outputs && result.outputs.length === 6, 'read-only batch recovers after channel expiry');
+    if (result && result.outputs) ok(result.outputs.every((r, i) => dec.decode(unb64(r.payload.data)) === 'OUT' + i), 'all six cursor payloads are exact');
+    ok(srv.wire.filter(r => r.action === 'seal_open').length === opens + 1, 'one safe channel reopen');
+    ok(!messages.some(m => /may have completed|check the result/i.test(m)), 'output expiry never warns that a command may have executed');
+    for (let i = 0; i < sids.length; i++) await win.api('input', {body: {session_id: sids[i], data: 'FRESH' + i}});
+    ok(sids.every((sid, i) => srv.sessions[sid].input === 'FRESH' + i && srv.sessions[sid].inputCalls === 1), 'fresh input reaches every session exactly once');
+  } finally { cleanup(env); }
+});
+
+test('sealed batch output: cancelling one of six waiters preserves the channel and other readers', async () => {
+  const srv = await new FakeWebsh().init();
+  const config = srv.config.bind(srv);
+  srv.config = () => Object.assign(config(), {output_batch: true});
+  const arrivals = [];
+  srv.hooks.output_many = req => new Promise(resolve => arrivals.push({req, resolve}));
+  const env = await mkEnv({sealed: true, server: srv}); const {win} = env;
+  // Browser fetch rejects when its signal is cancelled before headers.
+  // The shared fake normally models cancellation only after a stream opens.
+  const fetch = win.fetch;
+  win.fetch = (url, init) => {
+    const pending = fetch(url, init);
+    const signal = init && init.signal;
+    if (!signal) return pending;
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(new win.DOMException('private read cancelled', 'AbortError'));
+      signal.addEventListener('abort', abort, {once: true});
+      if (signal.aborted) abort();
+      pending.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+    });
+  };
+  const messages = [], toast = win.showToast;
+  win.showToast = function(message) { messages.push(String(message)); return toast.apply(this, arguments); };
+  const sids = Array.from({length: 6}, (_, i) => { const sid = srv.newSession(); srv.emit(sid, 'BATCH' + i); return sid; });
+  const controls = sids.map(() => new win.AbortController());
+  try {
+    await win.api('tmux_capture', {query: '&session_id=' + sids[0]});
+    const opens = srv.wire.filter(r => r.action === 'seal_open').length;
+    const reads = sids.map((sid, i) => win.api('output', {query: '&session_id=' + sid + '&since=0', signal: controls[i].signal}).catch(error => ({cancelled: error.name})));
+    ok(await until(() => arrivals.length === 1, 1000), 'six readers share one submitted batch');
+    controls[0].abort();
+    ok(await until(() => arrivals.length === 2, 1000), 'remaining readers get their replacement batch promptly');
+    if (arrivals[1]) arrivals[1].resolve(outputBatchReply(arrivals[1].req, srv));
+    const values = await Promise.race([Promise.all(reads), sleep(2000).then(() => [])]);
+    ok(values.length === 6 && values[0].cancelled === 'AbortError', 'only the cancelled reader is rejected');
+    ok(values.length === 6 && values.slice(1).every((r, i) => dec.decode(unb64(r.data)) === 'BATCH' + (i + 1)), 'all five remaining readers receive their exact bytes');
+    await win.api('input', {body: {session_id: sids[1], data: 'FRESH'}});
+    ok(srv.sessions[sids[1]].input === 'FRESH', 'fresh input still arrives once');
+    ok(srv.wire.filter(r => r.action === 'seal_open').length === opens, 'ordinary waiter cancellation does not invalidate the shared channel');
+    ok(!messages.some(m => /may have completed|check the result/i.test(m)), 'ordinary output cancellation produces no mutation uncertainty warning');
+  } finally {
+    for (const ctl of controls) ctl.abort();
+    for (const a of arrivals) a.resolve(outputBatchReply(a.req, srv));
+    cleanup(env);
+  }
+});
+
 test('sealed on: every API call but config/ping goes sealed; no plain URL or body carries anything', async () => {
   const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
   const p = await connect(env);
@@ -707,6 +784,44 @@ test('sealed I3: keys with an uncertain 410 reply are not delivered late after r
   await sleep(300);
   ok(!shellInput(srv, p).includes('LATE3'), 'the keys from the backoff were not delivered late; got ' + JSON.stringify(shellInput(srv, p)));
   ok(shellInput(srv, p) === 'new3', 'only fresh input follows uncertain delivery');
+  cleanup(env);
+});
+
+test('sealed I3: an expired held prefix drops the whole outage command including its recent suffix', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.restart(); srv.sealOpenFail = 500;
+  // Discover the lost channel with a read so this prefix is held locally
+  // before submission, not discarded after an ambiguous mutating reply.
+  await win.sealedFetch('GET', 'tmux_capture', {session_id: p.sid}).catch(() => {});
+  typeKeys(win, p, 'echo ');
+  ok(await until(() => p.sealHeld && p.sealHeld.length > 0, 3000), 'prefix held after the channel refused to open');
+  // The channel stays in backoff while the user finishes the same command.
+  env.skew += 19000;
+  typeKeys(win, p, 'OUTAGE_SUFFIX\r');
+  ok(await until(() => p.inputQueue.join('').includes('OUTAGE_SUFFIX'), 1000), 'recent suffix queued before its prefix expires');
+  // Expiry now happens with the suffix already queued, not at a new
+  // keypress. A new keypress after expiry starts a fresh input epoch.
+  env.skew += 6000;
+  srv.sealOpenFail = null;
+  ok(await until(() => (!p.sealHeld || !p.sealHeld.length) && !p.inputQueue.length && !p.inputInFlight, 4000), 'outage backlog settled');
+  ok(shellInput(srv, p) === '', 'neither the expired prefix nor its recent suffix executes; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(/not sent/i.test(win.document.body.textContent), 'user told the command was not sent');
+  typeKeys(win, p, 'fresh\r');
+  ok(await until(() => shellInput(srv, p).endsWith('fresh\r'), 3000), 'a newly typed command works after recovery');
+  ok(shellInput(srv, p) === 'fresh\r', 'only the new command reaches the shell; got ' + JSON.stringify(shellInput(srv, p)));
+  cleanup(env);
+});
+
+test('sealed I3: held input from a different session never discards the new shell command', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const oldSid = srv.newSession();
+  p.sealHeld = [{sid: oldSid, d: 'OLD_SHELL\r', at: win.Date.now() - HOLD_PAST}];
+  typeKeys(win, p, 'fresh-shell\r');
+  ok(await until(() => shellInput(srv, p) === 'fresh-shell\r', 3000), 'new shell input survives an obsolete held batch; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(srv.sessions[oldSid].input === '', 'old input never goes to its former shell either');
+  ok(!shellInput(srv, p).includes('OLD_SHELL'), 'no replay into the new shell');
   cleanup(env);
 });
 
