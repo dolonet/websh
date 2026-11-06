@@ -229,7 +229,15 @@ fallback value and must be present. The reply's `path` is always the
 directory actually listed — clients should read their position back
 from it rather than assuming the request was honoured.
 
-Entries arrive sorted directories-first by name. Clients are free to
+`type` is `d` directory, `f` regular file, `l` symlink, `o` anything
+else. A symlink whose target is a directory also has `"dir": true`
+(tested in the same remote loop, `[ -L "$f" ] && [ -d "$f" ]`); the
+bundled client lists, sorts and opens it as a folder at the link's own
+path, while `rm` and `mv` still act on the link only. Links to files
+and dangling links have no `dir`.
+
+Entries arrive sorted directories-first by name (links to directories
+count as directories). Clients are free to
 re-sort (the bundled one sorts by `mtime` descending by default).
 
 ### POST /api/rm
@@ -338,6 +346,47 @@ characters. Reply `{"ok": true}`; `400` not a JSON object, `413` too
 large, `429` more than 10 per IP in 10 minutes. A server without the
 action answers `404`, which a beacon ignores. Through `api.php` it is an
 ordinary JSON action.
+
+### POST /api/client_lat
+A page's input-latency report (additive; `proto` stays 1). Sent every
+5 minutes by a page that sent input in that window, and once more at
+`pagehide` if something is unsent (a `sendBeacon`, `text/plain`, plain
+mode only), so this action reads JSON whatever the media type (max
+16 KB). It goes through the same wrapper as every other call, so it is
+sealed when sealed mode is on and is allowed inside the channel (a
+report never opens a channel; at `pagehide` in sealed mode it is not
+sent). Body: `{"window_ms", "vis", "panes": [...]}`, up to 16 panes of
+`{"sid": first 8 chars, "mode": "sse"|"long-poll"|..., "sealed": bool,
+"n": input batches, "n_echo": batches whose echo came within 2 s,
+"slow": batches with total > 300 ms, "queue", "rtt", "echo", "paint",
+"total": {"p50", "p90", "max"} (integer ms), "worst": {"queue", "rtt",
+"echo", "paint", "total"} (the slowest batch), "inflight_max": the most
+input requests in flight or queued at once}`. Stages, per `/api/input`:
+`queue` first key -> request sent, `rtt` sent -> reply, `echo` sent ->
+the first output for the pane arriving afterwards, `paint` that arrival
+-> xterm's next render, `total` first key -> that render; a batch with
+no output within 2 s counts in `n` only; at `pagehide` a batch still
+waiting counts with the stages already known (`rtt` `-1` without a reply). Numbers and short words; no
+keys, no output.
+The server writes one line, `[INFO] client_lat from <ip>: ...`
+(`[WARN]` when a pane's total p90 is over 300 ms or its worst total over
+1000 ms), sanitised like `client_diag`; a missing or unknown field is
+`-1`. Reply `{"ok": true}`; `400` not a JSON object (nothing logged),
+`413` too large, `429` more than 30 per IP in 10 minutes. With
+`WEBSH_ACCESS_LOG` set each report is an access-log record
+(`event: client_lat`, `result: ok|rate_limited`). A server without the
+action answers `404`; the page then stops sending reports until it is
+reloaded. A failed or rate-limited report is dropped, never retried.
+Through `api.php` it is an ordinary JSON action.
+
+The server also logs its own side every 5 minutes
+(`WEBSH_INPUT_LAT_INTERVAL` seconds), for each session that received
+input in that window: `[INFO] input_lat sid=<8> n=<batches> srv
+p50/p90/max=<ms> pty p50/p90/max=<ms> pty_n=<samples>` - `srv` is the
+`/api/input` handler to the PTY write, `pty` that write to the next PTY
+output within 2 s (target + ssh + tmux + the application; no browser or
+network). The page's interval can be shortened for tests with
+`window.WEBSH_LAT_INTERVAL_MS`, read when the script loads.
 
 ### POST /api/seal_open, POST /api/sealed?c= (sealed channel)
 See [Sealed channel](#sealed-channel) below.

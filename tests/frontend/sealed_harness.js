@@ -556,6 +556,9 @@ async function mkEnv(o) {
     store.websh_settings = JSON.stringify(s);
   }
   for (const [k, v] of Object.entries(store)) win.localStorage.setItem(k, v);
+  // A test's own fakes that must be in place before websh.js runs (a
+  // virtual clock, a Terminal that renders): o.beforeBoot(win, rec).
+  if (o.beforeBoot) o.beforeBoot(win, rec);
   win.eval(js + EXPOSE);
   await Promise.race([win.bootReady, sleep(2000)]);
   await sleep(20);

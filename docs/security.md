@@ -125,6 +125,7 @@ Other events:
 | `auth_failed` | The read loop saw ssh reject the credentials (or re-prompt) after the auto-typed password. Fields: `sid`, `target_host`, `target_user`. This — not `connect result=ok` — is the brute-force signal: every password attempt relayed through websh produces one. |
 | `upload`, `download` | One record per transfer with `path` and `bytes`; download `result` is `ok`, `partial` (known size not reached), `over_cap`, `timeout` or `client_gone`. |
 | `rm`, `mkdir`, `mv` | Every file-browser mutation, on both outcomes (`result` `ok`/`error`, plus `error`). These are keystroke-free, so they appear in neither the session recording nor the scrollback — the access log is their only audit surface. `mv` carries `name`. |
+| `client_lat` | A page's latency report (see [Latency reports](#latency-reports)): `result` `ok` or `rate_limited`; nothing else. |
 | `save` | Vault write, with `target_host` / `target_user` / `target_port` of the entry (so a re-bound or mass-created entry is visible). |
 
 Common `result` values on `disconnect` events:
@@ -206,7 +207,9 @@ action names, session ids, host / username / password / key /
 `vault_key`, keystrokes, terminal output, file names, paths, file
 contents, directory listings, tmux slot ids. `/api/config`,
 `/api/ping`, the page and its static files stay plain (they carry no
-session data); the `client_diag` beacon is not sent at all.
+session data); the `client_diag` beacon is not sent at all. The
+`client_lat` report travels sealed like any other call (and only over
+a channel already open); its `pagehide` copy is not sent.
 
 What it still sees: that a websh page was loaded (its files are
 plain), the timing and sizes of requests and replies (a keystroke is
@@ -352,3 +355,18 @@ sensitive:
   stops a runaway recording, not the session.
 
 Replay with `asciinema play <file>` or any asciicast v2 player.
+
+## Latency reports
+
+To find where typing gets slow, the page sends `POST ?action=client_lat`
+every 5 minutes (only if input was sent in that window) and the server
+logs `input_lat` per session (`docs/protocol.md`, "POST /api/client_lat").
+What they contain: per pane an 8-character session id prefix, the
+transport name, whether sealed mode is on, counts, and latency
+percentiles / maxima in milliseconds; for the page the window length and
+`visibilityState`. Never keystrokes, their number of characters, output,
+host names or user names. The server clamps numbers, accepts words only
+from `A-Za-z0-9_.-` (16 characters), at most 16 panes and 16 KB, and 30
+reports per IP per 10 minutes (`429` beyond). Through the sealed channel
+the report is encrypted like any call; its `pagehide` copy is not sent
+in sealed mode.
