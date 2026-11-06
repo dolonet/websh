@@ -35,9 +35,27 @@ around your web server's authentication. The socket is created with
 owner-only permissions, so only your account can connect to it — provided
 PHP runs as your account (suPHP, per-user PHP-FPM pools, LSAPI: the usual
 shared-hosting setup). Override the path with `WEBSH_SOCKET`: under 108
-bytes, in a directory that belongs to your account and that no one else
-can write to — never `/tmp`. Both `api.php` and `server.py` refuse a
-directory other users could plant a socket in.
+bytes after resolving symlinks, in a directory that belongs to your
+account and has no group or other-user write permission. Every resolved
+ancestor must belong to your account or root and have no group or
+other-user write permission, except root-owned sticky directories such
+as `/tmp`. A private account-owned subdirectory under `/tmp` is allowed;
+placing the socket directly in `/tmp` is not. Both `api.php` and
+`server.py` validate this chain and use the resolved path.
+
+PHP must be able to determine its worker's uid through `posix_geteuid()`
+or by creating a temporary file and reading its owner. The script's
+owner is not a substitute. If both methods are unavailable, the proxy
+refuses to forward requests. Enable the POSIX function or configure an
+accessible PHP temporary directory, including any `open_basedir` rules.
+
+The chain check also needs PHP to inspect every resolved ancestor,
+including `/`. An `open_basedir` policy that blocks that inspection
+prevents this PHP proxy from running. Moving `WEBSH_SOCKET` elsewhere
+inside the same restricted home directory does not solve it. Ask the
+host to permit the required checks, or use the
+[Python-only layout](#python-only-no-php) behind a reverse proxy on a
+machine you control.
 
 > **Path details:** `api.php` looks for `websh.json` two directories up from itself
 > (i.e. the site root, above `www/`). This works for most hosting providers.
@@ -65,15 +83,21 @@ WEBSH_CONFIG=/path/to/websh.json WEBSH_SOCKET=/path/to/websh.sock nohup python3 
 
 **Upgrading from a version that listened on a TCP port:**
 - The old backend keeps running on `127.0.0.1:8765` (or your
-  `WEBSH_PORT`), reachable by anyone on the server, until it is stopped:
-  `pkill -f server.py` (the next request starts the new one), or ask your
-  host to restart your processes.
+  `WEBSH_PORT`), reachable by anyone on the server, until it is stopped.
+  Identify the process belonging to this deployment by its full script
+  path and listening port, then stop only that PID with `kill <PID>`.
+  The next request starts the new backend. If you cannot identify it
+  safely, ask your host to stop that deployment's process. Do not stop
+  other applications that happen to have a file named `server.py`.
 
 **An error about the backend socket or its directory:**
 - The directory holding `websh.sock` (by default the one with `websh.json`)
-  must belong to your account and be writable by it alone; with
-  `open_basedir`, it must also be inside the allowed paths. Otherwise point
-  `WEBSH_SOCKET` at such a directory.
+  must belong to your account and have no group or other-user write
+  permission. Its resolved ancestors must also satisfy the checks above.
+  PHP must be able to inspect the full chain, including `/`; see the
+  `open_basedir` limitation above. A different `WEBSH_SOCKET` helps only
+  when the selected path itself is unsafe, not when ancestor inspection
+  is prohibited by the host.
 - A stale `websh.sock` left by a crashed backend is replaced automatically;
   a regular file at that path is not — remove it.
 

@@ -9,6 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+python3 tests/php/test_socket_security.py
+
 # Private temp dir for the backend sockets; kernel-assigned ports for
 # php -S, so parallel CI jobs / dev boxes can't collide.
 WORK=$(mktemp -d)
@@ -21,15 +23,21 @@ PHP_PID=
 AUTO_PID=
 PLANTED_PID=
 SHARED_PID=
+BACKEND_PID_FILE=$WORK/backend.pid
 cleanup() {
   kill $STUB_PID $PHP_PID $AUTO_PID $PLANTED_PID $SHARED_PID 2>/dev/null || true
-  # The backend api.php auto-starts in step 8 runs from its own copy;
-  # give its SIGTERM shutdown a moment before removing the tree.
-  pkill -f "$WORK/site/www/console/server.py" 2>/dev/null || true
-  for i in $(seq 1 50); do
-    pgrep -f "$WORK/site/www/console/server.py" >/dev/null || break
-    sleep 0.1
-  done
+  # The private launcher records the exact PID before exec, including
+  # when auto-start fails before its first response. Never kill by pattern.
+  if [ -s "$BACKEND_PID_FILE" ]; then
+    backend_pid=$(cat "$BACKEND_PID_FILE")
+    if [[ "$backend_pid" =~ ^[0-9]+$ ]]; then
+      kill "$backend_pid" 2>/dev/null || true
+      for i in $(seq 1 50); do
+        kill -0 "$backend_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -131,10 +139,20 @@ json_ok stream "$r"
 #    the documented layout), owner-only, and the backend opens no TCP
 #    port.
 mkdir -p "$WORK/site/www/console"
-cp api.php server.py "$WORK/site/www/console/"
+cp api.php "$WORK/site/www/console/"
+cp server.py "$WORK/site/www/console/backend.py"
 echo '{}' > "$WORK/site/websh.json"
+cat > "$WORK/site/www/console/server.py" <<'LAUNCHER'
+import os
+from pathlib import Path
+import runpy
+
+Path(os.environ['WEBSH_SMOKE_PIDFILE']).write_text(str(os.getpid()))
+runpy.run_path(str(Path(__file__).with_name('backend.py')), run_name='__main__')
+LAUNCHER
 AUTO_PORT=$(free_port)
-env -u WEBSH_SOCKET -u WEBSH_CONFIG php -d display_errors=1 -d error_reporting=-1 \
+env -u WEBSH_SOCKET -u WEBSH_CONFIG WEBSH_SMOKE_PIDFILE="$BACKEND_PID_FILE" \
+  php -d display_errors=1 -d error_reporting=-1 \
   -d output_buffering=0 -S 127.0.0.1:$AUTO_PORT -t "$WORK/site/www" >/dev/null 2>&1 &
 AUTO_PID=$!
 r=
@@ -148,12 +166,33 @@ json_ok "auto-start ping" "$r"
 [ -S "$WORK/site/websh.sock" ] || fail "no socket next to websh.json" "$(ls -la "$WORK/site")"
 mode=$(stat -c %a "$WORK/site/websh.sock")
 [ "$mode" = "600" ] || fail "backend socket is not owner-only" "$mode"
-pid=$(pgrep -f "$WORK/site/www/console/server.py" | head -1)
-[ -n "$pid" ] || fail "auto-started server.py not found" "$(ps aux | grep server.py)"
+pid=$(cat "$BACKEND_PID_FILE")
+[[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+  || fail "auto-started server.py not found" "no live recorded PID"
 # exec() hands php -S's own listening socket down to the child; any
 # other listener is one server.py opened.
-command -v ss >/dev/null || fail "ss is needed for the TCP-listener check" ""
-own_tcp=$(ss -Hltnp 2>/dev/null | grep "pid=$pid," | grep -v "127.0.0.1:$AUTO_PORT " || true)
+own_tcp=$(python3 - "$pid" "$AUTO_PORT" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+pid, php_port = sys.argv[1], int(sys.argv[2])
+inodes = set()
+for fd in Path('/proc', pid, 'fd').iterdir():
+    try:
+        target = os.readlink(fd)
+    except FileNotFoundError:
+        continue
+    if target.startswith('socket:['):
+        inodes.add(target[8:-1])
+for protocol in ('tcp', 'tcp6'):
+    for line in Path('/proc/net', protocol).read_text().splitlines()[1:]:
+        fields = line.split()
+        if fields[3] == '0A' and fields[9] in inodes:
+            if int(fields[1].split(':')[1], 16) != php_port:
+                print(protocol, fields[1])
+PY
+)
 [ -z "$own_tcp" ] || fail "auto-started backend listens on TCP" "$own_tcp"
 
 # 9. A socket path in a directory other users can write is refused
@@ -174,6 +213,8 @@ for i in $(seq 1 50); do
   sleep 0.1
 done
 kill $PLANTED_PID $SHARED_PID 2>/dev/null || true
+PLANTED_PID=
+SHARED_PID=
 [ "$code" = "500" ] || fail "socket in a shared dir was used" "$code $(cat "$UNKNOWN_OUT")"
 grep -q 'writable only by it' "$UNKNOWN_OUT" || fail "shared-dir refusal reason" "$(cat "$UNKNOWN_OUT")"
 json_ok "shared-dir refusal" "$(cat "$UNKNOWN_OUT")"

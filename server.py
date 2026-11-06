@@ -4630,7 +4630,7 @@ class UnixServer(Server):
     _sock_ino = None
 
     def server_bind(self):
-        _check_socket_dir(self.server_address)
+        self.server_address = _check_socket_dir(self.server_address)
         _clear_stale_socket(self.server_address)
         # umask instead of a chmod after bind(): no window where the
         # socket exists with looser permissions.
@@ -4655,15 +4655,33 @@ class UnixServer(Server):
 
 
 def _check_socket_dir(path):
-    """Refuse a socket directory other users can create files in: a
-    co-tenant could plant a socket there before we bind, and api.php
-    would hand it what users type."""
-    d = os.path.dirname(os.path.abspath(path))
+    """Validate the resolved directory chain and return the path to use.
+
+    A private leaf in a renameable ancestor can be swapped just like a
+    writable leaf. Resolve aliases once and bind the returned path, so
+    an alias in an untrusted directory cannot redirect the later bind.
+    """
+    d = os.path.realpath(os.path.dirname(path) or os.curdir)
+    resolved = os.path.join(d, os.path.basename(path))
+    if len(os.fsencode(resolved)) > 107:
+        raise OSError(errno.ENAMETOOLONG, "WEBSH_SOCKET path is too long")
+    uid = os.geteuid()
     st = os.stat(d)
-    if (st.st_uid != os.geteuid() or st.st_mode & stat.S_IWOTH
-            or (st.st_mode & stat.S_IWGRP and st.st_gid != os.getegid())):
+    if st.st_uid != uid or st.st_mode & 0o022:
         raise OSError(errno.EPERM, "WEBSH_SOCKET directory {} must belong to "
                       "this user and be writable only by it".format(d))
+    current = d
+    while True:
+        st = os.stat(current)
+        sticky_root = st.st_uid == 0 and st.st_mode & stat.S_ISVTX
+        if st.st_uid not in (0, uid) or (st.st_mode & 0o022 and not sticky_root):
+            raise OSError(errno.EPERM, "WEBSH_SOCKET ancestor directory {} "
+                          "is not protected from other users".format(current))
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return resolved
 
 
 def _clear_stale_socket(path):
@@ -4675,6 +4693,8 @@ def _clear_stale_socket(path):
     except FileNotFoundError:
         return
     if stat.S_ISSOCK(st.st_mode):
+        if st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, "WEBSH_SOCKET belongs to another user")
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # A full backlog (wedged backend) blocks connect(); count it as
         # in use rather than hang every auto-start attempt.
@@ -4682,8 +4702,13 @@ def _clear_stale_socket(path):
         try:
             probe.connect(path)
         except ConnectionRefusedError:
-            os.unlink(path)
-            return
+            # Another starter may have replaced the stale file while
+            # our probe ran. Never unlink its newly bound socket.
+            now = os.lstat(path)
+            if (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+                os.unlink(path)
+                return
+            raise OSError(errno.EADDRINUSE, "WEBSH_SOCKET changed during startup")
         except OSError:
             pass
         finally:

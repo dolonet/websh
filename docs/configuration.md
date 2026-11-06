@@ -33,7 +33,7 @@ trust.
 |---|---|---|
 | `PORT` | `8765` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address |
-| `WEBSH_SOCKET` | *(unset)* | Listen on this Unix socket path instead of `HOST`:`PORT`. The socket is created `0600`, so only the websh user can connect; clients on it are trusted like `TRUSTED_PROXIES`. Its directory must belong to the websh user and not be writable by others (no `/tmp`). The PHP proxy always uses one (default `websh.sock` next to `websh.json`) — see [`deployment.md`](deployment.md#shared-hosting-php--python). |
+| `WEBSH_SOCKET` | *(unset)* | Listen on this Unix socket path instead of `HOST`:`PORT`. The socket is created `0600`, so only the websh user can connect; clients on it are trusted like `TRUSTED_PROXIES`. The resolved parent must belong to that user and have no group or other-user write permission. Every resolved ancestor must belong to that user or root and have no such write permission, except root-owned sticky ancestors such as `/tmp`. The PHP proxy always uses a socket (default `websh.sock` next to `websh.json`); see [`deployment.md`](deployment.md#shared-hosting-php--python). |
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |

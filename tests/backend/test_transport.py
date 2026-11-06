@@ -2225,6 +2225,42 @@ class TestUnixSocketServer(unittest.TestCase):
             server.UnixServer(self.path, server.Handler)
         self.assertFalse(os.path.exists(self.path))
 
+    def _assert_path_refused(self):
+        # Close an unexpectedly accepted server without starting a thread.
+        # This keeps the failing regression from leaking its socket.
+        try:
+            unexpected = server.UnixServer(self.path, server.Handler)
+        except OSError:
+            self.assertFalse(os.path.exists(self.path))
+        else:
+            unexpected.server_close()
+            self.fail("unsafe socket directory was accepted")
+
+    def test_same_group_writable_directory_is_refused(self):
+        os.chmod(self.tmpdir, 0o770)
+        self.assertEqual(os.stat(self.tmpdir).st_gid, os.getegid())
+        self._assert_path_refused()
+
+    def test_private_leaf_under_writable_ancestor_is_refused(self):
+        child = os.path.join(self.tmpdir, "private")
+        os.mkdir(child, 0o700)
+        self.path = os.path.join(child, "websh.sock")
+        for mode in (0o770, 0o777):
+            with self.subTest(ancestor_mode=oct(mode)):
+                os.chmod(self.tmpdir, mode)
+                self._assert_path_refused()
+
+    def test_symlink_target_with_writable_ancestor_is_refused(self):
+        shared = os.path.join(self.tmpdir, "shared")
+        child = os.path.join(shared, "private")
+        os.mkdir(shared, 0o700)
+        os.mkdir(child, 0o700)
+        os.chmod(shared, 0o777)
+        alias = os.path.join(self.tmpdir, "alias")
+        os.symlink(child, alias)
+        self.path = os.path.join(alias, "websh.sock")
+        self._assert_path_refused()
+
     def test_non_socket_file_is_left_alone(self):
         with open(self.path, "w") as f:
             f.write("keep me")

@@ -51,6 +51,14 @@ $WEBSH_CONFIG = getenv('WEBSH_CONFIG') ?: dirname(__FILE__) . '/../../websh.json
 // account can connect to it or create it there.
 $config_dir = @realpath(dirname($WEBSH_CONFIG)) ?: dirname($WEBSH_CONFIG);
 $WEBSH_SOCKET = trim((string) getenv('WEBSH_SOCKET')) ?: $config_dir . '/websh.sock';
+// Resolve and USE the same directory we validate. Keeping an original
+// symlink alias would let its owner retarget curl after the check.
+$socket_dir = @realpath(dirname($WEBSH_SOCKET));
+if ($socket_dir === false) {
+    config_error('cannot resolve the backend socket directory (open_basedir?); '
+        . 'set WEBSH_SOCKET to an accessible directory this account owns');
+}
+$WEBSH_SOCKET = $socket_dir . '/' . basename($WEBSH_SOCKET);
 // sun_path holds 107 bytes; past that bind() and connect() just fail.
 if (strlen($WEBSH_SOCKET) > 107) {
     config_error('backend socket path is too long; set WEBSH_SOCKET to a '
@@ -142,25 +150,59 @@ function config_error($msg) {
 
 // A socket path other accounts can create files at is a trap: a
 // co-tenant plants a socket there first and receives what users type.
-// So the directory must belong to this account and be closed to other
-// users' writes, and an existing socket must be ours. Returns the
-// problem, or '' when the path is safe.
+// Check the whole resolved chain: a private leaf inside a renameable
+// ancestor is still unsafe. Root-owned sticky ancestors such as /tmp
+// protect the next account-owned entry, but the leaf itself must never
+// be writable by a group or other users.
+function process_uid() {
+    if (function_exists('posix_geteuid')) return posix_geteuid();
+    // getmyuid() is the SCRIPT owner's uid, not the PHP worker's uid.
+    // The kernel stamps a newly created file with the worker's owner.
+    // fstat uses our open handle, so replacing its pathname cannot fool
+    // this fallback. Core PHP needs no optional POSIX extension here.
+    $probe = @tmpfile();
+    if ($probe === false) return false;
+    $info = @fstat($probe);
+    fclose($probe);
+    return is_array($info) && isset($info['uid']) ? $info['uid'] : false;
+}
+
+// Returns the problem, or '' when the path is safe.
 function socket_path_problem($socket) {
-    $uid = function_exists('posix_geteuid') ? posix_geteuid() : getmyuid();
-    $gid = function_exists('posix_getegid') ? posix_getegid() : getmygid();
-    $dir = @stat(dirname($socket));
+    $uid = process_uid();
+    if ($uid === false) {
+        return 'cannot determine the PHP worker uid; enable posix_geteuid '
+            . 'or allow PHP to create a temporary file';
+    }
+    $directory = @realpath(dirname($socket));
+    $dir = $directory === false ? false : @stat($directory);
     if (!$dir) {
         return 'cannot access the backend socket directory (open_basedir?); '
             . 'set WEBSH_SOCKET to a path in a directory this account owns';
     }
-    if ($dir['uid'] !== $uid || ($dir['mode'] & 0002)
-            || (($dir['mode'] & 0020) && $dir['gid'] !== $gid)) {
+    if ($dir['uid'] !== $uid || ($dir['mode'] & 0022)) {
         return 'the backend socket directory must belong to this account '
             . 'and be writable only by it; set WEBSH_SOCKET';
     }
-    $owner = @fileowner($socket);
-    if ($owner !== false && $owner !== $uid) {
-        return 'the backend socket belongs to another user';
+    for ($current = $directory; ; $current = dirname($current)) {
+        $info = @stat($current);
+        if (!$info || ($info['uid'] !== 0 && $info['uid'] !== $uid)
+                || (($info['mode'] & 0022)
+                    && !($info['uid'] === 0 && ($info['mode'] & 01000)))) {
+            return 'the backend socket directory has an unsafe ancestor; '
+                . 'use a path owned by this account or root, without group '
+                . 'or other-user writes (root-owned sticky ancestors are allowed)';
+        }
+        if (dirname($current) === $current) break;
+    }
+    $node = @lstat($socket);
+    if ($node !== false) {
+        if (($node['mode'] & 0170000) !== 0140000) {
+            return 'the backend socket path exists and is not a socket';
+        }
+        if ($node['uid'] !== $uid) {
+            return 'the backend socket belongs to another user';
+        }
     }
     return '';
 }
