@@ -7632,14 +7632,22 @@ function sendUploadPiece(p, u, file, offset) {
   let clearWatchdog = () => { if (watchdog !== null) { clearTimeout(watchdog); watchdog = null; } };
   let armWatchdog = () => {
     clearWatchdog();
-    watchdog = setTimeout(() => {
+    let deadline = Date.now() + stallMs;
+    let expire = () => {
       if (!u || u.cancelled || p.upload !== u) return;
+      // Timer/clock rounding can run this callback a millisecond early.
+      // Wait only the remaining time: treating that as a failed attempt
+      // would retry before the shared budget expires, then grant a new
+      // whole stall interval. Genuine byte progress alone re-arms it.
+      let remaining = deadline - Date.now();
+      if (remaining > 0) { watchdog = setTimeout(expire, remaining); return; }
       watchdog = null;
       xhr.onload = xhr.onerror = xhr.ontimeout = null;   // the abort must not re-enter
       try { xhr.abort(); } catch (e) {}
       u.xhr = null;
       retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true, true);
-    }, stallMs);
+    };
+    watchdog = setTimeout(expire, stallMs);
   };
 
   // Re-arm the stall watchdog only on a real ADVANCE of the byte count,

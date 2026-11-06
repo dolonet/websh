@@ -331,6 +331,91 @@ test('upload text: a stalled binary piece never switches to text, and fails with
   cleanup(e);
 });
 
+// Public clocks and timers, controlled independently of upload internals.
+// One timeout may run a millisecond early, matching the CI rounding race.
+function uploadClock(win, earlyDelay) {
+  let now = 0, nextId = -1, early = false;
+  const start = Date.now(), timers = new Map();
+  const oldNow = win.Date.now, oldPerf = win.performance.now;
+  const oldSet = win.setTimeout, oldClear = win.clearTimeout;
+  win.Date.now = () => start + now;
+  win.performance.now = () => now;
+  win.setTimeout = (fn, delay, ...args) => {
+    const id = nextId--;
+    let due = now + Math.max(0, Number(delay) || 0);
+    if (!early && Number(delay) === earlyDelay) { early = true; due--; }
+    timers.set(id, {due, fn, args}); return id;
+  };
+  win.clearTimeout = id => { if (!timers.delete(id)) oldClear.call(win, id); };
+  return {
+    get early() { return early; },
+    advance: async end => {
+      for (let steps = 0; steps < 1000; steps++) {
+        const next = [...timers].filter(([, t]) => t.due <= end).sort((a,b) => a[1].due - b[1].due)[0];
+        if (!next) { now = end; await sleep(0); return; }
+        timers.delete(next[0]); now = next[1].due;
+        next[1].fn(...next[1].args); await sleep(0);
+      }
+      throw new Error('private timer queue did not settle');
+    },
+    restore() {
+      timers.clear(); win.Date.now = oldNow; win.performance.now = oldPerf;
+      win.setTimeout = oldSet; win.clearTimeout = oldClear;
+    },
+  };
+}
+
+for (const text of [false, true]) {
+  test('upload deadline: ' + (text ? 'text' : 'binary') + ' early timer cannot grant a second full stall budget', async () => {
+    const e = await budgetEnv({storage: text ? {[MARK]: String(Date.now())} : {}});
+    const {win, srv} = e; const p = pane(e);
+    srv.stallBinary = true; srv.stallText = true;
+    const clock = uploadClock(win, BUDGET);
+    try {
+      win.handleUpload(p.id, {files: [new win.File([randomBytes(2 * MiB)], 'deadline.bin')], value: ''});
+      ok(await until(() => uploadReqs(srv).length === 1, 1000), 'one stalled upload was submitted');
+      await clock.advance(BUDGET + 5);
+      ok(clock.early, 'the first full-budget timeout was delivered one millisecond early');
+      ok(/Upload failed/.test(bannerOf(p)), 'failure by the original deadline, not a second budget; banner=' + JSON.stringify(bannerOf(p)) + ', requests=' + uploadReqs(srv).length);
+      ok(!uploadReqs(srv).some(x => x.text !== text), 'no wire-mode switch on a stall');
+      await clock.advance(2 * BUDGET + 10);
+      ok(/Upload failed/.test(bannerOf(p)), 'the stalled upload terminates visibly');
+    } finally {
+      if (p.upload) win.cancelUpload(p.id);
+      clock.restore(); cleanup(e);
+    }
+  });
+
+  test('upload deadline: ' + (text ? 'text' : 'binary') + ' genuine progress keeps a slow upload alive', async () => {
+    const e = await budgetEnv({storage: text ? {[MARK]: String(Date.now())} : {}});
+    const {win, srv} = e; const p = pane(e);
+    const clock = uploadClock(win);
+    let active;
+    srv.xhrCut = xhr => { active = xhr; return false; };
+    srv.hooks.upload = req => new Promise(resolve => {
+      let count = 0;
+      const tick = () => {
+        count++;
+        if (active.upload.onprogress) active.upload.onprogress({loaded: Math.floor(req.body.length * count / 6), total: req.body.length, lengthComputable: true});
+        if (count === 6) resolve(undefined);
+        else win.setTimeout(tick, BUDGET / 2);
+      };
+      win.setTimeout(tick, BUDGET / 2);
+    });
+    const data = randomBytes(64 * KiB);
+    try {
+      win.handleUpload(p.id, {files: [new win.File([data], 'slow.bin')], value: ''});
+      ok(await until(() => uploadReqs(srv).length === 1, 1000), 'one slow upload started');
+      await clock.advance(4 * BUDGET);
+      ok(/Saved to|Upload complete|Uploaded/i.test(bannerOf(p)), 'progress throughout three budgets completes successfully: ' + bannerOf(p));
+      ok(uploadReqs(srv).length === 1 && same(landed(srv, 'slow.bin'), data), 'one attempt, exact final bytes');
+    } finally {
+      if (p.upload) win.cancelUpload(p.id);
+      clock.restore(); cleanup(e);
+    }
+  });
+}
+
 test('upload text: blocked binary, then text stalls too - fails at the first text stall, nothing retried after it', async () => {
   const e = await budgetEnv(); const {win, srv} = e;
   srv.blockBinary = true;

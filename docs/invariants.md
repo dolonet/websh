@@ -115,7 +115,12 @@ blocked or cut short — a proxy or firewall on this network is likely
 limiting uploads; a smaller file may still go through"). A genuinely
 final reply (413, invalid path) still stops at once with its own
 message, never the proxy text; a slow-but-progressing upload is never
-killed by the wall-clock cap (onprogress re-arms it).
+killed by the wall-clock cap (onprogress re-arms it). A timeout delivered
+one millisecond before the clock deadline must not grant a second whole
+stall budget. CI caught a 1500 ms bound taking 3009 ms because the early
+callback retried and started a fresh full watchdog. The deterministic
+`upload deadline: …` guards cover binary/text early callbacks and genuine
+progress over three budgets without duplicating or losing file bytes.
 Where binary itself is blocked (an HTTPS-intercepting security product
 on the user's machine answers application/octet-stream POSTs itself),
 the upload does not give up: a non-websh reply, or cuts at the floor,
