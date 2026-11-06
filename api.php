@@ -461,7 +461,16 @@ function proxy_stream($url) {
     // pool exhausts. The browser's EventSource auto-reconnects on EOF so
     // a long-lived session reconnects through the timeout boundary.
     curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array('Accept: text/event-stream')));
+    // EventSource's automatic reconnect carries the id of the last event
+    // it received in Last-Event-ID; the backend resumes output from that
+    // cursor. The shim forwards no other browser headers, so pass this
+    // one through explicitly (digits only).
+    $extra = array('Accept: text/event-stream');
+    if (isset($_SERVER['HTTP_LAST_EVENT_ID']) && is_string($_SERVER['HTTP_LAST_EVENT_ID'])
+            && preg_match('/^[0-9]{1,20}$/D', $_SERVER['HTTP_LAST_EVENT_ID'])) {
+        $extra[] = 'Last-Event-ID: ' . $_SERVER['HTTP_LAST_EVENT_ID'];
+    }
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers($extra));
     curl_setopt($ch, CURLOPT_HEADERFUNCTION,
         function ($ch, $header) use (&$sent_headers) {
             $len = strlen($header);

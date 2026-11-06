@@ -10,6 +10,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -25,6 +26,19 @@ import uuid
 from tests.backend._base import (  # noqa: F401
     REPO_ROOT, LiveServerCase, _FakeNotifyMixin)
 import server
+
+
+def _unwrap(remote):
+    """The snippet inside `exec sh -c '<snippet>'` (see _mux_argv)."""
+    import shlex
+    parts = shlex.split(remote)
+    if parts[:3] == ["exec", "sh", "-c"] and len(parts) == 4:
+        return parts[3]
+    return remote
+
+
+def _remote(argv):
+    return _unwrap(argv[-1])
 
 
 def _pipe_stdout(*chunks):
@@ -541,7 +555,7 @@ class TestPushTmuxOptions(unittest.TestCase):
             # lines must end up chained into a *single* tmux invocation
             # via tmux's own `\;` separator — one ssh roundtrip, one
             # tmux server fork on the target, atomic application.
-            remote = cmd[-1]
+            remote = _remote(cmd)
             self.assertEqual(
                 remote,
                 "tmux set -g mouse on \\; set -g set-clipboard off "
@@ -607,7 +621,7 @@ class TestPushTmuxOptions(unittest.TestCase):
                 s.push_tmux_options([("mouse", "on")])
             # Single option case: no chaining, just one set-g.
             self.assertEqual(
-                calls[0][-1], "/usr/local/bin/tmux set -g mouse on")
+                _remote(calls[0]), "/usr/local/bin/tmux set -g mouse on")
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1032,10 +1046,11 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = True
             slot_id = "ok"
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 captured["tmp"] = tmp
                 captured["final"] = final
-                return True, "/home/alice/work/" + final
+                captured["dir"] = dest_dir
+                return True, (dest_dir or "/home/alice/work") + "/" + final
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
         try:
@@ -1047,9 +1062,154 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             self.assertEqual(body["path"], "/home/alice/work/report.csv")
             self.assertEqual(captured["tmp"], ".websh-tmp-x")
             self.assertEqual(captured["final"], "report.csv")
+            # No "dir" in the body: the pane's own cwd decides, as before.
+            self.assertIsNone(captured["dir"])
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
+
+    def test_finalize_accepts_a_destination_directory(self):
+        # The directory the file browser is showing. Naming it means tmux
+        # is no longer needed to know where the file goes, so this works
+        # for a non-persistent pane too.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "host.example"
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                captured["dir"] = dest_dir
+                return True, dest_dir + "/" + final
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-y",
+                "final": "a.txt", "dir": "/srv/www/uploads"})
+            self.assertEqual(code, 200)
+            self.assertEqual(captured["dir"], "/srv/www/uploads")
+            self.assertEqual(body["path"], "/srv/www/uploads/a.txt")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_undecodable_names_are_refused_not_misreported(self):
+        # A non-UTF-8 name is listed with U+FFFD and can never name its
+        # file again: rm found nothing and answered "already gone".
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "h"
+            def remove_path(self, p): raise AssertionError("must not run")
+            def rename_entry(self, p, n): raise AssertionError("must not run")
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            for path, body in (("/api/rm", {"path": "/srv/caf\ufffd.txt"}),
+                               ("/api/mv", {"path": "/srv/caf\ufffd.txt", "name": "x"})):
+                resp, code = self._post(path, dict(body, session_id=sid))
+                self.assertEqual(code, 400, path)
+                self.assertEqual(resp.get("code"), "undecodable_name", path)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_accepts_the_root_directory(self):
+        # rm/mkdir/mv refuse a bare "/" because there it can only be a
+        # bug; for an upload it is where root's files go, and the browser
+        # can show it. The shared validator was the wrong rule here.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "host.example"
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                captured["dir"] = dest_dir
+                return True, "/" + final
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-r",
+                "final": "a.txt", "dir": "/"})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(captured["dir"], "/")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_non_string_session_id_is_a_404_not_a_500(self):
+        # re.match raised TypeError on a list/dict/int, which the dispatch
+        # backstop turned into a 500 and an ERROR log line - for every
+        # endpoint that names a session. Cheap log spam, wrong status.
+        for sid in (["x"], {"a": 1}, 7, None):
+            for path, extra in (("/api/input", {"data": "x"}),
+                                ("/api/rm", {"path": "/tmp/x"}),
+                                ("/api/upload_finalize", {"tmp": "t", "final": "f"}),
+                                ("/api/upload_cancel", {"tmp": "t"})):
+                body = dict(extra, session_id=sid)
+                _, code = self._post(path, body)
+                self.assertEqual(code, 404, "%s sid=%r -> %s" % (path, sid, code))
+            # Disconnect is idempotent: "not an id" is answered like
+            # "already gone", never as a 500.
+            body, code = self._post("/api/disconnect", {"session_id": sid})
+            self.assertEqual((code, body.get("ok")), (200, True), repr(sid))
+
+    def test_finalize_rejects_an_unusable_destination(self):
+        # Relative, empty, NUL-bearing or non-string: a client bug, not a
+        # request to silently fall back to the pane's cwd.
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            last_activity = 0
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                raise AssertionError("must not reach the session")
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            for bad in ("relative/dir", "", "/bad\x00dir", 7, ["/tmp"],
+                        "/" + "x" * 5000):
+                body, code = self._post("/api/upload_finalize", {
+                    "session_id": sid, "tmp": "x", "final": "f", "dir": bad})
+                self.assertEqual(code, 400, "dir=%r should reject" % (bad,))
+                self.assertEqual(body["error"], "invalid dir")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_failure_status_matches_the_reason(self):
+        # A missing or read-only destination is the user's mistake, not a
+        # bad gateway: 502 across the board made the client show
+        # "the host refused the transfer" for a typo in a path.
+        for reason, want in (("no such file or directory", 404),
+                             ("Permission denied", 403),
+                             ("Read-only file system", 403)):
+            sid = str(uuid.uuid4())
+            class FakeSession:
+                persistent = True
+                slot_id = "ok"
+                last_activity = 0
+                _host = "host.example"
+                def finalize_upload(self, tmp, final, dest_dir=None, _r=reason):
+                    return False, _r
+            with server.sessions_lock:
+                server.sessions[sid] = FakeSession()
+            try:
+                body, code = self._post("/api/upload_finalize", {
+                    "session_id": sid, "tmp": "x", "final": "f",
+                    "dir": "/srv/nope"})
+                self.assertEqual(code, want, reason)
+                self.assertEqual(body["error"], reason)
+            finally:
+                with server.sessions_lock:
+                    server.sessions.pop(sid, None)
 
     def test_finalize_non_persistent_returns_200_with_flag(self):
         # The client uses non_persistent: true to know it should fall
@@ -1060,7 +1220,7 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = False
             slot_id = None
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 return False, "non-persistent"
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -1080,7 +1240,7 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = True
             slot_id = "ok"
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 return False, "finalize exit 1: mv refused"
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -1509,7 +1669,7 @@ class TestListDirPaneCwd(unittest.TestCase):
         self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
         # An inherited $D from the remote profile must not survive to
         # become the start directory.
-        self.assertTrue(cmd.startswith("D=; "), "cmd=" + cmd[:60])
+        self.assertTrue(_unwrap(cmd).startswith("D=; "), "cmd=" + cmd[:60])
 
     def test_default_still_resolves_the_requested_path(self):
         s = self._session()
@@ -1986,6 +2146,41 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         self.assertLess(time.time() - t0, 8)
         self.assertTrue(fake_proc.kill.called)
         self.assertTrue(fake_proc.wait.called)
+
+    def test_file_that_grows_after_stat_is_cut_at_the_declared_length(self):
+        # Bytes past Content-Length would be read by the client as the
+        # start of the NEXT response on a kept-alive connection.
+        import socket as _s
+        sid = str(uuid.uuid4())
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout = _pipe_stdout(b"OK\t4\n", b"abcdEXTRA-BYTES")
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            c = _s.create_connection(("127.0.0.1", self.port), timeout=5)
+            path = "/api/download?session_id={}&path=/tmp/log".format(sid)
+            c.sendall(("GET %s HTTP/1.1\r\nHost: x\r\n\r\n" % path).encode())
+            raw = b""
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    d = c.recv(65536)
+                except _s.timeout:
+                    break
+                if not d:
+                    break
+                raw += d
+                if b"\r\n\r\n" in raw and len(raw.split(b"\r\n\r\n", 1)[1]) >= 4:
+                    time.sleep(0.3)          # anything extra would arrive now
+                    c.setblocking(False)
+                    try:
+                        raw += c.recv(65536)
+                    except (BlockingIOError, OSError):
+                        pass
+                    break
+            c.close()
+        body = raw.split(b"\r\n\r\n", 1)[1]
+        self.assertEqual(body, b"abcd")
 
     def test_successful_download_streams_binary(self):
         from urllib.request import urlopen
@@ -2501,6 +2696,176 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
             self.assertIn("ermission denied", err, sh)
             self.assertEqual(server._side_channel_status(err), 403)
             shutil.rmtree(d)
+
+    def test_listing_survives_a_login_shell_that_fails_on_unmatched_globs(self):
+        """sshd runs the side-channel command in the user's LOGIN shell.
+        Under zsh's default NOMATCH, `for f in * .[!.]* ..?*` aborted with
+        "no matches found: ..?*" whenever a pattern matched nothing, so a
+        zsh user's browser could list nothing at all. bash's failglob is
+        the same rule; run the real argv's command string under it, the
+        way sshd would (no zsh needed on the test host)."""
+        if not shutil.which("bash"):
+            self.skipTest("needs bash")
+        d = os.path.join(self.tmp, "plain")
+        os.makedirs(d)
+        open(os.path.join(d, "a.txt"), "w").close()   # no dotfiles: ..?* can't match
+        s = self._session("dash" if "dash" in self.SHELLS else self.SHELLS[0])
+        login = ["bash", "-O", "failglob", "-c"]
+        # Replace the ssh transport: take the remote command exactly as
+        # _mux_argv builds it and hand it to the "login shell".
+        def run(remote_cmd, timeout, msg, err_prefix=None):
+            argv = s._mux_argv(remote_cmd)
+            return subprocess.run(login + [argv[-1]], capture_output=True,
+                                  timeout=timeout), None
+        s._mux_run = run
+        entries, path, err = s.list_dir(d)
+        self.assertIsNone(err)
+        self.assertEqual([e["name"] for e in entries], ["a.txt"])
+        # Proof the rule bites without the wrapper:
+        raw = subprocess.run(login + ["cd " + shlex.quote(d) +
+                                      " && for f in * .[!.]* ..?*; do :; done"],
+                             capture_output=True)
+        self.assertNotEqual(raw.returncode, 0)
+
+    def test_download_of_a_symlink_announces_the_target_size(self):
+        """`[ -f ]` follows the link but plain stat measured the LINK:
+        Content-Length was the length of the link text while cat streamed
+        the whole target - the browser saved a truncated file and said
+        "Download complete"."""
+        target = os.path.join(self.tmp, "big.bin")
+        with open(target, "wb") as f:
+            f.write(b"x" * 100000)
+        link = os.path.join(self.tmp, "l")
+        os.symlink(target, link)
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            argv0 = ["busybox", "sh", "-c"] if sh == "busybox" else [sh, "-c"]
+            s._mux_argv = lambda cmd, a=argv0: a + [cmd]
+            proc, err = s.download_file(link)
+            self.assertIsNone(err, sh)
+            out, _ = proc.communicate(timeout=10)
+            header, _, body = out.partition(b"\n")
+            self.assertEqual(header, b"OK\t100000", (sh, header))
+            self.assertEqual(len(body), 100000, sh)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_delete_behind_an_unsearchable_directory_is_not_already_gone(self):
+        # `[ -e ]` and `[ -L ]` are both false when stat fails with
+        # EACCES too; that was reported as {ok, already_gone} - an
+        # "Already deleted" toast for a file still on disk.
+        for sh in self.SHELLS:
+            d = os.path.join(self.tmp, "locked")
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "keep.txt"), "w").close()
+            os.chmod(d, 0o600)                    # readable, not searchable
+            try:
+                ok, err = self._session(sh).remove_path(os.path.join(d, "keep.txt"))
+            finally:
+                os.chmod(d, 0o755)
+            self.assertFalse(ok, sh)
+            self.assertIn("permission", err, sh)
+            self.assertTrue(os.path.exists(os.path.join(d, "keep.txt")), sh)
+            shutil.rmtree(d)
+        # A genuinely missing entry is still "already gone".
+        ok, err = self._session(self.SHELLS[0]).remove_path(
+            os.path.join(self.tmp, "never-was"))
+        self.assertEqual((ok, err), (True, "already gone"))
+
+    def test_procfs_file_is_streamed_without_a_zero_length(self):
+        # /proc files stat as 0 bytes but have content: "OK\t0" made the
+        # browser save an empty /proc/cpuinfo as "Download complete".
+        if not os.path.exists("/proc/cpuinfo"):
+            self.skipTest("needs procfs")
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            argv0 = ["busybox", "sh", "-c"] if sh == "busybox" else [sh, "-c"]
+            s._mux_argv = lambda cmd, a=argv0: a + [cmd]
+            proc, err = s.download_file("/proc/cpuinfo")
+            self.assertIsNone(err, sh)
+            out, _ = proc.communicate(timeout=10)
+            header, _, body = out.partition(b"\n")
+            self.assertEqual(header, b"OK\t-1", (sh, header))
+            self.assertGreater(len(body), 0, sh)
+        # A truly empty regular file still downloads as empty.
+        empty = os.path.join(self.tmp, "empty")
+        open(empty, "w").close()
+        s = self._session(self.SHELLS[0])
+        a = ["busybox", "sh", "-c"] if self.SHELLS[0] == "busybox" else [self.SHELLS[0], "-c"]
+        s._mux_argv = lambda cmd: a + [cmd]
+        proc, err = s.download_file(empty)
+        out, _ = proc.communicate(timeout=10)
+        self.assertEqual(out, b"OK\t-1\n")
+
+    def _finalize_in(self, sh, dest, tmp_name, final_name):
+        """Run finalize_upload against a real directory. $HOME is the
+        staging area (that is where /api/upload puts the bytes), so it is
+        pointed at the test's tmp dir for the duration of the call."""
+        s = self._session(sh)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp
+        try:
+            return s.finalize_upload(tmp_name, final_name, dest)
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_finalize_into_a_named_directory_with_hostile_names(self):
+        # The destination the file browser is showing can be any directory
+        # the user can reach - including one whose name ends in a space or
+        # a newline. It must be decoded into a variable, never parsed.
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "drop dir\n")
+            os.makedirs(dest, exist_ok=True)
+            self._touch(".websh-tmp-1")
+            ok, path = self._finalize_in(sh, dest, ".websh-tmp-1", "my report.txt")
+            self.assertTrue(ok, (sh, path))
+            self.assertEqual(path, dest + "/my report.txt", sh)
+            self.assertEqual(os.listdir(dest), ["my report.txt"], sh)
+            self.assertNotIn(".websh-tmp-1", os.listdir(self.tmp), sh)
+            shutil.rmtree(dest)
+
+    def test_finalize_into_a_named_directory_auto_increments(self):
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "d")
+            os.makedirs(dest, exist_ok=True)
+            open(os.path.join(dest, "a.txt"), "w").close()
+            self._touch(".websh-tmp-2")
+            ok, path = self._finalize_in(sh, dest, ".websh-tmp-2", "a.txt")
+            self.assertTrue(ok, (sh, path))
+            # The existing file is untouched; the new one lands beside it.
+            self.assertEqual(sorted(os.listdir(dest)), ["a(1).txt", "a.txt"], sh)
+            shutil.rmtree(dest)
+
+    def test_finalize_into_a_missing_directory_says_why(self):
+        for sh in self.SHELLS:
+            self._touch(".websh-tmp-3")
+            ok, err = self._finalize_in(
+                sh, os.path.join(self.tmp, "nope"), ".websh-tmp-3", "a.txt")
+            self.assertFalse(ok, sh)
+            self.assertIn("o such file", err, sh)
+            self.assertEqual(server._side_channel_status(err), 404, sh)
+            # The staged bytes are still there for a retry elsewhere.
+            self.assertIn(".websh-tmp-3", os.listdir(self.tmp), sh)
+            os.remove(os.path.join(self.tmp, ".websh-tmp-3"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_finalize_into_a_read_only_directory_says_why(self):
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "ro")
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, 0o555)
+            self._touch(".websh-tmp-4")
+            try:
+                ok, err = self._finalize_in(sh, dest, ".websh-tmp-4", "a.txt")
+            finally:
+                os.chmod(dest, 0o755)
+            self.assertFalse(ok, sh)
+            self.assertIn("ermission denied", err, sh)
+            self.assertEqual(server._side_channel_status(err), 403, sh)
+            shutil.rmtree(dest)
+            os.remove(os.path.join(self.tmp, ".websh-tmp-4"))
 
     def test_rename_refuses_to_clobber_and_stays_in_dir(self):
         for sh in self.SHELLS:

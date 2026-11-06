@@ -12,9 +12,13 @@ Thanks for your interest in websh.
 ## Code
 
 - No build step. The frontend (`websh.js`, `index.html`) is plain JS/HTML; the backend (`server.py`) is stdlib-only Python.
-- Run tests before opening a PR:
-  - Backend: `python3 test_server.py`
-  - Frontend: `node --check websh.js` and `node tests/frontend/test_*.js`
+- Run tests before opening a PR (CI runs the same set):
+  - Backend: `python3 -m unittest discover -s tests/backend -t .`
+  - Frontend: `node --check websh.js` and `cd tests/frontend && npm install && npm test` — it must end with `failed: 0`
+  - PHP proxy: `php -l api.php && bash tests/php/smoke.sh`
+  - Lint: `ruff check .`
+- Every bug fix comes with a regression test that fails without the fix.
+- Tests must not depend on timing luck: wait for a real signal (an event, a promise, a scripted fake) rather than a fixed sleep, and never touch shared state such as the user's tmux server — use a private socket (`tmux -L <unique name>`).
 
 ## Reporting bugs
 

@@ -38,6 +38,12 @@ class Echo(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
+        # Echo what the proxy forwarded, so the smoke can check that
+        # Last-Event-ID survives the hop.
+        self.wfile.write(("event: meta\ndata: last-event-id=" +
+                          (self.headers.get("Last-Event-ID") or "-") +
+                          "\n\n").encode())
+        self.wfile.flush()
         try:
             while True:
                 self.wfile.write(b": tick\n\n")

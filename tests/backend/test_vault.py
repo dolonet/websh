@@ -80,6 +80,7 @@ class TestVaultLoad(unittest.TestCase):
         self._old_env = os.environ.get("WEBSH_CREDS_PATH")
         os.environ["WEBSH_CREDS_PATH"] = self.path
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
 
     def tearDown(self):
@@ -181,6 +182,7 @@ class TestVaultWrite(unittest.TestCase):
         self._old_env = os.environ.get("WEBSH_CREDS_PATH")
         os.environ["WEBSH_CREDS_PATH"] = self.path
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
 
     def tearDown(self):
@@ -201,6 +203,7 @@ class TestVaultWrite(unittest.TestCase):
         server._save_creds_atomic(payload)
         # Drop cache so the loader actually reads the disk
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
         self.assertEqual(server._load_creds(), payload)
 
@@ -370,6 +373,7 @@ class TestSavedCardConnectAuthz(LiveServerCase):
             json.dump({"version": server._CREDS_SCHEMA_VERSION,
                        "vaults": {cls.VAULT: slot}}, f)
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
 
     def setUp(self):
@@ -492,6 +496,7 @@ class TestApiSave(LiveServerCase):
     def setUp(self):
         # Reset the creds cache so each test sees a fresh file
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
         server._rate_limits.clear()
         if os.path.exists(self.creds_path):
@@ -524,6 +529,59 @@ class TestApiSave(LiveServerCase):
             resp, code = self._post("/api/save", body)
             self.assertEqual(code, 400, override)
             self.assertIn("aad_v", resp.get("detail", ""))
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_unreadable_store_is_never_rewritten(self):
+        """A creds file that exists but cannot be parsed used to read as
+        an empty store; the next /api/save rewrote the file from it and
+        every other user's vault was gone for good. Now writes are
+        refused until the file is readable again, and nothing on disk is
+        touched."""
+        others = {"version": 1, "vaults": {
+            "CCCCCCCCCCCCCCCCCCCCCCCCCC": {"DDDDDDDDDDDDDDDDDDDDDDDDDD": {
+                "host": "a", "port": 22, "username": "u", "iv": "i", "ct": "c"}}}}
+        good = json.dumps(others)
+        for broken in (good[:-1] + ",}",            # hand edit: trailing comma
+                       "[1, 2]",                     # wrong root
+                       '{"version": 1}'):            # no vaults object
+            with open(self.creds_path, "w") as f:
+                f.write(broken)
+            server._creds_cache = None
+            body, code = self._post("/api/save", self._valid_body())
+            self.assertEqual(code, 503, broken)
+            self.assertEqual(body.get("code"), "creds_unreadable")
+            with open(self.creds_path) as f:
+                self.assertEqual(f.read(), broken, "file must be untouched")
+            # Delete must not answer "not found" (the client drops the card).
+            dcode, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
+                self.VAULT, self.CONN))
+            self.assertEqual(dcode, 503, broken)
+        # Once the file is fixed, saving works again - no restart needed -
+        # and the other vault survives.
+        with open(self.creds_path, "w") as f:
+            f.write(good)
+        server._creds_cache = None
+        _, code = self._post("/api/save", self._valid_body())
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        self.assertIn("CCCCCCCCCCCCCCCCCCCCCCCCCC", data["vaults"])
+        self.assertIn(self.VAULT, data["vaults"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads anything")
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_permission_denied_store_is_never_rewritten(self):
+        with open(self.creds_path, "w") as f:
+            f.write('{"version": 1, "vaults": {"X": {}}}')
+        os.chmod(self.creds_path, 0)
+        try:
+            server._creds_cache = None
+            _, code = self._post("/api/save", self._valid_body())
+            self.assertEqual(code, 503)
+        finally:
+            os.chmod(self.creds_path, 0o600)
+        with open(self.creds_path) as f:
+            self.assertIn('"X"', f.read())
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_valid_save_persists_record(self):
@@ -712,6 +770,7 @@ class TestApiSaveDelete(LiveServerCase):
 
     def setUp(self):
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
         server._rate_limits.clear()
         # Seed with one entry
@@ -782,6 +841,7 @@ class TestApiSaveDelete(LiveServerCase):
             }},
         })
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
         code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
             self.VAULT, self.CONN))
@@ -807,6 +867,7 @@ class TestApiConnectSaved(LiveServerCase):
 
     def setUp(self):
         server._creds_cache = None
+        server._creds_unreadable = None
         server._creds_cache_key = (0, 0)
         server._rate_limits.clear()
         # Seed a stored entry encrypted with self.key/self.iv
@@ -863,6 +924,7 @@ class TestApiConnectSaved(LiveServerCase):
         data["vaults"][self.VAULT][self.CONN]["host"] = "evil.example"
         server._save_creds_atomic(data)
         server._creds_cache = None
+        server._creds_unreadable = None
         with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
             body, code = self._post({
                 "vault_id": self.VAULT, "conn_id": self.CONN,
@@ -941,6 +1003,7 @@ class TestApiConnectSaved(LiveServerCase):
             }}},
         })
         server._creds_cache = None
+        server._creds_unreadable = None
         with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
             instance = unittest.mock.MagicMock(alive=True,
                                                auth_failed=False,
@@ -982,6 +1045,7 @@ class TestApiConnectSaved(LiveServerCase):
             }}},
         })
         server._creds_cache = None
+        server._creds_unreadable = None
         with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
             instance = unittest.mock.MagicMock(alive=True,
                                                auth_failed=False,

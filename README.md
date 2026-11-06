@@ -52,7 +52,7 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 ### 🖥️ Terminal
 
-Real xterm.js — copy-on-select, right-click paste, scrollback search (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`).
+Real xterm.js — copy-on-select, right-click paste, `Ctrl+V` paste (on by default; switch it off in ⚙ Options to send a literal `^V` to the shell), scrollback search (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`).
 
 - Split panes, horizontal or vertical, with draggable dividers
 - Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab`
@@ -62,17 +62,23 @@ Real xterm.js — copy-on-select, right-click paste, scrollback search (`Ctrl+Sh
 
 Tick **Persistent session** at connect — websh wraps the shell in a tmux session on the target host. Close the tab, reboot, restart `server.py`: the pane re-attaches to the same tmux session with scrollback and running processes intact. See [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
 
-- Reconnect button on disconnect; red banner on auth failure
+- One quiet reconnect bar on disconnect; a rejected password or key opens a dialog to re-enter credentials instead of looping
 - URL anchors (`#connect=Production`) for direct links and bookmarks
 - Saved connections in browser `localStorage`
+
+### 🛡️ Resilience
+
+- **Nothing lost on reconnect.** Output is read by cursor from a replay window, so a dropped stream, a sleeping laptop or a proxy that cut the connection resumes exactly where it stopped — no gap, no duplicate.
+- **Transport self-heals.** A closed SSE stream is reopened on its own; a proxy that buffers SSE sends that pane to long-polling; brief network errors are retried rather than ending the session.
+- **Clean teardown.** The ssh child is always reaped (no zombies holding session slots), idle sessions time out, the last output of a session is delivered before it is marked ended, and a client hanging up mid-request is routine, not a server error.
 
 ### 📁 File transfer
 
 Upload and download without `scp`.
 
-- **Upload.** Pick files; the browser streams the bytes through a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>`, no PTY, no base64, one HTTP POST per file). On persistent (tmux) panes the file is moved into `pane_current_path` automatically — vim/less/htop in the foreground stay untouched. Non-persistent panes type the `mv` into the foreground shell with an alt-screen guard. Auto-increment on name conflicts. Native xhr.upload progress, multi-file queue, cancel mid-flight.
+- **Upload.** Pick files or drop them on a pane; the browser streams the bytes through a piggybacked SSH ControlMaster channel (`cat > $HOME/<tmp>`, no PTY, no base64, one HTTP POST per file). Dropping them on the **file browser** instead — or using its **Upload** button — puts them in the folder you are looking at, keystroke-free on any pane. Otherwise the destination is where the shell is standing: `pane_current_path` on persistent (tmux) panes, or an `mv` typed into the foreground shell with an alt-screen guard. Auto-increment on name conflicts. Native xhr.upload progress, multi-file queue, cancel mid-flight.
 - **Download.** Select a filename in the terminal, click Download.
-- **Browse.** The file browser opens in the directory the pane is actually sitting in, not at `$HOME` — read from the shell's OSC 7 signal, or from `pane_current_path` on tmux panes. Clickable breadcrumb path, live name filter, and a dotfile toggle. Sort by name, size, or date (newest-first by default; the choice is remembered). Per-row **rename** (✎) and **delete** (✕, two-step confirm, never recursive), plus **New folder** — all keystroke-free over the SSH side channel, so a full-screen program in the foreground pane stays untouched.
+- **Browse.** The file browser opens in the directory the pane is actually sitting in, not at `$HOME` — read from the shell's OSC 7 signal, or from `pane_current_path` on tmux panes. Clickable breadcrumb path, live name filter, and a dotfile toggle. Sort by name, size, or date (newest-first by default; the choice is remembered). Per-row **rename** (✎) and **delete** (✕, two-step confirm, never recursive), plus **New folder** — all keystroke-free over the SSH side channel, so a full-screen program in the foreground pane stays untouched. Tick several rows (shift-click picks a run) to **download** or **delete** them in one go: one question for the batch, then one audited request per entry, with a summary that names whatever failed.
 - **Export scrollback.** Save the current buffer as a text file. Persistent panes pull the real tmux scrollback via `tmux capture-pane`.
 
 ### 🔐 Connection profiles
@@ -185,8 +191,11 @@ api.php                   PHP proxy — forwards browser requests to backend (op
 server.py                 Python backend — manages SSH sessions via PTY, serves frontend
 assets/                   Brand SVG (logo) loaded by index.html
 websh.json.example        Example server-side config
-test_server.py            Backend tests (unit + integration)
-tests/frontend/           jsdom-based frontend tests
+test_server.py            Back-compat runner for the backend suite
+tests/backend/            Backend tests — unit + integration (unittest)
+tests/frontend/           Frontend tests on jsdom
+tests/php/                PHP proxy smoke test
+.github/workflows/        CI: backend matrix, frontend, PHP, ruff, Docker
 docs/                     Design notes & reference docs
 Dockerfile                Container deployment
 websh.service             systemd unit file
@@ -196,14 +205,28 @@ LICENSE                   MIT license
 ## Tests
 
 ```bash
-# Backend (Python, stdlib only — unittest)
-python3 test_server.py -v
+# Backend (Python, stdlib only — unittest): ~680 tests
+python3 -m unittest discover -s tests/backend -t .   # or: python3 test_server.py -v
 
-# Frontend (Node 20 + jsdom)
+# Frontend (Node 20 + jsdom): ~1100 assertions
 cd tests/frontend && npm install && npm test
+
+# PHP proxy (needs php-cli with curl) and lint
+php -l api.php && bash tests/php/smoke.sh
+ruff check .
 ```
 
-Both suites also run on every PR via GitHub Actions.
+CI runs all of it on every push and PR: the backend on Python 3.9 and 3.12, each with and without `cryptography` (the vault's optional dependency), plus the frontend suite, the PHP smoke test, ruff, and a Docker build that boots the image and checks `/api/ping`, `/api/config` and the page.
+
+Backend line + branch coverage of `server.py` is about 88%:
+
+```bash
+pip install coverage
+coverage run --branch --include=server.py -m unittest discover -s tests/backend -t .
+coverage report
+```
+
+The suites are built to be deterministic: backend I/O paths are tested with scripted sessions instead of sleeps, the frontend harness waits for the app's own boot signal, and an unhandled rejection is reported as a failure of the running scenario instead of silently ending the run. A green run means `failed: 0` — treat any other result as red.
 
 ## License
 

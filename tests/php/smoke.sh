@@ -270,4 +270,13 @@ closed=
 for i in $(seq 1 40); do [ -f "$STUB_MARK" ] && { closed=1; break; }; sleep 0.1; done
 [ -n "$closed" ] || fail "backend stream connection not closed after client abort" "no EPIPE seen by the stub within 4s"
 
+# 10. Last-Event-ID (EventSource auto-reconnect cursor) reaches the
+#     backend; a non-numeric one is dropped.
+r=$(curl -s --max-time 1 -H 'Last-Event-ID: 12345' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=stream&session_id=stream_probe" || true)
+echo "$r" | grep -q 'last-event-id=12345' || fail "Last-Event-ID not forwarded" "$r"
+r=$(curl -s --max-time 1 -H 'Last-Event-ID: 1; rm' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=stream&session_id=stream_probe" || true)
+echo "$r" | grep -q 'last-event-id=-' || fail "junk Last-Event-ID forwarded" "$r"
+
 echo "PHP proxy smoke: all assertions passed"

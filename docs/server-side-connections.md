@@ -51,6 +51,14 @@ server log. If you need those, put them in the system `ssh_config` on
 the websh host instead of in `websh.json` (which has a broader trust
 profile — FTP'able on shared hosting, sometimes restored from backups).
 
+A session authenticates only with what the visitor (or the profile)
+supplied: websh passes `IdentityAgent=none` and `IdentitiesOnly=yes`,
+and `PubkeyAuthentication=no` when no key was given, so the websh host's
+own ssh-agent and default `~/.ssh/id_*` keys are never offered to a
+target. These apply to the destination only - a `ProxyJump` bastion is
+reached with the service account's normal ssh configuration (agent
+included), which is where operator credentials belong.
+
 A profile option takes precedence over websh's built-in default for the
 same key (OpenSSH keeps the first value, and websh emits its default only
 when the profile leaves the key unset). A few of those defaults back
@@ -139,10 +147,17 @@ your own boxes, add a `denied_hosts` array:
 
 Each entry is parsed as an IP address or CIDR network when possible
 (IPv4 and IPv6 both supported); otherwise it's matched as an exact
-hostname (case-insensitive). At connect time websh resolves the target
+hostname (case-insensitive; a trailing root dot is ignored, so
+`bastion.corp.` is the same entry as `bastion.corp`). At connect time websh resolves the target
 hostname via the system resolver and rejects the request if any of the
 returned addresses fall inside a denied range — so a public-looking
 domain whose A record points into RFC1918 is also blocked.
+
+A connection to `0.0.0.0` / `::` (the "unspecified" address, also
+written `0`) or to `::1` lands on the websh host itself, so these are
+tested as loopback: denying `127.0.0.0/8` blocks all of them. IPv6
+literals may carry a `%scope` only when it is a plain interface name or
+index (`fe80::1%eth0`); anything else is rejected as not a host.
 
 DNS resolution failures fail open (the request goes through; ssh's own
 resolver will then fail with a clear error). Hosts you've put in

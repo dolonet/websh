@@ -161,6 +161,24 @@ class TestHTTPApi(LiveServerCase):
                                         hdrs)
             self.assertNotEqual(code, 403, hdrs)
 
+    def test_proxy_that_drops_host_is_named_in_the_log_once(self):
+        """docs/deployment.md's nginx example used to omit
+        `proxy_set_header Host $host`: every browser request then arrived
+        as Host: 127.0.0.1:PORT with the public Origin and got 403, with
+        nothing saying why. The refusal stands (it IS indistinguishable
+        from CSRF), but the operator is told the fix - once."""
+        server._proxy_host_warned = False
+        with unittest.mock.patch.object(server, "_log") as log:
+            for _ in range(3):
+                _, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                         {"Origin": "https://ssh.example.com"})
+                self.assertEqual(code, 403)
+        warns = [c for c in log.call_args_list
+                 if "proxy_set_header Host" in str(c)]
+        self.assertEqual(len(warns), 1, log.call_args_list)
+        with open(os.path.join(REPO_ROOT, "docs", "deployment.md")) as f:
+            self.assertIn("proxy_set_header Host $host;", f.read())
+
     def test_forwarded_host_from_trusted_proxy_counts_as_origin(self):
         body, code = self._post_hdr(
             "/api/resize", {"session_id": "x"},
@@ -1074,6 +1092,10 @@ _FAKE_TMUX = r"""#!/bin/sh
 state=${TMUX_STATE:-/tmp/fake-tmux-state}
 sessions=$state/sessions
 mkdir -p "$state"; touch "$sessions"
+# `start-server \; set -g ... \; new-session ...`: act on the new-session.
+if [ "$1" = start-server ]; then
+  while [ $# -gt 0 ] && [ "$1" != new-session ]; do shift; done
+fi
 sub=$1; shift
 name=""
 while [ $# -gt 0 ]; do
@@ -1746,6 +1768,7 @@ class TestReapChild(unittest.TestCase):
         s.is_background = False
         s._password = None
         s._password_sent = True   # take the auth-watch branch, not pw-typing
+        s._auth_watch_until = time.time() + 30   # just typed it
         s.auth_failed = False
         s._auth_buf = b""
         s._auth_bytes_seen = 0
@@ -2515,7 +2538,9 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         s = self._session(master, pid)
         t = threading.Thread(target=s._read_loop, daemon=True)
         t.start()
-        if user_input is not None:
+        if callable(user_input):
+            user_input(s)                 # the test drives the timing
+        elif user_input is not None:
             time.sleep(0.3)
             s.write(user_input)
         t.join(timeout)
@@ -2562,6 +2587,106 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         self.assertNotIn(b"S3cret", out)
         self.assertIn(b"GOT:sudo ls", out)
 
+    def test_banner_mentioning_a_password_is_not_answered(self):
+        # sshd banners are printed before the prompt. One saying
+        # "Forgot your password: call IT" used to get the password typed
+        # into it 0.1 s later - echoed onto the screen, into the replay
+        # buffer and any recording - and the REAL prompt then read as a
+        # rejection, so login to that host always failed.
+        def child(fd):
+            os.write(fd, b"*** Authorised use only ***\r\n"
+                         b"Forgot your password: call IT on 555-0100\r\n")
+            time.sleep(0.05)
+            os.write(fd, b"Password: reset at https://it/\r\n")  # prompt-shaped, then more
+            time.sleep(0.05)
+            os.write(fd, b"\r\nalice@host's password: ")
+            time.sleep(0.8)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertEqual(out.count(b"GOT:"), 1, out)       # typed exactly once
+        self.assertFalse(s.auth_failed)
+
+    def test_idle_armed_session_does_not_answer_a_late_prompt(self):
+        # No prompt and no output for longer than the window: the arm
+        # expires even though the byte budget was never reached.
+        def child(fd):
+            time.sleep(0.5)
+            os.write(fd, b"[sudo] password for alice: ")
+            time.sleep(0.5)
+        orig = server.PASSWORD_ARM_MAX_SECONDS
+        server.PASSWORD_ARM_MAX_SECONDS = 0.2
+        try:
+            s, out = self._run(child)
+        finally:
+            server.PASSWORD_ARM_MAX_SECONDS = orig
+        self.assertFalse(s._password_sent)
+        self.assertNotIn(b"S3cret", out)
+
+    def test_real_rejection_is_still_detected(self):
+        def child(fd):
+            import select as _sel
+            os.write(fd, b"alice@host's password: ")
+            _sel.select([fd], [], [], 2)
+            os.read(fd, 4096)                                # our password
+            os.write(fd, b"\r\nPermission denied, please try again.\r\n"
+                         b"alice@host's password: ")
+            time.sleep(2)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertTrue(s.auth_failed)
+
+    def test_the_logged_in_users_own_commands_are_not_a_failed_login(self):
+        # A successful login with a short MOTD, then `sudo -i`: the sudo
+        # prompt (or "Permission denied" from `ls /root`) used to fall in
+        # the 4 KB post-password window, so the session was killed as
+        # auth_failed and an auth_failed record fed fail2ban.
+        def child(fd):
+            import select as _sel
+            os.write(fd, b"alice@host's password: ")
+            _sel.select([fd], [], [], 2)
+            os.read(fd, 4096)                                # our password
+            os.write(fd, b"\r\nWelcome to host\r\nalice@host:~$ ")
+            _sel.select([fd], [], [], 3)
+            os.read(fd, 4096)                                # user's command
+            os.write(fd, b"ls: cannot open directory '/root': Permission denied\r\n"
+                         b"[sudo] password for alice: ")
+            time.sleep(0.8)
+        def user(s):
+            # Wait for the login to complete, then type a command.
+            end = time.time() + 3
+            while time.time() < end and b"$ " not in s.output_buf:
+                time.sleep(0.05)
+            s.write(b"ls /root; sudo -i\r")
+        s, out = self._run(child, user_input=user)
+        self.assertTrue(s._password_sent)
+        self.assertFalse(s.auth_failed, out)
+
+    def test_rejected_key_is_an_auth_failure_not_an_early_exit(self):
+        # Key auth rejected: ssh prints "Permission denied (publickey)."
+        # and exits 255 at once - no prompt. The exit-255 classification
+        # ran before the reader reaped the child, found no exit status,
+        # and the client was told "SSH process exited immediately".
+        import pty
+        for _ in range(5):                      # timing-dependent: try a few
+            master, slave = pty.openpty()
+            pid = os.fork()
+            if pid == 0:
+                os.close(master)
+                os.write(slave, b"alice@host: Permission denied (publickey).\r\n")
+                os._exit(255)
+            os.close(slave)
+            s = self._session(master, pid)
+            s._password = None                  # key session: nothing to type
+            t = threading.Thread(target=s._read_loop, daemon=True)
+            t.start()
+            t.join(5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            self.assertFalse(s.alive)
+            self.assertTrue(s.auth_failed, "rejected key must read as auth failure")
+
     def test_bare_enter_does_not_disarm(self):
         # Pressing Enter while ssh is still connecting is common; it must
         # not cost the user the auto-type when the prompt then appears.
@@ -2571,6 +2696,442 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
             time.sleep(0.5)
         s, out = self._run(child, user_input=b"\r")
         self.assertTrue(s._password_sent)
+
+
+
+class TestOutputCursor(unittest.TestCase):
+    """read_since(): non-destructive cursor reads over a bounded replay
+    log - the basis of lossless reconnect."""
+
+    def _s(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s.output_buf = b""
+        s._replay = b""
+        s._replay_end = 0
+        s.last_activity = 0
+        return s
+
+    def _put(self, s, data):
+        with s.buf_lock:
+            s._append_output_locked(data)
+
+    def test_reads_do_not_consume(self):
+        s = self._s()
+        self._put(s, b"hello ")
+        self._put(s, b"world")
+        self.assertEqual(s.read_since(0), (b"hello world", 11, 0, False))
+        self.assertEqual(s.read_since(0)[0], b"hello world", "still there")
+        self.assertEqual(s.read_since(6), (b"world", 11, 0, False))
+        self.assertEqual(s.read_since(11), (b"", 11, 0, False))
+
+    def test_bytes_past_the_window_are_reported_lost(self):
+        s = self._s()
+        with unittest.mock.patch.object(server, "OUTPUT_REPLAY_BYTES", 10):
+            for i in range(10):
+                self._put(s, b"%d" % i * 3)            # 30 bytes total
+            data, end, lost, reset = s.read_since(0)
+        self.assertEqual(end, 30)
+        self.assertGreater(lost, 0)
+        self.assertEqual(lost + len(data), 30, "lost + delivered = all output")
+        self.assertTrue(b"".join(b"%d" % i * 3 for i in range(10)).endswith(data))
+        self.assertFalse(reset)
+
+    def test_unknown_cursor_resets(self):
+        s = self._s()
+        self._put(s, b"abc")
+        self.assertEqual(s.read_since(999), (b"abc", 3, 0, True))
+
+    def test_cursor_reads_drain_the_legacy_buffer(self):
+        # Otherwise output_buf would sit at its 1 MB cap for the life of
+        # every session a current client is attached to.
+        s = self._s()
+        self._put(s, b"x" * 100)
+        s.read_since(0)
+        self.assertEqual(s.output_buf, b"")
+        self.assertEqual(s.read_since(0)[0], b"x" * 100, "replay unaffected")
+
+    def test_legacy_read_still_destructive(self):
+        s = self._s()
+        self._put(s, b"old")
+        self.assertEqual(s.read(), b"old")
+        self.assertEqual(s.read(), b"")
+        self.assertEqual(s.read_since(0)[0], b"old", "replay keeps it")
+
+
+class TestLosslessReconnectHTTP(LiveServerCase):
+    """End to end over /api/stream and /api/output: output that went into
+    a connection the client never read is delivered again after the
+    reconnect - exactly once - and cursor-less (older) clients keep the
+    destructive semantics."""
+
+    def _session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "cur"; s.alive = True; s.auth_failed = False
+        s.buf_lock = threading.Lock(); s.output_buf = b""
+        s._replay = b""; s._replay_end = 0
+        s._data_event = threading.Event()
+        s._waiters = set(); s._waiters_lock = threading.Lock()
+        s._stream_active = False; s.owner = ""; s.client_ip = "127.0.0.1"
+        s.last_activity = time.time(); s.is_background = False
+        return s
+
+    def _put(self, s, data):
+        with s.buf_lock:
+            s._append_output_locked(data)
+        s._signal()
+
+    def _sse_events(self, sid, headers=None, query="", n_data=2, timeout=3):
+        """Read SSE events until n_data data events arrived; return
+        [(id, payload_dict)] and close the connection abruptly."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        c.request("GET", "/api/stream?session_id=" + sid + query,
+                  headers=headers or {})
+        r = c.getresponse()
+        events, cur = [], {}
+        deadline = time.time() + timeout
+        while len(events) < n_data and time.time() < deadline:
+            line = r.fp.readline().decode().rstrip("\n")
+            if line.startswith("id: "):
+                cur["id"] = int(line[4:])
+            elif line.startswith("data: "):
+                cur["data"] = json.loads(line[6:])
+            elif line == "" and "data" in cur:
+                events.append((cur.get("id"), cur["data"]))
+                cur = {}
+        c.close()
+        return events
+
+    @staticmethod
+    def _text(events):
+        return b"".join(base64.b64decode(e[1].get("data") or "") for e in events)
+
+    def test_reconnect_with_since_gets_exactly_the_missed_bytes(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"one ")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            ev = self._sse_events(sid, query="&since=0", n_data=2)
+            self.assertEqual(self._text(ev), b"one ")
+            cursor = ev[-1][1]["cursor"]
+            self.assertEqual(ev[-1][0], cursor, "SSE id carries the cursor")
+            # The connection dropped. Meanwhile the shell printed more -
+            # and a previous stream had "sent" it into a dead socket.
+            self._put(s, b"two ")
+            s.read_since(0)                   # someone else read it: no matter
+            time.sleep(0.1)
+            s._stream_active = False
+            ev2 = self._sse_events(sid, query="&since=%d" % cursor, n_data=2)
+            self.assertEqual(self._text(ev2), b"two ", "missed bytes, exactly once")
+
+    def test_last_event_id_wins_over_the_original_url(self):
+        # EventSource's automatic reconnect re-sends its ORIGINAL URL
+        # (since=0) plus Last-Event-ID.
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"abc")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            ev = self._sse_events(sid, query="&since=0",
+                                  headers={"Last-Event-ID": "2"}, n_data=2)
+        self.assertEqual(self._text(ev), b"c")
+
+    def test_long_poll_cursor(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"hello")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            body, code = self._get("/api/output?session_id=%s&since=0" % sid)
+            self.assertEqual((code, body["cursor"]), (200, 5))
+            self.assertEqual(base64.b64decode(body["data"]), b"hello")
+            body, code = self._get("/api/output?session_id=%s&since=3" % sid)
+            self.assertEqual(base64.b64decode(body["data"]), b"lo", "not consumed")
+
+    def test_cursorless_client_keeps_destructive_semantics(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"legacy")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            body, code = self._get("/api/output?session_id=%s" % sid)
+            self.assertEqual(base64.b64decode(body["data"]), b"legacy")
+            self.assertNotIn("cursor", body)
+            self.assertEqual(s.output_buf, b"", "legacy read drained")
+
+
+class _Wfile(object):
+    """wfile stand-in: records writes; raises for any write carrying one
+    of `fail_on` (bytes) to mimic a peer that went away mid-response."""
+    def __init__(self, fail_on=()):
+        self.chunks = []
+        self.fail_on = fail_on
+    def write(self, b):
+        if any(m in b for m in self.fail_on):
+            raise BrokenPipeError("peer closed")
+        self.chunks.append(b)
+    def flush(self):
+        pass
+    def text(self):
+        return b"".join(self.chunks).decode("utf-8")
+
+
+class _DeliverySession(object):
+    """Scripted session for the /api/output and /api/stream loops.
+    `reads` is what successive read() calls return; `on_wait` runs on
+    each wait_for_data() (the moment the handler parks)."""
+    def __init__(self, reads=(), on_wait=None):
+        self.alive = True
+        self.auth_failed = False
+        self.last_activity = 0
+        self._reads = list(reads)
+        self.unread_calls = []
+        self.waits = 0
+        self._on_wait = on_wait
+    def read(self):
+        return self._reads.pop(0) if self._reads else b""
+    def unread(self, data):
+        self.unread_calls.append(data)
+    def read_since(self, cursor):
+        data = self.read()
+        return data, cursor + len(data), 0, False
+    def wait_for_data(self, client_socket, timeout, selector=None):
+        self.waits += 1
+        if self._on_wait:
+            self._on_wait(self)
+        else:
+            time.sleep(min(timeout, 0.05))
+
+
+def _delivery_handler(sess, path="/api/output?session_id=x", wfile=None):
+    h = server.Handler.__new__(server.Handler)
+    h.path = path
+    h.headers = {}
+    h.status = []
+    h.send_response = lambda code, *a: h.status.append(code)
+    h.send_header = lambda *a, **k: None
+    h.end_headers = lambda *a, **k: None
+    h.connection = None
+    h._require_session = lambda sid: sess
+    h._build_session_selector = lambda session: type(
+        "_Sel", (), {"close": lambda self: None})()
+    h._client_gone = lambda: False
+    h.wfile = wfile or _Wfile()
+    return h
+
+
+class TestOutputLongPollEdges(unittest.TestCase):
+    """The /api/output paths the happy-path tests never reach: a quiet
+    session (the poll must time out with an empty, still-alive reply),
+    a session that dies while the poll is parked (answer at once, not
+    after the full timeout), and a client that hangs up during the
+    reply (the drained bytes must go back, or they are lost for good)."""
+
+    def _body(self, h):
+        raw = b"".join(h.wfile.chunks)
+        return json.loads(raw.decode("utf-8"))
+
+    def test_quiet_session_times_out_empty_and_alive(self):
+        sess = _DeliverySession()
+        h = _delivery_handler(sess, "/api/output?session_id=x&since=7")
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 0.2):
+            t0 = time.time()
+            h._output()
+            took = time.time() - t0
+        body = self._body(h)
+        self.assertEqual(body["data"], "")
+        self.assertTrue(body["alive"], "a quiet session is not a dead one")
+        self.assertEqual(body["cursor"], 7, "the cursor is echoed unchanged")
+        self.assertGreaterEqual(sess.waits, 1, "it parked instead of spinning")
+        self.assertLess(took, 3)
+
+    def test_session_dying_mid_wait_answers_at_once(self):
+        def die(s):
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess)
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 30):
+            t0 = time.time()
+            h._output()
+            took = time.time() - t0
+        body = self._body(h)
+        self.assertFalse(body["alive"])
+        self.assertEqual(body["data"], "")
+        self.assertLess(took, 2, "waited out the poll timeout on a dead session")
+
+    def test_output_arriving_mid_wait_is_delivered(self):
+        def produce(s):
+            s._reads.append(b"late\r\n")
+        sess = _DeliverySession(on_wait=produce)
+        h = _delivery_handler(sess)
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 30):
+            h._output()
+        body = self._body(h)
+        self.assertEqual(base64.b64decode(body["data"]), b"late\r\n")
+        self.assertTrue(body["alive"])
+
+    def test_hangup_during_reply_gives_the_bytes_back(self):
+        planted = b"do-not-lose-me"
+        sess = _DeliverySession(reads=[planted])
+        h = _delivery_handler(sess, wfile=_Wfile(
+            fail_on=[base64.b64encode(planted)]))
+        with self.assertRaises(BrokenPipeError):
+            h._output()
+        self.assertEqual(sess.unread_calls, [planted],
+                         "drained output lost when the reply failed")
+
+    def test_client_gone_before_read_drains_nothing(self):
+        sess = _DeliverySession(reads=[b"keep"])
+        h = _delivery_handler(sess)
+        h._client_gone = lambda: True
+        h._output()
+        self.assertEqual(sess._reads, [b"keep"], "read into a dead socket")
+        self.assertEqual(h.wfile.chunks, [])
+
+
+class TestStreamEdges(unittest.TestCase):
+    """/api/stream beyond the happy path: the heartbeat that keeps a quiet
+    stream open through proxies, and the final output of a session that
+    ends - delivered before 'end', and given back if that write fails."""
+
+    def test_quiet_stream_sends_keepalive(self):
+        clock = [1000.0]
+        fake_time = type("T", (), {"time": staticmethod(lambda: clock[0])})
+
+        def tick(s):
+            # Each park lasts the full keepalive interval; stop after
+            # two so the loop ends (the session then "dies").
+            clock[0] += 16
+            if s.waits >= 2:
+                s.alive = False
+        sess = _DeliverySession(on_wait=tick)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        with unittest.mock.patch.object(server, "time", fake_time):
+            h._stream_session(sess)
+        text = h.wfile.text()
+        self.assertEqual(text.count(": keepalive"), 1,
+                         "one heartbeat per silent interval; got " + repr(text))
+        self.assertLess(text.index(": keepalive"), text.index("event: end"))
+
+    def test_final_output_is_sent_before_end(self):
+        def die(s):
+            s._reads.append(b"logout\r\n")
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        h._stream_session(sess)
+        text = h.wfile.text()
+        marker = base64.b64encode(b"logout\r\n").decode("ascii")
+        self.assertIn(marker, text, "the last words of the session were dropped")
+        self.assertLess(text.index(marker), text.index("event: end"))
+        self.assertEqual(sess.unread_calls, [])
+
+    def test_final_output_write_failure_gives_bytes_back(self):
+        tail = b"bye"
+        def die(s):
+            s._reads.append(tail)
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess, "/api/stream?session_id=x",
+                              wfile=_Wfile(fail_on=[base64.b64encode(tail)]))
+        h._stream_session(sess)
+        self.assertEqual(sess.unread_calls, [tail])
+        self.assertNotIn("event: end", h.wfile.text(),
+                         "'end' written after the tail failed to go out")
+
+
+class TestReadLoopDrainsOnStop(unittest.TestCase):
+    """What the remote printed just before the session stopped (a logout
+    message, a shell's exit sequences) is still in the PTY when the loop
+    exits; the drain in _read_loop's finally must deliver it."""
+
+    def test_pending_pty_output_is_drained_after_stop(self):
+        import pty
+        master, slave = pty.openpty()
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            try:
+                os.write(slave, b"last words\r\n")
+                time.sleep(30)
+            finally:
+                os._exit(0)
+        os.close(slave)
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.master_fd = master
+        s.pid = pid
+        s.id = "test-drain"
+        s.alive = False          # stopped before the loop ever read
+        s.is_background = False
+        s.auth_failed = False
+        s.output_buf = b""
+        s.buf_lock = threading.Lock()
+        s._exit_status = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
+        s._signal = lambda: None
+        s._record = lambda *a: None
+        try:
+            # Let the child's write land in the PTY first.
+            deadline = time.time() + 5
+            import select as _select
+            while time.time() < deadline:
+                if _select.select([master], [], [], 0.05)[0]:
+                    break
+            t = threading.Thread(target=s._read_loop, daemon=True)
+            t.start()
+            t.join(15)
+            self.assertFalse(t.is_alive(), "_read_loop did not exit")
+            self.assertIn(b"last words", s.output_buf,
+                          "output pending at stop was not drained")
+            self.assertTrue(s.output_buf.endswith(server.TERM_RESET),
+                            "terminal reset must come after the drained tail")
+            self.assertIsNotNone(s._exit_status, "child not reaped")
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+
+
+class TestDispatchClientGone(unittest.TestCase):
+    """A client dropping mid-request is routine: it must not be logged as
+    an unhandled server error, and no 500 goes into the dead socket. A
+    genuine handler bug still is both."""
+
+    def _handler(self, exc):
+        h = server.Handler.__new__(server.Handler)
+        h.path = "/api/output?session_id=x"
+        h.headers = {}
+        h.client_address = ("203.0.113.5", 1)
+        h.replies = []
+        h._json = lambda obj, status=200: h.replies.append(status)
+        h._resolve_action = lambda: "output"
+        def boom():
+            raise exc
+        h._output = boom
+        return h
+
+    def _run(self, exc):
+        h = self._handler(exc)
+        with unittest.mock.patch.object(server, "_log") as log:
+            h._dispatch({"output": "_output"})
+        return h, [c.args[0] for c in log.call_args_list]
+
+    def test_client_gone_is_info_and_no_reply(self):
+        for exc in (BrokenPipeError(), ConnectionResetError(),
+                    ConnectionAbortedError()):
+            h, levels = self._run(exc)
+            self.assertNotIn("ERROR", levels, type(exc).__name__)
+            self.assertEqual(h.replies, [], "wrote a 500 into a dead socket")
+
+    def test_real_bug_still_logged_and_answered(self):
+        h, levels = self._run(KeyError("oops"))
+        self.assertIn("ERROR", levels)
+        self.assertEqual(h.replies, [500])
 
 
 if __name__ == "__main__":
