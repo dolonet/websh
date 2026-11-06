@@ -58,6 +58,9 @@ export async function run({ b, t }) {
 
   const iA = await b.connect({ persistent: false });
   const A = await b.ev(`Object.keys(panes)[${iA}]`);
+  // The baseline must use the loaded font, like the later split/reload:
+  // fallback-font dimensions can otherwise change during the scenario.
+  await b.ev(`document.fonts.ready.then(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))))`);
   if (!t.ok(await b.ev(`!!document.getElementById('paneTools')`), 'the top-bar pane actions (#paneTools) exist')) return;
   await until(() => fitted(A), 5000);
 

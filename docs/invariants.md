@@ -503,7 +503,16 @@ the same `_dispatch` with only path, headers, body and `wfile` swapped
 **T1. A green run means `failed: 0`.** A frontend run that dies prints
 no summary; that is a failure. `scripts/check.sh` enforces it.
 
-**T2. Tests wait for a signal, not for time.** The frontend harness
+**T2. Tests wait for a signal, not for time.** Browser pixel and terminal-size
+baselines wait for `document.fonts.ready` and settled layout. A late
+webfont changed an unlinked control's lowest ink row from 11 to 14 and
+its cell height from 15 to 17; it also changed a correctly fitted pane
+from 140x47 to 147x41. Comparing later output with the cached fallback
+font baseline falsely reported a persistent underline or lost rows.
+Guards: `linkstyle` and `tabsolo` retain their exact visual, PTY size and
+resize-count assertions after font readiness.
+
+The frontend harness
 waits on `bootReady`; hand-built windows are closed with `closeDom`.
 Fixed sleeps made one run in six fail. In a browser scenario one synthetic
 mouse jump straight onto a link, pressed at once, can click before
