@@ -404,10 +404,78 @@ class TestHTTPApi(LiveServerCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_stream_takeover_replaces_a_stale_holder(self):
+        """A second /api/stream for a session whose stream is parked (the
+        browser's old connection died without a FIN: laptop asleep,
+        network switched) takes the slot over at once instead of 409 -
+        the 409 made the client abandon SSE for long-polling. The old
+        connection is ended by the server."""
+        import http.client
+        import socket as _socket
+        sid = str(uuid.uuid4())
+
+        class Sess(_FakeNotifyMixin):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self.last_activity = 0
+            def read(self):
+                return b""
+
+        with server.sessions_lock:
+            server.sessions[sid] = Sess()
+        try:
+            s1 = _socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s1.sendall(("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
+                        "Host: 127.0.0.1\r\n\r\n").encode("ascii"))
+            buf = b""
+            s1.settimeout(0.3)
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: data" not in buf:
+                try:
+                    chunk = s1.recv(256)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except _socket.timeout:
+                    pass
+            self.assertIn(b"200", buf.split(b"\r\n", 1)[0])
+
+            t0 = time.time()
+            c2 = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c2.request("GET", "/api/stream?session_id=" + sid)
+            r2 = c2.getresponse()
+            took = time.time() - t0
+            self.assertEqual(r2.status, 200, "the newer stream takes over")
+            self.assertLess(took, 1.5, "takeover waited out the deadline")
+
+            # The stale connection is closed by the server.
+            s1.settimeout(3)
+            closed = False
+            end = time.time() + 3
+            try:
+                while time.time() < end:
+                    if not s1.recv(1024):
+                        closed = True
+                        break
+            except OSError:
+                closed = True
+            self.assertTrue(closed, "the superseded stream was not ended")
+            with server.sessions_lock:
+                server.sessions[sid].alive = False
+            r2.read()
+            c2.close()
+            s1.close()
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_stream_rejects_duplicate_with_409(self):
-        """A second /api/stream for an already-streaming session must
-        be rejected with 409 instead of silently racing two destructive
-        readers for the same buffer. The first stream is unaffected."""
+        """A holder that cannot step aside (blocked inside the session,
+        here a read() that waits on a gate) keeps the slot: after the
+        takeover deadline the second /api/stream is rejected with 409
+        instead of racing two readers or deadlocking the client. The
+        first stream is unaffected."""
         import http.client
         import socket as _socket
         import threading as _threading
@@ -455,7 +523,7 @@ class TestHTTPApi(LiveServerCase):
                 "first stream must respond 200; got: " + repr(buf[:80]))
             # First handler is now parked in read()/wait; _stream_active=True.
 
-            # Second stream: should be rejected immediately with 409.
+            # Second stream: rejected with 409 once the deadline passes.
             c2 = http.client.HTTPConnection("127.0.0.1", self.port,
                                             timeout=3)
             c2.request("GET", "/api/stream?session_id=" + sid)
@@ -3018,6 +3086,9 @@ class TestStreamEdges(unittest.TestCase):
         text = h.wfile.text()
         self.assertEqual(text.count(": keepalive"), 1,
                          "one heartbeat per silent interval; got " + repr(text))
+        # ...and one the client can actually see (EventSource hides
+        # comments): its watchdog tells a quiet stream from a dead one.
+        self.assertEqual(text.count("event: ping\ndata: {}\n\n"), 1, repr(text))
         self.assertLess(text.index(": keepalive"), text.index("event: end"))
 
     def test_final_output_is_sent_before_end(self):
@@ -3046,6 +3117,103 @@ class TestStreamEdges(unittest.TestCase):
         self.assertNotIn("event: end", h.wfile.text(),
                          "'end' written after the tail failed to go out")
 
+
+class TestShutdownIsNotSessionEnd(unittest.TestCase):
+    """A websh restart (every deploy) closes all sessions. That must not
+    reach the client as "the remote shell ended" ('end' / alive:false):
+    it left every pane at Disconnected, persistent ones included, whose
+    tmux was still running. A dropped stream / a 503 instead lets the
+    client find the session gone on the new server and re-attach."""
+
+    def test_stream_drops_without_end_when_shutdown_starts_mid_wait(self):
+        def shutdown(s):
+            server._shutting_down = True     # main() sets it, then close()
+            s._reads.append(server.TERM_RESET)
+            s.alive = False
+        sess = _DeliverySession(on_wait=shutdown)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        try:
+            h._stream_session(sess)
+        finally:
+            server._shutting_down = False
+        text = h.wfile.text()
+        self.assertNotIn("event: end", text)
+        self.assertNotIn(base64.b64encode(server.TERM_RESET).decode(), text,
+                         "the PTY teardown's screen reset reached the client")
+
+    def test_stream_race_alive_false_seen_before_flag_check(self):
+        # The loop read and found the session dead in the same round the
+        # flag went up: the post-loop check still suppresses 'end'.
+        class _Sess(_DeliverySession):
+            def read(self):
+                server._shutting_down = True
+                self.alive = False
+                return b""
+        sess = _Sess()
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        try:
+            h._stream_session(sess)
+        finally:
+            server._shutting_down = False
+        self.assertNotIn("event: end", h.wfile.text())
+
+    def test_long_poll_answers_transient_503(self):
+        def shutdown(s):
+            server._shutting_down = True
+            s.alive = False
+        sess = _DeliverySession(on_wait=shutdown)
+        h = _delivery_handler(sess)
+        try:
+            with unittest.mock.patch.object(server, "POLL_TIMEOUT", 5):
+                h._output()
+        finally:
+            server._shutting_down = False
+        body = json.loads(b"".join(h.wfile.chunks).decode("utf-8"))
+        self.assertEqual(h.status, [503])
+        self.assertEqual(body.get("code"), "restarting")
+        self.assertNotIn("alive", body)
+
+    def test_a_real_exit_still_ends_the_stream(self):
+        def exited(s):
+            s.alive = False
+        sess = _DeliverySession(on_wait=exited)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        h._stream_session(sess)
+        self.assertIn("event: end", h.wfile.text())
+
+class TestInputReplyCarriesCursor(unittest.TestCase):
+    """/api/input says where the session's output stands, so a client
+    whose output channel died quietly can notice it is behind."""
+
+    def _reply(self, sess):
+        h = server.Handler.__new__(server.Handler)
+        h.replies = []
+        h._json = lambda obj, status=200: h.replies.append((status, obj))
+        h._json_body = lambda: {"session_id": "x", "data": ""}
+        h._require_session = lambda sid: sess
+        h._client_ip = lambda: "203.0.113.5"
+        h._input()
+        return h.replies[0]
+
+    def test_cursor_is_the_output_end(self):
+        class S(object):
+            alive = True
+            auth_failed = False
+            _replay_end = 4711
+            def write(self, data):
+                return True
+        status, body = self._reply(S())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "alive": True, "cursor": 4711})
+
+    def test_session_without_a_cursor_omits_it(self):
+        class S(object):
+            alive = True
+            auth_failed = False
+            def write(self, data):
+                return True
+        _, body = self._reply(S())
+        self.assertNotIn("cursor", body)
 
 class TestReadLoopDrainsOnStop(unittest.TestCase):
     """What the remote printed just before the session stopped (a logout

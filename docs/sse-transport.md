@@ -42,7 +42,11 @@ to print yet — flushes it instantly.
 
 The pre-existing 10-second long-poll. Same JSON payload; no
 multi-message framing. The frontend uses this when SSE doesn't reach
-it, and never re-tries SSE for that pane (no flapping).
+it. While long-polling it tries the stream again from time to time
+(2 min, doubling up to 30 min) - NEXT TO the poll loop, so output never
+pauses for the attempt - and switches back once an event has actually
+arrived. One poll loop per pane: starting any output channel
+invalidates the previous loop's ticket (`p.outGen`).
 
 ### How the frontend chooses
 
@@ -58,11 +62,37 @@ it, and never re-tries SSE for that pane (no flapping).
    exactly the case we're guarding against.
 4. If the timer fires with no `'data'` / `'end'` event, an upstream is
    buffering us. Close the EventSource, set `p.sseDisabled = true`,
-   fall back.
-5. If `onerror` fires *before* any body event, treat as "this transport
-   doesn't work here" and fall back. Once SSE has delivered at least
-   one body event, transient errors are left to EventSource's own
-   auto-retry plus our wall-clock budget (below).
+   fall back. Exception: a timer that fired late (the page was frozen
+   or the machine asleep) or while the browser is offline proves
+   nothing - the stream is simply started over.
+5. If `onerror` fires *before* any body event, check the session over
+   plain HTTP and open the stream again; three such failures in a row
+   fall back to long-poll. Once SSE has delivered at least one body
+   event, transient errors are left to EventSource's own auto-retry
+   plus our wall-clock budget (below).
+
+### Silent connection death
+
+A connection that dies without a FIN - Wi-Fi switched, laptop slept, a
+NAT dropped the mapping - raises no error in the browser: the
+EventSource stays `OPEN` and silent, a long-poll never answers. Keys
+still go out (each `/api/input` is a new request), nothing comes back.
+Three independent detectors restart the output channel from the pane's
+cursor (`kickOutput`), so nothing is lost or printed twice:
+
+- **Heartbeat.** The server sends `event: ping` every 15 s of silence;
+  a stream with no event for 40 s is restarted. Armed only after the
+  first ping, so older servers are unaffected.
+- **Input cursor.** Every `/api/input` reply (keystrokes and the 30 s
+  keepalive) carries the session's output offset; a pane still behind
+  it 2 s later restarts its channel. This is the fast path: about 2 s
+  after the first keypress.
+- **Environment.** The browser's `online` event, a return from a long
+  absence (`visibilitychange`, bfcache), or a jump of the page's own
+  clock (sleep/freeze) restart every pane's channel.
+
+Long-poll requests are aborted after 25 s (the server answers within
+10), an unanswered `/api/input` after 10 s.
 
 The `'open'` event (HTTP headers received) is deliberately **not**
 listened to. Headers traverse a buffering proxy fine while the body
@@ -163,9 +193,12 @@ hit the guard and exit cleanly.
 `SSHSession.read()` is destructive. Two concurrent SSE consumers for
 the same session would race for bytes — each wakeup drains a fragment
 into one consumer's local variable, the other gets the next fragment,
-neither sees the full byte stream. The handler refuses a second
-`/api/stream` for an already-streaming session with `409 Conflict`
-("stream already active for this session"). The first consumer holds
+neither sees the full byte stream. A second `/api/stream` for an
+already-streaming session is the client reconnecting, so the newest
+wins: it bumps the session's stream generation, the holder steps aside
+before its next read and the slot changes hands in milliseconds. Only
+a holder that cannot step aside within ~2 s leaves the newcomer with
+`409 Conflict` ("stream already active for this session"). The consumer holds
 a per-session flag (`_stream_active`) under `sessions_lock` from the
 moment the request validates until the handler returns through any
 exit path — clean end, BrokenPipe, or unexpected exception.

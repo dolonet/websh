@@ -170,6 +170,9 @@ const EXPOSE = `
     get: () => currentConnectRun,
     set: v => { currentConnectRun = v; },
     configurable: true});
+  Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
+  Object.defineProperty(window, 'OUTPUT_LAG_MS', {get: () => OUTPUT_LAG_MS, set: v => { OUTPUT_LAG_MS = v; }, configurable: true});
+  Object.defineProperty(window, 'watchdogLastTick', {get: () => _watchdogLastTick, set: v => { _watchdogLastTick = v; }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
@@ -955,6 +958,268 @@ test('SSE closed for good (non-200 on reconnect) is recovered, not left spinning
   ok(p.sid === 'sse1', 'same session');
   p.polling = false;
   try { win.clearTimeout(p.sseFirstMsgTimer); } catch (e) {}
+  cleanup(env);
+});
+
+// One stream refused before its first event (409 while the old stream
+// held the slot; a deploy restarting the backend) switched the pane to
+// long-poll for good: in production a pane polled for hours, a request
+// per output chunk. It now asks over HTTP and goes back to the stream.
+function sseHarness(win) {
+  const sources = [];
+  win.EventSource = class {
+    constructor(url) { this.url = url; this.readyState = 0; this.l = {}; sources.push(this); }
+    addEventListener(ev, fn) { this.l[ev] = fn; }
+    set onerror(fn) { this._err = fn; }
+    close() { this.readyState = 2; this.closed = true; }
+  };
+  return sources;
+}
+function ssePane(win, sid) {
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = sid; p.polling = true; p.host = 'h'; p.outCursor = 0;
+  return p;
+}
+function sseStop(win, p) {
+  p.polling = false;
+  try { win.clearTimeout(p.sseFirstMsgTimer); } catch (e) {}
+}
+
+test('SSE refused before its first event goes back to the stream, not to long-poll', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-early');
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  sources[0].readyState = 2;            // 409: EventSource gives up at once
+  sources[0]._err();
+  await sleep(60);
+  ok(!p.sseDisabled, 'SSE not disabled by one early error');
+  ok(sources.length === 2 && !sources[1].closed, 'back on a fresh EventSource; sources=' + sources.length);
+  ok(log.filter(x => x.startsWith('output')).length === 1,
+     'one HTTP check, not a poll loop; got ' + log.join(','));
+  // A body event on the new stream resets the early-failure count.
+  sources[1].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  ok(p.sseEarlyFails === 0, 'count reset by a real frame; got ' + p.sseEarlyFails);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('SSE failing before the first event 3 times in a row falls back to long-poll', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-3x');
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  for (let i = 0; i < 3; i++) {
+    const es = sources[sources.length - 1];
+    es.readyState = 2; es._err();
+    await sleep(40);
+  }
+  ok(p.sseDisabled === true && p.sseDisabledReason === 'errors',
+     'disabled after 3 early failures; got ' + p.sseDisabled + '/' + p.sseDisabledReason);
+  ok(sources.length === 3, 'no 4th stream; got ' + sources.length);
+  const before = log.length;
+  await sleep(40);
+  ok(log.length > before, 'long-poll is running');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('a long-polling pane tries the stream NEXT TO the poll loop and switches when it works', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-retry');
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  // 'buffering' too: the first-message timer misfires on a slow link.
+  p.sseDisabled = true; p.sseDisabledReason = 'buffering'; p.sseDisabledAt = Date.now() - 10 * 60000;
+  win.pollOutput(p);
+  await sleep(40);
+  ok(sources.length === 1 && p.sseProbe === sources[0], 'probe stream opened; sources=' + sources.length);
+  ok(p.sseDisabled === true, 'still long-polling while the probe is out');
+  const polled = log.length;
+  await sleep(40);
+  ok(log.length > polled, 'output keeps flowing during the probe (no freeze)');
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  ok(!p.sseDisabled && sources.length === 2 && p.eventSource === sources[1],
+     'an event arrived: switched to the stream; sources=' + sources.length);
+  ok(sources[0].closed, 'probe closed');
+  const after = log.length;
+  await sleep(60);
+  ok(log.length - after <= 1, 'poll loop stopped; extra polls=' + (log.length - after));
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('a failed stream probe leaves the pane polling and doubles the wait', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-probe-fail');
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  p.sseDisabled = true; p.sseDisabledReason = 'errors'; p.sseDisabledAt = Date.now() - 10 * 60000;
+  win.pollOutput(p);
+  await sleep(40);
+  ok(sources.length === 1, 'probe opened');
+  sources[0]._err();
+  ok(p.sseDisabled && !p.sseProbe && sources[0].closed, 'probe failed: still long-poll');
+  ok(p.sseProbeWait === 240000, 'wait doubled; got ' + p.sseProbeWait);
+  const n = log.length;
+  await sleep(40);
+  ok(log.length > n && sources.length === 1, 'polling goes on, no immediate re-probe');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('only one poll loop per pane: a second start supersedes the first', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = ssePane(win, 'one-loop');
+  let inflight = 0, max = 0;
+  const base = win.fetch;
+  win.fetch = (url, init) => {
+    if (!/action=output/.test(url)) return base(url, init);
+    inflight++; max = Math.max(max, inflight);
+    return new Promise((res, rej) => {
+      const t = setTimeout(() => { inflight--; res({status: 200, json: () => Promise.resolve({data: '', alive: true, cursor: 0})}); }, 15);
+      if (init && init.signal) init.signal.addEventListener('abort', () => { clearTimeout(t); inflight--; rej(new Error('aborted')); });
+    });
+  };
+  win.fetch.__state = base.__state;
+  win.pollOutput(p);
+  await sleep(5);
+  win.pollOutput(p);            // e.g. fallback and reconnect both starting one
+  win.startOutput(p);
+  await sleep(120);
+  ok(max === 1, 'never two polls in flight; got ' + max);
+  ok(inflight === 1, 'and the loop is alive; inflight=' + inflight);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+// "Keys go out, nothing comes back, until I reload": the connection died
+// without a FIN (Wi-Fi switched, laptop slept) and nothing told the browser.
+test('stalled stream: no ping for SSE_STALL_MS restarts it from the cursor', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'stall');
+  p.outCursor = 321;
+  win.streamOutput(p);
+  sources[0].l.ping({data: '{}'});
+  ok(p.serverPings === true, 'server heartbeat seen');
+  win.outputWatchdogTick();
+  ok(sources.length === 1, 'a fresh stream is left alone');
+  p.sseLastAt = Date.now() - 41000;
+  p.lastKickAt = 0;
+  win.outputWatchdogTick();
+  ok(sources.length === 2 && sources[0].closed, 'silent stream replaced; sources=' + sources.length);
+  ok(/since=321/.test(sources[1].url), 'resumes from the cursor; url=' + sources[1].url);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('stalled stream: a server without pings is never restarted on silence', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'noping');
+  win.streamOutput(p);
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  p.sseLastAt = Date.now() - 10 * 60000;
+  win.outputWatchdogTick();
+  ok(sources.length === 1, 'quiet session on an older server left alone');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('input reply ahead of the pane\'s cursor restarts a channel that is not delivering', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'lag');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 100})});
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 164})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'ls\r');
+  await sleep(120);
+  ok(sources.length === 2 && sources[0].closed, 'dead stream replaced; sources=' + sources.length);
+  ok(/since=100/.test(sources[1].url), 'from the cursor; url=' + sources[1].url);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('input reply: a pane that caught up is left alone', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'nolag');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 103})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'x');
+  await sleep(20);
+  sources[0].l.data({data: JSON.stringify({data: Buffer.from('abc').toString('base64'), alive: true, cursor: 103})});
+  await sleep(100);
+  ok(sources.length === 1 && !sources[0].closed, 'healthy stream untouched; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('network back (online event) and a clock jump restart every pane\'s channel', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'online');
+  win.streamOutput(p);
+  win.dispatchEvent(new win.Event('online'));
+  ok(sources.length === 2 && sources[0].closed, 'online: stream restarted; sources=' + sources.length);
+  win.watchdogLastTick = Date.now() - 10 * 60000;            // the laptop slept
+  win.outputWatchdogTick();
+  ok(sources.length === 3 && sources[1].closed, 'after sleep: stream restarted; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('first-message timer firing late (page was asleep) restarts the stream, keeps SSE', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'late-timer');
+  const realST = win.setTimeout; let fire = null;
+  win.setTimeout = (fn, ms) => { if (ms === 5000 && !fire) { fire = fn; return 0; } return realST(fn, ms); };
+  const realNow = win.Date.now;
+  win.streamOutput(p);
+  win.setTimeout = realST;
+  ok(typeof fire === 'function', 'timer captured');
+  win.Date.now = () => realNow() + 60000;      // woke up a minute later
+  fire();
+  win.Date.now = realNow;
+  ok(!p.sseDisabled, 'SSE not written off as buffered');
+  ok(sources.length === 2, 'stream started over; sources=' + sources.length);
+  sseStop(win, p);
   cleanup(env);
 });
 
@@ -5931,6 +6196,328 @@ test('queueInput still sends a large-but-under-cap paste', async () => {
   await sleep(40);
   const sent = log.filter(e => e.action === 'input' && e.body && e.body.session_id === 'sid-ok');
   ok(sent.length === 1, '2 MB paste sent; got ' + sent.length);
+  cleanup(env);
+});
+
+// Typed text arrived scrambled in production ("ecoh" for "echo"): every
+// 10ms batch was its own /api/input, fired without waiting, and requests
+// in flight together reach the PTY in whatever order the network and the
+// backend's threads deliver them. The model below applies each request
+// after a random "network" delay; only strict one-at-a-time sending keeps
+// the order.
+function inputServer(win, opts) {
+  opts = opts || {};
+  const st = {applied: '', inflight: 0, maxInflight: 0, bodies: [], calls: 0};
+  const base = win.fetch;
+  win.fetch = function(url, init) {
+    const u = new URL(url, 'http://x/');
+    if (u.searchParams.get('action') !== 'input') return base(url, init);
+    const body = JSON.parse(init.body);
+    st.calls++; st.inflight++; st.maxInflight = Math.max(st.maxInflight, st.inflight);
+    const n = st.calls;
+    const delay = opts.delay ? opts.delay(n) : 1 + Math.floor(Math.random() * 25);
+    return new Promise((resolve, reject) => setTimeout(() => {
+      st.inflight--;
+      const r = opts.reply ? opts.reply(n, body) : null;
+      if (r === 'neterr') { reject(new TypeError('Failed to fetch')); return; }
+      if (r === 'hang') { st.inflight++; return; }
+      if (r && r.status) {
+        resolve({status: r.status, statusText: '', json: () => Promise.resolve({error: 'busy'})});
+        return;
+      }
+      st.applied += body.data; st.bodies.push(body.data);
+      resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true})});
+    }, delay));
+  };
+  return st;
+}
+
+test('input: keystrokes reach the PTY in the order typed, one request at a time', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-order';
+  const st = inputServer(win);
+  const text = 'echo the quick brown fox jumps over the lazy dog; ls -la /tmp\r';
+  for (const c of text) { win.queueInput(p, c); await sleep(Math.random() < 0.5 ? 0 : 12); }
+  for (let i = 0; i < 200 && st.applied.length < text.length; i++) await sleep(10);
+  ok(st.applied === text, 'order kept; got ' + JSON.stringify(st.applied));
+  ok(st.maxInflight === 1, 'never more than one input in flight; got ' + st.maxInflight);
+  ok(st.calls < text.length, 'keys typed during a request are batched; ' + st.calls + ' requests for ' + text.length + ' keys');
+  cleanup(env);
+});
+
+test('input: a busy (503) reply resends the same batch ahead of later keys', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-busy';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? {status: 503} : null});
+  win.queueInput(p, 'ab');
+  await sleep(20);
+  win.queueInput(p, 'cd');                 // typed while 'ab' waits to be resent
+  for (let i = 0; i < 100 && st.applied.length < 4; i++) await sleep(10);
+  ok(st.applied === 'abcd', 'resent batch first, nothing lost or doubled; got ' + JSON.stringify(st.applied));
+  cleanup(env);
+});
+
+test('input: a network error is not retried (the write may have landed)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-neterr';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? 'neterr' : null});
+  win.queueInput(p, 'x');
+  await sleep(30);
+  win.queueInput(p, 'y');
+  for (let i = 0; i < 100 && st.applied.length < 1; i++) await sleep(10);
+  await sleep(50);
+  ok(st.applied === 'y', 'no resend after a network error, later keys still flow; got ' + JSON.stringify(st.applied));
+  ok(st.calls === 2, 'two requests; got ' + st.calls);
+  cleanup(env);
+});
+
+test('input: 404 (session gone) reconnects the pane instead of dropping keys silently', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-new', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-dead'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  inputServer(win, {delay: () => 3, reply: () => ({status: 404})});
+  win.queueInput(p, 'ls\r');
+  for (let i = 0; i < 50 && !env.log.some(e => e.action === 'connect'); i++) await sleep(10);
+  ok(env.log.some(e => e.action === 'connect'), 'reconnect started; log=' + env.log.map(e => e.action).join(','));
+  ok(p.sid !== 'sid-dead', 'dead sid dropped; got ' + p.sid);
+  p.polling = false;
+  cleanup(env);
+});
+
+test('keepalive: 404 (session gone) reconnects instead of pinging a dead session forever', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-new2', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-dead2'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  inputServer(win, {delay: () => 3, reply: () => ({status: 404})});
+  const realSI = win.setInterval;
+  let tick = null;
+  win.setInterval = (fn, ms) => { if (ms === 30000) { tick = fn; return 1; } return realSI(fn, ms); };
+  win.startKeepalive(p);
+  win.setInterval = realSI;
+  ok(typeof tick === 'function', 'keepalive armed');
+  tick();
+  for (let i = 0; i < 50 && !env.log.some(e => e.action === 'connect'); i++) await sleep(10);
+  ok(env.log.some(e => e.action === 'connect'), 'reconnect started; log=' + env.log.map(e => e.action).join(','));
+  ok(p.sid !== 'sid-dead2', 'dead sid dropped; got ' + p.sid);
+  p.polling = false;
+  cleanup(env);
+});
+
+function goneThenOk(win, newSid) {
+  // /api/input: 404 for the dead sid, 200 (recorded) for any other.
+  const st = {sent: []};
+  const base = win.fetch;
+  win.fetch = (url, init) => {
+    if (!/action=input/.test(url)) return base(url, init);
+    const b = JSON.parse(init.body);
+    return sleep(3).then(() => {
+      if (b.session_id !== newSid) return {status: 404, statusText: '', json: () => Promise.resolve({error: 'session not found'})};
+      if (b.data) st.sent.push(b.data);
+      return {status: 200, json: () => Promise.resolve({ok: true, alive: true})};
+    });
+  };
+  win.fetch.__state = base.__state;
+  return st;
+}
+const RECONNECT_PLAN = sid => [
+  {action: 'config', response: {restrict_hosts: false, connections: []}},
+  {action: 'connect', response: {session_id: sid, alive: true}, delay: 30},
+  {action: 'resize', response: {ok: true}},
+  {action: 'output', response: {data: '', alive: true}, delay: 20},
+];
+
+test('input: keys typed into an expired PERSISTENT session arrive after the re-attach', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-back'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back');
+  win.queueInput(p, 'ls -la');
+  await sleep(25);
+  win.queueInput(p, '\r');               // typed while it re-attaches
+  for (let i = 0; i < 80 && p.sid !== 'sid-back'; i++) await sleep(10);
+  ok(p.sid === 'sid-back', 're-attached; sid=' + p.sid);
+  await sleep(60);
+  // /api/connect answered, but ssh is still logging in: keys written
+  // now are eaten by the login (seen in a real browser run).
+  ok(st.sent.length === 0 && p.inputGate === true, 'held until tmux is up; sent=' + JSON.stringify(st.sent));
+  const frame = t => win.handleOutputPayload(p, {data: Buffer.from(t, 'latin1').toString('base64'), alive: true}, 'sid-back');
+  frame('gorevds@host password: ');
+  await sleep(60);
+  ok(st.sent.length === 0, 'the password prompt does not open the gate');
+  frame('\x1b[?1049h\x1b[H\x1b[2Jtmux screen');
+  for (let i = 0; i < 80 && st.sent.join('') !== 'ls -la\r'; i++) await sleep(10);
+  ok(st.sent.join('') === 'ls -la\r', 'nothing lost, in order; got ' + JSON.stringify(st.sent));
+  ok(!p.inputGate, 'gate open');
+  win.queueInput(p, 'x');
+  for (let i = 0; i < 40 && st.sent.length < 2; i++) await sleep(10);
+  ok(st.sent.join('') === 'ls -la\rx', 'typing flows normally afterwards; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys are kept when the keepalive noticed the dead session first', async () => {
+  // Seen in a real browser: the keepalive ping and the typed batch were
+  // in flight together; the ping's 404 started the re-attach, and the
+  // batch's own 404, a few ms later, found "not my session any more"
+  // and the keys were dropped.
+  const env = await mkEnv(RECONNECT_PLAN('sid-back2'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back2');
+  win.queueInput(p, 'make test\r');
+  await sleep(11);                                   // the batch is in flight
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');   // someone else got the 404 first
+  for (let i = 0; i < 80 && p.sid !== 'sid-back2'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back2');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'make test\r', 'keys arrived after the re-attach; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys typed in the terminal WHILE a persistent pane re-attaches are kept', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-back3'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back3');
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');
+  ok(!p.sid && p.connecting, 're-attaching');
+  p.term._onDataCb('git status\r');          // through the terminal, as a keypress does
+  for (let i = 0; i < 80 && p.sid !== 'sid-back3'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back3');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'git status\r', 'kept and delivered; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys typed in the terminal of a disconnected pane go nowhere', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-x'));
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.persistent = true;
+  p.term._onDataCb('typed at a dead pane');
+  ok(p.inputQueue.length === 0 && !p.flushTimer, 'nothing queued');
+  ok(!env.log.some(e => e.action === 'input'), 'nothing sent');
+  cleanup(env);
+});
+
+test('input: keys still waiting to be sent survive the moment the session is found gone', async () => {
+  // Real browser, run 5 of 8: typed, and within the 10 ms before the
+  // batch leaves, the keepalive's 404 ended the session and wiped them.
+  const env = await mkEnv(RECONNECT_PLAN('sid-back4'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back4');
+  p.term._onDataCb('docker ps\r');
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');   // same tick
+  for (let i = 0; i < 80 && p.sid !== 'sid-back4'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back4');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'docker ps\r', 'delivered after the re-attach; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys for an expired NON-persistent session never reach the new shell', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-fresh'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true; p.persistent = false;
+  const st = goneThenOk(win, 'sid-fresh');
+  win.queueInput(p, 'rm -rf build');
+  await sleep(20);
+  win.queueInput(p, '\r');
+  for (let i = 0; i < 60 && p.sid !== 'sid-fresh'; i++) await sleep(10);
+  await sleep(60);
+  ok(p.sid === 'sid-fresh', 'reconnected; sid=' + p.sid);
+  ok(st.sent.length === 0, 'a different shell gets none of it; got ' + JSON.stringify(st.sent));
+  win.queueInput(p, 'x');
+  for (let i = 0; i < 40 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'x', 'new keys flow, old ones are gone; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: typing on a disconnected pane is dropped, not sent after a later reconnect', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-later'));
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.persistent = true;
+  win.queueInput(p, 'typed at a dead pane');
+  ok(p.inputQueue.length === 0, 'not queued; got ' + JSON.stringify(p.inputQueue));
+  cleanup(env);
+});
+
+test('input: held keys older than INPUT_HOLD_MS are dropped at re-attach', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-slow'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.host = 'h'; p.user = 'u'; p.persistent = true; p.sid = 'sid-slow';
+  const st = goneThenOk(win, 'sid-slow');
+  p.inputQueue = ['stale']; p.inputQueuedAt = Date.now() - 60000;
+  win.beginSessionIO(p);
+  win.openInputGate(p);
+  await sleep(60);
+  ok(st.sent.length === 0 && p.inputQueue.length === 0, 'stale keys dropped; sent=' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: a request that never answers does not freeze typing', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.INPUT_STALL_MS = 80;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-hang';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? 'hang' : null});
+  win.queueInput(p, 'a');
+  await sleep(20);
+  win.queueInput(p, 'b');
+  await sleep(40);
+  ok(st.calls === 1, 'waits for the first while it is merely slow; got ' + st.calls);
+  for (let i = 0; i < 50 && st.applied !== 'b'; i++) await sleep(10);
+  ok(st.applied === 'b', 'typing resumes after the stall timeout; got ' + JSON.stringify(st.applied));
   cleanup(env);
 });
 

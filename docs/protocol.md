@@ -64,7 +64,10 @@ connection / saved entry, `400` validation, `500` spawn failure.
 
 ### POST /api/input
 Body: `session_id`, `data` (UTF-8 keystrokes). Reply:
-`{"ok": bool, "alive": bool}`.
+`{"ok": bool, "alive": bool, "cursor": int}`. `cursor` is the offset of
+the end of the session's output so far: a client still behind it a
+couple of seconds later knows its output channel is not delivering and
+restarts it (see `docs/sse-transport.md`, "Silent connection death").
 
 ### GET /api/output?session_id=
 Long-poll: waits up to ~10 s for PTY output. Reply:
@@ -73,11 +76,14 @@ Long-poll: waits up to ~10 s for PTY output. Reply:
 
 ### GET /api/stream?session_id=
 SSE variant of `output` (one concurrent stream per session; a second
-attach waits ~250 ms for the slot then gets `409`). Framing: a
+attach takes the slot over from the first, which ends - `409` only if
+the holder cannot step aside within ~2 s). Framing: a
 `: ok` comment primer plus an empty *named* `event: data` event (the
 client's buffering-proxy detection depends on receiving it promptly),
 then named `event: data` events carrying the same JSON payload shape
-as `output`, `: keepalive` comment heartbeats, and a final
+as `output`, a heartbeat every 15 s of silence (a `: keepalive`
+comment for proxies plus a named `event: ping` the client can see),
+and a final
 `event: end` + `data: {"alive": false, ...}`. Note the events are
 named — a bare `EventSource.onmessage` consumer sees nothing.
 

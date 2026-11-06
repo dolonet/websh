@@ -1946,6 +1946,9 @@ class SSHSession(object):
     # reads them and would AttributeError on a stripped instance.
     _data_event = None
     _stream_active = False
+    # Bumped by a new /api/stream that finds the slot held: the holder
+    # sees its generation is stale and steps aside (see _stream).
+    _stream_gen = 0
     # Invariant: master_fd ∈ {a valid open fd, -1}. The sentinel -1 (rather
     # than None) means "closed / never opened" and lets master_fd-touching
     # methods early-return via `if self.master_fd < 0: return` instead of
@@ -4739,7 +4742,15 @@ class Handler(BaseHTTPRequestHandler):
                 # is the "this IP is a person" signal the scan-pattern
                 # detector forgives on (see _forgive_scan_for_ip).
                 _forgive_scan_for_ip(self._client_ip())
-            self._json({"ok": ok, "alive": session.alive})
+            reply = {"ok": ok, "alive": session.alive}
+            # Where the session's output stands. A client whose output
+            # channel died quietly (Wi-Fi switched, laptop slept: no FIN,
+            # no error) sees its own cursor fall behind this and restarts
+            # the channel, instead of showing nothing until a reload.
+            end = getattr(session, "_replay_end", None)
+            if isinstance(end, int):
+                reply["cursor"] = end
+            self._json(reply)
         except Exception as e:
             self._json({"error": "input error: " + str(e)}, 500)
 
@@ -4769,6 +4780,14 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 if self._client_gone():
                     return
+                if _shutting_down:
+                    # Transient for the client (it retries the SAME
+                    # session); the restarted server then says 404 and
+                    # the pane re-attaches. Not {"alive": false}, which
+                    # means the remote shell itself ended.
+                    self._json({"error": "server restarting",
+                                "code": "restarting"}, 503)
+                    return
                 extra = {}
                 if cursor is None:
                     data = session.read()
@@ -4796,6 +4815,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise
                     return
                 if not session.alive:
+                    if _shutting_down:
+                        continue    # answered as 503 at the loop top
                     body = {"data": "", "alive": False,
                             "auth_failed": session.auth_failed}
                     body.update(extra)
@@ -4846,16 +4867,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "forbidden"}, 403)
                 return
         # Acquire the per-session stream slot under sessions_lock. A second
-        # /api/stream for the same session is mostly the *legitimate*
-        # client reconnecting (visibility resume, network blip, EventSource
-        # auto-retry); the previous holder may not have observed the FIN
-        # yet, especially through nginx. Wait briefly (~250 ms) for the
-        # previous holder's `finally` to release the slot — most races
-        # resolve in single-digit ms. After the deadline, fall back to a
-        # 409 so a truly stuck holder doesn't deadlock the client.
-        deadline = time.time() + 0.25
+        # /api/stream for the same session is the client reconnecting
+        # (visibility resume, network blip, EventSource auto-retry), and
+        # the NEWEST stream wins: the previous holder may be writing into
+        # a connection that died without a FIN (laptop asleep, network
+        # switched), which TCP only notices minutes later. It used to keep
+        # the slot all that time and every reconnect got a 409 - and the
+        # client then gave up on SSE for good. Bump the generation and wake
+        # the holder; it steps aside before its next read (output is read
+        # by cursor, so nothing is lost) and releases the slot in ms. A
+        # holder blocked inside a write can't look; after the deadline a
+        # 409 still keeps a truly stuck one from deadlocking the client.
+        deadline = time.time() + 2.0
         session = None
         duplicate = False
+        took_over = False
+        my_gen = 0
         while True:
             with sessions_lock:
                 session = sessions.get(sid)
@@ -4871,7 +4898,12 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if not session._stream_active:
                     session._stream_active = True
+                    my_gen = getattr(session, "_stream_gen", 0)
                     break
+                if not took_over:
+                    session._stream_gen = getattr(session, "_stream_gen", 0) + 1
+                    took_over = True
+                    session._signal()
             if time.time() >= deadline:
                 duplicate = True
                 break
@@ -4884,7 +4916,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            self._stream_session(session, self._output_cursor(params))
+            self._stream_session(session, self._output_cursor(params),
+                                 gen=my_gen)
         finally:
             # Release the per-session stream slot regardless of how the
             # body exited (clean end, BrokenPipe, exception). Done under
@@ -4893,7 +4926,7 @@ class Handler(BaseHTTPRequestHandler):
             with sessions_lock:
                 session._stream_active = False
 
-    def _stream_session(self, session, cursor=None):
+    def _stream_session(self, session, cursor=None, gen=None):
         """Body of /api/stream once the per-session slot is held.
 
         With a cursor (current clients) output is read with read_since():
@@ -4968,6 +5001,18 @@ class Handler(BaseHTTPRequestHandler):
                     if data and cursor is None:
                         session.unread(data)
                     return
+                if _shutting_down:
+                    # Drop the connection without 'end': the client sees
+                    # a broken stream, the restarted server answers 404,
+                    # and the pane re-attaches (tmux) or reconnects. Also
+                    # before any read - the PTY teardown's terminal reset
+                    # must not reach a screen that is about to resume.
+                    return
+                if gen is not None and getattr(session, "_stream_gen", 0) != gen:
+                    # A newer stream for this session asked for the slot:
+                    # this connection is the stale one. Nothing was read
+                    # this round, so nothing is lost.
+                    return
                 extra = {}
                 if cursor is None:
                     data = session.read()
@@ -5012,7 +5057,13 @@ class Handler(BaseHTTPRequestHandler):
                 # time.sleep(POLL_INTERVAL) busy-poll.
                 now = time.time()
                 if now - last_send > KEEPALIVE:
-                    self.wfile.write(b": keepalive\n\n")
+                    # The comment keeps proxies from idling the stream
+                    # out; the named event is what the CLIENT can see
+                    # (EventSource hides comments) - its watchdog restarts
+                    # a stream that has gone silent. Older clients have
+                    # no listener for it and ignore it.
+                    self.wfile.write(
+                        b": keepalive\n\nevent: ping\ndata: {}\n\n")
                     self.wfile.flush()
                     last_send = now
                 next_keepalive = last_send + KEEPALIVE
@@ -5020,6 +5071,8 @@ class Handler(BaseHTTPRequestHandler):
                 session.wait_for_data(self.connection, timeout,
                                       selector=sel)
 
+            if _shutting_down:
+                return      # see the check at the top of the loop
             # Drain any remaining buffered output before sending 'end'.
             head = "event: data\n"
             tbody = {"alive": False, "auth_failed": session.auth_failed}
@@ -5976,6 +6029,14 @@ def _warn_max_threads_misconfig():
             MAX_THREADS))
 
 
+# Set when the server is going down (deploy, systemctl restart). Sessions
+# then die only because websh restarts, not because the remote shell
+# exited: stream and long-poll readers must not report that as the end of
+# the session, or every pane - persistent ones included, whose tmux lives
+# on - sits at "Disconnected" after each deploy. See _stream_session/_output.
+_shutting_down = False
+
+
 def _close_all_sessions():
     """Snapshot the session registry under the lock, clear it, then close
     each session OUTSIDE the lock — close() runs SIGTERM/WNOHANG/SIGKILL/
@@ -6097,6 +6158,8 @@ def main():
 
     stop_event.wait()
     _log("INFO", "shutting down")
+    global _shutting_down
+    _shutting_down = True
     _close_all_sessions()
     server.shutdown()
     server.server_close()
