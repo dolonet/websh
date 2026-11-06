@@ -128,6 +128,33 @@
     /* ── Panes ── */
     #panes{flex:1;display:flex;overflow:hidden}
     .pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative}
+    /* Drag-and-drop upload target: an outline + the reason/instruction. */
+    .pane-reconnect{position:absolute;top:40px;left:50%;transform:translateX(-50%);z-index:15;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid #e5a50a;border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+    /* Drag-and-drop target. Drawn as its own layer ABOVE the terminal:
+       an `outline` on .pane paints under xterm's positioned render
+       layers, so only the top (pane bar) and bottom strip of the frame
+       were ever visible. ::before = full rounded dashed frame + dimmed,
+       slightly blurred backdrop so the card stays legible over busy
+       output; ::after = the card. --dz is the accent (amber = refused). */
+    .pane.drop-target{--dz:var(--ac);--dz-rgb:88,166,255}
+    .pane.drop-target.drop-refused{--dz:var(--wn);--dz-rgb:210,153,34}
+    .pane.drop-target::before{content:'';position:absolute;inset:6px;z-index:30;pointer-events:none;
+      border:2px dashed var(--dz);border-radius:10px;
+      background:rgba(13,17,23,.72);
+      background-image:radial-gradient(ellipse at center,rgba(var(--dz-rgb),.16),rgba(var(--dz-rgb),.04) 70%);
+      -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
+      animation:dz-in .12s ease-out}
+    /* Centered with inset:0 + margin:auto (a left:50% box shrink-wraps to
+       half the pane and wrapped the text in narrow splits). */
+    .pane.drop-target::after{content:'\2B06\FE0E  ' attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;z-index:31;pointer-events:none;
+      width:max-content;max-width:calc(100% - 48px);height:max-content;text-align:center;
+      background:var(--sf);color:var(--tx);border:1px solid var(--dz);border-radius:10px;
+      padding:12px 20px;font-size:14px;font-weight:600;letter-spacing:.2px;
+      box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 4px rgba(var(--dz-rgb),.14);
+      animation:dz-in .12s ease-out}
+    .pane.drop-target.drop-refused::after{content:'\26A0\FE0E  ' attr(data-drop-msg);color:var(--dz);font-weight:500}
+    @keyframes dz-in{from{opacity:0}to{opacity:1}}
+    @media (prefers-reduced-motion:reduce){.pane.drop-target::before,.pane.drop-target::after{animation:none}}
     .pane.active>.pane-bar{background:var(--sf)}
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
     .pane-badge{font-size:10px;padding:1px 6px;border-radius:10px;font-weight:500}
@@ -239,6 +266,11 @@
     /* ── File browser modal ── */
     .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:680px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
     .fb-hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
+    /* .panel-close is absolutely positioned for the other panels; here it
+       belongs in the header row, not in the page's top-right corner. */
+    .fb-hd .panel-close{position:static;flex-shrink:0;margin-left:auto}
+    .fb-host{flex-shrink:1;min-width:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--ac);border:1px solid var(--bd);border-radius:4px;padding:2px 7px}
+    .fb-cf-note{color:var(--dim);font-size:11px}
     /* Breadcrumb path. Scrolls horizontally on a deep path rather than
        ellipsising, so every segment stays clickable; min-width:0 keeps
        it from shoving the close button off the row. */
@@ -249,7 +281,7 @@
     .fb-crumb.cur:hover{background:none}
     .fb-crumb-sep{color:var(--dim);opacity:.5;flex-shrink:0;padding:0 1px}
     /* Toolbar row: create/hidden/filter on the left, sort on the right. */
-    .fb-tools{display:flex;align-items:center;gap:6px;padding:7px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
+    .fb-tools{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
     .fb-tool{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 9px;border-radius:4px;font-size:11px;font-family:inherit;white-space:nowrap;flex-shrink:0;transition:.15s}
     .fb-tool:hover{color:var(--tx);border-color:var(--dim)}
     .fb-tool.on{color:var(--ac);border-color:var(--ac)}
@@ -298,6 +330,7 @@
     .fb-cf-yes:hover{background:var(--dg)!important;color:#fff!important}
     /* Hidden by the name filter or the dotfile toggle. */
     .fb-row.fb-hide{display:none}
+    .fb-row:focus-visible{outline:2px solid var(--ac);outline-offset:-2px}
     .fb-msg{padding:20px;text-align:center;color:var(--dim);font-size:13px}
     .fb-msg.err{color:var(--dg)}
     .fb-ft{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bd);flex-shrink:0}
@@ -310,6 +343,7 @@
       .fb-dt{display:none}
       .fb-sz{min-width:52px}
       .fb-sort button{padding:3px 5px}
+      .fb-sort{margin-left:auto}
       .fb-tool{padding:3px 6px}
     }
   </style>
@@ -565,13 +599,14 @@
 
 <!-- File browser modal -->
 <div id="fbOv" class="ov h" onclick="if(event.target===this)closeFb()">
-  <div class="fb-panel">
+  <div class="fb-panel" role="dialog" aria-modal="true" aria-label="File browser">
     <div class="fb-hd">
-      <button class="fb-up" onclick="fbUp()" title="Parent directory">&#x2191;</button>
-      <!-- Clickable path segments (breadcrumbs), rendered by renderFbCrumbs.
+      <button class="fb-up" onclick="fbUp()" title="Parent directory" aria-label="Parent directory">&#x2191;</button>
+      <!-- Clickable path segments (breadcrumbs), rendered by setFbPath.
            data-path carries the full resolved path for scripts/tests. -->
+      <span class="fb-host" id="fbHost" hidden></span>
       <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
-      <button class="panel-close" onclick="closeFb()">&#x00D7;</button>
+      <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser">&#x00D7;</button>
     </div>
     <div class="fb-tools">
       <button type="button" class="fb-tool" onclick="fbNewFolder()" title="Create a folder here">&#x002B; Folder</button>

@@ -566,6 +566,66 @@ class TestStartupRefusals(unittest.TestCase):
                              unit)
 
 
+class TestStaticCompressionAndValidators(LiveServerCase):
+    """websh.js (~230 KB) was re-sent raw on every page load: no gzip,
+    no ETag. Now gzip is negotiated and a matching If-None-Match gets a
+    body-less 304, while Cache-Control stays no-cache so a deploy is
+    still picked up immediately."""
+
+    def _get(self, path, headers):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", path, headers=headers)
+        r = c.getresponse(); body = r.read(); c.close()
+        return r, body
+
+    def test_gzip_negotiated_and_body_is_identical(self):
+        import gzip as _gz
+        raw_r, raw = self._get("/websh.js", {})
+        self.assertEqual(raw_r.status, 200)
+        self.assertIsNone(raw_r.getheader("Content-Encoding"))
+        gz_r, gz = self._get("/websh.js", {"Accept-Encoding": "gzip, br"})
+        self.assertEqual(gz_r.getheader("Content-Encoding"), "gzip")
+        self.assertIn("Accept-Encoding", gz_r.getheader("Vary"))
+        self.assertLess(len(gz), len(raw) // 2)
+        self.assertEqual(_gz.decompress(gz), raw)
+        # gzip;q=0 is a refusal.
+        r, _ = self._get("/websh.js", {"Accept-Encoding": "gzip;q=0"})
+        self.assertIsNone(r.getheader("Content-Encoding"))
+
+    def test_etag_revalidation_returns_304(self):
+        r, body = self._get("/websh.js", {"Accept-Encoding": "gzip"})
+        tag = r.getheader("ETag")
+        self.assertTrue(tag and tag.startswith('"'))
+        self.assertEqual(r.getheader("Cache-Control"), "no-cache")
+        r2, body2 = self._get("/websh.js", {"Accept-Encoding": "gzip",
+                                            "If-None-Match": tag})
+        self.assertEqual(r2.status, 304)
+        self.assertEqual(body2, b"")
+        # The identity variant has a different tag: no cross-variant 304.
+        r3, _ = self._get("/websh.js", {"If-None-Match": tag})
+        self.assertEqual(r3.status, 200)
+        # Weak-prefixed and listed tags match too.
+        r4, _ = self._get("/websh.js", {"Accept-Encoding": "gzip",
+                                        "If-None-Match": '"x", W/' + tag})
+        self.assertEqual(r4.status, 304)
+
+    def test_changed_file_gets_a_new_tag(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "f.js")
+            with open(p, "w") as f:
+                f.write("a" * 2000)
+            t1 = server._static_blob(p)[2]
+            time.sleep(0.01)
+            with open(p, "w") as f:
+                f.write("b" * 2001)
+            t2 = server._static_blob(p)[2]
+            self.assertNotEqual(t1, t2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestAuthVaultStartupGuard(unittest.TestCase):
     """main() refuses to start when WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE
     are both set: the vault is keyed by client-supplied vault_id, not by the

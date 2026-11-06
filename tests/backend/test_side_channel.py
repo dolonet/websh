@@ -182,6 +182,33 @@ class TestSideChannelRateLimit(unittest.TestCase):
             httpd.shutdown(); httpd.server_close()
             server.WEBSH_AUTH_HEADER = orig_hdr
 
+    def test_rm_failures_use_meaningful_statuses(self):
+        """502 for every failure was wrong and fragile: a proxy may swap a
+        5xx body for its own HTML. Known reasons map to 404/409/403/400;
+        an already-gone target is a success."""
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+                for ret, want in (((False, "Permission denied"), 403),
+                                  ((False, "Directory not empty"), 409),
+                                  ((False, "File name too long"), 400),
+                                  ((False, "ssh error: boom"), 502),
+                                  ((True, "already gone"), 200)):
+                    fake.remove_path.return_value = ret
+                    code, data = self._hit(port, "POST", "/api/rm",
+                                           b'{"session_id":"{sid}","path":"/x"}', sid)
+                    self.assertEqual(code, want, (ret, data))
+                    if ret[0]:
+                        self.assertIn(b'"already_gone": true', data)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+
     def test_upload_size_cap_and_empty_body(self):
         """Mutation guard: MAX_UPLOAD_SIZE appeared in no test - deleting
         the 413 check left the suite green - and the 400 on an empty body
@@ -1507,12 +1534,12 @@ class TestRemovePath(unittest.TestCase):
         s._username = "alice"
         return s
 
-    def _run(self, returncode, capture=None):
+    def _run(self, returncode, capture=None, stderr=b""):
         s = self._session()
         result = unittest.mock.MagicMock()
         result.returncode = returncode
         result.stdout = b""
-        result.stderr = b""
+        result.stderr = stderr
 
         def fake_run(argv, **_):
             if capture is not None:
@@ -1534,19 +1561,23 @@ class TestRemovePath(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(err, "")
 
-    def test_exit_codes_map_to_distinct_messages(self):
-        """Each failure mode gets its own message — a bare "exit 1"
-        leaves the user unable to tell "already gone" from "not empty"
-        from "not yours"."""
-        seen = set()
-        for code, needle in ((3, "no such file"),
-                             (4, "not empty"),
-                             (5, "permission")):
-            ok, err = self._run(code)
+    def test_failure_reason_comes_from_the_remote_error(self):
+        """The reason is the remote tool's own errno text, not a guess
+        from the exit code: EBUSY / EROFS used to read "permission
+        denied", a chmod-000 parent "no such file"."""
+        for stderr, needle in (
+                (b"rmdir: failed to remove '/proc': Device or resource busy\n", "busy"),
+                (b"rm: can't remove '/ro/f': Read-only file system\n", "Read-only"),
+                (b"rmdir: failed to remove '/d': Directory not empty\n", "not empty"),
+                (b"rm: cannot remove '/x': Permission denied\n", "Permission denied")):
+            ok, err = self._run(5, stderr=stderr)
             self.assertFalse(ok)
             self.assertIn(needle, err)
-            seen.add(err)
-        self.assertEqual(len(seen), 3, "messages must be distinguishable")
+
+    def test_already_gone_is_success(self):
+        # A retry after a lost response must not report a failure for a
+        # delete that already happened.
+        self.assertEqual(self._run(3), (True, "already gone"))
 
     def test_unknown_exit_code_still_reports(self):
         ok, err = self._run(9)
@@ -1670,7 +1701,7 @@ class TestMakeDir(unittest.TestCase):
         s._username = "alice"
         return s
 
-    def _run(self, returncode, capture=None):
+    def _run(self, returncode, capture=None, stderr=b""):
         s = self._session()
         result = unittest.mock.MagicMock()
         result.returncode = returncode
@@ -1731,11 +1762,12 @@ class TestRenameEntry(unittest.TestCase):
         s._username = "alice"
         return s
 
-    def _run(self, returncode, capture=None):
+    def _run(self, returncode, capture=None, stderr=b""):
         s = self._session()
         result = unittest.mock.MagicMock()
         result.returncode = returncode
-        result.stdout = result.stderr = b""
+        result.stdout = b""
+        result.stderr = stderr
 
         def fake_run(argv, **_):
             if capture is not None:
@@ -1752,14 +1784,13 @@ class TestRenameEntry(unittest.TestCase):
         self.assertEqual(err, "")
 
     def test_exit_codes_distinct(self):
-        seen = set()
-        for code, needle in ((3, "no such"), (4, "already exists"),
-                             (5, "permission")):
-            ok, err = self._run(code)
-            self.assertFalse(ok)
-            self.assertIn(needle, err)
-            seen.add(err)
-        self.assertEqual(len(seen), 3)
+        self.assertEqual(self._run(3), (False, "no such file or directory"))
+        ok, err = self._run(4)
+        self.assertIn("already exists", err)
+        ok, err = self._run(5, stderr=b"mv: cannot move 'a' to 'b/a': Not a directory\n")
+        self.assertFalse(ok)
+        self.assertEqual(err, "Not a directory")
+        self.assertEqual(server._side_channel_status(err), 409)
 
     def test_destination_is_a_sibling(self):
         """The new name is joined onto dirname(src) inside the shell, so
@@ -2437,6 +2468,38 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
             self.assertEqual(path, d, sh)              # no .strip()
             self.assertEqual(sorted(e["name"] for e in entries),
                              sorted(weird), sh)
+            shutil.rmtree(d)
+
+    def test_pane_cwd_that_no_longer_exists_falls_back_to_home(self):
+        # tmux reports a deleted cwd as "path (deleted)"; an unreadable
+        # cwd can't be entered. Pane-cwd mode must land in $HOME rather
+        # than fail the whole listing. An explicit path still fails.
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            s.pane_cwd_expr = lambda: 'D="/nonexistent/gone (deleted)"; '
+            entries, path, err = s.list_dir("~", pane_cwd=True)
+            self.assertIsNone(err, sh)
+            self.assertEqual(os.path.realpath(path),
+                             os.path.realpath(os.path.expanduser("~")), sh)
+            entries, path, err = s.list_dir("/nonexistent/explicit")
+            self.assertEqual(err, "directory not found", sh)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_real_permission_error_is_reported_as_such(self):
+        # rm inside a chmod-555 directory: the old mapping guessed from the
+        # exit code; now the remote's own words come back.
+        for sh in self.SHELLS:
+            d = os.path.join(self.tmp, "ro")
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "f"), "w").close()
+            os.chmod(d, 0o555)
+            try:
+                ok, err = self._session(sh).remove_path(os.path.join(d, "f"))
+            finally:
+                os.chmod(d, 0o755)
+            self.assertFalse(ok, sh)
+            self.assertIn("ermission denied", err, sh)
+            self.assertEqual(server._side_channel_status(err), 403)
             shutil.rmtree(d)
 
     def test_rename_refuses_to_clobber_and_stays_in_dir(self):
