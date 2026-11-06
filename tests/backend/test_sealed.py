@@ -860,7 +860,7 @@ class TestSealedUnavailable(unittest.TestCase):
         code, raw = self.s.get("/api/config")
         self.assertEqual(code, 200)
         cfg = json.loads(raw.decode())
-        self.assertEqual(cfg.get("sealed"), {"available": False, "identity": None})
+        self.assertEqual(cfg.get("sealed"), {"available": False, "identity": None, "wire": 2})
         self.assertEqual(cfg["proto"], 1)
 
     def test_seal_open_and_sealed_answer_501(self):
@@ -1538,27 +1538,43 @@ class TestSealedThroughPhpProxy(_SealedThroughAFront, _FakeSshCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.php_port = _free_port()
+        # The proxy uses Unix sockets. Point it at this in-process fixture,
+        # otherwise it auto-starts another backend without our sessions or
+        # slow-link controls and the assertions exercise the wrong server.
+        unix = server.UnixServer(os.path.join(cls.work, "proxy.sock"), server.Handler)
+        thread = threading.Thread(target=unix.serve_forever, daemon=True)
+        thread.start()
+        def stop_unix():
+            unix.shutdown()
+            unix.server_close()
+            thread.join(timeout=5)
+        cls.addClassCleanup(stop_unix)
         # WEBSH_PHP_DOCROOT: another api.php to put in front (to prove these
         # tests fail on an older proxy).
         root = os.environ.get("WEBSH_PHP_DOCROOT") or REPO_ROOT
         # php -S serves one request at a time unless told otherwise; the
         # open stream would block every other request (shared hosting has
         # a pool of workers).
-        env = {"WEBSH_PORT": str(cls.port), "PHP_CLI_SERVER_WORKERS": "4"}
+        env = {"WEBSH_SOCKET": unix.server_address, "PHP_CLI_SERVER_WORKERS": "4"}
         if _php_route() == "local":
             e = dict(os.environ)
             e.update(env)
             cls.php = subprocess.Popen(
                 ["php", "-S", "127.0.0.1:%d" % cls.php_port, "-t", root],
-                env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
             cls.php_name = None
         else:
             cls.php_name = "websh-sealed-php-%d-%d" % (os.getpid(), cls.php_port)
             cls.php = subprocess.Popen(
-                ["docker", "run", "--rm", "--name", cls.php_name, "--network", "host",
-                 "-e", "WEBSH_PORT=%d" % cls.port, "-e", "PHP_CLI_SERVER_WORKERS=4", "-v", root + ":/w", "-w", "/w",
+                ["docker", "run", "--rm", "--name", cls.php_name, "--network", "bridge",
+                 "--user", "%d:%d" % (os.getuid(), os.getgid()),
+                 "-p", "127.0.0.1:%d:%d" % (cls.php_port, cls.php_port),
+                 "-e", "WEBSH_SOCKET=" + unix.server_address,
+                 "-e", "PHP_CLI_SERVER_WORKERS=4", "-v", cls.work + ":" + cls.work,
+                 "-v", root + ":/w:ro", "-w", "/w",
                  "websh-php-smoke:latest",
-                 "php", "-S", "127.0.0.1:%d" % cls.php_port, "-t", "/w"],
+                 "php", "-S", "0.0.0.0:%d" % cls.php_port, "-t", "/w"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + 30
         while True:
@@ -1581,11 +1597,15 @@ class TestSealedThroughPhpProxy(_SealedThroughAFront, _FakeSshCase):
             subprocess.run(["docker", "stop", "-t", "2", cls.php_name],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if cls.php.poll() is None:
-            cls.php.terminate()
+            if not cls.php_name:
+                os.killpg(cls.php.pid, signal.SIGTERM)
+            else:
+                cls.php.terminate()
             try:
                 cls.php.wait(10)
             except subprocess.TimeoutExpired:
                 cls.php.kill()
+                cls.php.wait(5)
 
     @classmethod
     def tearDownClass(cls):

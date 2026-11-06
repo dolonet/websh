@@ -138,9 +138,12 @@ class TestUploadTextBody(_UploadCase):
         self.assertEqual(code, 409, j)
         self.assertEqual(j, {"error": "offset mismatch", "size": 10})
         self.assertEqual(self.file(".websh-tmp-o"), b"x" * 10, "file untouched")
-        # offset 0 again starts over, as for raw pieces
-        self.assertEqual(self.up(".websh-tmp-o", b"z", offset=0)[0], 200)
-        self.assertEqual(self.file(".websh-tmp-o"), b"z")
+        # A delayed first piece cannot erase later immutable staging bytes,
+        # whether the wire body is binary or base64 JSON.
+        code, j = self.up(".websh-tmp-o", b"z", offset=0)
+        self.assertEqual(code, 409, j)
+        self.assertEqual(j, {"error": "offset mismatch", "size": 10})
+        self.assertEqual(self.file(".websh-tmp-o"), b"x" * 10)
 
     def test_a_bad_text_body_is_400_and_writes_nothing(self):
         good = base64.b64encode(b"hello").decode()
