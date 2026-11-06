@@ -106,6 +106,62 @@ than a lost one. `404` means the session is gone: the pane reconnects,
 and for a persistent pane the batch is held for the re-attach (see
 `docs/persistent-sessions.md`, "Coming back after an absence").
 
+### Paint guard
+
+Output that reached the page must be on screen. Users (Chrome on macOS,
+Yandex Browser on Windows) came back to a hidden tab, typed, saw
+nothing, and a reload showed it all; the server had the keys and the
+echo. The diagnostics beacon (below) caught one: a pane on a visible
+page had output written 5 ms before the reload and xterm had not
+rendered for 18 s - and the first version of this guard (a timer only,
+standing down whenever the page said it was hidden) had not fired once.
+
+Two ways xterm 5.5 stops drawing, read from its source:
+
+1. It parses written data in `WriteBuffer._innerWrite`, from a
+   `setTimeout`. Neither that loop nor its `EventEmitter.fire` (which
+   calls listeners during parsing) catches an exception: one throw leaves
+   the chunks queued with no timer scheduled, and every later write only
+   appends - nothing is parsed or drawn again until a reload.
+2. The DOM renderer draws on `requestAnimationFrame` and pauses while an
+   IntersectionObserver says the terminal is off screen; a pause never
+   lifted, or a frame that never runs, freezes the screen.
+
+What websh does:
+
+- The check runs on every write (output arrives on network events, which
+  run when timers may not) and from a timer once writes stop. It counts
+  from the FIRST write not rendered since the last render, so a steady
+  trickle of output cannot postpone it; a render while written chunks
+  still wait unparsed (the cursor blink draws even when parsing is dead)
+  does not count.
+- "On screen" means the pane's tab is shown and the page is visible, or
+  has focus: a page the user is typing into is being looked at, whatever
+  `visibilityState` says.
+- After 1 s: if parsing has not moved for 1 s with chunks queued, xterm's
+  write loop is run again by hand, skipping a chunk that throws (its
+  output is lost; the screen goes on); then a full refresh. Next time
+  the renderer is reset by hand (pause lifted, stuck frame dropped,
+  glyph cache cleared, rows rendered at once). Then the pane is left for
+  10 s. Each step is a `console.warn` (`paint: ...`), at most one per
+  second per pane.
+- A pane coming back on screen - the page shown again
+  (`visibilitychange`, any absence), the window focused, `pageshow`, its
+  tab shown (which also covers a pane moved or merged) - is repainted
+  in full. It is refitted first only if its box no longer matches its
+  cols/rows, so no `/api/resize` goes out when nothing changed (a resize
+  makes tmux redraw the whole screen).
+
+No timer runs unless something was written or a repaint asked for; a
+pane in a hidden tab is not watched (it is repainted when shown).
+
+When the page goes away (`pagehide`) while some pane looks stuck -
+output on screen unrendered for over 1 s, the parse queue stuck, behind
+the server's output offset for over 2 s, or a paint recovery happened -
+one `navigator.sendBeacon` to `client_diag`
+(`docs/protocol.md`) puts the numbers in the server log, so the next
+occurrence says which of the two it was. Nothing is sent otherwise.
+
 The `'open'` event (HTTP headers received) is deliberately **not**
 listened to. Headers traverse a buffering proxy fine while the body
 sits in the buffer — disarming the timer or resetting the retry

@@ -22,8 +22,13 @@ export async function run({ b, t, port }) {
   resetConnections(port);
   const word = tagOf('T') + '_after_reset_0123456789';
   await b.type(i, `echo ${word}\r`);
-  await sleep(3000);
-  t.ok((await b.lines(i)).includes(word), 'typing right after a reset arrives intact');
+  // Waited for, not slept: the echo comes back with the stream, ~3 s
+  // after the reset in both modes (measured 2026-10-21: 2.0-3.05 s plain,
+  // 3.01-3.05 s sealed). A fixed 3 s sleep failed 1 run in 10 plain and
+  // 4 in 10 sealed with the text already on its way.
+  const back = await until(async () => (await b.lines(i)).includes(word), 10000);
+  t.note(`echo after the reset: ${back} ms`);
+  t.ok(back >= 0, 'typing right after a reset arrives intact');
   const st = (await b.state())[i];
   t.ok(st.sid === sid && st.sse, 'same session, on SSE');
   await b.type(i, 'exit\r');

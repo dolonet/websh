@@ -158,10 +158,16 @@ path. The client stops with an error if the existing file is larger
 than the selected file, without reusing or finalizing that path.
 Without `offset`, the legacy whole-file request still overwrites its
 destination. The client sends
-pieces (4 MB, smaller after failures, each retried on its own) only
-when `/api/config` says `upload_chunks: true`, because an older server
-would overwrite the file with every piece. Pieces are what let an
-upload cross a proxy or VPN that cuts long or large requests.
+pieces (4 MB, each retried on its own) only when `/api/config` says
+`upload_chunks: true`, because an older server would overwrite the file
+with every piece. Pieces are what let an upload cross a proxy or VPN
+that cuts long or large requests. A cut piece (nginx `400 "client sent
+fewer bytes than Content-Length"`, a dropped connection, or our own
+short-body `502`) halves the piece size from the first failure down to
+256 KB, so a size the proxy passes is found and the file still lands
+whole. A truncation never reaches the server as a final error; the
+client only gives up (fast, with a "blocked or cut short" banner) when
+no piece lands within its wall-clock budget.
 
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
@@ -281,6 +287,29 @@ Public configuration for the client. Reply: `{"connections": [...],
 int, "version": str, "proto": int, "vault_enabled": bool}`
 (connection entries carry no secrets; deployments may extend this with
 additive fields).
+
+### POST /api/client_diag
+A page's diagnostics beacon (`navigator.sendBeacon` on `pagehide`, sent
+only when some pane looked stuck; see `docs/sse-transport.md`, "Paint
+guard"). Body: a JSON object - the beacon sends it as `text/plain`, so
+this action reads JSON whatever the media type (max 16 KB). Page fields:
+`vis` (visibilityState), `focus` (bool), `vis_ago` (ms since the last
+visibility change), `recoveries`, `err` (the last uncaught error
+message, at most 80 characters) and `err_ago`. `panes`: up to 16 of
+`{"sid": first 8 chars, "got", "srv": output offsets, "write_ago",
+"parse_ago", "render_ago": ms, "unrendered": ms output has waited to be
+drawn, "pend": chunks xterm has not parsed, "pend_ms": ms parsing has not
+moved, "paused", "frame": xterm's render pause / pending frame (1/0/-1),
+"cols", "rows", "w", "h", "mode": "sse"|"sse-closed"|"long-poll"|
+"recover"|"none", "tab_hidden", "recoveries", "resumes", "hidden_skips",
+"unpainted", "wedged", "behind": bools}`. No terminal content.
+The server writes one log line, `[WARN]` when a pane is `unpainted`,
+`wedged` or `behind`, `[INFO]` otherwise; numbers are clamped, words
+limited to 16 characters of `A-Za-z0-9_.-`, the error text to 80 plain
+characters. Reply `{"ok": true}`; `400` not a JSON object, `413` too
+large, `429` more than 10 per IP in 10 minutes. A server without the
+action answers `404`, which a beacon ignores. Through `api.php` it is an
+ordinary JSON action.
 
 ### GET /api/ping
 Liveness (also used by the PHP shim's auto-start probe). Reply:
