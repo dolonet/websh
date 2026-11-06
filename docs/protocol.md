@@ -74,6 +74,37 @@ Long-poll: waits up to ~10 s for PTY output. Reply:
 `{"data": base64, "alive": bool, "auth_failed": bool}`. An empty
 `data` with `alive: true` is a keepalive; `alive: false` is terminal.
 
+### POST /api/output_many
+Available when `/api/config` advertises `output_batch: true`. Body:
+`{"sessions":[{"session_id":uuid,"since":0},...]}`. Session ids must be
+unique, cursors must be nonnegative integers, and the list must contain
+between 1 and `max(128, MAX_SESSIONS + MAX_BG_SESSIONS)` entries. This
+fits every live session without imposing another limit on pane count.
+
+One long-poll waits up to ~10 s for output from any listed session and
+returns all entries in request order:
+`{"outputs":[{"status":200,"payload":{"data":base64,"alive":true,"auth_failed":false,"cursor":12}},...]}`.
+Each payload has the same cursor semantics as `/api/output`; a missing
+session gets `status: 404` and `payload: {"error":"session not found"}`,
+and another user's session gets `status: 403` and a forbidden payload.
+Such errors do not discard output from other entries. Bad bodies get an
+HTTP 400; a shutdown gets an HTTP 503 with `code: restarting`.
+One reply carries at most 1 MiB of raw terminal bytes, shared evenly
+between entries. Each cursor advances only across the bytes returned;
+the next call retrieves the remainder without skipping output.
+If a session has ended but still has retained output after that cursor,
+its payload stays `alive: true` and `auth_failed: false` until those
+bytes have been returned. Terminal flags never cut a partial reply short.
+
+The browser uses at most three SSE connections, counting background
+probes, plus one shared `output_many` request for every other pane.
+New panes join that request immediately. This leaves connections for
+input and connect on HTTP/1.x, whose per-origin limit is six, even
+when many idle panes are open. Sealed mode carries the same action and
+body inside its encrypted request. The original endpoints remain for
+older cached clients; clients use them with servers that lack this
+capability.
+
 ### GET /api/stream?session_id=
 SSE variant of `output` (one concurrent stream per session; a second
 attach takes the slot over from the first, which ends - `409` only if
@@ -495,10 +526,12 @@ Content-Length and did not reach it (a cut download) gets no end frame.
 
 An outer non-200 reply is unverified transport information. A proxy can
 replace a successfully executed request's reply with a 410 or a busy 503,
-so neither proves non-execution. Read-only GET calls may reopen a lost
-channel and retry once. POST calls are never resent by the sealed fetch
-boundary after an unverified response, a post-send network failure, or
-an invalid or truncated encrypted reply. Their outcome is reported as
+so neither proves non-execution. Read-only GET calls and the explicitly
+read-only POST `output_many` may reopen a lost channel and retry once.
+Cancelling a shared output batch leaves its healthy channel usable.
+The sealed fetch boundary never resends any other POST after an
+unverified response, a post-send network failure, or an invalid or
+truncated encrypted reply. Their outcome is reported as
 uncertain; future calls can open a fresh channel. Input drops that
 uncertain batch and its queued suffix for the same session, preserves
 typing for a newer session, and accepts later fresh typing. A local

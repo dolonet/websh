@@ -112,7 +112,7 @@ export class LocalServer {
 // meta.front = 'h2'. Self-signed certificate (the browser is started
 // with --ignore-certificate-errors); prefix, logs and pid in a temp dir.
 export class H2Front {
-  constructor(port, upstream) { this.port = port; this.upstream = upstream; }
+  constructor(port, upstream, http1 = false) { this.port = port; this.upstream = upstream; this.http1 = http1; }
   get url() { return `https://127.0.0.1:${this.port}/`; }
   async start() {
     this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'websh-e2e-nginx-'));
@@ -136,7 +136,7 @@ http {
   client_body_temp_path ${d}/body; proxy_temp_path ${d}/proxy;
   fastcgi_temp_path ${d}/fcgi; uwsgi_temp_path ${d}/uwsgi; scgi_temp_path ${d}/scgi;
   server {
-    listen 127.0.0.1:${this.port} ssl http2;
+    listen 127.0.0.1:${this.port} ssl${this.http1 ? '' : ' http2'};
     ssl_certificate ${d}/c.pem; ssl_certificate_key ${d}/k.pem;
     client_max_body_size 2g;
     proxy_request_buffering off;

@@ -57,7 +57,7 @@ for (const name of (args.length ? args : names)) {
     console.log(`\n=== ${name}${repeat > 1 ? ` (${n}/${repeat})` : ''}: ${meta.about}`);
     const t = new Report();
     const server = url ? null : new LocalServer(cfg.port, meta.env);
-    const front = !server ? null : meta.front === 'h2' ? new H2Front(cfg.port + 1, cfg.port)
+    const front = !server ? null : (meta.front === 'h2' || meta.front === 'h1') ? new H2Front(cfg.port + 1, cfg.port, meta.front === 'h1')
       : meta.front === 'prod' ? new ProdFront(cfg.port + 2, cfg.port) : null;
     let b = null;
     try {

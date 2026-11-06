@@ -21,16 +21,31 @@ chunks are typed, then checks that none overtook it and the shell
 received the command exactly once in order.
 
 **I2. A failed input is resent only when the reply proves it never
-reached the PTY** (503, 429, 502). A network error is not retried: the
-write may have landed and only the reply was lost, and a doubled key
-(`rm` then Enter, twice) is worse than a lost one.
-Guard: frontend `input: a busy (503) reply…`, `input: a network error is
-not retried`.
+reached the PTY.** An explicit websh `busy`, `restarting` or
+`rate_limited` refusal is before the write and permits a retry. A
+502/503/429 status by itself proves nothing: a proxy can lose the
+reply after the command executed. Such a reply and a network error
+must never resend the batch; later keys still flow in order. A doubled
+command (`rm` then Enter, twice) is worse than a lost key.
+Guard: frontend `input: a generic HTTP ... after execution never
+repeats a command`, `input: an explicit before-write refusal ...`,
+`input: a network error is not retried`.
 
 **I3. Keys are never replayed into a different shell, and never stale.**
 Held keys go out only when a *persistent* pane re-attaches to its tmux
 session, within `INPUT_HOLD_MS` (20 s). A non-persistent reconnect is a
 new shell. A pane nobody is reconnecting drops what is typed at it.
+If a sealed outage expires the held prefix of a command, discard the
+whole accumulated outage input, including a recent suffix still in the
+normal queue for that same session. Expiry is checked before accepting
+a new keypress and before waiting on channel backoff: input already
+queued at expiry is discarded, then the new keypress starts fresh
+input. A held batch belonging to an old session is discarded without
+dropping new input for the current one.
+Executing the suffix alone can turn `echo filename` into
+a different command. The user sees that the input was not sent, and
+new typing after recovery works. Guard: frontend `sealed I3: an expired
+held prefix drops the whole outage command including its recent suffix`.
 Guard: frontend `input: keys for an expired NON-persistent session…`,
 `input: typing on a disconnected pane…`, `input: held keys older than…`.
 
@@ -219,6 +234,26 @@ prints: typed text back on screen in ~0.2 s, output keeps flowing to
 its last line, 3 rounds; on the code before the fix the pane froze at
 the throw and nothing typed appeared in 15 s; and a 15 s spinner
 triggers no `paint:` recovery).
+
+**O10. One page leaves connections available for input.**
+Six independent SSE streams on HTTP/1.1 used every Chromium connection:
+input did not leave the browser and a seventh pane could not connect.
+At most three page-owned SSE streams are kept open. Remaining panes
+share one cursor-based `output_many` long-poll; hidden panes are alive,
+and a quiet pane wakes the shared poll as soon as it prints. A missing
+or forbidden session affects only its own result; cancelling one batch
+cannot cancel another reader. A batch reply has a bounded raw output
+budget shared fairly by its panes; cursors advance only over delivered
+bytes. An ended or auth-failed session remains nonterminal until its
+last retained byte is delivered, including a final append racing the
+response. Starting the next shared poll uses a microtask, never a
+browser timer that a hidden page can throttle to one second per reply.
+The capability `output_batch` lets new
+clients keep speaking to old servers, and the old single-session
+endpoints remain available. Guard: backend `test_output_many.py`;
+frontend `test_output_batch.js` (browser timers frozen);
+e2e `connections` on HTTP/1.1, plain and sealed, with EventSource
+available and unavailable.
 
 ## Layout and tabs
 
@@ -460,7 +495,11 @@ body carries an action, a session id, credentials, keys typed, output,
 paths, file names or contents. If the channel cannot be opened, or the
 server's identity differs from the pinned one, nothing is sent - not
 in clear, not through the unverified key - and the user sees why.
-A lost channel may be reopened automatically for a read. A mutation is
+A lost channel may be reopened automatically for a read, including the
+read-only POST `output_many`. Cancelling one batch waiter must preserve
+the shared channel, the remaining readers and fresh input, without a
+mutation uncertainty warning. Guard: frontend `sealed batch output: …`.
+A mutation is
 never resent after an unverified outer reply, even 410 or a busy 503,
 or after a damaged/truncated encrypted reply: a proxy can replace the
 reply after execution. Uncertain input drops its sent batch and queued
@@ -520,8 +559,10 @@ call whose caller gave up while it waited for the channel (the input
 stall timer) is not sent, and an `input` that waited for the channel
 longer than `INPUT_HOLD_MS` (the "key changed" dialog left open) is
 dropped with a toast, never sent; held batches whose oldest key is older
-than `INPUT_HOLD_MS` are all dropped with that toast (never the end of
-a command without its start). Closing a sealed stream cancels its
+than `INPUT_HOLD_MS` are dropped together with the normal input queue
+for the same session, with that toast (never the end of a command
+without its start). A held batch for an old session is discarded
+without dropping new typing for the current session. Closing a sealed stream cancels its
 body quietly - no unhandled rejection in the page. The server runs the inner request through
 the same `_dispatch` with only path, headers, body and `wfile` swapped
 (`Handler._sealed`), so I1-I4 and O1-O9 hold through it unchanged.
@@ -554,6 +595,12 @@ swallows a click within 400 ms of a drag's release
 JSON (`/api/ping`), never the application root: a popup at the root
 restores the saved workspace and can detach the very tmux pane whose
 next link is being tested.
+
+The `latency` pagehide scenario waits for the final input POST reply,
+not just its echo. SSE can echo Enter before an emulated 100 ms HTTP
+reply arrives; navigating then aborts the measurement and made a report
+contain 11 batches for 12 requests. The input is not lost. Waiting for
+`inputInFlight` and the queue to clear makes the scenario deterministic.
 
 **T3. A fix comes with a test that fails without it.** Check it: put
 the old code back and watch the test go red.
