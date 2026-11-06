@@ -16,9 +16,12 @@ a short-lived (non-persistent) session instead.
 ## How reattach works
 
 Each persistent pane stores its slot id in browser `localStorage`
-alongside the connection record. On refresh, the frontend re-opens the
-pane with the same slot id and tmux re-attaches you to the existing
-session. Slot ids are per pane instance — closing a pane with `[x]`
+alongside the connection record (the `websh_panes` manifest, which also
+holds the tabs, their order, each tab's split layout and the tab in
+front). On refresh, the frontend re-opens every pane of every tab with
+the same slot id and tmux re-attaches you to the existing session -
+panes in background tabs included. A manifest written before tabs
+existed loads as one tab holding its layout. Slot ids are per pane instance — closing a pane with `[x]`
 does not free the slot for reuse.
 
 ## Coming back after an absence
@@ -51,7 +54,9 @@ Clicking `[x]` on a persistent pane pops a confirm modal (Cancel /
 Terminate session / Terminate and never ask again). "Terminate" sends
 `tmux kill-session` on the target before the pane closes. If you just
 close the browser tab without terminating, the session stays alive on
-the target and you can re-attach later.
+the target and you can re-attach later. Closing a whole websh tab (its
+`×` or a middle-click) asks once for all of its persistent panes, under
+the same "never ask again" setting.
 
 ## Idle-TTL watchdog
 

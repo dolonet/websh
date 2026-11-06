@@ -47,6 +47,20 @@ Persistent panes wrap the shell in tmux on the target.
   a new server for hours: additions must be ignorable, removals need a
   version bump.
 
+## Two agents, not one
+
+Code and tests are written by different agents, and the one that
+writes the code never sees the tests - only their results
+(`scripts/check.sh --results`). The tester's goal is a product without
+bugs, not a green suite; the implementer's goal is the behaviour in
+the report it was given, nothing more. A coordinator relays reports
+between them and is the only one who commits and deploys. The briefs
+are in `agents/` (`README.md` has the loop; `implementer.md` and
+`tester.md` are the roles, usable as system prompts by any tool;
+`scripts/agents-setup.sh` writes tool-specific adapters). A session
+that has only one agent still keeps the order: test first, from the
+request, then the code, then try to break it.
+
 ## Finding your way
 
     scripts/codemap.py            sections of server.py and websh.js, with line numbers
@@ -77,6 +91,7 @@ keep them true when you change the code under them.
     scripts/check.sh                        everything that must be green; exit status is the verdict
     scripts/check.sh --quick                while iterating
     scripts/check.sh --full                 + the CI matrix in docker (3.9, no cryptography)
+    scripts/check.sh --results              failures as results only, no test source (the implementer's view)
     python3 -m unittest tests.backend.test_transport.TestStreamEdges     one backend class
     (cd tests/frontend && node test_connect.js | grep -A8 "=== name")    one frontend test's output
     scripts/e2e.sh                          browser scenarios, private instance (tests/e2e/README.md)
@@ -85,12 +100,15 @@ keep them true when you change the code under them.
 
 ## How a change is done
 
-1. **Reproduce first.** A failing test, or a failing browser scenario
-   for anything that depends on timing or the network. If it cannot be
+1. **Reproduce first** - the tester writes the failing test, or the
+   failing browser scenario for anything that depends on timing or the
+   network, from the request, not from the code. If it cannot be
    reproduced, say so; do not fix a guess.
-2. Fix the cause. One logical change per commit.
-3. **Prove the test guards the fix**: put the old code back
-   (`git stash -- file`), watch the test go red, restore.
+2. The implementer fixes the cause from the tester's report. One
+   logical change per commit.
+3. **Prove the test guards the fix** (tester): put the old code back
+   (`git stash -- file`), watch the test go red, restore. Then try to
+   break the fix: edge cases, repetition, a real browser.
 4. `scripts/check.sh` - green means `failed: 0` on every run. For
    transport, input, reconnect or session-lifecycle changes also
    `scripts/e2e.sh`.

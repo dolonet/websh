@@ -80,6 +80,7 @@ jobs:
       - run: for f in scripts/*.sh tests/e2e/*.sh; do bash -n "$f"; done
       - run: for f in tests/e2e/*.mjs tests/e2e/scenarios/*.mjs; do node --check "$f"; done
       - run: python3 scripts/codemap.py && python3 scripts/codemap.py tests >/dev/null
+      - run: test -s agents/implementer.md && test -s agents/tester.md && bash scripts/agents-setup.sh
       - run: node tests/e2e/run.mjs --list
 
   ruff:

@@ -88,15 +88,23 @@ export class Browser {
   static async launch() {
     if (!cfg.chrome) throw new Error('no headless Chromium found: set E2E_CHROME');
     const b = new Browser();
-    const port = 9300 + Math.floor(Math.random() * 600);
+    // Port 0: Chromium picks a free port and writes it to
+    // DevToolsActivePort in its own profile directory. A random port from
+    // a fixed range once landed on ANOTHER headless Chromium already
+    // listening there, and the scenario drove (and navigated) that
+    // browser's page - never touch what you did not start.
     b.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'websh-e2e-chrome-'));
-    b.proc = spawn(cfg.chrome, ['--no-sandbox', '--disable-gpu', `--remote-debugging-port=${port}`,
+    b.proc = spawn(cfg.chrome, ['--no-sandbox', '--disable-gpu', '--remote-debugging-port=0',
       `--user-data-dir=${b.dir}`, '--window-size=1200,800', 'about:blank'], { stdio: 'ignore' });
+    let port = 0;
     for (let i = 0; i < 100 && !b.ws; i++) {
       try {
-        const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
-        const page = list.find(t => t.type === 'page');
-        if (page) b.ws = new WebSocket(page.webSocketDebuggerUrl);
+        if (!port) port = +fs.readFileSync(path.join(b.dir, 'DevToolsActivePort'), 'utf8').split('\n')[0];
+        if (port) {
+          const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+          const page = list.find(t => t.type === 'page');
+          if (page) b.ws = new WebSocket(page.webSocketDebuggerUrl);
+        }
       } catch (e) {}
       if (!b.ws) await sleep(100);
     }

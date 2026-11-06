@@ -94,6 +94,45 @@ Guard: backend `test_upload_in_pieces_appends_at_the_right_offset`,
 frontend `upload in pieces: …`; e2e `upload` (two connection resets
 under a 12 MB upload, sha256 compared on disk).
 
+## Layout and tabs
+
+**U1. A pane in a hidden tab is never fitted to its hidden box.**
+A hidden tab's root is `display:none`, so its panes have a 0x0 box; a
+fit there makes a 2x1 terminal and, through `onResize`, a 2x1 PTY -
+for tmux, every other client of that session is squashed too. Every
+fit path skips such a pane and marks it (`_fitDeferred`): the
+ResizeObserver callback, `fitPaneWhenStable` (also between its settle
+steps), `applySettings` (zoom, font), `beginSessionIO`, the split drag
+and close refits, the drift watchdog. The absence kick still restarts
+the output of hidden panes (its `onSettled` runs without the fit).
+`showTab()` applies the current display settings, fits every pane of
+the tab once, and the PTY is resized only if cols/rows changed
+(`flushPaneResize` dedups). On reload each tab is built while its root
+is on screen, so panes restored into background tabs connect at a real
+size. Guard: frontend `tabs: a hidden tab keeps its output and is never
+fitted…`, `tabs: showing a tab fits its panes…`, `tabs: the recovery
+after a long absence reaches panes in hidden tabs`, `tabs: a zoom made
+while a tab is hidden…`. The e2e scenarios `tabs`/`tabstress` do NOT
+guard U1: Chromium's fit addon happens to propose nothing for a
+`display:none` box, so with every one of these skips removed they stay
+green (checked 2026-10-01). The unit harness proposes 2x1 for a 0-size
+box - what the addon does for a box that is laid out but empty - and
+that is the guard.
+
+**U2. Hidden tabs are alive.** Streams, keepalive, input queues and
+held keys, reconnects and the absence kick apply to every pane, not
+only to the tab on screen; nothing in the transport or input code may
+filter by the active tab. A pane's state changes reach its tab's dot
+whether or not it is the active pane. Guard: frontend `tabs: a hidden
+tab keeps its output…`, `tabs: the dot shows the worst pane state…`;
+e2e `tabs`.
+
+**U3. A layout saved by an older version still loads.** The manifest
+is versioned (`PANES_VERSION`); version 2 (one layout, no tabs) loads
+as one tab holding that layout, and the panes keep their sessionStorage
+secrets. Guard: frontend `tabs: a manifest saved by the previous
+version loads as one tab…`.
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

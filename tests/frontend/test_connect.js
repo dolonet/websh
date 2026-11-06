@@ -3185,12 +3185,20 @@ test('reconnect-bar: one alarm, not two - the card is quiet unless it must not b
      'disconnected state shown by a dot');
   ok(/\.pane-badge\.s-on,\.pane-badge\.s-wait,\.pane-badge\.s-off\{background:none;padding:0;color:var\(--dim\)\}/.test(css),
      'badge text is dim, not a coloured pill');
-  ok(/\.pane-overlays\{[^}]*align-items:flex-end/.test(css),
-     'overlay cards size to their content instead of spanning the pane');
-  // Centred at the top the card landed on the first line of output and
-  // pressed against the pane bar.
-  ok(/\.pane-overlays\{position:absolute;bottom:0/.test(css),
-     'the stack sits in the bottom corner, off the first line of output');
+  // The stack sits at the top centre of the terminal area. It was moved to
+  // the bottom-right corner once (4b4f2c7) to keep it off the first line of
+  // output; the owner found that worse - the button is where the eye goes
+  // first at the top, and the first line under it is a fair price. Cards
+  // stay sized to their content (centred, not stretched across the pane).
+  const ov = (css.match(/\.pane-overlays\{([^}]*)\}/) || [, ''])[1];
+  ok(/(^|;)align-items:center(;|$)/.test(ov),
+     'overlay cards are centred and size to their content; rule: ' + ov);
+  ok(/(^|;)top:0(px)?(;|$)/.test(ov),
+     'the stack is anchored at the top of the terminal area; rule: ' + ov);
+  ok(!/(^|;)bottom:/.test(ov),
+     'the stack is not anchored to the bottom; rule: ' + ov);
+  ok(/(^|;)left:0(px)?(;|$)/.test(ov) && /(^|;)right:0(px)?(;|$)/.test(ov),
+     'the stack spans the pane width so its centre is the pane centre; rule: ' + ov);
   ok(!/class="reconnect-bar h"[^>]*>\s*<span[^>]*>Disconnected/.test(js),
      'the card carries no pre-baked status word to leak');
   // Every line websh writes into the terminal shares one form, so ours
@@ -8629,6 +8637,1255 @@ test('saved connections can be edited in place', async () => {
 });
 
 // =====================================================================
+// Tabs (step 1): browser-style tabs, each holding its own split layout.
+// Written from the behaviour spec, before the feature existed.
+//
+// DOM contract these tests rely on (the implementer provides it):
+//   #tabs                     the strip, inside .top, between .top-l and .top-r
+//   #tabs .tab[data-tab=ID]   one per tab, in strip order; the shown one has .active
+//   .tab .tab-dot             state dot: s-on (green) / s-wait (amber) / s-off (red)
+//   .tab .tab-label           text = the .pane-label text of the tab's active pane
+//   .tab .tab-split           split marker, only shown with 2+ panes, text has the count
+//   .tab .tab-close           the x; a click on it closes the tab and nothing else
+//   .tab.activity             unseen output in an inactive tab
+//   #tabNew                   the "+" button, after the last tab
+//   #panes .tab-root[data-tab=ID]   the tab's layout root (pane / split-h / split-v
+//                             tree as today); the inactive ones are hidden with
+//                             the .h class, the hidden attribute or display:none
+// Tabs react to real mouse events (mousedown/mouseup/click, middle button
+// = auxclick), registered with addEventListener; #tabNew may use either.
+//
+// The environment below models layout, which jsdom does not have: an
+// element is 0x0 when it or an ancestor is hidden (.h, [hidden],
+// display:none) or detached, else box.cols*9 x box.rows*18 px. The fit
+// addon fake behaves like the real one: in a 0-size box it proposes 2x1
+// (the degenerate size), in a visible box it proposes `box`. The
+// ResizeObserver fake fires, like a browser's, whenever an observed
+// element's size changes (checked after every DOM mutation).
+// =====================================================================
+const _now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+async function until(fn, ms) {
+  const t0 = _now();
+  while (_now() - t0 < (ms || 1500)) {
+    try { if (fn()) return true; } catch (e) {}
+    await sleep(5);
+  }
+  try { return !!fn(); } catch (e) { return false; }
+}
+
+function installLayoutModel(win) {
+  const lay = {box: {cols: 80, rows: 24}, ros: []};
+  const hiddenEl = el => {
+    if (!el || !el.isConnected) return true;
+    for (let e = el; e && e.nodeType === 1; e = e.parentElement) {
+      if (e.hidden || (e.classList && e.classList.contains('h'))) return true;
+      if (e.style && e.style.display === 'none') return true;
+      if (win.getComputedStyle(e).display === 'none') return true;
+    }
+    return false;
+  };
+  lay.hidden = hiddenEl;
+  const sizeOf = el => hiddenEl(el) ? {width: 0, height: 0}
+    : {width: lay.box.cols * 9, height: lay.box.rows * 18};
+  lay.sizeOf = sizeOf;
+  const P = win.HTMLElement.prototype;
+  const def = (k, f) => Object.defineProperty(P, k, {get() { return f(this); }, configurable: true});
+  def('offsetWidth', el => sizeOf(el).width);
+  def('offsetHeight', el => sizeOf(el).height);
+  def('clientWidth', el => sizeOf(el).width);
+  def('clientHeight', el => sizeOf(el).height);
+  def('offsetParent', el => hiddenEl(el) ? null : el.parentElement);
+  P.getBoundingClientRect = function() {
+    const s = sizeOf(this);
+    return {x: 0, y: 0, top: 0, left: 0, right: s.width, bottom: s.height,
+            width: s.width, height: s.height, toJSON() {}};
+  };
+  P.checkVisibility = function() { return !hiddenEl(this); };
+
+  const Base = win.Terminal;
+  win.Terminal = class extends Base {
+    constructor(o) {
+      super(o); this._resizeCbs = []; this._resizes = []; this.element = null;
+      // Options are kept, so a font change changes how many cells fit.
+      this.options = Object.assign({}, o || {});
+      if (!lay.baseFont && this.options.fontSize) lay.baseFont = this.options.fontSize;
+    }
+    loadAddon(a) { if (a && typeof a.activate === 'function') a.activate(this); }
+    open(container) {
+      const d = container.ownerDocument.createElement('div');
+      d.className = 'xterm';
+      container.appendChild(d);
+      this.element = d;
+    }
+    dispose() { if (this.element) { this.element.remove(); this.element = null; } this._disposed = true; }
+    onResize(cb) {
+      this._resizeCbs.push(cb);
+      return {dispose: () => { this._resizeCbs = this._resizeCbs.filter(c => c !== cb); }};
+    }
+    resize(cols, rows) {
+      if (cols === this.cols && rows === this.rows) return;
+      this.cols = cols; this.rows = rows;
+      this._resizes.push([cols, rows]);
+      this._resizeCbs.slice().forEach(cb => cb({cols, rows}));
+    }
+  };
+  win.FitAddon = {FitAddon: class {
+    activate(t) { this._t = t; }
+    dispose() {}
+    proposeDimensions() {
+      const t = this._t;
+      if (!t || !t.element || !t.element.parentElement) return undefined;
+      if (hiddenEl(t.element.parentElement)) return {cols: 2, rows: 1};
+      // The box holds box.cols x box.rows cells at the font size the
+      // first terminal was made with; a bigger font fits fewer.
+      const k = (lay.baseFont && t.options && t.options.fontSize) ? lay.baseFont / t.options.fontSize : 1;
+      return {cols: Math.floor(lay.box.cols * k), rows: Math.floor(lay.box.rows * k)};
+    }
+    fit() {
+      const d = this.proposeDimensions();
+      if (!d) return;
+      this._t.resize(d.cols, d.rows);
+    }
+  }};
+  win.ResizeObserver = class {
+    constructor(cb) { this.cb = cb; this.els = new Map(); lay.ros.push(this); }
+    observe(el) { this.els.set(el, {width: -1, height: -1}); lay.schedule(); }
+    unobserve(el) { this.els.delete(el); }
+    disconnect() { this.els.clear(); lay.ros = lay.ros.filter(r => r !== this); }
+  };
+  lay.pump = () => {
+    lay.ros.slice().forEach(ro => {
+      const entries = [];
+      ro.els.forEach((last, el) => {
+        const s = sizeOf(el);
+        if (s.width !== last.width || s.height !== last.height) {
+          ro.els.set(el, s);
+          entries.push({target: el, contentRect: {x: 0, y: 0, width: s.width, height: s.height}});
+        }
+      });
+      if (entries.length) { try { ro.cb(entries, ro); } catch (e) { console.error(e); } }
+    });
+  };
+  let queued = false;
+  lay.schedule = () => {
+    if (queued) return;
+    queued = true;
+    setTimeout(() => { queued = false; try { lay.pump(); } catch (e) {} }, 0);
+  };
+  lay.setBox = (cols, rows) => {
+    lay.box = {cols, rows};
+    lay.pump();
+    win.dispatchEvent(new win.Event('resize'));
+  };
+  lay.start = () => {
+    lay.mo = new win.MutationObserver(() => lay.schedule());
+    lay.mo.observe(win.document, {attributes: true, childList: true, subtree: true,
+                                  attributeFilter: ['class', 'style', 'hidden']});
+  };
+  return lay;
+}
+
+const TAB_EXPOSE = `
+; (function(){
+  Object.defineProperty(window, 'activeId', {get: () => activeId, configurable: true});
+})();`;
+
+async function mkTabEnv(plan, pre) {
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                               url: 'http://localhost/websh/'});
+  const win = dom.window;
+  const log = [];
+  const state = {dead: false};
+  makeFakes(win);
+  const lay = installLayoutModel(win);
+  win.fetch = makeFetch(plan, log, state);
+  _injectVaultGlobals(win);
+  win.localStorage.clear();
+  win.sessionStorage.clear();
+  if (pre) {
+    Object.keys(pre.local || {}).forEach(k => win.localStorage.setItem(k, pre.local[k]));
+    Object.keys(pre.session || {}).forEach(k => win.sessionStorage.setItem(k, pre.session[k]));
+  }
+  lay.start();
+  win.eval(js + EXPOSE + TAB_EXPOSE);
+  await Promise.race([win.bootReady, sleep(2000)]);
+  await sleep(30);
+  return {dom, win, log, state, lay};
+}
+
+function snapshotStorage(win) {
+  const out = {local: {}, session: {}};
+  for (let i = 0; i < win.localStorage.length; i++) {
+    const k = win.localStorage.key(i); out.local[k] = win.localStorage.getItem(k);
+  }
+  for (let i = 0; i < win.sessionStorage.length; i++) {
+    const k = win.sessionStorage.key(i); out.session[k] = win.sessionStorage.getItem(k);
+  }
+  return out;
+}
+
+const TAB_PLAN = (extra) => ([
+  {action: 'config', response: {restrict_hosts: false, connections: []}},
+  ...(extra || []),
+  {action: 'connect', response: b => ({session_id: 'sid-' + (b.host || b.connection), alive: true})},
+  {action: 'resize', response: {ok: true}},
+  {action: 'output', response: {data: '', alive: true}, delay: 20},
+  {action: 'disconnect', response: {ok: true}},
+  {action: 'input', response: {ok: true}},
+]);
+
+// ---- DOM helpers ----
+const tabEls = win => Array.from(win.document.querySelectorAll('#tabs .tab'));
+const tabId = el => el ? el.getAttribute('data-tab') : null;
+const activeTab = win => win.document.querySelector('#tabs .tab.active');
+const tabById = (win, id) => tabEls(win).find(t => tabId(t) === id) || null;
+const tabRoots = win => Array.from(win.document.querySelectorAll('#panes .tab-root'));
+const tabRootById = (win, id) => tabRoots(win).find(r => r.getAttribute('data-tab') === id) || null;
+const tabOfPane = p => { const r = p && p.el && p.el.closest('.tab-root'); return r ? r.getAttribute('data-tab') : null; };
+const tabElOfPane = (win, p) => tabById(win, tabOfPane(p));
+const panesOfTab = (win, id) => paneList(win).filter(p => tabOfPane(p) === id);
+const tabLabel = t => { const l = t && t.querySelector('.tab-label'); return l ? l.textContent.trim() : null; };
+const paneLabel = p => { const l = p.el.querySelector('[data-pane-label]'); return l ? l.textContent.trim() : ''; };
+const dotState = t => {
+  const d = t && t.querySelector('.tab-dot');
+  if (!d) return 'no .tab-dot';
+  return ['s-on', 's-wait', 's-off'].filter(c => d.classList.contains(c)).join(' ') || 'no state class';
+};
+
+function fire(win, el, type, button) {
+  const C = (type === 'click' || type === 'auxclick' || type.startsWith('mouse')) ? win.MouseEvent : win.Event;
+  el.dispatchEvent(new C(type, {bubbles: true, cancelable: true, button: button || 0,
+                                buttons: type === 'mousedown' ? (button === 1 ? 4 : 1) : 0}));
+}
+// A real left click: mousedown, mouseup, click. A static inline onclick
+// (jsdom does not run those) is evaluated instead of the click event.
+function press(win, el) {
+  fire(win, el, 'mousedown', 0);
+  fire(win, el, 'mouseup', 0);
+  const code = el.getAttribute && el.getAttribute('onclick');
+  if (code) win.eval('(function(){' + code + '})').call(el);
+  else fire(win, el, 'click', 0);
+}
+function middleClick(win, el) {
+  fire(win, el, 'mousedown', 1);
+  fire(win, el, 'mouseup', 1);
+  fire(win, el, 'auxclick', 1);
+}
+function clickTab(win, t) { press(win, t.querySelector('.tab-label') || t); }
+function closeTabX(win, t) {
+  const x = t.querySelector('.tab-close');
+  if (!x) return false;
+  press(win, x);
+  return true;
+}
+function needTabs(win) {
+  const ok1 = !!$(win, 'tabs') && !!$(win, 'tabNew');
+  ok(ok1, 'tab strip present: #tabs and the "+" button #tabNew');
+  return ok1;
+}
+
+async function tConnect(win, host, o) {
+  o = o || {};
+  $(win, 'iH').value = host; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'pw-' + host;
+  $(win, 'iName').value = '';
+  $(win, 'iPersistent').checked = !!o.persistent;
+  win.doConnect();
+  await until(() => hidden($(win, 'ov')) && paneList(win).some(p => p.host === host && p.sid), 2000);
+  return paneList(win).find(p => p.host === host) || null;
+}
+async function tNewTab(win, host, o) {
+  const btn = $(win, 'tabNew');
+  if (!btn) return null;
+  const before = tabEls(win).length;
+  press(win, btn);
+  await until(() => !hidden($(win, 'ov')), 1000);
+  const p = await tConnect(win, host, o);
+  await until(() => tabEls(win).length > before, 500);
+  return p;
+}
+async function tSplit(win, from, dir, host, o) {
+  win.splitPane(from.id, dir);
+  await until(() => !hidden($(win, 'ov')), 1000);
+  return tConnect(win, host, o);
+}
+const resizesFor = (env, sid, from) => env.log.slice(from || 0)
+  .filter(e => e.action === 'resize' && e.body && e.body.session_id === sid);
+const disconnectsFor = (env, sid, from) => env.log.slice(from || 0)
+  .filter(e => e.action === 'disconnect' && e.body && e.body.session_id === sid);
+const degenerate = e => e.body.cols < 20 || e.body.rows < 5;
+function confirmCounter(win) {
+  const el = $(win, 'confirmOv');
+  const c = {opened: 0};
+  let was = !hidden(el);
+  new win.MutationObserver(() => {
+    const now = !hidden(el);
+    if (now && !was) c.opened++;
+    was = now;
+  }).observe(el, {attributes: true, attributeFilter: ['class', 'style', 'hidden']});
+  return c;
+}
+const b64 = (win, s) => win.btoa(s);
+
+// =====================================================================
+test('tabs: the strip sits in the top bar with dot, label, split marker and +', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  ok(!!a, 'first pane connected');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const top = win.document.querySelector('.top');
+  const strip = $(win, 'tabs');
+  ok(top.contains(strip), '#tabs is inside the top bar (.top)');
+  const F = win.Node.DOCUMENT_POSITION_FOLLOWING;
+  ok(!!(top.querySelector('.top-l').compareDocumentPosition(strip) & F) &&
+     !!(strip.compareDocumentPosition(top.querySelector('.top-r')) & F),
+     '#tabs sits between the logo (.top-l) and the right-hand buttons (.top-r)');
+  let ts = tabEls(win);
+  ok(ts.length === 1, 'one tab after the first connect; got ' + ts.length);
+  const t = ts[0];
+  ok(t && t.classList.contains('active'), 'that tab is active');
+  ok(dotState(t) === 's-on', 'its dot says connected (s-on); got ' + dotState(t));
+  ok(tabLabel(t) === paneLabel(a) && paneLabel(a) !== '',
+     'its label is the pane label "' + paneLabel(a) + '"; got ' + JSON.stringify(tabLabel(t)));
+  const sm = t && t.querySelector('.tab-split');
+  ok(!sm || env.lay.hidden(sm), 'no split marker with one pane');
+  const plus = $(win, 'tabNew');
+  ok(top.contains(plus) && !!(t.compareDocumentPosition(plus) & F),
+     '"+" (#tabNew) is in the top bar, after the last tab');
+  ok(!!(plus.compareDocumentPosition(top.querySelector('.top-r')) & F),
+     '"+" comes before the right-hand buttons');
+  ok(tabOfPane(a) === tabId(t), 'the pane lives in .tab-root[data-tab="' + tabId(t) + '"]; got ' + tabOfPane(a));
+  const b = await tSplit(win, a, 'h', 'b.host');
+  ts = tabEls(win);
+  ok(ts.length === 1, 'a split does not make a tab; got ' + ts.length);
+  const sm2 = ts[0] && ts[0].querySelector('.tab-split');
+  ok(!!sm2 && !env.lay.hidden(sm2) && /2/.test(sm2.textContent),
+     'split marker shows the pane count 2; got ' + (sm2 ? JSON.stringify(sm2.textContent) : 'none'));
+  ok(b && tabOfPane(b) === tabId(ts[0]), 'the split pane is in the same tab');
+  cleanup(env);
+});
+
+test('tabs: + opens the login form; connecting makes a new active tab with one pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), {local: {websh_connections: JSON.stringify([
+    {name: 'saved one', host: 's.host', user: 'u', port: 22}])}});
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const tA = tabId(activeTab(win));
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  ok(!hidden($(win, 'ov')), '"+" opens the login form');
+  ok(!hidden($(win, 'btnCancel')), 'the form can be dismissed (x shown)');
+  ok(/saved one/.test($(win, 'savedList').textContent), 'saved connections are listed in it');
+  ok(tabEls(win).length === 1, 'opening the form alone creates no tab');
+  const b = await tConnect(win, 'b.host');
+  ok(!!b, 'second pane connected');
+  await until(() => tabEls(win).length === 2, 500);
+  const ts = tabEls(win);
+  ok(ts.length === 2, 'two tabs; got ' + ts.length);
+  if (!b || ts.length !== 2) { cleanup(env); return; }
+  const tB = tabOfPane(b);
+  ok(tB && tB !== tA, 'the new pane is in a NEW tab, not in the first one');
+  ok(tabId(activeTab(win)) === tB, 'the new tab is active');
+  ok(tabId(ts[1]) === tB, 'the new tab is added after the existing one');
+  ok(panesOfTab(win, tB).length === 1 && panesOfTab(win, tA).length === 1,
+     'each tab holds exactly one pane');
+  ok(win.activeId === b.id, 'the new pane is the active pane; got ' + win.activeId);
+  ok(!!tabRootById(win, tA) && env.lay.hidden(tabRootById(win, tA)), 'the first tab\'s layout is hidden');
+  ok(!!tabRootById(win, tB) && !env.lay.hidden(tabRootById(win, tB)), 'the new tab\'s layout is shown');
+  ok(a.sid === 'sid-a.host' && disconnectsFor(env, 'sid-a.host').length === 0,
+     'the first tab\'s pane stays connected');
+  ok(b.term._focusCalls > 0, 'keyboard focus went into the new pane');
+  cleanup(env);
+});
+
+test('tabs: dismissing the + form creates nothing, also after a failed attempt', async () => {
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'bad.host', response: {auth_failed: true, alive: false}},
+  ]));
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const tA = tabId(activeTab(win));
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(hidden($(win, 'ov')), 'Escape closes the + form');
+  ok(tabEls(win).length === 1 && tabRoots(win).length === 1, 'no tab and no layout root left behind');
+  ok(tabId(activeTab(win)) === tA && win.activeId === a.id, 'the first tab and its pane stay active');
+  // Second try: the connect fails, then the user gives up.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'nope';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await until(() => !hidden($(win, 'tmuxOv')) && /Authentication failed/.test($(win, 'tmTitle').textContent), 1000);
+  ok(/Authentication failed/.test($(win, 'tmTitle').textContent), 'auth failure reported');
+  clickBtn(win, 'tmCancel');
+  await until(() => hidden($(win, 'tmuxOv')), 500);
+  clickBtn(win, 'btnCancel');
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(hidden($(win, 'ov')), 'the form closes');
+  ok(tabEls(win).length === 1, 'still one tab after a failed + and dismiss; got ' + tabEls(win).length);
+  ok(tabRoots(win).length === 1, 'no empty layout root left behind; got ' + tabRoots(win).length);
+  ok(paneList(win).length === 1 && a.sid === 'sid-a.host', 'the first pane is untouched');
+  ok(tabId(activeTab(win)) === tA && win.activeId === a.id, 'the first tab stays active');
+  cleanup(env);
+});
+
+test('tabs: + with a single restricted ready host connects straight into a new tab', async () => {
+  const env = await mkTabEnv([
+    {action: 'config', response: {restrict_hosts: true, connections:
+      [{name: 'only', kind: 'ready', host: '1.2.3.4', port: 22, username: 'alex', persistent: false}]}},
+    {action: 'connect', response: (() => { let n = 0; return () => ({session_id: 'sid-only-' + (++n), alive: true}); })()},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}, delay: 20},
+  ]);
+  const win = env.win;
+  await until(() => paneList(win).some(p => p.sid), 1500);
+  if (!needTabs(win)) { cleanup(env); return; }
+  ok(tabEls(win).length === 1, 'auto-connect at boot made one tab; got ' + tabEls(win).length);
+  press(win, $(win, 'tabNew'));
+  await until(() => tabEls(win).length === 2 && paneList(win).filter(p => p.sid).length === 2, 1500);
+  ok(hidden($(win, 'ov')), 'no login form for the only allowed ready host');
+  ok(tabEls(win).length === 2, 'a second tab was created; got ' + tabEls(win).length);
+  const np = paneList(win).find(p => p.sid === 'sid-only-2');
+  ok(!!np && tabOfPane(np) === tabId(activeTab(win)), 'the new pane is in the new, active tab');
+  cleanup(env);
+});
+
+test('tabs: a split stays inside its own tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = b && await tSplit(win, b, 'v', 'c.host');
+  if (!b || !c) { ok(false, 'setup: panes b and c'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  ok(tabOfPane(c) === tB, 'split of b lands in b\'s tab');
+  ok(panesOfTab(win, tA).length === 1 && panesOfTab(win, tB).length === 2,
+     'A has 1 pane, B has 2; got ' + panesOfTab(win, tA).length + '/' + panesOfTab(win, tB).length);
+  ok(!!tabRootById(win, tB).querySelector('.split-v'), 'B\'s layout holds the vertical split');
+  ok(!tabRootById(win, tA).querySelector('.split-h, .split-v'), 'A\'s layout has no split');
+  const smA = tabById(win, tA).querySelector('.tab-split');
+  ok(!smA || env.lay.hidden(smA), 'A shows no split marker');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const d = await tSplit(win, a, 'h', 'd.host');
+  ok(!!d && tabOfPane(d) === tA, 'split from A lands in A');
+  ok(panesOfTab(win, tB).length === 2, 'B still has 2 panes');
+  ok(tabEls(win).length === 2, 'still two tabs');
+  cleanup(env);
+});
+
+test('tabs: closing the last pane of a tab removes it and activates the right neighbour, else the left', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = await tNewTab(win, 'c.host');
+  if (!b || !c) { ok(false, 'setup: three tabs'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  // B gets a split; closing one of its two panes keeps the tab.
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  const b2 = await tSplit(win, b, 'h', 'b2.host');
+  win.closePane(b2.id);
+  await until(() => !win.panes[b2.id], 500);
+  ok(tabEls(win).length === 3 && tabId(activeTab(win)) === tB, 'closing one of two panes keeps the tab and stays in it');
+  const sm = tabById(win, tB).querySelector('.tab-split');
+  ok(!sm || env.lay.hidden(sm), 'split marker gone with one pane left');
+  win.closePane(b.id);
+  await until(() => tabEls(win).length === 2, 500);
+  ok(tabEls(win).map(tabId).join() === [tA, tC].join(), 'B removed from the strip; got ' + tabEls(win).map(tabId));
+  ok(!tabRootById(win, tB), 'B\'s layout root removed');
+  ok(tabId(activeTab(win)) === tC, 'the right neighbour C became active; got ' + tabId(activeTab(win)));
+  ok(win.activeId === c.id && !env.lay.hidden(tabRootById(win, tC)), 'C\'s pane is active and shown');
+  win.closePane(c.id);
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabId(activeTab(win)) === tA, 'no right neighbour: the left one (A) became active');
+  ok(win.activeId === a.id && !env.lay.hidden(tabRootById(win, tA)), 'A\'s pane is active and shown');
+  ok(a.sid === 'sid-a.host', 'A\'s pane was never touched');
+  cleanup(env);
+});
+
+test('tabs: closing the last pane of the last tab returns to the initial login form', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  win.closePane(a.id);
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')) && win.overlayMode === 'initial', 'initial login form shown; mode ' + win.overlayMode);
+  ok(hidden($(win, 'btnCancel')), 'and it cannot be dismissed (nothing to go back to)');
+  ok(tabEls(win).length === 0, 'no tab left in the strip; got ' + tabEls(win).length);
+  const b = await tConnect(win, 'b.host');
+  ok(!!b && tabEls(win).length === 1 && tabOfPane(b) === tabId(activeTab(win)),
+     'connecting again makes exactly one active tab; got ' + tabEls(win).length);
+  cleanup(env);
+});
+
+test('tabs: the x closes a whole tab; a tab with live tmux panes asks once', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host', {persistent: true});
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host', {persistent: true});
+  const c = await tNewTab(win, 'c.host');
+  if (!b1 || !b2 || !c) { ok(false, 'setup: tabs A, B (two tmux panes), C'); cleanup(env); return; }
+  ok(b1.persistent && b1.slotId && b2.persistent && b2.slotId, 'B\'s panes are live tmux panes');
+  const tA = tabOfPane(a), tB = tabOfPane(b1), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const modal = confirmCounter(win);
+  // x on an inactive short-lived tab: closes it, no question, A stays.
+  ok(closeTabX(win, tabById(win, tC)), 'C has a .tab-close');
+  await until(() => !tabById(win, tC), 500);
+  ok(!tabById(win, tC) && !win.panes[c.id], 'C and its pane are gone');
+  ok(modal.opened === 0, 'no confirm for a short-lived tab');
+  ok(disconnectsFor(env, 'sid-c.host').length === 1 && !disconnectsFor(env, 'sid-c.host')[0].body.terminate,
+     'C\'s session disconnected once, not "terminated"');
+  ok(tabId(activeTab(win)) === tA && win.activeId === a.id, 'the x on an inactive tab does not switch tabs');
+  // x on the tmux tab: one question for both panes; Cancel keeps all.
+  closeTabX(win, tabById(win, tB));
+  await until(() => modal.opened > 0, 500);
+  ok(modal.opened === 1, 'one confirm for the whole tab; got ' + modal.opened);
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!tabById(win, tB) && b1.sid && b2.sid, 'Cancel keeps the tab and both sessions');
+  ok(disconnectsFor(env, 'sid-b1.host').length + disconnectsFor(env, 'sid-b2.host').length === 0,
+     'nothing disconnected on Cancel');
+  const before = modal.opened;
+  closeTabX(win, tabById(win, tB));
+  await until(() => modal.opened > before, 500);
+  win.confirmTerminate(false);
+  await until(() => !tabById(win, tB), 500);
+  await sleep(30);
+  ok(modal.opened === before + 1, 'still exactly one confirm for two tmux panes; got ' + (modal.opened - before));
+  ok(hidden($(win, 'confirmOv')), 'no second confirm left open');
+  const d1 = disconnectsFor(env, 'sid-b1.host'), d2 = disconnectsFor(env, 'sid-b2.host');
+  ok(d1.length === 1 && d1[0].body.terminate === true && d2.length === 1 && d2[0].body.terminate === true,
+     'both tmux sessions terminated, once each; got ' + d1.length + '/' + d2.length);
+  ok(!tabById(win, tB) && !win.panes[b1.id] && !win.panes[b2.id], 'B and its panes are gone');
+  ok(tabEls(win).length === 1 && tabId(activeTab(win)) === tA, 'A remains, active');
+  cleanup(env);
+});
+
+test('tabs: closing a tmux tab with "don\'t ask again" set asks nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host', {persistent: true});
+  const b2 = b1 && await tSplit(win, b1, 'v', 'b2.host', {persistent: true});
+  if (!b2) { ok(false, 'setup'); cleanup(env); return; }
+  win.localStorage.setItem('websh_terminate_no_ask', '1');
+  const modal = confirmCounter(win);
+  closeTabX(win, tabElOfPane(win, b1));
+  await until(() => tabEls(win).length === 1, 500);
+  ok(modal.opened === 0, 'no confirm');
+  ok(disconnectsFor(env, 'sid-b1.host').some(e => e.body.terminate) &&
+     disconnectsFor(env, 'sid-b2.host').some(e => e.body.terminate), 'both terminated');
+  ok(tabId(activeTab(win)) === tabOfPane(a), 'A is active');
+  cleanup(env);
+});
+
+test('tabs: middle-click closes a tab, once', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b);
+  middleClick(win, tabElOfPane(win, a));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && !win.panes[a.id], 'middle-click closed A');
+  ok(disconnectsFor(env, 'sid-a.host').length === 1, 'A\'s session disconnected exactly once; got ' +
+     disconnectsFor(env, 'sid-a.host').length);
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'B stays active');
+  cleanup(env);
+});
+
+test('tabs: a hidden tab keeps its output and is never fitted to its hidden box', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const urls = recordUrls(win);
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  win.flushPaneResize(a);
+  await until(() => a.lastSentCols === 80, 500);
+  const mark = env.log.length;
+  const sizesBefore = a.term._resizes.length;
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  ok(env.lay.hidden(a.el), 'a\'s tab is hidden');
+  // The output channel of the hidden pane keeps running.
+  const polls = () => urls.filter(u => /action=output/.test(u) && /sid-a\.host/.test(u)).length;
+  const p0 = polls();
+  await until(() => polls() >= p0 + 3, 1500);
+  ok(polls() >= p0 + 3, 'the hidden pane keeps asking for output; ' + (polls() - p0) + ' polls');
+  ok(a.polling && a.sid === 'sid-a.host', 'the hidden pane stays connected');
+  const written = [];
+  const w0 = a.term.write;
+  a.term.write = d => { written.push(typeof d === 'string' ? d : String.fromCharCode.apply(null, Array.from(d))); };
+  win.handleOutputPayload(a, {data: b64(win, 'hello from A'), alive: true}, a.sid);
+  ok(written.join('').indexOf('hello from A') >= 0, 'output reaches the hidden terminal');
+  a.term.write = w0;
+  // Things that refit panes, while A is hidden.
+  env.lay.pump();
+  win.dispatchEvent(new win.Event('resize'));
+  win.zoomIn();
+  await sleep(250);              // past the 150 ms resize debounce
+  win.zoomOut();
+  await sleep(250);
+  const sizes = a.term._resizes.slice(sizesBefore);
+  ok(sizes.length === 0, 'the hidden terminal is never resized; got ' + JSON.stringify(sizes));
+  ok(a.term.cols === 80 && a.term.rows === 24, 'still 80x24; got ' + a.term.cols + 'x' + a.term.rows);
+  const rs = resizesFor(env, 'sid-a.host', mark);
+  ok(rs.length === 0, 'no /api/resize for the hidden pane; got ' + JSON.stringify(rs.map(e => e.body)));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0,
+     'no degenerate resize from any pane');
+  cleanup(env);
+});
+
+test('tabs: showing a tab fits its panes and resizes the PTY only when the size changed', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  win.flushPaneResize(a);
+  await until(() => a.lastSentCols === 80 && a.lastSentRows === 24, 500);
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  // Same size: back and forth costs no resize.
+  let mark = env.log.length;
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await sleep(250);
+  ok(!env.lay.hidden(a.el), 'A is shown');
+  ok(a.term.cols === 80 && a.term.rows === 24, 'A fits its box: 80x24; got ' + a.term.cols + 'x' + a.term.rows);
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0,
+     'no /api/resize when the size did not change; got ' + JSON.stringify(resizesFor(env, 'sid-a.host', mark).map(e => e.body)));
+  // The window changes size while A is hidden.
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await sleep(20);
+  mark = env.log.length;
+  env.lay.setBox(120, 40);
+  await until(() => b.term.cols === 120, 500);
+  await sleep(250);
+  ok(b.term.cols === 120 && b.term.rows === 40, 'the visible pane follows the window: 120x40; got ' + b.term.cols + 'x' + b.term.rows);
+  ok(a.term.cols === 80 && a.term.rows === 24, 'the hidden pane is left alone; got ' + a.term.cols + 'x' + a.term.rows);
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'and sends no resize while hidden; got ' +
+     JSON.stringify(resizesFor(env, 'sid-a.host', mark).map(e => e.body)));
+  mark = env.log.length;
+  clickTab(win, tabById(win, tA));
+  await until(() => resizesFor(env, 'sid-a.host', mark).length > 0, 1000);
+  await sleep(250);
+  ok(a.term.cols === 120 && a.term.rows === 40, 'shown again, A is fitted to 120x40; got ' + a.term.cols + 'x' + a.term.rows);
+  const rs = resizesFor(env, 'sid-a.host', mark).map(e => e.body.cols + 'x' + e.body.rows);
+  ok(rs.length === 1 && rs[0] === '120x40', 'exactly one /api/resize 120x40 for A; got ' + JSON.stringify(rs));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('tabs: switching to a tab focuses the pane last active in it; top-bar search follows', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  if (!needTabs(win) || !a1) { cleanup(env); return; }
+  const a2 = await tSplit(win, a1, 'h', 'a2.host');
+  const b = await tNewTab(win, 'b.host');
+  if (!a2 || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  fire(win, a1.el, 'mousedown', 0);           // the user clicks into a1
+  fire(win, win.document, 'mouseup', 0);
+  ok(win.activeId === a1.id, 'a1 active after a click into it');
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(win.activeId === b.id, 'B shown: its pane is active; got ' + win.activeId);
+  ok(!a1.el.classList.contains('active') && b.el.classList.contains('active'), 'pane highlight moved to b');
+  const f0 = a1.term._focusCalls;
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await sleep(20);
+  ok(win.activeId === a1.id, 'back in A, a1 (last active there) is active, not a2; got ' + win.activeId);
+  ok(a1.term._focusCalls > f0, 'keyboard focus went into a1');
+  ok(a1.el.classList.contains('active') && !b.el.classList.contains('active'), 'only a1 highlighted');
+  win.toggleSearch();
+  ok(!a1.el.querySelector('[data-search]').classList.contains('h'), 'top-bar search opens on a1');
+  ok(b.el.querySelector('[data-search]').classList.contains('h'), 'not on the hidden tab\'s pane');
+  cleanup(env);
+});
+
+test('tabs: the dot shows the worst pane state, also for panes that are not active', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  if (!needTabs(win) || !a1) { cleanup(env); return; }
+  const a2 = await tSplit(win, a1, 'h', 'a2.host');
+  const b = await tNewTab(win, 'b.host');
+  if (!a2 || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  win.activatePane(a2.id);
+  ok(dotState(tabById(win, tA)) === 's-on' && dotState(tabById(win, tB)) === 's-on', 'both tabs green');
+  // Hold a2 really in "reconnecting": any successful /api/output reply
+  // rightly clears that state (the link works), so a2's output requests
+  // must stop answering first. Wait for one issued after the stall, so
+  // no earlier, still-answering request is in flight.
+  let stalled = 0;
+  const innerFetch = win.fetch;
+  win.fetch = function(url, init) {
+    if (/action=output/.test(String(url)) && /session_id=sid-a2\.host/.test(String(url))) {
+      stalled++;
+      return new Promise(() => {});
+    }
+    return innerFetch(url, init);
+  };
+  win.fetch.__state = innerFetch.__state;
+  ok(await until(() => stalled > 0, 1500), 'a2\'s output channel is stalled (setup)');
+  win.setReconnecting(a2, true);
+  await sleep(10);
+  ok(a2.reconnecting, 'a2 is still reconnecting (setup)');
+  ok(dotState(tabById(win, tA)) === 's-wait', 'A amber while a2 reconnects; got ' + dotState(tabById(win, tA)));
+  ok(dotState(tabById(win, tB)) === 's-on', 'B unaffected');
+  // a1 is not the active pane; its session ends.
+  win.handleOutputPayload(a1, {data: '', alive: false}, a1.sid);
+  await sleep(10);
+  ok(!a1.sid && !a1.connecting, 'a1 is disconnected (precondition)');
+  ok(dotState(tabById(win, tA)) === 's-off', 'A red: disconnected beats reconnecting; got ' + dotState(tabById(win, tA)));
+  win.setReconnecting(a2, false);
+  await sleep(10);
+  ok(dotState(tabById(win, tA)) === 's-off', 'A stays red while a1 is down; got ' + dotState(tabById(win, tA)));
+  // A pane in a hidden tab goes down.
+  win.handleOutputPayload(b, {data: '', alive: false}, b.sid);
+  await sleep(10);
+  ok(dotState(tabById(win, tB)) === 's-off', 'hidden tab B turns red when its pane disconnects; got ' + dotState(tabById(win, tB)));
+  cleanup(env);
+});
+
+test('tabs: output in a hidden tab marks it; showing it clears the mark; the active tab never marks', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  const marked = id => tabById(win, id).classList.contains('activity');
+  ok(!marked(tA) && !marked(tB), 'no marks at the start');
+  win.handleOutputPayload(b, {data: b64(win, 'echo'), alive: true}, b.sid);    // B is active
+  ok(!marked(tB), 'output in the active tab does not mark it');
+  win.handleOutputPayload(a, {data: '', alive: true}, a.sid);
+  ok(!marked(tA), 'an empty frame (no output) does not mark a hidden tab');
+  win.handleOutputPayload(a, {data: b64(win, 'build done'), alive: true}, a.sid);
+  ok(marked(tA), 'output in hidden tab A marks it (.activity)');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(!marked(tA), 'showing A clears its mark');
+  win.handleOutputPayload(a, {data: b64(win, 'more'), alive: true}, a.sid);
+  ok(!marked(tA), 'output while A is shown does not mark it');
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(!marked(tA), 'output the user saw in A does not mark A once they leave it');
+  cleanup(env);
+});
+
+test('tabs: the tab label and document.title follow the active tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  ok(tabLabel(tabById(win, tB)) === paneLabel(b), 'B labelled with b\'s pane label; got ' + tabLabel(tabById(win, tB)));
+  ok(tabLabel(tabById(win, tA)) === paneLabel(a), 'A labelled with a\'s pane label; got ' + tabLabel(tabById(win, tA)));
+  ok(win.document.title.indexOf(paneLabel(b)) === 0, 'title follows B; got ' + win.document.title);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(win.document.title.indexOf(paneLabel(a)) === 0, 'title follows A after a click; got ' + win.document.title);
+  const c = await tSplit(win, a, 'h', 'c.host');
+  ok(!!c && win.activeId === c.id, 'split pane c active in A');
+  ok(tabLabel(tabById(win, tA)) === paneLabel(c), 'A\'s label follows its active pane c; got ' + tabLabel(tabById(win, tA)));
+  win.activatePane(a.id);
+  ok(tabLabel(tabById(win, tA)) === paneLabel(a), 'and back to a; got ' + tabLabel(tabById(win, tA)));
+  ok(tabLabel(tabById(win, tB)) === paneLabel(b), 'B\'s label is unaffected');
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  win.closePane(b.id);
+  await until(() => tabEls(win).length === 1, 500);
+  ok(win.document.title.indexOf(paneLabel(a)) === 0, 'closing B: title follows A\'s active pane; got ' + win.document.title);
+  cleanup(env);
+});
+
+test('tabs: Ctrl+Tab cycles panes inside the active tab only', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  if (!needTabs(win) || !a1) { cleanup(env); return; }
+  const a2 = await tSplit(win, a1, 'h', 'a2.host');
+  const b = await tNewTab(win, 'b.host');
+  if (!a2 || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  const key = shift => win.document.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Tab', code: 'Tab', ctrlKey: true, shiftKey: !!shift, bubbles: true, cancelable: true}));
+  key(); key();
+  ok(win.activeId === b.id && tabId(activeTab(win)) === tB, 'in a one-pane tab Ctrl+Tab stays put; got ' + win.activeId);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const seen = [];
+  for (let i = 0; i < 4; i++) { key(); seen.push(win.activeId); }
+  key(true); seen.push(win.activeId);
+  ok(seen.every(id => id === a1.id || id === a2.id), 'Ctrl+Tab never leaves tab A; got ' + seen.join(','));
+  ok(new Set(seen).size === 2, 'and it does cycle between a1 and a2; got ' + seen.join(','));
+  ok(tabId(activeTab(win)) === tA, 'tab A stays active');
+  cleanup(env);
+});
+
+test('tabs: tabs, their order, layouts and the active tab survive a reload', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN()); const w1 = env1.win;
+  const a1 = await tConnect(w1, 'a1.host');
+  if (!needTabs(w1) || !a1) { cleanup(env1); return; }
+  const a2 = await tSplit(w1, a1, 'h', 'a2.host');
+  const b = await tNewTab(w1, 'b.host');
+  const c = await tNewTab(w1, 'c.host');
+  if (!a2 || !b || !c) { ok(false, 'setup'); cleanup(env1); return; }
+  clickTab(w1, tabElOfPane(w1, b));
+  await until(() => tabId(activeTab(w1)) === tabOfPane(b), 500);
+  await sleep(50);
+  const snap = snapshotStorage(w1);
+  const hostsOf = (win, t) => panesOfTab(win, tabId(t)).map(p => p.host).sort().join('+');
+  const order1 = tabEls(w1).map(t => hostsOf(w1, t));
+  cleanup(env1);
+
+  const env2 = await mkTabEnv(TAB_PLAN(), snap); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 4, 2000);
+  ok(tabEls(w2).length === 3, 'three tabs after reload; got ' + tabEls(w2).length);
+  const order2 = tabEls(w2).map(t => hostsOf(w2, t));
+  ok(order2.join() === order1.join(), 'same tabs, same order, same panes in each; got ' +
+     JSON.stringify(order2) + ' want ' + JSON.stringify(order1));
+  ok(activeTab(w2) && hostsOf(w2, activeTab(w2)) === 'b.host', 'the active tab (b) is active again; got ' +
+     (activeTab(w2) ? hostsOf(w2, activeTab(w2)) : 'none'));
+  const pa = paneList(w2).find(p => p.host === 'a1.host');
+  ok(!!pa && !!tabRootById(w2, tabOfPane(pa)).querySelector('.split-h'), 'A\'s split layout restored');
+  const connects = env2.log.filter(e => e.action === 'connect').map(e => e.body);
+  ok(['a1.host', 'a2.host', 'b.host', 'c.host'].every(h => connects.some(cb => cb.host === h && cb.password === 'pw-' + h)),
+     'every pane in every tab reconnected with its own password; got ' +
+     JSON.stringify(connects.map(cb => cb.host + ':' + cb.password)));
+  ok(connects.every(cb => cb.cols >= 20 && cb.rows >= 5), 'no pane (hidden tabs included) connects with a degenerate size; got ' +
+     JSON.stringify(connects.map(cb => cb.host + ' ' + cb.cols + 'x' + cb.rows)));
+  ok(env2.log.filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize after reload');
+  // Only switching the tab must be remembered too.
+  const pc = paneList(w2).find(p => p.host === 'c.host');
+  const before = JSON.stringify(snapshotStorage(w2).local);
+  clickTab(w2, tabElOfPane(w2, pc));
+  await until(() => JSON.stringify(snapshotStorage(w2).local) !== before, 1000);
+  const snap2 = snapshotStorage(w2);
+  cleanup(env2);
+  const env3 = await mkTabEnv(TAB_PLAN(), snap2); const w3 = env3.win;
+  await until(() => paneList(w3).filter(p => p.sid).length === 4 && !!activeTab(w3), 2000);
+  ok(activeTab(w3) && hostsOf(w3, activeTab(w3)) === 'c.host', 'a tab switch alone is remembered across reload; got ' +
+     (activeTab(w3) ? hostsOf(w3, activeTab(w3)) : 'none'));
+  cleanup(env3);
+});
+
+test('tabs: a manifest saved by the previous version loads as one tab with its whole layout', async () => {
+  const rec = h => ({label: h, via: 'manual', host: h, port: 22, user: 'u', auth: 'pw',
+                     persistent: false, slot_id: null, tmux_cmd: 'tmux', cols: 80, rows: 24});
+  const pre = {local: {websh_panes: JSON.stringify({
+    version: 2,
+    layout: {type: 'split', dir: 'h',
+             a: {type: 'split', dir: 'v', a: {type: 'leaf', pane: 'p1'}, b: {type: 'leaf', pane: 'p3'}},
+             b: {type: 'leaf', pane: 'p2'}},
+    panes: {p1: rec('h1'), p2: rec('h2'), p3: rec('h3')},
+  })}, session: {websh_panes_session: JSON.stringify({
+    p1: {password: 'pw1'}, p2: {password: 'pw2'}, p3: {password: 'pw3'}})}};
+  const env = await mkTabEnv(TAB_PLAN(), pre); const win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 3, 2000);
+  const connects = env.log.filter(e => e.action === 'connect').map(e => e.body);
+  ok(connects.length === 3 && ['h1', 'h2', 'h3'].every(h => connects.some(cb => cb.host === h && cb.password === 'pw' + h.slice(1))),
+     'all three panes reconnect with their own passwords; got ' + JSON.stringify(connects.map(cb => cb.host + ':' + cb.password)));
+  if (!needTabs(win)) { cleanup(env); return; }
+  ok(tabEls(win).length === 1, 'loaded as ONE tab; got ' + tabEls(win).length);
+  const t = tabEls(win)[0];
+  ok(!!t && t.classList.contains('active'), 'and it is active');
+  ok(paneList(win).every(p => tabOfPane(p) === tabId(t)), 'all three panes are in it');
+  const root = t && tabRootById(win, tabId(t));
+  ok(!!root && !!root.querySelector('.split-h .split-v'), 'the nested split is kept');
+  const sm = t && t.querySelector('.tab-split');
+  ok(!!sm && /3/.test(sm.textContent), 'split marker says 3; got ' + (sm ? JSON.stringify(sm.textContent) : 'none'));
+  await sleep(50);
+  // And the next reload (new format now) still has everything.
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 3, 2000);
+  ok(paneList(w2).length === 3 && tabEls(w2).length === 1, 'a second reload: still one tab with three panes; got ' +
+     tabEls(w2).length + ' tab(s), ' + paneList(w2).length + ' pane(s)');
+  const c2 = env2.log.filter(e => e.action === 'connect').map(e => e.body);
+  ok(['h1', 'h2', 'h3'].every(h => c2.some(cb => cb.host === h && cb.password === 'pw' + h.slice(1))),
+     'with the right passwords again');
+  cleanup(env2);
+});
+
+test('tabs: the recovery after a long absence reaches panes in hidden tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = b && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  ok(env.lay.hidden(a.el) && env.lay.hidden(b.el), 'a and b are in hidden tabs');
+  const kicked = new Set();
+  const orig = win.kickOutput;
+  win.kickOutput = function(p, force) { if (p) kicked.add(p.id); return orig.apply(this, arguments); };
+  const mark = env.log.length;
+  const sizes0 = [a, b].map(p => p.term._resizes.length);
+  // bfcache restore: one of the two "you were away" signals.
+  const ev = new win.Event('pageshow');
+  Object.defineProperty(ev, 'persisted', {value: true});
+  win.dispatchEvent(ev);
+  await until(() => kicked.has(a.id) && kicked.has(b.id) && kicked.has(c.id), 1500);
+  ok(kicked.has(a.id) && kicked.has(b.id), 'the output channel of panes in hidden tabs is restarted; kicked ' +
+     Array.from(kicked).join(','));
+  ok(kicked.has(c.id), 'and of the visible one');
+  await sleep(250);
+  ok(a.term._resizes.length === sizes0[0] && b.term._resizes.length === sizes0[1],
+     'the hidden terminals were not refitted to their hidden box; got ' +
+     JSON.stringify([a.term._resizes.slice(sizes0[0]), b.term._resizes.slice(sizes0[1])]));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  win.kickOutput = orig;
+  cleanup(env);
+});
+
+// ---- Tabs, round 2: what the first round did not reach ----
+
+test('tabs: a failed + that is dismissed returns to the tab the user was on', async () => {
+  // Tabs A, B with A in front. "+" -> the login fails -> the user closes
+  // the form. They must be back on A, not on whichever tab happens to be
+  // next to the half-made one.
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'bad.host', response: {auth_failed: true, alive: false}},
+  ]));
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'nope';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await until(() => !hidden($(win, 'tmuxOv')) && /Authentication failed/.test($(win, 'tmTitle').textContent), 1000);
+  clickBtn(win, 'tmCancel');
+  await until(() => hidden($(win, 'tmuxOv')), 500);
+  clickBtn(win, 'btnCancel');
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabEls(win).length === 2 && tabRoots(win).length === 2, 'still two tabs, no leftover root; got ' +
+     tabEls(win).length + '/' + tabRoots(win).length);
+  ok(tabId(activeTab(win)) === tA, 'back on A, the tab the user was on; got the tab of ' +
+     (activeTab(win) ? panesOfTab(win, tabId(activeTab(win))).map(p => p.host) : 'none'));
+  ok(win.activeId === a.id, 'a is the active pane; got ' + win.activeId);
+  ok(!env.lay.hidden(a.el) && env.lay.hidden(b.el), 'A shown, B hidden');
+  // Same with Escape right after "+" (nothing materialized): also A.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabId(activeTab(win)) === tA, 'Escape on an untouched + form also leaves A in front');
+  cleanup(env);
+});
+
+test('tabs: a zoom made while a tab is hidden is applied when it is shown, with one resize', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  win.flushPaneResize(a);
+  await until(() => a.lastSentCols === 80, 500);
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a);
+  const mark = env.log.length;
+  const f0 = a.term.options.fontSize;
+  win.zoomIn(); win.zoomIn();
+  const f1 = win.settings.fontSize;
+  ok(f1 > f0, 'zoomed in: ' + f0 + ' -> ' + f1);
+  const want = [Math.floor(80 * env.lay.baseFont / f1), Math.floor(24 * env.lay.baseFont / f1)];
+  await until(() => b.term.cols === want[0], 1000);
+  ok(b.term.cols === want[0] && b.term.rows === want[1], 'the visible pane is refitted to ' + want.join('x') +
+     '; got ' + b.term.cols + 'x' + b.term.rows);
+  await sleep(250);
+  ok(a.term.cols === 80 && a.term.rows === 24, 'the hidden one is left alone; got ' + a.term.cols + 'x' + a.term.rows);
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'no resize for the hidden pane');
+  const m2 = env.log.length;
+  clickTab(win, tabById(win, tA));
+  await until(() => a.term.cols === want[0], 1000);
+  await sleep(250);
+  ok(a.term.options.fontSize === f1, 'shown, A gets the new font size; got ' + a.term.options.fontSize);
+  ok(a.term.cols === want[0] && a.term.rows === want[1], 'and is refitted to ' + want.join('x') + '; got ' +
+     a.term.cols + 'x' + a.term.rows);
+  const rs = resizesFor(env, 'sid-a.host', m2).map(e => e.body.cols + 'x' + e.body.rows);
+  ok(rs.length === 1 && rs[0] === want.join('x'), 'exactly one /api/resize ' + want.join('x') + '; got ' + JSON.stringify(rs));
+  cleanup(env);
+});
+
+test('tabs: closing the active pane of a split tab keeps that tab in front', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host');
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host');
+  if (!b2) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b1);
+  ok(win.activeId === b2.id, 'b2 active');
+  win.closePane(b2.id);
+  await until(() => !win.panes[b2.id], 500);
+  ok(tabId(activeTab(win)) === tB, 'tab B stays in front');
+  ok(win.activeId === b1.id && b1.term._focusCalls > 0, 'b1 becomes the active pane; got ' + win.activeId);
+  ok(env.lay.hidden(a.el), 'A stays hidden');
+  cleanup(env);
+});
+
+test('tabs: dragging a tab along the strip reorders it, and the order survives a reload', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  const c = await tNewTab(win, 'c.host');
+  if (!b || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const order = w => tabEls(w).map(t => panesOfTab(w, tabId(t)).map(p => p.host).join('+')).join(',');
+  ok(order(win) === 'a.host,b.host,c.host', 'start order; got ' + order(win));
+  const mouse = (target, type, x, buttons) => target.dispatchEvent(new win.MouseEvent(type,
+    {bubbles: true, cancelable: true, button: 0, buttons: buttons, clientX: x, clientY: 5}));
+  // A plain click on C: no reorder.
+  const cEl = tabElOfPane(win, c);
+  mouse(cEl, 'mousedown', 500, 1); mouse(win.document, 'mouseup', 500, 0);
+  mouse(cEl, 'click', 500, 0);
+  ok(order(win) === 'a.host,b.host,c.host', 'a click does not reorder; got ' + order(win));
+  // The layout model puts every tab at x=0..720: x=10 is left of all centres.
+  mouse(cEl, 'mousedown', 500, 1);
+  mouse(win.document, 'mousemove', 400, 1);
+  mouse(win.document, 'mousemove', 10, 1);
+  mouse(win.document, 'mouseup', 10, 0);
+  ok(order(win) === 'c.host,a.host,b.host', 'C dragged to the front; got ' + order(win));
+  ok(tabId(activeTab(win)) === tabOfPane(c) && win.activeId === c.id, 'C is still the active tab');
+  ok(!cEl.classList.contains('dragging'), 'no drag state left on the tab');
+  // A mouse move after the button is up is not a drag.
+  mouse(win.document, 'mousemove', 700, 0);
+  ok(order(win) === 'c.host,a.host,b.host', 'a move without the button does nothing');
+  // The button released outside the window (no mouseup reaches the
+  // page): the next move, with no button down, must not drag the tab.
+  const aEl = tabElOfPane(win, a);
+  mouse(aEl, 'mousedown', 500, 1);
+  mouse(win.document, 'mousemove', 700, 0);
+  mouse(win.document, 'mousemove', 10, 0);
+  ok(order(win) === 'c.host,a.host,b.host', 'a lost mouseup leaves no drag behind; got ' + order(win));
+  mouse(win.document, 'mouseup', 10, 0);
+  await sleep(50);
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 3, 2000);
+  ok(order(w2) === 'c.host,a.host,b.host', 'the new order survives a reload; got ' + order(w2));
+  ok(activeTab(w2) && panesOfTab(w2, tabId(activeTab(w2)))[0].host === 'a.host', 'A (pressed last) active after reload');
+  cleanup(env2);
+});
+
+test('tabs: a file dropped on a pane of a tab shown after a switch uploads into that pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  clickTab(win, tabElOfPane(win, b));
+  await until(() => win.activeId === b.id, 500);
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id, files) => started.push([id, files.map(f => f.name)]);
+  const item = {kind: 'file', getAsFile: () => ({name: 'x.txt', size: 3}), webkitGetAsEntry: () => ({isDirectory: false})};
+  const drag = (target, type) => {
+    const ev = new win.Event(type, {bubbles: true, cancelable: true});
+    Object.defineProperty(ev, 'dataTransfer', {value: {types: ['Files'], items: [item], files: [item.getAsFile()], dropEffect: ''}});
+    target.dispatchEvent(ev);
+    return ev;
+  };
+  drag(b.el, 'dragenter');
+  ok(b.el.classList.contains('drop-target'), 'the shown pane highlights');
+  const ev = drag(b.el, 'drop');
+  ok(ev.defaultPrevented, 'drop handled');
+  ok(started.length === 1 && started[0][0] === b.id, 'upload goes to b, the pane it was dropped on; got ' + JSON.stringify(started));
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'still on B');
+  // A tab drag is not a file drag: mouse-dragging a tab starts no upload.
+  const t = tabElOfPane(win, a);
+  t.dispatchEvent(new win.MouseEvent('mousedown', {bubbles: true, button: 0, buttons: 1, clientX: 300}));
+  win.document.dispatchEvent(new win.MouseEvent('mousemove', {bubbles: true, buttons: 1, clientX: 10}));
+  win.document.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true, clientX: 10}));
+  ok(started.length === 1, 'a tab drag starts no upload');
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
+test('tabs: closing a tab whose pane is still connecting leaves nothing behind', async () => {
+  // A reload with two tabs; B's reconnect is slow. The user closes B
+  // with its x before the connect answers.
+  const rec = h => ({label: 'u@' + h, via: 'manual', host: h, port: 22, user: 'u', auth: 'pw',
+                     persistent: false, slot_id: null, tmux_cmd: 'tmux', cols: 80, rows: 24});
+  const pre = {local: {websh_panes: JSON.stringify({version: 2,
+    layout: {type: 'leaf', pane: 'p1'}, panes: {p1: rec('a.host')}})},
+    session: {websh_panes_session: JSON.stringify({p1: {password: 'pw-a.host'}})}};
+  // Build a two-tab manifest through the product itself: first boot from v2,
+  // add a tab, then reload with B's connect slowed down.
+  const env0 = await mkTabEnv(TAB_PLAN(), pre); const w0 = env0.win;
+  await until(() => paneList(w0).some(p => p.sid), 2000);
+  if (!needTabs(w0)) { cleanup(env0); return; }
+  const b0 = await tNewTab(w0, 'b.host');
+  if (!b0) { ok(false, 'setup'); cleanup(env0); return; }
+  clickTab(w0, tabElOfPane(w0, paneList(w0).find(p => p.host === 'a.host')));
+  await sleep(50);
+  const snap = snapshotStorage(w0);
+  cleanup(env0);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'b.host', response: {session_id: 'sid-b-late', alive: true}, delay: 300},
+  ]), snap);
+  const win = env.win;
+  await until(() => tabEls(win).length === 2 && paneList(win).some(p => p.host === 'a.host' && p.sid), 1500);
+  const b = paneList(win).find(p => p.host === 'b.host');
+  ok(!!b && !b.sid && b.connecting, 'B\'s pane is still connecting (setup)');
+  if (!b) { cleanup(env); return; }
+  ok(dotState(tabElOfPane(win, b)) === 's-wait', 'B\'s dot is amber while it connects; got ' + dotState(tabElOfPane(win, b)));
+  closeTabX(win, tabElOfPane(win, b));
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1, 'B closed');
+  await until(() => disconnectsFor(env, 'sid-b-late').length > 0, 1000);
+  ok(disconnectsFor(env, 'sid-b-late').length === 1, 'the session that arrived late is disconnected, once');
+  await sleep(50);
+  ok(tabEls(win).length === 1 && tabRoots(win).length === 1 && paneList(win).length === 1,
+     'no tab, root or pane came back; got ' + tabEls(win).length + '/' + tabRoots(win).length + '/' + paneList(win).length);
+  ok(win.activeId === paneList(win)[0].id && hidden($(win, 'ov')), 'A stays in front, no login form');
+  const m = JSON.parse(win.localStorage.getItem('websh_panes'));
+  ok(!/b\.host/.test(JSON.stringify(m)), 'B is gone from the saved manifest');
+  cleanup(env);
+});
+
+test('tabs: + then the current tab closes while the form is open', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  // B in front; "+" opens the form; B goes away underneath it.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  win.closeTab(tabOfPane(b));
+  await until(() => tabEls(win).length === 1, 500);
+  ok(!hidden($(win, 'ov')), 'the form is still open');
+  ok(tabId(activeTab(win)) === tabOfPane(a), 'A came forward');
+  const c = await tConnect(win, 'c.host');
+  ok(!!c && tabEls(win).length === 2 && tabOfPane(c) !== tabOfPane(a), 'the connect still makes a new tab');
+  ok(tabId(activeTab(win)) === tabOfPane(c), 'and shows it');
+  // Now the only tab left closes under an open + form: the form becomes
+  // the initial one, and connecting makes exactly one tab.
+  win.closeTab(tabOfPane(a));
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  win.closeTab(tabOfPane(c));
+  await until(() => tabEls(win).length === 0, 500);
+  ok(win.overlayMode === 'initial' && !hidden($(win, 'ov')), 'last tab gone: initial form; mode ' + win.overlayMode);
+  const d = await tConnect(win, 'd.host');
+  ok(!!d && tabEls(win).length === 1 && tabRoots(win).length === 1, 'one tab after connecting; got ' + tabEls(win).length);
+  cleanup(env);
+});
+
+test('tabs: a reload where one tab\'s pane fails to log in keeps every tab', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN()); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { cleanup(env1); return; }
+  const b = await tNewTab(w1, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env1); return; }
+  clickTab(w1, tabElOfPane(w1, a));
+  await sleep(50);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'b.host', response: {auth_failed: true, alive: false}},
+  ]), snap);
+  const win = env.win;
+  await until(() => paneList(win).some(p => p.host === 'a.host' && p.sid) &&
+                    env.log.some(e => e.action === 'connect' && e.body.host === 'b.host'), 1500);
+  await sleep(100);
+  const pb = paneList(win).find(p => p.host === 'b.host');
+  ok(tabEls(win).length === 2 && !!pb, 'both tabs are still there; got ' + tabEls(win).length);
+  ok(hidden($(win, 'ov')), 'no login form pops up');
+  ok(!!pb && dotState(tabElOfPane(win, pb)) === 's-off', 'B\'s dot is red; got ' + (pb && dotState(tabElOfPane(win, pb))));
+  ok(tabId(activeTab(win)) === tabOfPane(paneList(win).find(p => p.host === 'a.host')), 'A stays in front');
+  const m = win.localStorage.getItem('websh_panes');
+  ok(/b\.host/.test(m), 'B is kept in the saved manifest, to retry with a new password');
+  cleanup(env);
+});
+
+test('tabs: rapid switching while both tabs stream output', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  win.flushPaneResize(a);
+  await until(() => a.lastSentCols === 80, 500);
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  win.flushPaneResize(b);
+  await until(() => b.lastSentCols === 80, 500);
+  const mark = env.log.length;
+  const got = {a: 0, b: 0};
+  const wa = a.term.write, wb = b.term.write;
+  a.term.write = d => { got.a += d.length; }; b.term.write = d => { got.b += d.length; };
+  let n = 0;
+  for (let i = 0; i < 60; i++) {
+    win.handleOutputPayload(a, {data: b64(win, 'aaaaaaaaaa'), alive: true}, a.sid);
+    win.handleOutputPayload(b, {data: b64(win, 'bbbbbbbbbb'), alive: true}, b.sid);
+    n += 10;
+    clickTab(win, tabElOfPane(win, i % 2 ? b : a));
+    if (i % 7 === 0) await sleep(0);
+  }
+  // last click (i=59) was on b
+  await sleep(300);
+  ok(got.a === n && got.b === n, 'every byte reached both terminals; got ' + got.a + '/' + got.b + ' of ' + n);
+  ok(tabId(activeTab(win)) === tabOfPane(b) && win.activeId === b.id, 'the last clicked tab is in front');
+  ok(!env.lay.hidden(b.el) && env.lay.hidden(a.el), 'and only it is shown');
+  ok(a.term.cols === 80 && b.term.cols === 80 && a.term.rows === 24 && b.term.rows === 24, 'sizes untouched');
+  const rs = env.log.slice(mark).filter(e => e.action === 'resize');
+  ok(rs.length === 0, 'no resize for a size that never changed; got ' + JSON.stringify(rs.map(e => e.body)));
+  ok(!tabElOfPane(win, b).classList.contains('activity'), 'the tab in front carries no activity mark');
+  a.term.write = wa; b.term.write = wb;
+  cleanup(env);
+});
+
+
+test('tabs: a background reconnect while the + form is open does not hijack the new tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  // b in front; "+" opened; meanwhile a (hidden tab) loses its session
+  // and reconnects by itself.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 1000);
+  win.handleOutputPayload(a, {error: 'session not found'}, a.sid);
+  await until(() => a.sid === 'sid-a.host' && !a.connecting, 1000);
+  ok(a.sid === 'sid-a.host', 'a reconnected by itself');
+  ok(!hidden($(win, 'ov')) && win.overlayMode === 'tab', 'the + form stays open; mode ' + win.overlayMode);
+  ok(tabEls(win).length === 2 && tabOfPane(a) !== tabOfPane(b), 'no tab created or merged by the reconnect');
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'the reconnect did not bring its tab to the front');
+  const c = await tConnect(win, 'c.host');
+  ok(!!c && tabEls(win).length === 3 && panesOfTab(win, tabOfPane(c)).length === 1, 'the + connect makes its own tab');
+  ok(panesOfTab(win, tabOfPane(a)).length === 1 && a.sid === 'sid-a.host', 'a keeps its tab and session');
+  cleanup(env);
+});
+
+// =====================================================================
 // A stray rejection used to take node down mid-run with no summary, so
 // a crash looked like "no result" rather than a failure. Count it as a
 // failure against the scenario that was running and keep going.
@@ -8639,7 +9896,7 @@ process.on('unhandledRejection', e => {
   console.log('  UNHANDLED REJECTION: ' + (e && e.stack || e));
 });
 (async () => {
-  for (const s of scenarios) {
+  for (const s of scenarios.filter(x => new RegExp(process.env.ONLY || '.').test(x.name))) {
     current = s.name;
     console.log('\n=== ' + s.name + ' ===');
     try { await s.fn(); } catch (e) {

@@ -54,8 +54,9 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 Real xterm.js — copy-on-select, right-click paste, `Ctrl+V` paste (on by default; switch it off in ⚙ Options to send a literal `^V` to the shell), scrollback search (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`).
 
+- Tabs in the top bar, each holding its own split layout: `+` opens the login form for a new tab; drag a tab to reorder it, middle-click or `×` to close it (persistent sessions are confirmed once per tab). Tabs in the background stay connected and mark themselves when output arrives. Tabs, their order and layouts come back after a reload
 - Split panes, horizontal or vertical, with draggable dividers
-- Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab`
+- Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab` (within the current tab)
 - Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight
 
 ### 🔁 Persistent sessions
@@ -205,6 +206,7 @@ tests/php/                PHP proxy smoke test
 tests/e2e/                Browser scenarios: real Chromium, real ssh, network faults
 scripts/                  check.sh (all tests), e2e.sh, deploy.sh, codemap.py
 AGENTS.md                 Guide for contributors and coding agents
+agents/                   The two roles (implementer, tester) and how they work together
 .github/workflows/        CI: backend matrix, frontend, PHP, ruff, Docker
 docs/                     Design notes & reference docs
 Dockerfile                Container deployment
