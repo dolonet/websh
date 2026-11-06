@@ -8,7 +8,9 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    # setup-python no longer supplies Python 3.9 for the newest Ubuntu.
+    # Keep the supported interpreter while testing 3.12 on the current image.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-22.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
