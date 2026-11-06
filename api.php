@@ -134,13 +134,22 @@ function backend_headers($extra = array()) {
     return $h;
 }
 
+// curl_close() only frees the handle before PHP 8.0; since then handles
+// are objects freed when they go out of scope, and 8.5 deprecates the
+// call. Hosts with display_errors on would print that notice into the
+// JSON body — and with output buffering off also lose the status code
+// to "headers already sent".
+function release_curl($ch) {
+    if (PHP_VERSION_ID < 80000) curl_close($ch);
+}
+
 function ping_backend($backend) {
     $ch = curl_init($backend . '/api/ping');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 2);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 1);
     $ok = curl_exec($ch) !== false;
-    curl_close($ch);
+    release_curl($ch);
     return $ok;
 }
 
@@ -156,7 +165,7 @@ function proxy_post($url) {
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     if ($resp === false) {
         header('HTTP/1.1 502 Bad Gateway');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
@@ -175,7 +184,7 @@ function proxy_get($url) {
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     if ($resp === false) {
         header('HTTP/1.1 502 Bad Gateway');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
@@ -209,7 +218,7 @@ function proxy_upload($url) {
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     fclose($in);
     if ($resp === false) {
         header('HTTP/1.1 502 Bad Gateway');
@@ -253,7 +262,7 @@ function proxy_download($url) {
     });
     $ok = curl_exec($ch);
     $err = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     if (!$sent_headers) {
         http_response_code(502);
         header('Content-Type: application/json');
@@ -279,7 +288,7 @@ function proxy_delete($url) {
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     if ($resp === false) {
         header('HTTP/1.1 502 Bad Gateway');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
@@ -352,7 +361,7 @@ function proxy_stream($url) {
     });
     $ok = curl_exec($ch);
     $err = curl_error($ch);
-    curl_close($ch);
+    release_curl($ch);
     if (!$sent_headers) {
         // curl never received a response status line — treat as gateway
         // failure rather than letting PHP emit its default text/html.

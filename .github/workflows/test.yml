@@ -41,13 +41,26 @@ jobs:
 
   php-lint:
     # The PHP proxy shipped untested — not even syntax-checked. The
-    # ubuntu-latest runner image includes the PHP CLI (with curl).
-    # The behavioral smoke boots api.php under `php -S` against an echo
+    # behavioral smoke boots api.php under `php -S` against an echo
     # backend and asserts the proxy contract: method/query/body
-    # passthrough, X-Forwarded-For injection, save_delete POST→DELETE.
+    # passthrough, X-Forwarded-For injection, save_delete POST→DELETE,
+    # status forwarding, the streaming helpers, and clean JSON with
+    # every PHP notice displayed.
+    # Shared hosts run whatever PHP the panel offers, so test both ends:
+    # 7.4 (still patched as vendor packages) and the newest release,
+    # where deprecations show up first.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ["7.4", "8.5"]
     steps:
       - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: curl
+          coverage: none
       - name: php -l api.php
         run: php -l api.php
       - name: Behavioral smoke (php -S vs echo backend)
