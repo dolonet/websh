@@ -113,6 +113,8 @@ function _restorePaneFromDrag(p) {
 //   'initial' — no panes yet (fresh app, last pane closed). Modal.
 //   'split'   — user clicked split. Dismissable; dismiss is a no-op
 //               before materialize, undoes the split after.
+//   'tab'     — user clicked "+" (newTab). Dismissable the same way;
+//               the new tab is created only on a successful connect.
 //   null      — form not driving a new-pane flow (e.g. not shown).
 // A pane is only added to the DOM on successful connect (materialize step),
 // so dismissing before connect cleanly leaves the layout untouched.
@@ -650,13 +652,24 @@ function createPane(container) {
   // older setTimeout(fit, 50) fallback is now redundant: ResizeObserver
   // covers the cold-layout case and fitPaneWhenStable covers the
   // webfont-load case.
-  new ResizeObserver(() => { fit.fit() }).observe(termEl);
+  // A pane in a hidden tab is not fitted here: its box is 0x0 and the
+  // fit would shrink the terminal (and, through onResize, the PTY) to
+  // 2x1. showTab() fits it once the tab is on screen.
+  new ResizeObserver(() => {
+    if (paneHidden(p)) { p._fitDeferred = true; return; }
+    fit.fit();
+  }).observe(termEl);
   wirePaneDrop(p);
 
   return p;
 }
 
 function activatePane(id) {
+  // A pane in a tab that is not on screen: bring its tab forward, which
+  // activates the pane remembered for it (this one).
+  let t = panes[id] ? tabOfPane(panes[id]) : null;
+  if (t && t.id !== activeTabId) { t.lastActive = id; showTab(t.id); return; }
+  if (t && t.lastActive !== id) { t.lastActive = id; renderTab(t); }
   if (activeId === id) return;
   let prev = activeId ? panes[activeId] : null;
   if (prev) {
@@ -708,7 +721,318 @@ function updatePaneBadge(p) {
   let db = p.el.querySelector('[data-download-btn]');
   if (db) db.disabled = !p.sid || busy;
   updatePaneTag(p);
+  // The tab's dot is the worst state of its panes, so ANY pane's change
+  // must reach it - not only the active pane's (a background pane that
+  // drops while the user works elsewhere has to turn its tab red).
+  renderTab(tabOfPane(p));
 }
+
+// ── Tabs ────────────────────────────────────────────────────────────
+// A tab is a root container (#panes > .tab-root[data-tab]) holding its
+// own split tree, plus a handle in the strip (#tabs > .tab[data-tab]).
+// Only the active tab's root is shown; the others carry `.h`
+// (display:none) and stay fully alive: streams, keepalive, input
+// queues, reconnects and the absence kick run for their panes exactly
+// as for visible ones.
+//
+// Which tab a pane belongs to is read from the DOM (the root it sits
+// in), never stored on the pane: moving a pane element into another
+// root is all it takes to move it between tabs, without touching its
+// session.
+//
+// Sizing: a pane in a hidden tab has a 0x0 box. Fitting it there gives
+// a 2x1 terminal and a 2x1 PTY - a shell that wraps every character,
+// and a tmux session squashed for every other client. So every fit
+// path (ResizeObserver, fitPaneWhenStable, beginSessionIO, split drag,
+// close) skips a hidden pane and marks it; showTab() fits every pane of
+// the tab once it has its real box, and the resize goes to the server
+// only if cols/rows actually changed (flushPaneResize dedups).
+// docs/invariants.md U1.
+const tabs = [];          // strip order
+let activeTabId = null;
+let tabCounter = 0;
+
+function tabById(id) {
+  for (let i = 0; i < tabs.length; i++) if (tabs[i].id === id) return tabs[i];
+  return null;
+}
+function tabOfPane(p) {
+  if (!p || !p.el || !p.el.closest) return null;
+  let root = p.el.closest('.tab-root');
+  return root ? tabById(root.getAttribute('data-tab')) : null;
+}
+function activeTab() { return tabById(activeTabId); }
+// Panes of a tab, in layout (DOM) order.
+function panesInTab(t) {
+  if (!t) return [];
+  let out = [];
+  t.root.querySelectorAll('.pane').forEach(el => {
+    let p = panes[el.getAttribute('data-pane')];
+    if (p) out.push(p);
+  });
+  return out;
+}
+// True when the pane has no real box to be fitted to: its tab is hidden.
+function paneHidden(p) {
+  let root = p && p.el && p.el.closest ? p.el.closest('.tab-root') : null;
+  if (!root) return false;
+  return root.classList.contains('h') || root.hidden;
+}
+// Fit every pane that is on screen. Hidden ones are only marked; their
+// tab fits them when shown.
+function fitVisiblePanes() {
+  Object.keys(panes).forEach(k => {
+    let p = panes[k];
+    if (paneHidden(p)) { p._fitDeferred = true; return; }
+    try { p.fitAddon.fit(); } catch (e) {}
+  });
+}
+
+function createTab() {
+  let id = 't' + (++tabCounter);
+  let root = document.createElement('div');
+  root.className = 'tab-root h';
+  root.setAttribute('data-tab', id);
+  $('panes').appendChild(root);
+
+  let el = document.createElement('div');
+  el.className = 'tab';
+  el.setAttribute('data-tab', id);
+  el.setAttribute('role', 'tab');
+  el.innerHTML =
+    `<span class="tab-dot s-off"></span>` +
+    `<span class="tab-label"></span>` +
+    `<span class="tab-split h"></span>` +
+    `<button class="tab-close" title="Close tab" aria-label="Close tab">${ic('close')}</button>`;
+  $('tabs').appendChild(el);
+
+  let t = {id: id, root: root, el: el, lastActive: null, activity: false, _key: null};
+  tabs.push(t);
+  wireTab(t);
+  document.body.classList.add('has-tabs');
+  return t;
+}
+
+// Mouse handling of one tab handle. Activation is on mousedown (as in
+// browsers), with preventDefault so the click does not move keyboard
+// focus out of the terminal showTab just focused. The close button and
+// the middle button never activate: closing a background tab must not
+// bring it to the front first.
+function wireTab(t) {
+  let el = t.el;
+  let closeBtn = el.querySelector('.tab-close');
+  closeBtn.addEventListener('mousedown', e => { e.stopPropagation(); e.preventDefault(); });
+  closeBtn.addEventListener('click', e => { e.stopPropagation(); closeTab(t.id); });
+  el.addEventListener('mousedown', e => {
+    if (e.button === 1) { e.preventDefault(); return; }   // no autoscroll
+    if (e.button !== 0) return;
+    e.preventDefault();
+    if (activeTabId !== t.id) showTab(t.id);
+    else { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (err) {} } }
+    startTabDrag(t, e.clientX);
+  });
+  el.addEventListener('auxclick', e => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    closeTab(t.id);
+  });
+}
+
+// Drag a tab along the strip to reorder. Plain mouse events, not HTML5
+// drag-and-drop: a native drag would be seen by the panes' file-drop
+// handlers, and a tab is not a file.
+let _tabDrag = null;
+function startTabDrag(t, x) { _tabDrag = {t: t, x0: x, moved: false}; }
+document.addEventListener('mousemove', e => {
+  let d = _tabDrag;
+  if (!d) return;
+  if ((e.buttons & 1) === 0) { endTabDrag(); return; }
+  if (!d.moved && Math.abs(e.clientX - d.x0) < 5) return;
+  if (!d.moved) { d.moved = true; d.t.el.classList.add('dragging'); }
+  let strip = $('tabs');
+  let others = Array.prototype.filter.call(strip.children,
+    c => c !== d.t.el && c.classList.contains('tab'));
+  let before = null;
+  for (let i = 0; i < others.length; i++) {
+    let r = others[i].getBoundingClientRect();
+    if (e.clientX < r.left + r.width / 2) { before = others[i]; break; }
+  }
+  if (before) { if (d.t.el.nextSibling !== before) strip.insertBefore(d.t.el, before); }
+  else if (strip.lastElementChild !== d.t.el) strip.appendChild(d.t.el);
+});
+document.addEventListener('mouseup', () => endTabDrag());
+function endTabDrag() {
+  let d = _tabDrag;
+  _tabDrag = null;
+  if (!d || !d.moved) return;
+  d.t.el.classList.remove('dragging');
+  // The strip's DOM order is the truth; bring the array in line.
+  let order = [];
+  $('tabs').querySelectorAll('.tab').forEach(el => {
+    let t = tabById(el.getAttribute('data-tab'));
+    if (t) order.push(t);
+  });
+  if (order.length === tabs.length) { tabs.length = 0; order.forEach(t => tabs.push(t)); }
+  saveSessions();
+}
+
+// Show tab `id`: hide every other root, show this one, fit its panes to
+// their real box, and focus the pane that was last active in it.
+function showTab(id, o) {
+  let t = tabById(id);
+  if (!t) return;
+  let changed = activeTabId !== id;
+  activeTabId = id;
+  tabs.forEach(o => {
+    let on = o === t;
+    o.root.classList.toggle('h', !on);
+    o.el.classList.toggle('active', on);
+    o.el.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  t.activity = false;
+  let ps = panesInTab(t);
+  let p = panes[t.lastActive];
+  if (!p || ps.indexOf(p) < 0) p = ps[0] || null;
+  if (p) {
+    activatePane(p.id);
+    try { p.term.focus(); } catch (e) {}
+    setTitle(p.label || '');
+  }
+  // Now that the root is laid out again: fit each pane once to its real
+  // size. The settle loop ends in flushPaneResize, which posts only a
+  // size the server does not already have.
+  ps.forEach(q => {
+    q._fitDeferred = false;
+    applyTermSettings(q);        // a zoom or font change made while hidden
+    fitPaneWhenStable(q);
+  });
+  tabs.forEach(renderTab);
+  scrollTabIntoView(t);
+  if (changed && !(o && o.noSave)) saveSessions();
+}
+
+function scrollTabIntoView(t) {
+  let strip = $('tabs');
+  if (!strip || !t) return;
+  let el = t.el;
+  let left = el.offsetLeft, right = left + el.offsetWidth;
+  if (left < strip.scrollLeft) strip.scrollLeft = left;
+  else if (right > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = right - strip.clientWidth;
+}
+
+// Remove an (emptied) tab. If it was the active one, the tab to its
+// right is shown, else the one to its left.
+function removeTab(t) {
+  let idx = tabs.indexOf(t);
+  if (idx < 0) return;
+  tabs.splice(idx, 1);
+  t.root.remove();
+  t.el.remove();
+  if (!tabs.length) {
+    activeTabId = null;
+    document.body.classList.remove('has-tabs');
+    return;
+  }
+  if (activeTabId === t.id) {
+    let next = tabs[idx] || tabs[idx - 1];
+    activeTabId = null;
+    showTab(next.id);
+  }
+}
+
+function removeAllTabs() {
+  tabs.slice().forEach(t => { t.root.remove(); t.el.remove(); });
+  tabs.length = 0;
+  activeTabId = null;
+  $('panes').innerHTML = '';
+  $('tabs').innerHTML = '';
+  document.body.classList.remove('has-tabs');
+}
+
+// Dot (worst pane state), label (the tab's active pane), split marker
+// and activity mark. Memoized: it runs from updatePaneBadge, which runs
+// on every output frame.
+function _paneDotState(p) {
+  if (p.sid) return p.reconnecting ? 'wait' : 'on';
+  return p.connecting ? 'wait' : 'off';
+}
+function renderTab(t) {
+  if (!t) return;
+  let ps = panesInTab(t);
+  let rank = {on: 0, wait: 1, off: 2};
+  let worst = 'on';
+  ps.forEach(p => { let s = _paneDotState(p); if (rank[s] > rank[worst]) worst = s; });
+  if (!ps.length) worst = 'off';
+  let ap = panes[t.lastActive];
+  if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
+  let label = ap ? (ap.label || '') : '';
+  let active = t.id === activeTabId;
+  let act = !!t.activity && !active;
+  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0].join('\u0001');
+  if (t._key === key) return;
+  t._key = key;
+  t.el.querySelector('.tab-dot').className = 'tab-dot s-' + worst;
+  t.el.querySelector('.tab-label').textContent = label;
+  let sp = t.el.querySelector('.tab-split');
+  sp.textContent = ps.length > 1 ? '▥' + ps.length : '';
+  sp.classList.toggle('h', ps.length < 2);
+  sp.title = ps.length > 1 ? ps.length + ' panes' : '';
+  t.el.classList.toggle('activity', act);
+  t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '');
+}
+
+// Output reached a pane whose tab is not on screen: mark the tab.
+function noteTabActivity(p) {
+  let root = p.el.closest && p.el.closest('.tab-root');
+  if (!root || root.getAttribute('data-tab') === activeTabId) return;
+  let t = tabById(root.getAttribute('data-tab'));
+  if (!t || t.activity) return;
+  t.activity = true;
+  renderTab(t);
+}
+
+// "+": open the login form for a new tab. Nothing is created until the
+// connect succeeds (materializeTarget); dismissing the form leaves the
+// current tab as it was.
+function newTab() {
+  if (!Object.keys(panes).length) return;   // the initial form is up
+  pendingSplit = null;
+  overlayMode = 'tab';
+  connectingFor = null;
+  openConnectForm();
+}
+
+// Close a whole tab. Live persistent (tmux) panes are confirmed once for
+// the tab, under the same "don't ask again" setting as closing a pane.
+function _liveTmux(p) { return !!(p && p.persistent && p.sid && p.slotId); }
+function closeTab(id) {
+  let t = tabById(id);
+  if (!t) return;
+  let doClose = () => {
+    if (tabs.indexOf(t) < 0) return;
+    panesInTab(t).forEach(p => _destroyPane(p.id, _liveTmux(p)));
+    if (tabs.indexOf(t) >= 0 && !panesInTab(t).length) { removeTab(t); saveSessions(); }
+  };
+  let live = panesInTab(t).filter(_liveTmux);
+  if (!live.length || localStorage.getItem(TERMINATE_NO_ASK_KEY)) { doClose(); return; }
+  let title = live.length === 1 ? null
+    : 'Terminate ' + live.length + ' sessions in this tab?';
+  showTerminateModal(live[0], neverAgain => {
+    if (neverAgain) localStorage.setItem(TERMINATE_NO_ASK_KEY, '1');
+    doClose();
+  }, title);
+}
+
+// Strip: a vertical wheel scrolls it sideways when it overflows.
+(function () {
+  let strip = $('tabs');
+  if (!strip) return;
+  strip.addEventListener('wheel', e => {
+    if (strip.scrollWidth <= strip.clientWidth || !e.deltaY || e.deltaX) return;
+    strip.scrollLeft += e.deltaY;
+    e.preventDefault();
+  }, {passive: false});
+})();
 
 // ── Split / Close ───────────────────────────────────────────────────
 // Split does NOT mutate the DOM. It records the intent and opens the
@@ -719,7 +1043,12 @@ function splitPane(id, dir) {
   pendingSplit = {fromId: id, dir: dir};
   overlayMode = 'split';
   connectingFor = null;
+  openConnectForm();
+}
 
+// Open the login form for a new pane ('split' or 'tab' overlay mode set
+// by the caller).
+function openConnectForm() {
   // Auto-connect shortcut for a single ready host — materialize happens
   // inside connectByName via materializeTarget.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
@@ -741,11 +1070,17 @@ function splitPane(id, dir) {
 // mode. Creates the DOM + term, places it in the layout, returns it.
 // For 'reauth'/null mode, returns the existing target pane.
 function materializeTarget() {
-  if (overlayMode === 'initial') {
-    let root = $('panes');
-    let np = createPane(root);
+  if (overlayMode === 'initial' || overlayMode === 'tab') {
+    // A new tab, shown before the pane is created in it so the pane is
+    // fitted to a real box from the start. 'initial' reuses an empty
+    // tab if one is somehow left over.
+    let t = (overlayMode === 'initial' && tabs.length === 1 && !panesInTab(tabs[0]).length)
+      ? tabs[0] : createTab();
+    showTab(t.id);
+    let np = createPane(t.root);
     activatePane(np.id);
     connectingFor = np.id;
+    renderTab(t);
     return np;
   }
   if (overlayMode === 'split' && pendingSplit) {
@@ -764,6 +1099,7 @@ function materializeTarget() {
     activatePane(np.id);
     connectingFor = np.id;
     pendingSplit = null;
+    renderTab(tabOfPane(np));
     return np;
   }
   return targetPane();
@@ -784,13 +1120,16 @@ function cancelConnect() {
   // (user clicked Connect, auth failed, form stayed open, user now
   // dismisses), remove it. For pure intent (no materialize yet) there's
   // nothing to clean up.
-  if (np && !np.sid && (overlayMode === 'initial' || overlayMode === 'split')) {
+  if (np && !np.sid && (overlayMode === 'initial' || overlayMode === 'split' || overlayMode === 'tab')) {
     let wrap = np.el.parentNode;
-    if (wrap && wrap.id === 'panes') {
-      // Initial case: pane sits directly in #panes root.
+    if (wrap && wrap.classList.contains('tab-root')) {
+      // Initial / new-tab case: the pane sits directly in its tab's
+      // root - the tab goes with it.
+      let t = tabOfPane(np);
       np.term.dispose();
       delete panes[np.id];
       np.el.remove();
+      if (t && !panesInTab(t).length) removeTab(t);
     } else if (wrap) {
       // Split case: unwrap and restore the sibling.
       let parent = wrap.parentNode;
@@ -813,8 +1152,11 @@ function cancelConnect() {
   overlayMode = null;
   connectingFor = null;
   hideOverlay();
-  let ids = Object.keys(panes);
-  if (ids.length && !panes[activeId]) activatePane(ids[ids.length - 1]);
+  let t = activeTab();
+  if (t && !panes[activeId]) {
+    let ps = panesInTab(t);
+    if (ps.length) activatePane(ps[ps.length - 1].id);
+  }
 }
 
 // User-facing close. Persistent panes with a live tmux session need a
@@ -880,17 +1222,28 @@ function _destroyPane(id, terminate) {
   p.term.dispose();
 
   let wrap = p.el.parentNode;
+  let tab = tabOfPane(p);
   delete panes[id];
 
   // No panes left → back to the initial-login flow. No pane is
   // materialized yet; the form drives creation on submit.
   if (!Object.keys(panes).length) {
-    $('panes').innerHTML = '';
+    removeAllTabs();
     overlayMode = 'initial';
     pendingSplit = null;
     connectingFor = null;
     showOverlay();
     renderSaved();
+    saveSessions();
+    return;
+  }
+
+  // The tab's last pane: the tab goes, and if it was in front, its
+  // right (else left) neighbour comes forward.
+  if (wrap && wrap.classList.contains('tab-root')) {
+    p.el.remove();
+    if (tab) removeTab(tab);
+    fitVisiblePanes();
     saveSessions();
     return;
   }
@@ -908,14 +1261,20 @@ function _destroyPane(id, terminate) {
     p.el.remove();
   }
 
-  // Activate another pane
-  if (activeId === id) {
-    let ids = Object.keys(panes);
-    if (ids.length) activatePane(ids[0]);
+  // Activate another pane of the same tab - only if the closed one was
+  // the active pane (closing a pane of a background tab changes nothing
+  // in front).
+  if (activeId === id && tab) {
+    let ps = panesInTab(tab);
+    if (ps.length) activatePane(ps[0].id);
+  }
+  if (tab) {
+    if (tab.lastActive === id) { let ps = panesInTab(tab); tab.lastActive = ps.length ? ps[0].id : null; }
+    renderTab(tab);
   }
 
-  // Refit all terminals after layout change
-  Object.keys(panes).forEach(k => { panes[k].fitAddon.fit() });
+  // Refit the terminals on screen after the layout change
+  fitVisiblePanes();
   saveSessions();
 }
 
@@ -1074,8 +1433,16 @@ function reconnectPane(id) {
 // Persistent panes wrap their remote shell in tmux; on refresh we resume
 // by slot_id so the layout + running processes come back intact. Layout
 // tree is serialized from the DOM so we can rebuild splits verbatim.
+//
+// Manifest versions:
+//   1  legacy key `websh_manifest` (slots + connect bodies), migrated.
+//   2  {version, layout, panes}: one layout, no tabs.
+//   3  {version, tabs: [{layout, active}], active, panes}: one layout per
+//      tab in strip order; `active` is the index of the tab in front,
+//      a tab's `active` the id of its last active pane. Version 2 (and
+//      1) load as one tab holding that layout.
 const PANES_KEY = 'websh_panes';
-const PANES_VERSION = 2;
+const PANES_VERSION = 3;
 
 function slotIdFor(user, host, port) {
   // Human-readable + unique. Sanitize to backend's [A-Za-z0-9_-]{1,64}.
@@ -1198,7 +1565,7 @@ function buildConnectBody(rec, termCols, termRows) {
 }
 
 function serializeLayout(rootEl) {
-  // rootEl is #panes; walk its single child (pane or split wrapper).
+  // rootEl is a tab's root; walk its single child (pane or split wrapper).
   let first = null;
   for (let i = 0; i < rootEl.children.length; i++) {
     let ch = rootEl.children[i];
@@ -1229,20 +1596,36 @@ function saveSessions() {
     let rec = paneRecord(panes[k]);
     if (rec) out[k] = rec;
   });
+  let tabList = [];
+  let activeIdx = 0;
+  tabs.forEach(t => {
+    let layout = serializeLayout(t.root);
+    if (!layout) return;
+    if (t.id === activeTabId) activeIdx = tabList.length;
+    tabList.push({layout: layout, active: t.lastActive || null});
+  });
   let manifest = {
     version: PANES_VERSION,
-    layout: serializeLayout($('panes')),
+    tabs: tabList,
+    active: activeIdx,
     panes: out
   };
   try { localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(manifest)); } catch(e) {}
 }
+// A version-2 manifest (one layout) as a version-3 one: one tab.
+function _manifestV2toV3(m) {
+  return {version: PANES_VERSION, tabs: m.layout ? [{layout: m.layout, active: null}] : [],
+          active: 0, panes: m.panes};
+}
 function loadManifest() {
-  // Load v2 directly, or migrate from the legacy v1 "websh_manifest" key.
+  // Load v3 directly; v2 as one tab; or migrate from the legacy v1
+  // "websh_manifest" key.
   try {
     let raw = localStorage.getItem(storageKey(PANES_KEY));
     if (raw) {
       let m = JSON.parse(raw);
-      if (m && m.version === PANES_VERSION) return m;
+      if (m && m.version === PANES_VERSION && Array.isArray(m.tabs)) return m;
+      if (m && m.version === 2) return _manifestV2toV3(m);
     }
   } catch(e) {}
   // Migrate v1 → v2, then drop the old key.
@@ -1272,7 +1655,7 @@ function loadManifest() {
         rows: b.rows || 24
       };
     });
-    let migrated = { version: PANES_VERSION, layout: old.layout, panes };
+    let migrated = _manifestV2toV3({ layout: old.layout, panes });
     localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(migrated));
     localStorage.removeItem(storageKey('websh_manifest'));
     return migrated;
@@ -1622,7 +2005,9 @@ function endSession(p, o) {
 //
 // Strategy: on either signal — visibility return after >10s hidden,
 // or bfcache restore — refit every active pane and reopen its output
-// stream. If the server-side session is still alive, the SSE primer
+// stream. Panes in hidden tabs get the stream restart without the refit
+// (fitPaneWhenStable skips them and still runs onSettled); their tab
+// fits them when shown. If the server-side session is still alive, the SSE primer
 // arrives in one frame and nothing visible happens. If it was reaped,
 // the reconnect path fires and tmux brings the shell back.
 //
@@ -1746,6 +2131,7 @@ function handleOutputPayload(p, r, sid) {
     // them where the cursor is. Skipping them on p.sid=null would
     // silently drop end-of-session output.
     updatePaneBadge(p);
+    noteTabActivity(p);
 
     // Tight loop instead of Uint8Array.from(chunk, c => c.charCodeAt(0)):
     // this runs per output chunk on the hottest path (noisy output like
@@ -1809,7 +2195,7 @@ function handleOutputPayload(p, r, sid) {
       showReconnectBar(p);
     }
     p.recentOutput = '';
-    if(activeId===p.id) updatePaneBadge(p);
+    updatePaneBadge(p);       // any pane: its tab's dot follows it
     return true;
   }
   return false;
@@ -1887,7 +2273,7 @@ function transportFatal(p, e) {
   p.term.write(msg);
   endSession(p, {save: true});
   if(p.host || p.connection) showReconnectBar(p);
-  if(activeId===p.id) updatePaneBadge(p);
+  updatePaneBadge(p);         // any pane: its tab's dot follows it
 }
 
 // ── Output channel: SSE stream, long-poll fallback, stall detection ─
@@ -2382,8 +2768,20 @@ function beginSessionIO(p, o) {
   // Force a resize so resumed tmux sessions redraw at the real size.
   // flushPaneResize uses p.term.cols/rows post-fit and updates
   // p.lastSent* so subsequent refit triggers can dedup.
-  p.fitAddon.fit();
-  flushPaneResize(p);
+  // A pane in a hidden tab (restored on reload) has no box: the PTY was
+  // created at the size the connect asked for, which is what the server
+  // now has; showTab() fits it and resizes only if that differs.
+  if (paneHidden(p)) {
+    p._fitDeferred = true;
+    if (p._connectCols && p._connectRows) {
+      p.lastSentCols = p._connectCols;
+      p.lastSentRows = p._connectRows;
+    }
+  } else {
+    p.fitAddon.fit();
+    flushPaneResize(p);
+  }
+  updatePaneBadge(p);
   startKeepalive(p);
   saveSessions();
   startOutput(p);
@@ -2480,6 +2878,8 @@ async function connectPane(p, opts) {
   }
   let body = buildConnectBody(rec, p.term.cols, p.term.rows);
   if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
+  // The size this PTY starts at (beginSessionIO, for a hidden pane).
+  p._connectCols = body.cols; p._connectRows = body.rows;
 
   if (body.vault_id) {
     console.log('connectPane: vault conn_id=' + body.conn_id +
@@ -2647,12 +3047,14 @@ function tmuxSwitchToShortLived(id) {
 let pendingTerminate = null;
 
 const _confirmTrap = makeModalTrap('confirmOv', () => confirmCancel());
-function showTerminateModal(p, onConfirm) {
+function showTerminateModal(p, onConfirm, title) {
   pendingTerminate = onConfirm;
   // Prefer the human label (saved name or connection name) over the raw
   // host IP — matches what the user sees in the pane's title bar.
   let name = p.label || p.connection || p.host || 'server';
-  $('cfTitle').textContent = 'Terminate session on ' + name + '?';
+  // `title`: closing a whole tab with several live sessions asks once,
+  // for all of them (closeTab).
+  $('cfTitle').textContent = title || ('Terminate session on ' + name + '?');
   // Initial focus on Cancel — the safe default for a destructive
   // confirm; Escape cancels too (previously this dialog trapped
   // neither focus nor Escape).
@@ -3003,8 +3405,9 @@ function setTitle(label) {
 
 // Dismissable iff the user has somewhere to retreat to:
 //   'split'   — the source pane exists (and always will), so yes.
+//   'tab'     — the current tab is still there, so yes.
 //   'initial' — there's no other pane; they must complete auth.
-function overlayDismissable() { return overlayMode === 'split'; }
+function overlayDismissable() { return overlayMode === 'split' || overlayMode === 'tab'; }
 function showOverlay(){
   $('ov').classList.remove('h');
   $('btnCancel').classList.toggle('h', !overlayDismissable());
@@ -6166,21 +6569,32 @@ function applySettings(opts){
   opts = opts || {};
   let forceFlush = opts.forceFlush !== false;
   ensureFontLink(settings.font);
-  let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
     let p = panes[k];
-    let t = p.term;
-    t.options.fontSize = settings.fontSize;
-    t.options.fontWeight = settings.fontWeight;
-    t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
-    t.options.lineHeight = settings.lineHeight;
-    if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
+    // A pane in a hidden tab gets the new font when its tab is shown
+    // (showTab -> applyTermSettings): xterm measures the cell on every
+    // font change, and in a display:none box that measures nothing.
+    if (paneHidden(p)) { p._fitDeferred = true; return; }
+    applyTermSettings(p);
     // Single fit path: the settle loop inside fitPaneWhenStable does
     // both the font-load wait AND the multi-frame convergence check,
     // replacing the old "immediate-RAF fit AND a deferred refit after
     // document.fonts.load" pair that was racing.
     fitPaneWhenStable(p, { flush: forceFlush });
   });
+}
+// The display settings onto one terminal. Setting an unchanged value is
+// a no-op in xterm (its option setter compares), so this is cheap to
+// repeat.
+function applyTermSettings(p) {
+  let t = p && p.term;
+  if (!t || !t.options) return;
+  let stack = fontStack(settings.font);
+  t.options.fontSize = settings.fontSize;
+  t.options.fontWeight = settings.fontWeight;
+  t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
+  t.options.lineHeight = settings.lineHeight;
+  if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
 }
 // Refit a pane with a font-load gate and a settle loop.
 //
@@ -6219,6 +6633,15 @@ function fitPaneWhenStable(p, opts){
   if (!p || !panes[p.id] || !p.fitAddon) return;
   let onSettled = (opts && opts.onSettled) || null;
   if (onSettled) (p._pendingSettled = p._pendingSettled || []).push(onSettled);
+  // A pane in a hidden tab has no box to fit to (see ── Tabs): skip the
+  // fit and the resize, mark it for showTab(), and still resume whoever
+  // was waiting - the absence kick restarts output from onSettled, and
+  // a hidden tab's panes need that as much as visible ones.
+  if (!p._fitInFlight && paneHidden(p)) {
+    p._fitDeferred = true;
+    _drainPendingSettled(p);
+    return;
+  }
   // Re-entry guard: settle-loop forceMeasure() and the fontFamily
   // round-trip both cause xterm to fire its own change events. If a
   // second fitPaneWhenStable call races in before the first finishes
@@ -6300,6 +6723,9 @@ function fitPaneWhenStable(p, opts){
     let attempts = 0, lastCols = -1;
     let step = () => {
       if (!owns()) { abort(); return; }
+      // Its tab was hidden while this fit was settling: stop before
+      // fitting to the 0x0 box; showTab() fits it again.
+      if (paneHidden(p)) { p._fitDeferred = true; abort(); return; }
       forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
@@ -6337,6 +6763,7 @@ function _driftWatchdogTick(p) {
   if (!p || !p.term || !p.term.element || !p.term.element.parentElement) {
     return false;
   }
+  if (paneHidden(p)) return false;      // 0x0 box: nothing to compare
   try {
     let cs = p.term._core && p.term._core._charSizeService;
     if (!cs || !cs.width) return false;
@@ -6642,14 +7069,14 @@ function toggleFullscreen(){
     ratio=Math.max(0.1,Math.min(0.9,ratio));
     dragging.a.style.flex=ratio+'';
     dragging.b.style.flex=(1-ratio)+'';
-    Object.keys(panes).forEach(k => {panes[k].fitAddon.fit()});
+    fitVisiblePanes();
   }
   function endDrag() {
     if(!dragging) return;
     dragging.handle.classList.remove('dragging');
     document.body.classList.remove('resizing','resizing-v');
     dragging=null;
-    Object.keys(panes).forEach(k => {panes[k].fitAddon.fit()});
+    fitVisiblePanes();
     saveSessions();
   }
   // Mouse events
@@ -6709,7 +7136,8 @@ window.addEventListener('blur', () => {
 
 // ── Keyboard shortcuts ──────────────────────────────────────────────
 function cyclePanes(reverse) {
-  let ids = Object.keys(panes);
+  // Within the tab on screen: a pane in a hidden tab is not a target.
+  let ids = panesInTab(activeTab()).map(p => p.id);
   if (ids.length < 2) return;
   let idx = ids.indexOf(activeId);
   if (reverse) idx = (idx - 1 + ids.length) % ids.length;
@@ -6787,12 +7215,11 @@ function doAutoConnect() {
 // just re-run a plain connect with the saved credentials.
 function tryRestoreSessions() {
   let m = loadManifest();
-  if (!m || !m.layout || !m.panes || !Object.keys(m.panes).length) return false;
+  if (!m || !m.tabs || !m.tabs.length || !m.panes || !Object.keys(m.panes).length) return false;
 
   let restored = {};
-  let root = $('panes');
   Object.keys(panes).forEach(k => { try { panes[k].term.dispose(); } catch(e) {} delete panes[k]; });
-  root.innerHTML = '';
+  removeAllTabs();
 
   function build(parent, node) {
     if (!node) return null;
@@ -6813,11 +7240,30 @@ function tryRestoreSessions() {
     build(wrap, node.b);
     return wrap;
   }
-  build(root, m.layout);
-
-  let ids = Object.keys(restored);
-  if (!ids.length) return false;
-  activatePane(restored[ids[0]].id);
+  // One tab at a time, each built while its root is the one on screen:
+  // xterm opens into a laid-out element and every pane gets a real size
+  // (fitted synchronously below) before the connect body reads it. A
+  // pane opened in a hidden root would connect at whatever it had, and
+  // never be fitted until its tab is shown. Then the root is hidden
+  // again and the saved active tab comes forward.
+  let built = [];
+  let front = null;
+  m.tabs.forEach((tm, idx) => {
+    if (!tm || !tm.layout) return;
+    let t = createTab();
+    tabs.forEach(o => o.root.classList.toggle('h', o !== t));
+    let before = Object.keys(restored).length;
+    build(t.root, tm.layout);
+    if (Object.keys(restored).length === before) { removeTab(t); return; }
+    panesInTab(t).forEach(q => { try { q.fitAddon.fit(); } catch (e) {} });
+    t.lastActive = (tm.active && restored[tm.active]) ? restored[tm.active].id
+                                                      : panesInTab(t)[0].id;
+    built.push(t);
+    if (idx === m.active) front = t;
+  });
+  tabs.forEach(o => o.root.classList.add('h'));
+  if (!built.length) { removeAllTabs(); return false; }
+  showTab((front || built[0]).id, {noSave: true});   // records are not filled yet
 
   // Re-key every pane's sessionStorage secret from its old id to the id
   // build() just minted (ids restart at p1 on every page load, and the

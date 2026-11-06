@@ -29,6 +29,35 @@
     .top-l{display:flex;align-items:center;gap:10px}
     .logo{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:16px;font-weight:700;letter-spacing:-0.01em;color:var(--tx)}
     .top-slogan{font-size:11px;color:var(--dim)}
+    /* ── Tabs ── The strip takes the room between the logo and the
+       right-hand buttons. Tabs shrink to a minimum width (label
+       ellipsised), then the strip scrolls sideways; the page itself
+       never does (every flex item here may shrink: min-width:0). */
+    .top{gap:10px;min-width:0}
+    .top-l,.top-r{flex-shrink:0}
+    .top-r{margin-left:auto}
+    body.has-tabs .top-slogan{display:none}
+    @media (max-width:600px){body.has-tabs .top .logo{display:none}}
+    #tabs{display:flex;align-items:center;gap:2px;flex:0 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;position:relative;scrollbar-width:none;align-self:stretch}
+    #tabs::-webkit-scrollbar{display:none}
+    #tabNew{flex-shrink:0}
+    .tab{display:flex;align-items:center;gap:6px;flex:0 1 180px;min-width:96px;max-width:220px;height:28px;padding:0 4px 0 10px;border-radius:6px;border:1px solid transparent;color:var(--dim);font-size:12px;cursor:default;user-select:none;-webkit-user-select:none;transition:background .15s,color .15s}
+    .tab:hover{background:rgba(255,255,255,.05);color:var(--tx)}
+    .tab.active{background:var(--bg);border-color:var(--bd);color:var(--tx)}
+    .tab.dragging{opacity:.75;cursor:grabbing}
+    .tab-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--dim);padding:0}
+    .tab-dot.s-on{background:var(--ok)}
+    .tab-dot.s-wait{background:var(--wn)}
+    .tab-dot.s-off{background:var(--dg)}
+    .tab-label{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tab.activity .tab-label{color:var(--ac);font-weight:600}
+    .tab.activity .tab-dot{box-shadow:0 0 0 2px rgba(88,166,255,.45)}
+    .tab-split{font-size:11px;color:var(--dim);flex-shrink:0}
+    .tab-close{background:none;border:none;color:var(--dim);cursor:pointer;padding:2px;border-radius:4px;line-height:1;flex-shrink:0;visibility:hidden}
+    .tab-close .ic{width:12px;height:12px;vertical-align:-1px}
+    .tab:hover .tab-close,.tab.active .tab-close{visibility:visible}
+    .tab-close:hover{color:var(--dg);background:rgba(255,255,255,.08)}
+    .tab-root{flex:1;display:flex;min-width:0;min-height:0}
     .s-off{background:rgba(248,81,73,.15);color:var(--dg)}
     .s-wait{background:rgba(210,153,34,.15);color:var(--wn)}
     .s-on{background:rgba(63,185,80,.15);color:var(--ok)}
@@ -219,13 +248,12 @@
        back. The stack is anchored to the terminal area, so it needs no
        knowledge of the pane bar's height.
 
-       Bottom-right, not top-centre: centred at the top the card landed
-       squarely on the first line of output ("tail -f /va[Reconnect]ted")
-       and pressed against the pane bar. The bottom-right corner is the
-       emptiest part of a terminal - lines are left-aligned and rarely
-       full width - and it is where the eye already is when a session
-       dies, next to the prompt. */
-    .pane-overlays{position:absolute;bottom:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:6px;pointer-events:none}
+       Top-centre: that is where the owner finds the Reconnect card most
+       convenient - it is the first thing seen when a pane goes dead. The
+       price is known and accepted: the card covers the first rows of
+       output while it is up. Each card is only as wide as its content,
+       so the rest of those rows stays visible on both sides. */
+    .pane-overlays{position:absolute;top:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px;pointer-events:none}
     .pane-overlays>*{max-width:100%}
     .pane-overlays>*{pointer-events:auto}
     /* Dim the terminal of inactive panes so the one in use stands out: a
@@ -532,6 +560,8 @@
     <span class="logo">websh</span>
     <span class="top-slogan">Powerful web terminal</span>
   </div>
+  <div id="tabs" role="tablist" aria-label="Tabs"></div>
+  <button id="tabNew" class="tbtn" onclick="newTab()" title="New tab" aria-label="New tab"><svg class="ic"><use href="#i-plus"></use></svg></button>
   <div class="top-r">
     <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search"><svg class="ic"><use href="#i-search"></use></svg></button>
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>

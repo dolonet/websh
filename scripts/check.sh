@@ -3,11 +3,34 @@
 #   scripts/check.sh            backend, frontend x3, lint, syntax, PHP
 #   scripts/check.sh --quick    backend, frontend x1, lint, syntax
 #   scripts/check.sh --full     + backend on Python 3.9 and without `cryptography` (docker)
+#   scripts/check.sh --results  results only: which checks failed and what they saw,
+#                               never a line of test source (the implementer's view,
+#                               see agents/README.md); combinable with --quick
 # The frontend suite runs several times on purpose: its failures used to
 # be intermittent, and one green run proved nothing.
 cd "$(dirname "$0")/.." || exit 2
-MODE=${1:-}
+MODE=""; RESULTS=
+for a in "$@"; do case "$a" in --results) RESULTS=1;; *) MODE=$a;; esac; done
 FRONT_RUNS=3; [ "$MODE" = --quick ] && FRONT_RUNS=1
+# Failure details for the implementer: names and messages, no source.
+# unittest prints the failing test line and its file; strip both.
+show_backend_failures() {
+  if [ -n "$RESULTS" ]; then
+    grep -E '^(FAIL|ERROR): ' "$1" | sed -E 's/ \(.*//' | head -20
+    grep -E '^(AssertionError|[A-Za-z]+Error|Exception)(: |$)' "$1" | grep -vE '^  File' | sort | uniq -c | sort -rn | head -20 | sed -E 's/^ *([0-9]+) /  [\1x] /'
+  else
+    grep -E '^(FAIL|ERROR):' "$1" | head -20
+  fi
+}
+show_frontend_failures() {
+  if [ -n "$RESULTS" ]; then
+    # "=== name ===" headers of the scenarios that failed, with their
+    # FAIL lines (assertion messages); stack traces are dropped.
+    awk '/^=== /{h=$0; shown=0} /^  (FAIL|THREW|UNHANDLED)/{if(!shown){print h; shown=1} print}' "$1" | grep -vE '^\s+at ' | head -40
+  else
+    grep -E 'FAIL|THREW|UNHANDLED' "$1" | head -10; tail -5 "$1" | grep -v passed
+  fi
+}
 LOG=$(mktemp -d)
 fail=0
 step() { printf '%-34s' "$1"; }
@@ -28,7 +51,7 @@ else skip "ruff not installed (pip install 'ruff==0.15.*')"; fi
 step "backend"
 if env -u TERM -u TMUX -u TMUX_PANE python3 -m unittest discover -s tests/backend -t . >"$LOG/be" 2>&1; then
   ok "$(grep '^Ran' "$LOG/be") $(tail -1 "$LOG/be")"
-else bad "$(tail -1 "$LOG/be")"; grep -E '^(FAIL|ERROR):' "$LOG/be" | head -20; fi
+else bad "$(tail -1 "$LOG/be")"; show_backend_failures "$LOG/be"; fi
 
 [ -d tests/frontend/node_modules ] || (cd tests/frontend && npm install --no-audit --no-fund >/dev/null 2>&1)
 for i in $(seq 1 $FRONT_RUNS); do
@@ -37,7 +60,7 @@ for i in $(seq 1 $FRONT_RUNS); do
   line=$(grep 'passed:' "$LOG/fe$i" | tail -1)
   # No summary line = the run died; that is a failure, not "no result".
   if echo "$line" | grep -q 'failed: 0$'; then ok "$(echo $line)"
-  else bad "${line:-no summary - the run crashed}"; grep -E 'FAIL|THREW|UNHANDLED' "$LOG/fe$i" | head -10; tail -5 "$LOG/fe$i" | grep -v passed; fi
+  else bad "${line:-no summary - the run crashed}"; show_frontend_failures "$LOG/fe$i"; fi
 done
 
 if [ "$MODE" != --quick ]; then
@@ -60,5 +83,5 @@ if [ "$MODE" = --full ]; then
 fi
 
 echo
-if [ $fail = 0 ]; then echo "ALL GREEN"; else echo "RED - do not commit (logs: $LOG)"; fi
+if [ $fail = 0 ]; then echo "ALL GREEN"; elif [ -n "$RESULTS" ]; then echo "RED - see the failures above; the tests themselves are the tester's (agents/README.md)"; rm -rf "$LOG"; else echo "RED - do not commit (logs: $LOG)"; fi
 exit $fail
