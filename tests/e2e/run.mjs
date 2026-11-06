@@ -10,7 +10,7 @@
 //   node tests/e2e/run.mjs --list
 import fs from 'node:fs';
 import path from 'node:path';
-import { HERE, cfg, Browser, LocalServer, Report, haveSudo, blackholeOff } from './lib.mjs';
+import { HERE, cfg, Browser, LocalServer, H2Front, Report, haveSudo, blackholeOff } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const take = flag => { const i = args.indexOf(flag); if (i < 0) return null; return args.splice(i, 2)[1]; };
@@ -51,12 +51,14 @@ for (const name of (args.length ? args : names)) {
     console.log(`\n=== ${name}${repeat > 1 ? ` (${n}/${repeat})` : ''}: ${meta.about}`);
     const t = new Report();
     const server = url ? null : new LocalServer(cfg.port, meta.env);
+    const front = (server && meta.front === 'h2') ? new H2Front(cfg.port + 1, cfg.port) : null;
     let b = null;
     try {
       if (server) await server.start();
-      b = await Browser.launch();
-      await b.open(url || server.url);
-      await run({ b, t, server, port: cfg.port });
+      if (front) await front.start();
+      b = await Browser.launch({ full: meta.browser === 'full' });
+      await b.open(url || (front ? front.url : server.url));
+      await run({ b, t, server, front, port: cfg.port });
       t.ok(b.errors.length === 0, 'no script errors' + (b.errors.length ? ': ' + b.errors.slice(0, 3).join(' | ') : ''));
     } catch (e) {
       t.ok(false, 'scenario aborted: ' + (e && e.message || e));
@@ -68,6 +70,7 @@ for (const name of (args.length ? args : names)) {
         if (end.left.length) { leftovers.push(...end.left); t.note('NOT cleaned up: ' + end.left.join(', ')); }
         await b.close();
       }
+      if (front) await front.stop();
       if (server) await server.stop();
     }
     ran++;

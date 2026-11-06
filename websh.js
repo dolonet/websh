@@ -588,6 +588,14 @@ function createPane(container) {
     _dragStartX:0, _dragStartY:0, _dragMoved:false
   };
   panes[id] = p;
+  // ── Paint guard: what xterm rendered, and when.
+  if (typeof term.onRender === 'function') {
+    term.onRender(() => notePaneRendered(p));
+    p.paintWatchable = true;
+  }
+  if (typeof term.onWriteParsed === 'function') {
+    term.onWriteParsed(() => notePaneParsed(p));
+  }
   // Schedule a font-load-aware settle-loop refit after registration so
   // the helper can guard its RAFs against pane teardown via panes[id].
   // (Do not re-add a charSizeChange listener here — recursion via the
@@ -1276,7 +1284,8 @@ function showTab(id, o) {
   ps.forEach(q => {
     q._fitDeferred = false;
     applyTermSettings(q);        // a zoom or font change made while hidden
-    fitPaneWhenStable(q, {onSettled: _resyncScrollSoon});
+    // ...and repainted in full, expecting a render (── Paint guard).
+    fitPaneWhenStable(q, {onSettled: q2 => { _resyncScrollSoon(q2); repaintPane(q2); }});
   });
   tabs.forEach(renderTab);
   renderPaneTools();
@@ -3313,6 +3322,7 @@ function endSession(p, o) {
   p.cwd = '';
   p.osc7Host = null;     // a new session pins its own OSC 7 host
   p.outCursor = 0;       // cursors are per session
+  p.serverCursor = null;
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
   // Nothing accepts keystrokes any more (queueInput is guarded on
@@ -3381,6 +3391,7 @@ document.addEventListener('visibilitychange', () => {
   }
   let hiddenFor = _lastHiddenAt ? (Date.now() - _lastHiddenAt) : 0;
   _lastHiddenAt = 0;
+  repaintVisiblePanes();     // any absence (── Paint guard)
   if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
   kickPanesAfterAbsence();
 });
@@ -3412,6 +3423,341 @@ window.addEventListener('pageshow', (e) => {
     }, () => {});
   }
 });
+
+// ── Paint guard: output that reached the page is on screen ──────────
+// Reported by several users (Chrome on macOS, Yandex Browser on Windows):
+// back in a tab that had been hidden, they typed and nothing appeared;
+// a reload showed it all. The server's log had the keys and the echo.
+// The diagnostics beacon (below) caught one (2026-10-18): a pane on a
+// visible page had output written 5 ms before the reload and xterm had
+// not rendered it for 18 s - and the first version of this guard, which
+// only checked from a timer and stood down whenever the page said it
+// was hidden, never fired. So:
+//  - the check runs on every write (output arrives on network events,
+//    which run even when timers do not) and from a timer for when the
+//    writes stop; it measures from the FIRST write not rendered since
+//    the last render (p.unrenderedSince), so a steady trickle of output
+//    (a spinner, a status line) cannot keep postponing it;
+//  - "on screen" is the pane's tab shown and the page visible - or the
+//    page focused: a page the user is typing into is being looked at,
+//    whatever visibilityState says;
+//  - a pane coming back on screen (page shown, window focused,
+//    pageshow, its tab shown - which covers a pane moved or merged) is
+//    repainted in full, refitted first only if its box no longer
+//    matches its cols/rows (no /api/resize otherwise: flushPaneResize
+//    dedups, and a resize makes tmux redraw everything).
+// Two ways xterm 5.5 stops drawing, both read from its source:
+//  1. It parses written data in WriteBuffer._innerWrite, from a
+//     setTimeout. Nothing there catches an exception, nor does its
+//     EventEmitter.fire for listeners called during parsing: one throw
+//     leaves the chunks queued and no timer scheduled, and every later
+//     write only appends to the queue - nothing is parsed again, so
+//     nothing is drawn, until a reload. unwedgeWrites() resumes the loop
+//     and skips a chunk that throws (that chunk's output is lost; the
+//     screen goes on).
+//  2. The DOM renderer draws on requestAnimationFrame and pauses while
+//     an IntersectionObserver says the terminal is off screen. A pause
+//     never lifted, or a frame that never runs, freezes the screen.
+//     renderHard() lifts both by hand and renders the rows at once.
+// Recovery, at most once per PAINT_WATCH_MS: resume parsing if it is
+// stuck, then a full refresh; next time a renderer reset; then leave the
+// pane for PAINT_QUIET_MS. Each step is a console.warn ("paint: ...").
+// No work when nothing is written; a pane in a hidden tab is not watched
+// (U1/U2: it is repainted when shown).
+const PAINT_WATCH_MS = 1000;
+const PAINT_QUIET_MS = 10000;
+let _paintRecoveries = 0;     // whole page, for the diagnostics beacon
+let _visChangedAt = 0;        // last visibilitychange, for the beacon
+let _lastPageError = null;    // last uncaught error {at, msg}, for the beacon
+
+function pageLooked() {
+  if (typeof document === 'undefined') return true;
+  if (document.visibilityState !== 'hidden') return true;
+  try { return document.hasFocus(); } catch (e) { return false; }
+}
+
+function paneOnScreen(p) {
+  if (!p || !p.term || !p.term.element || paneHidden(p)) return false;
+  return pageLooked();
+}
+
+function notePaneRendered(p) {
+  let now = Date.now();
+  p.lastRenderAt = now;
+  // A render while written chunks still wait unparsed (the cursor blink
+  // draws even when parsing has died) does not show that output: keep
+  // waiting from when parsing last moved.
+  let b = writeBacklog(p);
+  if (b && b.chunks && p.unrenderedSince) {
+    p.unrenderedSince = p.pendSince || now;
+    return;
+  }
+  p.unrenderedSince = 0;
+  p.paintStage = 0;
+  if (p.paintTimer) { clearTimeout(p.paintTimer); p.paintTimer = null; }
+}
+
+// xterm finished a parse slice.
+function notePaneParsed(p) {
+  let now = Date.now();
+  p.lastParsedAt = now;
+  let b = writeBacklog(p);
+  p.pendSince = (b && b.chunks) ? now : 0;
+}
+
+// Output went into the terminal (called after term.write).
+function notePaneWritten(p) {
+  let now = Date.now();
+  p.lastWriteAt = now;
+  let b = writeBacklog(p);
+  if (b && b.chunks && !p.pendSince) p.pendSince = now;   // waiting to be parsed
+  if (!p.paintWatchable) return;
+  if (!paneOnScreen(p)) { p.unrenderedSince = 0; return; }
+  if (!p.unrenderedSince) p.unrenderedSince = now;
+  checkPaint(p);
+}
+
+// Expect a render from now on (a repaint was asked for).
+function expectPaint(p) {
+  if (!p || !p.paintWatchable || !paneOnScreen(p)) return;
+  if (!p.unrenderedSince) p.unrenderedSince = Date.now();
+  checkPaint(p);
+}
+
+function armPaintCheck(p, ms) {
+  if (p.paintTimer) return;
+  p.paintTimer = setTimeout(() => { p.paintTimer = null; checkPaint(p); }, Math.max(50, ms));
+}
+
+function checkPaint(p) {
+  if (panes[p.id] !== p || !p.unrenderedSince) return;
+  if (!paneOnScreen(p)) { p.unrenderedSince = 0; p.paintHiddenSkips = (p.paintHiddenSkips || 0) + 1; return; }
+  let now = Date.now();
+  let due = Math.max(p.unrenderedSince + PAINT_WATCH_MS, (p.lastRecoveryAt || 0) + PAINT_WATCH_MS,
+                     p.paintQuietUntil || 0);
+  if (now < due) { armPaintCheck(p, due - now); return; }
+  let stage = p.paintStage || 0;
+  let waited = now - p.unrenderedSince;
+  p.lastRecoveryAt = now;
+  if (stage >= 2) {
+    console.warn('paint: pane', p.id, 'still not rendering after a renderer reset; ' +
+                 'leaving it for', PAINT_QUIET_MS, 'ms');
+    p.paintStage = 0;
+    p.paintQuietUntil = now + PAINT_QUIET_MS;
+    armPaintCheck(p, PAINT_QUIET_MS);
+    return;
+  }
+  p.paintRecoveries = (p.paintRecoveries || 0) + 1;
+  _paintRecoveries++;
+  // Staged and re-armed before the attempt: a render it causes at once
+  // (renderHard renders synchronously) clears this via notePaneRendered.
+  p.paintStage = stage + 1;
+  armPaintCheck(p, PAINT_WATCH_MS);
+  unwedgeWrites(p, now);
+  if (stage === 0) {
+    console.warn('paint: pane', p.id, 'has output not rendered for', waited,
+                 'ms; forcing a full refresh');
+    renderFull(p);
+  } else {
+    console.warn('paint: pane', p.id, 'did not render after a full refresh; ' +
+                 'resetting the renderer');
+    renderHard(p);
+  }
+}
+
+// xterm's write queue: chunks written but not parsed yet (see 1. above).
+function writeBacklog(p) {
+  try {
+    let wb = p.term._core && p.term._core._writeBuffer;
+    if (wb && Array.isArray(wb._writeBuffer) && typeof wb._bufferOffset === 'number') {
+      return {wb: wb, chunks: Math.max(0, wb._writeBuffer.length - wb._bufferOffset)};
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Parsing stopped with data queued (no parse for PAINT_WATCH_MS while
+// chunks wait): run xterm's write loop again; a chunk that throws is
+// skipped.
+function unwedgeWrites(p, now) {
+  let b = writeBacklog(p);
+  if (!b || !b.chunks || typeof b.wb._innerWrite !== 'function') return;
+  if (!p.pendSince || now - p.pendSince < PAINT_WATCH_MS) return;   // parsing moves
+  console.warn('paint: pane', p.id, 'xterm stopped parsing with', b.chunks,
+               'chunks queued; resuming it');
+  p.parseResumes = (p.parseResumes || 0) + 1;
+  for (let i = 0; i < 16; i++) {
+    let wb = b.wb;
+    if (wb._writeBuffer.length <= wb._bufferOffset) break;
+    try { wb._innerWrite(); break; }
+    catch (e) {
+      p.parseErrors = (p.parseErrors || 0) + 1;
+      _lastPageError = {at: Date.now(), msg: String(e && e.message || e)};
+      console.warn('paint: pane', p.id, 'a chunk throws in xterm\'s parser; skipping it:', e);
+      let d = wb._writeBuffer[wb._bufferOffset];
+      wb._bufferOffset++;
+      wb._pendingData = Math.max(0, (wb._pendingData || 0) - ((d && d.length) || 0));
+    }
+  }
+}
+
+function renderFull(p) {
+  try { p.term.refresh(0, p.term.rows - 1); } catch (e) {}
+}
+
+// The terminal's box no longer matches its cols/rows (the window changed
+// while the page was hidden or frozen).
+function paneNeedsFit(p) {
+  try {
+    let d = p.fitAddon && p.fitAddon.proposeDimensions();
+    return !!d && d.cols > 0 && d.rows > 0 && (d.cols !== p.term.cols || d.rows !== p.term.rows);
+  } catch (e) { return false; }
+}
+
+// xterm 5.5's render service, private names, every step guarded: a
+// different xterm only loses this step, never the page. Lift a pause the
+// IntersectionObserver left on a terminal that is on screen, drop an
+// animation frame that never ran, re-measure the font, rebuild the glyph
+// cache, and render the rows now rather than on a frame.
+function renderHard(p) {
+  let deb = null;
+  try {
+    let core = p.term._core;
+    let rs = core && core._renderService;
+    deb = rs && rs._renderDebouncer;
+    if (rs && rs._isPaused) {
+      rs._isPaused = false;
+      try { if (rs._pausedResizeTask) rs._pausedResizeTask.flush(); } catch (e) {}
+    }
+    if (deb && deb._animationFrame !== undefined) {
+      try { cancelAnimationFrame(deb._animationFrame); } catch (e) {}
+      deb._animationFrame = undefined;
+    }
+    let cs = core && core._charSizeService;
+    if (cs && !cs.hasValidSize && cs.measure) cs.measure();
+  } catch (e) {}
+  try { p.term.clearTextureAtlas(); } catch (e) {}
+  renderFull(p);
+  try { if (deb && typeof deb._innerRefresh === 'function') deb._innerRefresh(); } catch (e) {}
+  if (paneNeedsFit(p)) fitPaneWhenStable(p);
+}
+
+// Repaint a pane that may just have come back on screen, and expect it
+// to render. A refit only when the box changed.
+function repaintPane(p) {
+  if (!paneOnScreen(p)) return;
+  if (paneNeedsFit(p)) {
+    fitPaneWhenStable(p, {onSettled: q => { renderFull(q); expectPaint(q); }});
+    return;
+  }
+  renderFull(p);
+  expectPaint(p);
+}
+
+function repaintVisiblePanes() {
+  Object.values(panes).forEach(p => { if (p && p.term) repaintPane(p); });
+}
+window.addEventListener('focus', repaintVisiblePanes);
+window.addEventListener('pageshow', repaintVisiblePanes);
+document.addEventListener('visibilitychange', () => { _visChangedAt = Date.now(); });
+window.addEventListener('error', e => {
+  _lastPageError = {at: Date.now(), msg: String((e && (e.message || (e.error && e.error.message))) || 'error')};
+});
+
+// ── Diagnostics beacon ───────────────────────────────────────────────
+// So the next "typed, nothing on screen, reload shows it" is caught in
+// the server log: when the page goes away (a reload, a closed tab) and
+// some pane looks stuck - output on screen not rendered for over
+// PAINT_WATCH_MS, xterm's parse queue stuck, behind the server's output
+// offset, or a paint recovery happened - one
+// navigator.sendBeacon to ?action=client_diag carries per pane: an
+// 8-character session id prefix, offsets, ages of the last write, parse
+// and render, how long output has waited unrendered, xterm's parse queue
+// and render-pause state, cols/rows against the element's size, the
+// transport, counters; and for the page: visibility, focus, the age of
+// the last visibility change, the last uncaught error message (cut to 80
+// characters). No terminal content, no secrets. Nothing is sent when
+// nothing looks stuck. A server without the action answers 404 to a
+// beacon nobody reads. pagehide only (not beforeunload, which costs the
+// page its back/forward cache): it fires on reload, close and navigation.
+let _diagSent = false;
+
+function paneTransport(p) {
+  if (p.eventSource) return 'sse';
+  if (!p.sid) return 'none';
+  let t = p.transport || 'none';
+  return t === 'sse' ? 'sse-closed' : t;
+}
+
+function paneDiag(p, now) {
+  let box = null;
+  try { box = p.el.querySelector('.pane-term').getBoundingClientRect(); } catch (e) {}
+  let ago = t => (t ? Math.max(0, now - t) : -1);
+  let srv = (typeof p.serverCursor === 'number') ? p.serverCursor : -1;
+  let b = writeBacklog(p);
+  let paused = -1, frame = -1;
+  try {
+    let rs = p.term._core && p.term._core._renderService;
+    if (rs) {
+      paused = rs._isPaused ? 1 : 0;
+      let deb = rs._renderDebouncer;
+      if (deb) frame = deb._animationFrame !== undefined ? 1 : 0;
+    }
+  } catch (e) {}
+  let unrendered = p.unrenderedSince ? now - p.unrenderedSince : -1;
+  let pend = b ? b.chunks : -1;
+  return {
+    sid: String(p.sid || '').slice(0, 8),
+    got: p.outCursor || 0,
+    srv: srv,
+    write_ago: ago(p.lastWriteAt),
+    parse_ago: ago(p.lastParsedAt),
+    render_ago: ago(p.lastRenderAt),
+    unrendered: unrendered,
+    pend: pend,
+    pend_ms: p.pendSince ? now - p.pendSince : -1,
+    paused: paused, frame: frame,
+    cols: p.term.cols || 0, rows: p.term.rows || 0,
+    w: box ? Math.round(box.width) : -1, h: box ? Math.round(box.height) : -1,
+    mode: paneTransport(p),
+    tab_hidden: paneHidden(p),
+    recoveries: p.paintRecoveries || 0,
+    resumes: p.parseResumes || 0,
+    hidden_skips: p.paintHiddenSkips || 0,
+    unpainted: unrendered > PAINT_WATCH_MS,
+    // Chunks queued and parsing has not moved for a while: the loop died.
+    wedged: pend > 0 && !!p.pendSince && now - p.pendSince > PAINT_WATCH_MS,
+    // The server said there is more output than this pane got, a while ago
+    // (serverCursor comes only from /api/input replies, so it may lag).
+    behind: !!p.sid && srv > (p.outCursor || 0) && now - (p.serverCursorAt || now) > OUTPUT_LAG_MS
+  };
+}
+
+function sendDiagBeacon() {
+  if (_diagSent || typeof navigator === 'undefined' || !navigator.sendBeacon) return;
+  let now = Date.now();
+  let list = [];
+  Object.values(panes).forEach(p => {
+    if (!p || !p.term) return;
+    try { list.push(paneDiag(p, now)); } catch (e) {}
+  });
+  if (!list.some(d => d.unpainted || d.wedged || d.behind || d.recoveries)) return;
+  _diagSent = true;
+  let focus = false;
+  try { focus = document.hasFocus(); } catch (e) {}
+  try {
+    navigator.sendBeacon(`${API}?action=client_diag`, JSON.stringify({
+      vis: document.visibilityState, focus: focus,
+      vis_ago: _visChangedAt ? now - _visChangedAt : -1,
+      recoveries: _paintRecoveries,
+      err: _lastPageError ? _lastPageError.msg.slice(0, 80) : '',
+      err_ago: _lastPageError ? now - _lastPageError.at : -1,
+      panes: list.slice(0, 16)
+    }));
+  } catch (e) {}
+}
+window.addEventListener('pagehide', sendDiagBeacon);
+window.addEventListener('pageshow', e => { if (e.persisted) _diagSent = false; });
 
 // ── Output payload (both transports) ────────────────────────────────
 // Apply one decoded JSON payload from either transport. Returns true if
@@ -3478,6 +3824,7 @@ function handleOutputPayload(p, r, sid) {
     let bytes = new Uint8Array(chunk.length);
     for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i);
     p.term.write(bytes);
+    notePaneWritten(p);       // ── Paint guard
     // Keep a short tail of decoded output only while we're still
     // within the tmux-death detection window on a persistent pane.
     if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
@@ -3650,6 +3997,7 @@ function kickAllOutputs(force) {
 function noteServerCursor(p, r, sid) {
   if (!r || typeof r.cursor !== 'number' || p.sid !== sid) return;
   let want = r.cursor;
+  if (want !== p.serverCursor) { p.serverCursor = want; p.serverCursorAt = Date.now(); }
   let seen = p.outCursor || 0;
   if (want <= seen || p.lagTimer) return;
   p.lagTimer = setTimeout(() => {
@@ -3750,6 +4098,7 @@ function streamOutput(p) {
     return;
   }
   p.eventSource = es;
+  p.transport = 'sse';          // for the diagnostics beacon
   p.sseGotAnyMessage = false;
   p.sseLastAt = Date.now();
   let armedAt = Date.now();
@@ -3865,6 +4214,7 @@ function pollOutput(p, gen) {
   if (gen === undefined) { abortPoll(p); gen = p.outGen = (p.outGen || 0) + 1; }
   else if (gen !== p.outGen) return;
   let mySid = p.sid;
+  p.transport = 'long-poll';
   // A request parked on a dead connection never answers by itself.
   let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   p.pollAbort = ctl;
@@ -3899,6 +4249,7 @@ function pollOutput(p, gen) {
 function recoverClosedStream(p, mySid, gen) {
   if (!p.polling || p.sid !== mySid) return;
   if (gen !== undefined && gen !== p.outGen) return;
+  p.transport = 'recover';
   let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   p.pollAbort = ctl;      // kickOutput/abortPoll can cancel it, like a poll
   let stall = setTimeout(() => { if (ctl) { try { ctl.abort(); } catch (e) {} } }, POLL_STALL_MS);
@@ -6275,15 +6626,39 @@ function describeUploadError(xhr, resp, u) {
 // A file goes up in pieces (UPLOAD_CHUNK_BYTES each, its own short POST
 // with ?offset=) when the server appends them (config.upload_chunks).
 // One long POST of the whole file was cut mid-body by corporate proxies
-// and VPNs - the owner had to switch networks to upload anything. A
-// piece that fails is retried, after two failures with smaller pieces;
-// the server refuses a piece that does not start where the file ends
-// (409 + the real size) so a retry can never duplicate or skip bytes.
+// and VPNs - the owner had to switch networks to upload anything.
+//
+// The piece size is ADAPTIVE. A proxy that truncates the body answers
+// 400 (sometimes 499) with "client sent fewer bytes than Content-Length"
+// before our server is reached, drops the connection outright, or - the
+// owner's real case - cuts by size while HOLDING the connection open, so
+// the body stalls with no reply; our own short-body reply carries the
+// same text. Every such cut - truncation body, dropped connection, a
+// mid-body stall (the watchdog in sendUploadPiece), or a timeout - is a
+// size/duration the proxy enforces, so it HALVES the piece from the
+// FIRST failure (down toward UPLOAD_CHUNK_MIN): a small file already
+// gets through, so shrinking reaches a size that passes and the file
+// still lands whole. A plain 5xx with no such body is a transient server
+// blip, retried at the SAME size. Forward progress (a piece that lands)
+// resets the failure/try budget and the wall-clock clock but KEEPS the
+// shrunk size. The server refuses a piece that does not start where the
+// file ends (409 + the real size) so a retry can never duplicate or skip
+// bytes; 429 means slow down, not a failure, and keeps the size.
+//
+// Fast, visible failure when it truly cannot get through: give up within
+// UPLOAD_WALLCLOCK_MS of no landed piece (not tries x the 120 s per-piece
+// timeout), and once shrunk to the floor with the first piece still not
+// landed, stop after ~2 more attempts. The give-up banner then names the
+// probable proxy/firewall cause.
 let UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_MIN = 256 * 1024;
 const UPLOAD_CHUNK_TRIES = 8;
 let UPLOAD_CHUNK_TIMEOUT_MS = 120000;
 let UPLOAD_RETRY_BASE_MS = 500;
+// No piece has landed for this long (across retries) - end the upload
+// with the "blocked or cut short" banner instead of tries x 120 s. Any
+// landed piece resets the clock. A `let` so tests can shrink it.
+let UPLOAD_WALLCLOCK_MS = 35000;
 
 function uploadNextFile(p) {
   let u = p.upload;
@@ -6299,6 +6674,9 @@ function uploadNextFile(p) {
     Date.now().toString(36);
   u.chunkSize = UPLOAD_CHUNK_BYTES;
   u.chunkFails = 0;
+  u.floorFails = 0;
+  u.cutSeen = false;
+  u.lastAdvance = Date.now();
   if (serverConfig && serverConfig.upload_chunks && file.size > 0) {
     sendUploadPiece(p, u, file, 0);
   } else {
@@ -6338,6 +6716,18 @@ function uploadFileDone(p, u, file) {
   });
 }
 
+// A truncated request body: nginx or another proxy answers "client sent
+// fewer bytes than Content-Length" (status 400, sometimes 499) before
+// our server is reached, and our own short-body reply carries the same
+// text as {error:...}. Match either the JSON error or a plain/HTML proxy
+// body - that is the signal to shrink and retry, not to give up.
+function uploadBodyTruncated(xhr, resp) {
+  let re = /client sent fewer bytes than content-length/i;
+  if (resp && typeof resp.error === 'string' && re.test(resp.error)) return true;
+  let t = xhr && xhr.responseText;
+  return typeof t === 'string' && re.test(t);
+}
+
 function sendUploadPiece(p, u, file, offset) {
   if (!u || u.cancelled || p.upload !== u) return;
   let end = Math.min(file.size, offset + u.chunkSize);
@@ -6346,20 +6736,85 @@ function sendUploadPiece(p, u, file, offset) {
   xhr.open('POST', uploadUrl(p, u, offset), true);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
+
+  // Mid-body stall watchdog. The owner's proxy cut uploads by SIZE while
+  // HOLDING the connection open: the body stalls partway (the bar froze
+  // at some %), onprogress stops ADVANCING, and nothing ends until the
+  // 120 s xhr.timeout - a piece was retried only every ~2 min. So if the
+  // uploaded byte count does not advance for a whole UPLOAD_WALLCLOCK_MS,
+  // abort the piece and treat it as a cut. A real advance (see below)
+  // re-arms it, so a slow-but-progressing upload (bytes still moving,
+  // however slowly) is never killed by the cap - only a genuine stall,
+  // with no byte of progress for the full budget, is. It stays armed
+  // through the response wait too, since a proxy can hold the connection
+  // after taking the body; xhr.onload (a landed piece) clears it.
+  let stallMs = UPLOAD_WALLCLOCK_MS;
+  let watchdog = null;
+  let clearWatchdog = () => { if (watchdog !== null) { clearTimeout(watchdog); watchdog = null; } };
+  let armWatchdog = () => {
+    clearWatchdog();
+    watchdog = setTimeout(() => {
+      if (!u || u.cancelled || p.upload !== u) return;
+      watchdog = null;
+      xhr.onload = xhr.onerror = xhr.ontimeout = null;   // the abort must not re-enter
+      try { xhr.abort(); } catch (e) {}
+      u.xhr = null;
+      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true);
+    }, stallMs);
+  };
+
+  // Re-arm the stall watchdog only on a real ADVANCE of the byte count,
+  // not on every onprogress event: a proxy that stops forwarding mid-body
+  // but holds the connection open can keep firing onprogress with the
+  // SAME e.loaded, and re-arming on those would keep the watchdog alive
+  // forever (the bar froze at 67% of the piece with no failure). Only
+  // bytes actually moving keep a slow-but-live upload alive.
+  let lastLoaded = 0;
   xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
     u.fileOffset = offset + e.loaded;
     updateUploadProgress(p);
+    if (e.loaded > lastLoaded) { lastLoaded = e.loaded; armWatchdog(); }
   };
-  let retry = why => {
+  // The watchdog is NOT disarmed when the body finishes uploading: the
+  // proxy can hold the connection open AFTER taking the body and never
+  // answer, so the response wait is bounded by the same timer - no piece
+  // has LANDED until xhr.onload runs, which clears it. (A server append
+  // slower than UPLOAD_WALLCLOCK_MS is then treated as a stall too; the
+  // budget is the whole no-forward-progress window, not just body bytes.)
+
+  // Give up now. Once a cut has been seen (a proxy/nginx body truncation,
+  // a dropped connection, or a mid-body stall / timeout) name the
+  // probable cause and an action; otherwise fall back to the specific
+  // reason the caller computed.
+  let giveUp = fallback => {
+    finishUpload(p, false, u.cutSeen
+      ? 'blocked or cut short — a proxy or firewall on this network is' +
+        ' likely limiting uploads; a smaller file may still go through'
+      : fallback);
+  };
+
+  let retry = (why, cut) => {
     if (!u || u.cancelled || p.upload !== u) return;
+    clearWatchdog();
+    if (cut) u.cutSeen = true;
     u.chunkFails++;
-    if (u.chunkFails >= UPLOAD_CHUNK_TRIES) {
-      finishUpload(p, false, why); return;
+    // Halve from the first cut (down toward the floor); a non-cut
+    // failure (a plain 5xx server blip) keeps the size - the piece is
+    // not known to be too big.
+    if (cut) u.chunkSize = Math.max(UPLOAD_CHUNK_MIN, u.chunkSize >> 1);
+    // Wall-clock budget: no piece has landed for this long - stop now
+    // (with the cut banner if cuts were seen) rather than tries x 120 s.
+    if (Date.now() - u.lastAdvance >= UPLOAD_WALLCLOCK_MS) { giveUp(why); return; }
+    // This attempt was already at the floor and the first piece still
+    // has not landed: shrinking is exhausted, so stop after ~2 such
+    // attempts instead of the whole try budget. (end - offset is the
+    // size we just sent, before the halving above takes effect.)
+    if (cut && offset === 0 && (end - offset) <= UPLOAD_CHUNK_MIN) {
+      u.floorFails = (u.floorFails || 0) + 1;
+      if (u.floorFails >= 2) { giveUp(why); return; }
     }
-    // Smaller pieces after the second failure: what a proxy cuts is
-    // usually a size or a duration.
-    if (u.chunkFails >= 2) u.chunkSize = Math.max(UPLOAD_CHUNK_MIN, u.chunkSize >> 1);
+    if (u.chunkFails >= UPLOAD_CHUNK_TRIES) { giveUp(why); return; }
     let delay = Math.min(16 * UPLOAD_RETRY_BASE_MS, UPLOAD_RETRY_BASE_MS * Math.pow(2, u.chunkFails - 1));
     console.log('upload: piece at', offset, 'failed (' + why + '), retry', u.chunkFails,
                 'in', delay, 'ms, piece size', u.chunkSize);
@@ -6367,6 +6822,7 @@ function sendUploadPiece(p, u, file, offset) {
   };
   xhr.onload = () => {
     if (!u || u.cancelled) return;
+    clearWatchdog();
     let resp = null;
     try { resp = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status === 409 && resp && typeof resp.size === 'number' && resp.size >= 0) {
@@ -6395,22 +6851,40 @@ function sendUploadPiece(p, u, file, offset) {
       return;
     }
     if (xhr.status !== 200 || !resp || !resp.ok) {
-      // A session or file problem is final; a proxy's 5xx / 408 is
-      // worth another try.
-      let transient = xhr.status === 408 || xhr.status >= 500;
+      // nginx or a proxy that truncated the body answers 400 (sometimes
+      // 499) with "client sent fewer bytes than Content-Length" before
+      // our server is reached, and our own short-body reply carries the
+      // same text: that is a cut - retry AND shrink. A plain 408/5xx is
+      // transient too, but retried at the SAME size (a server blip, not
+      // a size limit). Everything else - 413, invalid path, a session
+      // error, a plain 400 - is the server's final verdict and stops.
+      let cut = uploadBodyTruncated(xhr, resp);
+      let transient = cut || xhr.status === 408 || xhr.status >= 500;
       if (!transient) { finishUpload(p, false, describeUploadError(xhr, resp, u)); return; }
-      retry(describeUploadError(xhr, resp, u));
+      retry(describeUploadError(xhr, resp, u), cut);
       return;
     }
+    // A piece landed: forward progress. Reset the failure/try budget,
+    // the wall-clock clock and the cut flag, but KEEP the shrunk size.
     u.chunkFails = 0;
     u.throttled = 0;
+    u.floorFails = 0;
+    u.cutSeen = false;
+    u.lastAdvance = Date.now();
     u.fileOffset = end;
     updateUploadProgress(p);
     if (end < file.size) sendUploadPiece(p, u, file, end);
     else uploadFileDone(p, u, file);
   };
-  xhr.onerror = () => retry(describeUploadError(xhr, null, u));
-  xhr.ontimeout = () => retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s');
+  // A dropped connection (status 0, no HTTP reply) and a timeout are both
+  // how a proxy/VPN that cuts the body by size/duration shows up when no
+  // usable reply reaches us: treat each as a cut - shrink and retry, and
+  // name the proxy cause on give-up - not a final "could not start"
+  // (describeUploadError keeps that reason for its own callers and the
+  // log line here).
+  xhr.onerror = () => { clearWatchdog(); retry(describeUploadError(xhr, null, u), true); };
+  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true); };
+  armWatchdog();
   xhr.send(file.slice(offset, end));
 }
 

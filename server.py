@@ -895,6 +895,84 @@ def _access_log_emit(event, ip, **fields):
         _log("WARN", "access log write failed: {}".format(e))
 
 
+# ─── Client diagnostics (/api/client_diag) ───────────────────────────
+# A page that goes away with a pane that looked stuck sends one beacon;
+# it becomes one log line. Small, rate-limited per IP, numbers and short
+# words only (see Handler._client_diag).
+CLIENT_DIAG_MAX_BODY = 16384
+CLIENT_DIAG_MAX = 10              # beacons per IP per window
+CLIENT_DIAG_WINDOW = 600
+CLIENT_DIAG_MAX_PANES = 16
+_client_diag_limits = {}
+_client_diag_lock = Lock()
+_DIAG_WORD_RE = re.compile(r"[A-Za-z0-9_.-]{0,16}")
+
+
+def _diag_int(v):
+    """An integer field of a diagnostics beacon, clamped; -1 if absent."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)) and v == v:
+        return int(max(-1, min(v, 10 ** 15)))
+    return -1
+
+
+def _diag_word(v):
+    """A short word field of a diagnostics beacon; '?' if it is not one."""
+    if isinstance(v, str) and _DIAG_WORD_RE.fullmatch(v):
+        return v or "-"
+    return "?"
+
+
+def _diag_text(v):
+    """A free-text field of a diagnostics beacon (an error message): at
+    most 80 characters, anything outside a plain set replaced by '_'."""
+    if not isinstance(v, str):
+        return "-"
+    v = re.sub(r"[^A-Za-z0-9 _.,:;'()\[\]/-]", "_", v[:80]).strip()
+    return v or "-"
+
+
+def format_client_diag(body):
+    """(level, text) for a diagnostics beacon body (a dict). WARN when a
+    pane had output written but not rendered, xterm's parse queue was
+    stuck, or it was behind the server's output offset; INFO otherwise."""
+    panes = body.get("panes")
+    if not isinstance(panes, list):
+        panes = []
+    parts = []
+    warn = False
+    for d in panes[:CLIENT_DIAG_MAX_PANES]:
+        if not isinstance(d, dict):
+            continue
+        flags = [k for k in ("unpainted", "wedged", "behind", "tab_hidden")
+                 if d.get(k) is True]
+        warn = warn or any(k in flags for k in ("unpainted", "wedged", "behind"))
+        parts.append(
+            "[sid={} got={} srv={} write_ago={}ms parse_ago={}ms "
+            "render_ago={}ms unrendered={}ms pend={} pend_ms={} paused={} "
+            "frame={} term={}x{} box={}x{} mode={} recoveries={} resumes={} "
+            "hidden_skips={}{}]".format(
+                _diag_word(d.get("sid")), _diag_int(d.get("got")),
+                _diag_int(d.get("srv")), _diag_int(d.get("write_ago")),
+                _diag_int(d.get("parse_ago")), _diag_int(d.get("render_ago")),
+                _diag_int(d.get("unrendered")), _diag_int(d.get("pend")),
+                _diag_int(d.get("pend_ms")), _diag_int(d.get("paused")),
+                _diag_int(d.get("frame")), _diag_int(d.get("cols")),
+                _diag_int(d.get("rows")), _diag_int(d.get("w")),
+                _diag_int(d.get("h")), _diag_word(d.get("mode")),
+                _diag_int(d.get("recoveries")), _diag_int(d.get("resumes")),
+                _diag_int(d.get("hidden_skips")),
+                (" " + ",".join(flags)) if flags else ""))
+    text = ("vis={} focus={} vis_ago={}ms paint_recoveries={} err_ago={}ms "
+            "err={!r} panes={} {}").format(
+        _diag_word(body.get("vis")), _diag_int(body.get("focus")),
+        _diag_int(body.get("vis_ago")), _diag_int(body.get("recoveries")),
+        _diag_int(body.get("err_ago")), _diag_text(body.get("err")),
+        len(parts), " ".join(parts)).rstrip()
+    return ("WARN" if warn else "INFO"), text
+
+
 # ─── Rate limiting ──────────────────────────────────────────────────
 
 _rate_limits = {}  # IP -> list of timestamps
@@ -3762,6 +3840,8 @@ def cleanup():
     # disappears from RAM entirely.
     now = time.time()
     _prune_stale(_rate_limits, _rate_lock, now - RATE_LIMIT_WINDOW)
+    _prune_stale(_client_diag_limits, _client_diag_lock,
+                 now - CLIENT_DIAG_WINDOW)
     _prune_stale(_side_channel_rate_limits, _side_channel_rate_lock,
                  now - SIDE_CHANNEL_RATE_WINDOW)
     # Scan-pattern values are (ts, host) tuples, not bare timestamps.
@@ -4097,6 +4177,7 @@ class Handler(BaseHTTPRequestHandler):
         "mkdir":           "_mkdir",
         "mv":              "_mv",
         "save":            "_save_credential",
+        "client_diag":     "_client_diag",
         # Compatibility with the bundled frontend in Python-only mode.
         # The PHP shim translates POST ?action=save_delete into
         # DELETE /api/save; when server.py serves api.php-style URLs
@@ -5810,6 +5891,38 @@ class Handler(BaseHTTPRequestHandler):
         _access_log_emit("download", self._client_ip(), sid=sid,
                          target_host=getattr(session, "_host", ""),
                          path=path, bytes=sent, result=result)
+
+    # ── Client diagnostics ──────────────────────────────────────────
+
+    def _client_diag(self):
+        """POST /api/client_diag - a page's diagnostics beacon (see
+        format_client_diag and websh.js "Diagnostics beacon"). It comes
+        from navigator.sendBeacon, which sends a string as text/plain, so
+        this one handler reads JSON whatever the media type: all it does
+        is write one bounded log line (the Origin check in do_POST still
+        applies, and it is rate-limited per IP)."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = -1
+        if n < 0 or n > CLIENT_DIAG_MAX_BODY:
+            self._json({"error": "bad size"}, 413 if n > 0 else 400)
+            return
+        try:
+            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else None
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            self._json({"error": "invalid json"}, 400)
+            return
+        ip = self._client_ip()
+        if not _rate_limit_take(_client_diag_limits, _client_diag_lock, ip,
+                                CLIENT_DIAG_MAX, CLIENT_DIAG_WINDOW):
+            self._json({"error": "rate limited"}, 429)
+            return
+        level, text = format_client_diag(body)
+        _log(level, "client diag from {}: {}".format(ip, text))
+        self._json({"ok": True})
 
     # ── Disconnect ──────────────────────────────────────────────────
 

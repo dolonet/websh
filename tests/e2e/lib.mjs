@@ -34,6 +34,23 @@ function findChrome() {
   }
   return '';
 }
+// Full Chromium (not the headless shell), run with --headless=new: its
+// tabs have a real visibility state. A tab put behind another one is
+// document.hidden, its timers are throttled and its rendering stops -
+// what a user's browser does when they switch to another tab. The
+// headless shell reports "visible" for ever.
+function findFullChrome() {
+  if (process.env.E2E_CHROME_FULL) return process.env.E2E_CHROME_FULL;
+  const root = path.join(os.homedir(), '.cache/ms-playwright');
+  let dirs = [];
+  try { dirs = fs.readdirSync(root).filter(d => /^chromium-\d+$/.test(d)).sort().reverse(); } catch (e) {}
+  for (const d of dirs) {
+    const p = path.join(root, d, 'chrome-linux64/chrome');
+    if (fs.existsSync(p)) return p;
+  }
+  return '';
+}
+export const fullChrome = () => findFullChrome();
 
 // ── sudo (network faults only) ──────────────────────────────────────
 export function sudo(args) {
@@ -83,18 +100,82 @@ export class LocalServer {
   async restart() { await this.stop(); await this.start(); }
 }
 
+// ── a private nginx in front (HTTP/2 + TLS, like the deployment) ────
+// The deployment is reached over HTTP/2 through nginx with
+// proxy_buffering off; the private instance alone is plain HTTP/1.1,
+// where Chromium allows six connections per host and every stream holds
+// one. A scenario that needs the deployment's transport sets
+// meta.front = 'h2'. Self-signed certificate (the browser is started
+// with --ignore-certificate-errors); prefix, logs and pid in a temp dir.
+export class H2Front {
+  constructor(port, upstream) { this.port = port; this.upstream = upstream; }
+  get url() { return `https://127.0.0.1:${this.port}/`; }
+  async start() {
+    this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'websh-e2e-nginx-'));
+    const d = this.dir;
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+      '-subj', '/CN=127.0.0.1', '-keyout', d + '/k.pem', '-out', d + '/c.pem'], { stdio: 'ignore' });
+    fs.writeFileSync(d + '/nginx.conf', `
+daemon off; pid ${d}/nginx.pid; error_log ${d}/error.log info;
+events { worker_connections 1024; }
+http {
+  access_log ${d}/access.log;
+  client_body_temp_path ${d}/body; proxy_temp_path ${d}/proxy;
+  fastcgi_temp_path ${d}/fcgi; uwsgi_temp_path ${d}/uwsgi; scgi_temp_path ${d}/scgi;
+  server {
+    listen 127.0.0.1:${this.port} ssl http2;
+    ssl_certificate ${d}/c.pem; ssl_certificate_key ${d}/k.pem;
+    client_max_body_size 2g;
+    proxy_request_buffering off;
+    location / {
+      proxy_pass http://127.0.0.1:${this.upstream};
+      proxy_http_version 1.1;
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 1800s; proxy_send_timeout 1800s;
+      proxy_buffering off;
+    }
+  }
+}`);
+    this.proc = spawn('nginx', ['-p', d, '-c', d + '/nginx.conf'], { stdio: 'ignore' });
+    for (let i = 0; i < 50; i++) {
+      try { execFileSync('curl', ['-skf', '-o', '/dev/null', this.url + 'api/ping']); return; } catch (e) {}
+      await sleep(100);
+    }
+    throw new Error('private nginx did not start on port ' + this.port + ' (see ' + d + '/error.log)');
+  }
+  accessLog() { try { return fs.readFileSync(this.dir + '/access.log', 'utf8'); } catch (e) { return ''; } }
+  async stop() {
+    const p = this.proc; this.proc = null;
+    if (p && p.exitCode === null) {
+      const gone = new Promise(r => p.once('exit', r));
+      p.kill('SIGQUIT');
+      await Promise.race([gone, sleep(3000)]);
+      if (p.exitCode === null) p.kill('SIGKILL');
+    }
+    if (process.env.E2E_KEEP_NGINX) return;
+    try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
 // ── browser ─────────────────────────────────────────────────────────
 export class Browser {
-  static async launch() {
-    if (!cfg.chrome) throw new Error('no headless Chromium found: set E2E_CHROME');
+  static async launch(o) {
+    const full = !!(o && o.full);
+    const bin = full ? findFullChrome() : cfg.chrome;
+    if (!bin) throw new Error(full ? 'no full Chromium found: set E2E_CHROME_FULL'
+                                   : 'no headless Chromium found: set E2E_CHROME');
     const b = new Browser();
+    b.full = full;
     // Port 0: Chromium picks a free port and writes it to
     // DevToolsActivePort in its own profile directory. A random port from
     // a fixed range once landed on ANOTHER headless Chromium already
     // listening there, and the scenario drove (and navigated) that
     // browser's page - never touch what you did not start.
     b.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'websh-e2e-chrome-'));
-    b.proc = spawn(cfg.chrome, ['--no-sandbox', '--disable-gpu', '--remote-debugging-port=0',
+    b.proc = spawn(bin, [...(full ? ['--headless=new'] : []), '--ignore-certificate-errors', '--no-sandbox', '--disable-gpu', '--remote-debugging-port=0',
       `--user-data-dir=${b.dir}`, '--window-size=1200,800', 'about:blank'], { stdio: 'ignore' });
     let port = 0;
     for (let i = 0; i < 100 && !b.ws; i++) {
@@ -103,7 +184,7 @@ export class Browser {
         if (port) {
           const list = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
           const page = list.find(t => t.type === 'page');
-          if (page) b.ws = new WebSocket(page.webSocketDebuggerUrl);
+          if (page) { b.ws = new WebSocket(page.webSocketDebuggerUrl); b.targetId = page.id; }
         }
       } catch (e) {}
       if (!b.ws) await sleep(100);
@@ -206,6 +287,16 @@ export class Browser {
       { offline: !!o.offline, latency: o.latency || 0, downloadThroughput: -1,
         uploadThroughput: o.upload || -1 });   // bytes/s
   }
+  // Another browser tab in front of ours (full Chromium only): the page
+  // becomes document.hidden as for a user who switched tabs; show()
+  // brings ours back.
+  async hide() {
+    if (!this.full) throw new Error('hide() needs Browser.launch({full: true})');
+    if (!this.otherTarget)
+      this.otherTarget = (await this.send('Target.createTarget', { url: 'about:blank' })).result.targetId;
+    else await this.send('Target.activateTarget', { targetId: this.otherTarget });
+  }
+  show() { return this.send('Target.activateTarget', { targetId: this.targetId }); }
   freeze() { return this.send('Page.setWebLifecycleState', { state: 'frozen' }); }
   unfreeze() { return this.send('Page.setWebLifecycleState', { state: 'active' }); }
   // End every session; persistent ones take their tmux session with them.

@@ -173,7 +173,7 @@ const EXPOSE = `
   Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
   Object.defineProperty(window, 'OUTPUT_LAG_MS', {get: () => OUTPUT_LAG_MS, set: v => { OUTPUT_LAG_MS = v; }, configurable: true});
   Object.defineProperty(window, 'watchdogLastTick', {get: () => _watchdogLastTick, set: v => { _watchdogLastTick = v; }, configurable: true});
-  for (const k of ['UPLOAD_CHUNK_BYTES', 'UPLOAD_CHUNK_TIMEOUT_MS', 'UPLOAD_RETRY_BASE_MS'])
+  for (const k of ['UPLOAD_CHUNK_BYTES', 'UPLOAD_CHUNK_TIMEOUT_MS', 'UPLOAD_RETRY_BASE_MS', 'UPLOAD_WALLCLOCK_MS'])
     Object.defineProperty(window, k, {get: () => eval(k), set: v => { eval(k + ' = v'); }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
@@ -5918,14 +5918,258 @@ test('upload in pieces: a final answer (413) stops the upload, no retries', asyn
   cleanup(env);
 });
 
-test('upload in pieces: eight failures in a row give up with the reason', async () => {
+// Repeated per-piece timeouts (the server never answers) are a cut like
+// any other: the client shrinks, then gives up with the visible,
+// proxy-named banner in FEWER than the full try budget - not a bare "no
+// answer" after 8 attempts. (Was: 8 tries, generic message - the
+// pre-fix behaviour.)
+test('upload in pieces: repeated timeouts give up fast with the proxy-named banner', async () => {
   const {env, win, p} = await pieceEnv();
   const st = pieceServer(win, () => 'timeout');
   win.UPLOAD_CHUNK_TIMEOUT_MS = 5;
   win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
-  for (let i = 0; i < 2000 && !/failed/i.test(bannerOf(p)); i++) await sleep(10);
-  ok(/Upload failed: no answer from the server/.test(bannerOf(p)), 'gave up with the reason; got ' + JSON.stringify(bannerOf(p)));
-  ok(st.calls.length === 8, 'eight tries; got ' + st.calls.length);
+  for (let i = 0; i < 2000 && !/Upload (failed|blocked)|cut short/i.test(bannerOf(p)); i++) await sleep(10);
+  ok(/blocked|cut short|proxy|firewall/i.test(bannerOf(p)), 'gave up with the proxy-named banner; got ' + JSON.stringify(bannerOf(p)));
+  ok(st.calls.length < 8, 'fewer than the full try budget (UPLOAD_CHUNK_TRIES=8); got ' + st.calls.length);
+  cleanup(env);
+});
+
+// ── Proxy that truncates uploads (B: shrink through; A: fast, named failure) ──
+// Measured on the owner's corporate network: GET (download) of a 1.2 MB
+// file works; a POST upload of a normal file is cut by a proxy while a
+// couple-of-KB file passes - so the proxy limits by SIZE/DURATION, not
+// outright. nginx logs the first 4 MB piece as 400 ("client sent fewer
+// bytes than Content-Length") or 499, retried every ~2 min, 6×, then it
+// gives up; the progress bar sits at 0% with no message for many minutes.
+// These are the UNIT layer for the client's shrink / give-up / banner
+// logic (the logic lives in websh.js, not server.py). The honest
+// wall-clock + real-bytes reproduction is tests/e2e/scenarios/proxytrunc.mjs.
+
+// B. A piece cut by the proxy must shrink on the VERY NEXT try, not only
+// after a second generic failure. Proxy model: any body over 1 MB is
+// dropped (status 0 / onerror), smaller bodies pass.
+test('upload in pieces: a truncated piece shrinks on the next try, not after a second failure', async () => {
+  const {env, win, p} = await pieceEnv();
+  const TH = 1024 * 1024;
+  const st = pieceServer(win, (offset, len) =>
+    len > TH ? 'neterr' : {status: 200, body: {ok: true, size: offset + len}});
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  const at0 = st.calls.filter(c => c.offset === 0).map(c => c.len);
+  ok(at0.length >= 2, 'the first piece was retried; sizes at offset 0: ' + at0.join(','));
+  ok(at0[1] < at0[0], 'the retry after the FIRST truncation is smaller; sizes at offset 0: ' + at0.join(','));
+  cleanup(env);
+});
+
+// B. The owner's exact signature: nginx returns 400 "client sent fewer
+// bytes than Content-Length" for an over-size piece. That is a proxy
+// truncation, not a final client error - the client must shrink and
+// retry (not give up), and a file that gets through this way must be
+// byte-for-byte complete. Proxy model: 400 for any body over 512 KB on
+// EVERY offset, 200 otherwise (so the shrunk size must persist across
+// pieces - forward progress keeps the small size, it is not re-grown and
+// re-truncated on every piece).
+test('upload in pieces: a 400 "fewer bytes" truncation shrinks and the file still completes whole', async () => {
+  const {env, win, p} = await pieceEnv();
+  const TH = 512 * 1024;
+  const st = pieceServer(win, (offset, len) =>
+    len > TH
+      ? {status: 400, body: {error: 'client sent fewer bytes than Content-Length'}}
+      : {status: 200, body: {ok: true, size: offset + len}});
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length > 1, 'the 400 was retried, not treated as final; requests: ' + st.calls.length);
+  ok(assembled(st) === 10 * 1024 * 1024,
+     'every byte landed once, in order, after shrinking; pieces=' + JSON.stringify(st.file));
+  ok(/Saved to/.test(bannerOf(p)), 'upload completed; banner=' + JSON.stringify(bannerOf(p)));
+  const n400 = st.calls.filter(c => c.len > TH).length;
+  ok(n400 <= 6, 'the shrunk size persists across pieces (not re-truncated each time); over-size requests: ' + n400);
+  // Keep-size: every piece after the first offset is <= the size that
+  // got through (<= TH); the client does not re-grow to 4 MB and get
+  // truncated again on each piece.
+  ok(st.calls.filter(c => c.offset > 0).every(c => c.len <= TH),
+     'pieces after offset 0 stay at the shrunk size (<= ' + TH + '); got ' +
+     st.calls.filter(c => c.offset > 0).map(c => c.len).join(','));
+  cleanup(env);
+});
+
+// Guard: forward progress resets the failure/try budget but KEEPS the
+// shrunk size. The proxy truncates (400 "fewer bytes") the FIRST attempt
+// at each offset, then lets the retry through - so every piece fails once
+// and the total failures across the file exceed what a single piece's try
+// budget would allow; the upload must still complete because each landed
+// piece resets the budget. (On the old code the first 400 is final → no
+// completion: this is red before the fix.)
+test('upload in pieces: forward progress resets the try budget and keeps the shrunk size', async () => {
+  const {env, win, p} = await pieceEnv();
+  const seen = {};
+  const st = pieceServer(win, (offset, len) => {
+    seen[offset] = (seen[offset] || 0) + 1;
+    return seen[offset] === 1
+      ? {status: 400, body: {error: 'client sent fewer bytes than Content-Length'}}
+      : {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 3 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(assembled(st) === 3 * 1024 * 1024, 'file complete, every byte once/in order; pieces=' + JSON.stringify(st.file));
+  ok(/Saved to/.test(bannerOf(p)), 'completed; banner=' + JSON.stringify(bannerOf(p)));
+  const sizes = st.calls.map(c => c.len);
+  ok(sizes[sizes.length - 1] <= sizes[0], 'the last piece is no bigger than the first (size kept, not re-grown); ' + sizes.join(','));
+  cleanup(env);
+});
+
+// Guard: a genuinely FINAL 400 (invalid path) stops at once, with its own
+// message - NOT the proxy/truncation banner. Protects the fix from
+// treating every 400 as a cut.
+test('upload in pieces: a final 400 (invalid path) stops at once with its own message', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, () => ({status: 400, body: {error: 'invalid path'}}));
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length === 1, 'one request, no retries; got ' + st.calls.length);
+  ok(/rejected by the server/.test(bannerOf(p)), 'its own message; got ' + JSON.stringify(bannerOf(p)));
+  ok(!/blocked|cut short|proxy|firewall/i.test(bannerOf(p)), 'NOT the proxy text; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+// Guard: cancelling while the upload is retrying/shrinking stops it
+// cleanly - banner "Cancelled", and no further request is sent (the new
+// stall-watchdog must not spawn a zombie piece after cancel).
+test('upload in pieces: cancel during a shrink stops cleanly, no zombie request', async () => {
+  const {env, win, p} = await pieceEnv();
+  win.UPLOAD_WALLCLOCK_MS = 4000;            // long enough not to give up before we cancel
+  const st = pieceServer(win, (offset, len) =>
+    len > 256 * 1024 ? 'neterr' : {status: 200, body: {ok: true, size: offset + len}});
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  for (let i = 0; i < 400 && st.calls.length < 3; i++) await sleep(5);
+  const before = st.calls.length;
+  win.cancelUpload(p.id);
+  for (let i = 0; i < 40; i++) await sleep(5);
+  ok(st.calls.length === before, 'no request after cancel; before=' + before + ' after=' + st.calls.length);
+  ok(/Cancelled/.test(bannerOf(p)), 'banner shows Cancelled; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+// A custom XHR that emits a couple of upload progress ticks and then
+// goes SILENT, never sending a reply (a proxy that holds the connection
+// open but takes nothing - the owner's 120 s stall). It honours
+// xhr.timeout so the OLD code's only escape is the full per-piece
+// timeout. `onEachSend` lets a test count pieces.
+function stallXhr(win, onEachSend) {
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; this.timeout = 0; }
+    open(m, u) { this.url = u; }
+    setRequestHeader() {}
+    abort() { this.aborted = true; clearTimeout(this._p1); clearTimeout(this._p2); clearTimeout(this._tt); }
+    send() {
+      if (onEachSend) onEachSend();
+      this._p1 = setTimeout(() => { if (!this.aborted && this.upload.onprogress) this.upload.onprogress({loaded: 1000}); }, 8);
+      this._p2 = setTimeout(() => { if (!this.aborted && this.upload.onprogress) this.upload.onprogress({loaded: 2000}); }, 24);
+      if (this.timeout) this._tt = setTimeout(() => { if (!this.aborted && this.ontimeout) this.ontimeout(); }, this.timeout);
+    }
+  };
+}
+
+// A: a stalled piece surfaces a VISIBLE, proxy-named failure FAST (within
+// the wall-clock budget), not after the 120 s per-piece timeout. On the
+// old code (no stall watchdog) nothing shows within the bound → red.
+test('upload in pieces: a stalled body fails fast on the wall-clock budget, not the 120 s timeout', async () => {
+  const {env, win, p} = await pieceEnv();
+  win.UPLOAD_WALLCLOCK_MS = 120;             // body stalled this long with no progress -> give up
+  win.UPLOAD_CHUNK_TIMEOUT_MS = 4000;        // the per-piece timeout, far past the wall-clock bound
+  let sends = 0;
+  stallXhr(win, () => { sends++; });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  // A correct fix aborts a stalled body ~UPLOAD_WALLCLOCK_MS after progress
+  // stops (~150 ms here); it must not wait the full 4 s per-piece timeout.
+  let shown = false;
+  for (let i = 0; i < 150 && !shown; i++) { await sleep(10); shown = /Upload (failed|blocked)|cut short/i.test(bannerOf(p)); }
+  ok(shown, 'a failure banner appeared within ~1.5 s (<< the 4 s timeout); banner=' + JSON.stringify(bannerOf(p)));
+  ok(/blocked|cut short|proxy|firewall/i.test(bannerOf(p)), 'and it names the probable cause; got ' + JSON.stringify(bannerOf(p)));
+  win.cancelUpload(p.id);                    // stop any in-flight loop (old code) before teardown
+  cleanup(env);
+});
+
+// A custom XHR that KEEPS emitting progress (a slow but live transfer),
+// then completes 200 - must NOT be killed by the wall-clock watchdog
+// (progress re-arms it). Guards the cap against killing a healthy slow
+// upload.
+test('upload in pieces: a slow but progressing upload is not killed by the wall-clock cap', async () => {
+  const {env, win, p} = await pieceEnv();
+  win.UPLOAD_WALLCLOCK_MS = 120;             // shorter than the whole transfer below
+  const size = 1024 * 1024;                  // one piece
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; this.timeout = 0; }
+    open(m, u) { this.url = u; } setRequestHeader() {}
+    abort() { this.aborted = true; clearTimeout(this._t); }
+    send() {
+      let ticks = 0;
+      const tick = () => {
+        if (this.aborted) return;
+        ticks++;
+        if (this.upload.onprogress) this.upload.onprogress({loaded: ticks * 150000});
+        if (ticks < 6) { this._t = setTimeout(tick, 40); }      // progress every 40 ms < 120 ms budget
+        else {
+          if (this.upload.onload) this.upload.onload();          // body fully sent
+          this.status = 200; this.responseText = JSON.stringify({ok: true, size: size});
+          if (this.onload) this.onload();
+        }
+      };
+      this._t = setTimeout(tick, 40);
+    }
+  };
+  win.handleUpload(p.id, {files: [bigFile('big.bin', size)], value: ''});
+  let done = false;
+  for (let i = 0; i < 120 && !done; i++) { await sleep(10); done = /Saved to|Upload complete/.test(bannerOf(p)); }
+  ok(done, 'the slow upload completed, was not aborted; banner=' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+// A. When the proxy truncates and the piece can never get through (even
+// the smallest piece is over the proxy's limit), the user must get a
+// VISIBLE, SPECIFIC error that names the probable cause (a proxy /
+// firewall / size limit) and is actionable - not a generic network /
+// iCloud message. Proxy model: any body over 200 KB is dropped, which is
+// below the 256 KB shrink floor, so no piece ever passes.
+test('upload in pieces: an unpassable truncation fails with a proxy/size cause named', async () => {
+  const {env, win, p} = await pieceEnv();
+  const TH = 200 * 1024;                       // below UPLOAD_CHUNK_MIN (256 KB)
+  const st = pieceServer(win, (offset, len) =>
+    len > TH ? 'neterr' : {status: 200, body: {ok: true, size: offset + len}});
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  const banner = bannerOf(p);
+  // A terminal failure banner (not progress, not success). The agreed
+  // wording for a truncation give-up is "Upload blocked or cut short — …".
+  ok(/Upload (failed|blocked)|cut short/i.test(banner) && !/\d+%\s*$/.test(banner),
+     'a terminal failure banner is shown; got ' + JSON.stringify(banner));
+  ok(/proxy|firewall|size limit|too large|network.*(between|limit)|blocking|blocked/i.test(banner),
+     'the reason names a probable proxy/size cause; got ' + JSON.stringify(banner));
+  // The stale iCloud/connection hint is a per-retry debug reason only; it
+  // must not be the final banner the user is left with.
+  ok(!/iCloud|Drive/i.test(banner), 'no stale iCloud text in the final banner; got ' + JSON.stringify(banner));
+  cleanup(env);
+});
+
+// A. The same unpassable truncation must be given up FAST, not after the
+// full try budget of long timeouts (8 × 120 s ≈ 16 min of a 0% bar). With
+// no forward progress and the floor reached, the client must stop early -
+// it must not keep hammering the floor-sized piece to exhaust the budget.
+test('upload in pieces: no forward progress is stopped fast, not after the whole try budget', async () => {
+  const {env, win, p} = await pieceEnv();
+  const TH = 200 * 1024;
+  const FLOOR = 256 * 1024;        // UPLOAD_CHUNK_MIN in websh.js (const, not exposed)
+  const TRIES = 8;                 // UPLOAD_CHUNK_TRIES in websh.js (const, not exposed)
+  const st = pieceServer(win, (offset, len) =>
+    len > TH ? 'neterr' : {status: 200, body: {ok: true, size: offset + len}});
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(/Upload (failed|blocked)|cut short/i.test(bannerOf(p)), 'it did fail; banner=' + JSON.stringify(bannerOf(p)));
+  ok(st.calls.length < TRIES,
+     'gave up before the full try budget (' + TRIES + '); requests: ' + st.calls.length);
+  const floorTries = st.calls.filter(c => c.len === FLOOR).length;
+  ok(floorTries <= 2,
+     'did not keep hammering the floor-sized piece; floor-sized requests: ' + floorTries);
   cleanup(env);
 });
 

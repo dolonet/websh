@@ -194,7 +194,12 @@ export async function run({ b, t }) {
     t.ok(up >= 0 && /Saved to|Upload complete/.test(txt), `a file dropped on the moved tmux pane uploads into it (${J(txt)})`);
     t.ok(J(await shapes()) === J([C, `(h ${B} ${A})`]), 'and the drop moved nothing');
     await type(A, `rm -f ${fname} ~/${fname}\r`);
-  } finally { try { fs.unlinkSync(local); } catch (e) {} }
+  } finally {
+    try { fs.unlinkSync(local); } catch (e) {}
+    // The typed rm above can lose the race with the reload below; when
+    // the target is this machine, remove the uploaded copy directly.
+    try { fs.unlinkSync(path.join(os.homedir(), fname)); } catch (e) {}
+  }
 
   // 5. Reload: the moved layout comes back; B is still the same tmux shell.
   const before = (await shapes()).map(x => x.replace(/p\d+/g, 'P'));
