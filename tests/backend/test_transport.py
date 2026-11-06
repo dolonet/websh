@@ -2257,9 +2257,18 @@ class TestUnixSocketServer(unittest.TestCase):
             with self.subTest(headers=headers):
                 client = _UnixHTTPConnection(self.path)
                 try:
+                    payload = json.dumps({"session_id": "missing"})
+                    request_headers = dict(headers, **{
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(payload)),
+                    })
+                    # The Origin gate rejects headers before reading the
+                    # body. For that refusal, send only headers and read
+                    # its actual 403: http.client otherwise writes the body
+                    # separately and can race the server closing its side.
                     client.request("POST", "/api/resize",
-                                   json.dumps({"session_id": "missing"}),
-                                   dict(headers, **{"Content-Type": "application/json"}))
+                                   None if expected == 403 else payload,
+                                   request_headers)
                     response = client.getresponse()
                     body = json.loads(response.read())
                     self.assertEqual(response.status, expected, body)
