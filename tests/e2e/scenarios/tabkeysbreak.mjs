@@ -40,12 +40,8 @@ export async function run({ b, t }) {
     if (!(o && o.noUp)) await b.send('Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, base));
   };
   const sent = [];
-  b.ws.addEventListener('message', m => {
-    const d = JSON.parse(m.data);
-    if (d.method === 'Network.requestWillBeSent' && /action=input/.test(d.params.request.url)) {
-      try { sent.push(JSON.parse(d.params.request.postData || '{}').data || ''); } catch (e) {}
-    }
-  });
+  // (b.onInput: plain requests and, under E2E_SEALED=1, sealed ones.)
+  b.onInput(data => sent.push(data));
   const focusIn = async id => {
     await click(`#panes .pane[data-pane="${id}"] .xterm-screen`);
     await until(() => b.ev(`${pane(id)}.el.contains(document.activeElement)`), 3000);

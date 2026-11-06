@@ -69,12 +69,8 @@ export async function run({ b, t }) {
   };
   // Everything websh sent to the shells, from the network.
   const sent = [];
-  b.ws.addEventListener('message', m => {
-    const d = JSON.parse(m.data);
-    if (d.method === 'Network.requestWillBeSent' && /action=input/.test(d.params.request.url)) {
-      try { sent.push(JSON.parse(d.params.request.postData || '{}').data || ''); } catch (e) {}
-    }
-  });
+  // (b.onInput: plain requests and, under E2E_SEALED=1, sealed ones.)
+  b.onInput(data => sent.push(data));
   const wire = () => sent.join('');
   // Show the pane's tab with a click (independent of the shortcuts),
   // then click into its terminal.

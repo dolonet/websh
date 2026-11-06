@@ -27,7 +27,9 @@ $action  = (isset($_GET['action']) && is_string($_GET['action'])) ? $_GET['actio
 // SSE stream needs a longer execution window than the JSON endpoints.
 // Some shared hosts cap this hard, in which case the stream is killed
 // after the cap and the browser falls back to long-poll automatically.
-if ($action === 'stream') {
+// A sealed request may carry the stream too (its action is inside the
+// encrypted frame), so it gets the same window.
+if ($action === 'stream' || $action === 'sealed') {
     @set_time_limit(0);
 } else {
     @set_time_limit(55);
@@ -40,7 +42,7 @@ if (!defined('CURLOPT_UNIX_SOCKET_PATH')) {
     config_error('PHP curl lacks Unix socket support (needs PHP 7.0.7+ and libcurl 7.40+)');
 }
 
-if ($action !== 'stream') {
+if ($action !== 'stream' && $action !== 'sealed') {
     header('Content-Type: application/json');
     header('Cache-Control: no-cache, no-store, must-revalidate');
 }
@@ -128,6 +130,7 @@ switch ($action) {
     case 'stream':   proxy_stream($URL);   break;
     case 'download': proxy_download($URL); break;
     case 'upload':   proxy_upload($URL);   break;
+    case 'sealed':   proxy_sealed($URL);   break;
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
@@ -331,8 +334,14 @@ function proxy_upload($url) {
     curl_setopt($ch, CURLOPT_INFILE, $in);
     curl_setopt($ch, CURLOPT_INFILESIZE, $len);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    // A piece is raw bytes, or the same bytes as {"b64": ...} JSON when
+    // binary uploads are blocked on the user's machine: keep its type,
+    // the backend decodes by it.
+    $ctype = isset($_SERVER['CONTENT_TYPE']) ? (string) $_SERVER['CONTENT_TYPE'] : '';
+    $semi = strpos($ctype, ';');
+    $ctype = strtolower(trim($semi === false ? $ctype : substr($ctype, 0, $semi)));
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
-        'Content-Type: application/octet-stream',
+        'Content-Type: ' . ($ctype === 'application/json' ? 'application/json' : 'application/octet-stream'),
         'Content-Length: ' . $len,
     )));
     curl_setopt($ch, CURLOPT_TIMEOUT, 0);
@@ -507,6 +516,75 @@ function proxy_stream($url) {
     if (!$sent_headers) {
         // curl never received a response status line — treat as gateway
         // failure rather than letting PHP emit its default text/html.
+        http_response_code(502);
+        header('Content-Type: application/json');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+    }
+}
+
+// Sealed channel (docs/protocol.md "Sealed channel"): a JSON POST body
+// {"f": base64} and a text/event-stream reply (one base64 frame per
+// event) that may carry the output stream or a download inside. The
+// body is passed verbatim; the reply is passed
+// verbatim and UNBUFFERED, chunk by chunk as the backend writes it, and
+// its status is the backend's (410 "channel unknown" makes the browser
+// open a new channel, so it must not become a 200 or a 502).
+function proxy_sealed($url) {
+    $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+    if ($method !== 'POST') {
+        header('HTTP/1.1 405 Method Not Allowed');
+        header('Content-Type: application/json');
+        echo '{"error":"method not allowed"}';
+        return;
+    }
+    ignore_user_abort(true);   // see proxy_stream
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('output_buffering', '0');
+    @ini_set('implicit_flush', '1');
+    while (ob_get_level() > 0) { ob_end_clean(); }
+    @ob_implicit_flush(true);
+
+    $sent_headers = false;
+    $ch = backend_curl($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents('php://input'));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+    curl_setopt($ch, CURLOPT_HEADER, false);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 3600);   // as proxy_stream
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
+        'Content-Type: application/json',
+        'Expect:',
+    )));
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION,
+        function ($ch, $header) use (&$sent_headers) {
+            $len = strlen($header);
+            $h = trim($header);
+            if (!$sent_headers
+                    && preg_match('#^HTTP/\S+\s+(\d+)\b#', $h, $m)) {
+                $code = intval($m[1]);
+                http_response_code($code);
+                header('Cache-Control: no-cache');
+                if ($code === 200) {
+                    header('Content-Type: text/event-stream');
+                    header('X-Accel-Buffering: no');
+                } else {
+                    header('Content-Type: application/json');
+                }
+                $sent_headers = true;
+            }
+            return $len;
+        });
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
+        echo $data;
+        @flush();
+        if (connection_aborted()) return 0;
+        return strlen($data);
+    });
+    $ok = curl_exec($ch);
+    $err = curl_error($ch);
+    release_curl($ch);
+    if (!$sent_headers) {
         http_response_code(502);
         header('Content-Type: application/json');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));

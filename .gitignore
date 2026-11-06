@@ -16,3 +16,4 @@ tests/e2e/local.env.sh
 # Machine-specific notes for agents and people (docs/local-notes.md)
 AGENTS.local.md
 CLAUDE.local.md
+websh.sealed.key

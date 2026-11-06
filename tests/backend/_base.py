@@ -29,6 +29,15 @@ if REPO_ROOT not in sys.path:
 # outside the repo) — sanitize before the import.
 os.environ.pop("WEBSH_CONFIG", None)
 
+# The sealed-mode identity key is created on first use, by default next
+# to the vault store - for an in-process test server that is the cwd,
+# i.e. the repository root. Every in-process server of the suite shares
+# one throwaway key instead (the identity is loaded once per process).
+_SEALED_KEY_DIR = tempfile.mkdtemp(prefix="websh-test-sealed-key-")
+os.environ["WEBSH_SEALED_KEY_FILE"] = os.path.join(_SEALED_KEY_DIR, "websh.sealed.key")
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, _SEALED_KEY_DIR, True)
+
 import server
 
 

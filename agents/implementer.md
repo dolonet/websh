@@ -26,7 +26,7 @@ with the reason; it is not yours to change.
 the checks say now; anything you could not do or did not check.
 Never say "done" for what you did not see pass.
 
-**Constraints that are not negotiable:** stdlib-only Python that runs
-on 3.9; a single `server.py` and a single `websh.js`; wire-protocol
+**Constraints that are not negotiable:** stdlib-only Python (tested on
+3.9 and 3.12); a single `server.py` and a single `websh.js`; wire-protocol
 additions must be ignorable by old clients; no secrets in code,
 commits or logs; no commit trailers naming a tool.

@@ -50,5 +50,9 @@ export async function run({ b, t, port }) {
     await b.type(i, `rm -f ~/${name}\r`);
   }
   t.ok(cuts === 2, `the connection was really cut twice (${cuts})`);
-  t.ok(b.requests.upload >= 3 + cuts, `sent in pieces, cut pieces retried: ${b.requests.upload} upload requests`);
+  // Under E2E_SEALED=1 b.requests.upload counts the sealed upload pieces
+  // (lib.mjs _countSealed), padding-only ones included; those are named.
+  const pad = b.requests.upload_pad || 0;
+  t.ok(b.requests.upload - pad >= 3 + cuts, `sent in pieces, cut pieces retried: ${b.requests.upload} upload requests` +
+       (process.env.E2E_SEALED === '1' ? ` (sealed, ${pad} of them padding-only)` : ''));
 }

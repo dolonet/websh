@@ -44,9 +44,11 @@ function api(action, opts) {
   // that must tell "the session is gone" (404) from "the server or a
   // proxy hiccuped" (503 busy, 502/504, 429) can - an {error} alone
   // can't say which.
-  return fetch(url, init).then(r => r.json().catch(() => ({
-    error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
-           ' (unexpected reply from the server or a proxy)'}))
+  return apiFetch(url, init).then(r => r.json().catch(e => {
+    if (e && e.sealedDeliveryUnknown) throw e;
+    return {error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
+                   ' (unexpected reply from the server or a proxy)'};
+  })
     .then(j => {
       if (j && typeof j === 'object') {
         try { Object.defineProperty(j, '_status', {value: r.status}); } catch (e) {}
@@ -76,6 +78,757 @@ const CAP_CODES = ['rate_limited', 'session_cap_per_ip',
 function isCapacityError(r, msg) {
   if (r && CAP_CODES.indexOf(r.code) >= 0) return true;
   return /too many (connection attempts|active sessions|background sessions)/i.test(msg || '');
+}
+
+// ── Sealed channel ─────────────────────────────────────────────────
+// "Encrypt traffic inside websh" (settings.sealed, off by default): a
+// second layer under TLS for networks that read HTTPS (a corporate root
+// CA, DPI). Off, nothing here runs and every request is exactly what it
+// was. On, every API call except config and ping goes as ONE AES-GCM
+// frame to ?action=sealed&c=<channel> (as JSON {"f": base64}), carrying
+// the real method, action, query and body; the reply comes back as
+// text/event-stream, one `data: <base64 frame>` event per frame, read as
+// it arrives, so the output stream and downloads still stream. Text on
+// both legs: an HTTPS-intercepting security product refused binary
+// (application/octet-stream) POSTs outright. Wire contract: docs/protocol.md "Sealed channel".
+//
+// The decision is made per call, at the boundary: apiFetch() for fetch,
+// openEventSource() for the output stream, newApiXhr() for uploads. The
+// call sites keep their own logic - retries, stall detection, cursors -
+// and see a normal Response / EventSource / XHR.
+//
+// Never a silent downgrade: while the setting is on, a call that cannot
+// be sealed (no channel, the server cannot seal, the key changed and was
+// not trusted) is answered by a local 503 {error, code:"sealed_unavailable"}
+// that was never sent anywhere - so the input queue resends it (I2: the
+// reply proves the keys did not reach the PTY), the output loops retry
+// inside their budget and then show the failure, connect shows the text.
+// It is never sent in plain form instead.
+const SEALED_PLAIN_ACTIONS = {config: 1, ping: 1};
+const SEALED_WIRE_VERSION = 2;
+const SEALED_PIN_KEY = 'websh_sealed_pin';
+const SEALED_RETRY_MS = 2000;     // a failed open is not retried sooner
+let _seal = null;                 // the open channel: {id, kc, ks, aadC, aadS, seq, fp}
+let _sealOpening = null;          // Promise while a channel is being opened
+let _sealFailAt = 0, _sealFailMsg = '';
+let _sealRefused = null;          // {old, fresh}: a changed key the user did not trust
+let _sealToastAt = 0;
+let _sealLost = 0;                // 410s in a row that a fresh channel did not cure
+// Input's stall timer needs to distinguish an unsent handshake wait
+// from a request already handed to fetch. Weak keys need no teardown.
+const _sealSentRequests = new WeakMap();
+// Made on first use: a page that never seals needs none of this.
+let _sealEncoder = null;
+const _sealEnc = {encode: s => (_sealEncoder || (_sealEncoder = new TextEncoder())).encode(s)};
+
+function sealedOn() { return !!(settings && settings.sealed); }
+
+// stream.cancel() / reader.cancel() return a promise that rejects when
+// the stream already failed (an aborted fetch): closing must never
+// surface as an unhandled rejection in the page.
+function _quietCancel(x) {
+  try {
+    let pr = x && x.cancel && x.cancel();
+    if (pr && pr.catch) pr.catch(() => {});
+  } catch (e) {}
+}
+
+function _sealErr(msg) { let e = new Error(msg); e.sealed = true; return e; }
+
+function _u8cat() {
+  let n = 0;
+  for (let i = 0; i < arguments.length; i++) n += arguments[i].length;
+  let out = new Uint8Array(n), o = 0;
+  for (let i = 0; i < arguments.length; i++) { out.set(arguments[i], o); o += arguments[i].length; }
+  return out;
+}
+// Base64 in pieces of 24 KiB (a multiple of 3, so the pieces join into
+// one valid string): no argument list or binary string the size of a
+// multi-MB upload piece.
+function _b64enc(u8) {
+  let out = [];
+  for (let i = 0; i < u8.length; i += 0x6000) {
+    out.push(btoa(String.fromCharCode.apply(null, u8.subarray(i, i + 0x6000))));
+  }
+  return out.join('');
+}
+function _b64dec(str) {
+  let s = atob(String(str || '')), u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return u;
+}
+
+function sealedPin() {
+  try { return localStorage.getItem(storageKey(SEALED_PIN_KEY)) || ''; } catch (e) { return ''; }
+}
+function _sealedPinSet(fp) {
+  try { localStorage.setItem(storageKey(SEALED_PIN_KEY), fp); } catch (e) {}
+}
+
+// SHA-256 of the identity key's SPKI DER, uppercase hex in groups of 4:
+// the same text the server prints at start ("sealed channel: identity").
+async function sealedFingerprint(der) {
+  let h = new Uint8Array(await crypto.subtle.digest('SHA-256', der));
+  let hex = Array.from(h, b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+  return hex.match(/.{4}/g).join(' ');
+}
+
+function sealedServerAvailable() {
+  // Unknown until /api/config answered: then try, the server says 501.
+  if (!serverConfig) return true;
+  return !!(serverConfig.sealed && serverConfig.sealed.available);
+}
+
+// Pending answer of the "server key has changed" dialog.
+let _sealedMismatchResolve = null;
+let _sealedMismatchTrap = null;
+function askSealedMismatch(oldFp, newFp) {
+  if (!_sealedMismatchTrap) {
+    _sealedMismatchTrap = makeModalTrap('ovSealedMismatch', () => sealedMismatchAnswer(false));
+  }
+  return new Promise(resolve => {
+    _sealedMismatchResolve = resolve;
+    $('sealedOldFp').textContent = oldFp;
+    $('sealedNewFp').textContent = newFp;
+    _sealedMismatchTrap.open(() => $('sealedCancelBtn'));
+  });
+}
+function sealedMismatchAnswer(trust) {
+  if (_sealedMismatchTrap) _sealedMismatchTrap.close();
+  let r = _sealedMismatchResolve;
+  _sealedMismatchResolve = null;
+  if (r) r(!!trust);
+}
+
+// Handshake: ephemeral ECDH, the reply's signature checked with the
+// identity key it carries, that key checked against the pin - all
+// before the channel is used for anything.
+async function _sealOpenChannel() {
+  let subtle = (typeof crypto !== 'undefined') && crypto.subtle;
+  if (!subtle) throw _sealErr('this browser offers no Web Crypto here (the page needs HTTPS)');
+  if (!sealedServerAvailable()) throw _sealErr('the server cannot encrypt (no cryptography module)');
+  if (_sealRefused) throw _sealErr('the server key changed and was not trusted');
+  let kp = await subtle.generateKey({name: 'ECDH', namedCurve: 'P-256'}, false, ['deriveBits']);
+  let cpub = new Uint8Array(await subtle.exportKey('raw', kp.publicKey));
+  let r;
+  try {
+    r = await fetch(`${API}?action=seal_open`, {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({wire: SEALED_WIRE_VERSION, pub: _b64enc(cpub)})});
+  } catch (e) { throw _sealErr('the server cannot be reached'); }
+  let j = await r.json().catch(() => null);
+  if (!r.ok || !j || typeof j.channel !== 'string' || !/^[0-9a-f]{32}$/.test(j.channel)) {
+    throw _sealErr((j && typeof j.error === 'string' ? j.error : 'HTTP ' + r.status) +
+                   ' (opening the encrypted channel)');
+  }
+  if (j.wire !== SEALED_WIRE_VERSION) {
+    throw _sealErr('encrypted traffic requires matching server and client versions; update websh and reload this page');
+  }
+  let spub = _b64dec(j.pub), idDer = _b64dec(j.identity), sig = _b64dec(j.sig);
+  let ok = false;
+  try {
+    let idKey = await subtle.importKey('spki', idDer, {name: 'ECDSA', namedCurve: 'P-256'}, false, ['verify']);
+    ok = await subtle.verify({name: 'ECDSA', hash: 'SHA-256'}, idKey, sig,
+                             _u8cat(cpub, spub, _sealEnc.encode(j.channel + ':sealed:' + SEALED_WIRE_VERSION)));
+  } catch (e) { ok = false; }
+  if (!ok) throw _sealErr('the server’s signature does not verify');
+  let fp = await sealedFingerprint(idDer);
+  let pin = sealedPin();
+  if (pin && pin !== fp) {
+    if (!await askSealedMismatch(pin, fp)) {
+      _sealRefused = {old: pin, fresh: fp};
+      throw _sealErr('the server key changed and was not trusted');
+    }
+  }
+  if (pin !== fp) _sealedPinSet(fp);
+  let srv = await subtle.importKey('raw', spub, {name: 'ECDH', namedCurve: 'P-256'}, false, []);
+  let bits = await subtle.deriveBits({name: 'ECDH', public: srv}, kp.privateKey, 256);
+  let hk = await subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+  let salt = _u8cat(cpub, spub);
+  let dk = info => subtle.deriveKey({name: 'HKDF', hash: 'SHA-256', salt: salt, info: _sealEnc.encode(info)},
+                                    hk, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
+  return {id: j.channel, kc: await dk('websh sealed c2s'), ks: await dk('websh sealed s2c'),
+          aadC: _sealEnc.encode(j.channel + ':c2s'), aadS: _sealEnc.encode(j.channel + ':s2c'),
+          seq: 0, fp: fp};
+}
+
+// The channel, opened lazily by the first sealed call and shared by
+// every pane of the page.
+function sealChannel() {
+  if (_seal) return Promise.resolve(_seal);
+  if (_sealOpening) return _sealOpening;
+  if (Date.now() - _sealFailAt < _sealBackoffMs()) return Promise.reject(_sealErr(_sealFailMsg));
+  _sealOpening = _sealOpenChannel().then(ch => {
+    _sealOpening = null;
+    _seal = ch;
+    _sealFailAt = 0;
+    renderSealedState();
+    return ch;
+  }, e => {
+    _sealOpening = null;
+    _sealFailAt = Date.now();
+    _sealFailMsg = (e && e.message) || String(e);
+    renderSealedState();
+    let now = Date.now();
+    if (now - _sealToastAt > 15000) {
+      _sealToastAt = now;
+      showToast('Encrypted traffic: ' + _sealFailMsg + '. Nothing was sent unencrypted.', 'err');
+    }
+    throw (e && e.sealed) ? e : _sealErr(_sealFailMsg);
+  });
+  return _sealOpening;
+}
+
+// How long a failed open (or a channel the server forgot again at once)
+// keeps further calls local: 2 s, doubling per repeat up to 8 s - well
+// under INPUT_HOLD_MS, so keys held through an outage still go out once
+// the server answers again.
+function _sealBackoffMs() {
+  return Math.min(8000, SEALED_RETRY_MS * Math.pow(2, Math.max(0, _sealLost - 1)));
+}
+
+// Milliseconds until a sealed call may try the network again (0: now).
+function _sealWaitMs() {
+  if (_seal || _sealOpening || !sealedOn()) return 0;
+  let w = _sealFailAt + _sealBackoffMs() - Date.now();
+  return w > 0 ? w : 0;
+}
+
+// The server forgot a channel that was opened a moment ago: a restart
+// loop, or channels dropped faster than they are used. Resending again
+// would only repeat it - fail the call (locally, as an open failure)
+// and back off.
+function _sealLostAgain() {
+  _sealLost++;
+  _sealFailAt = Date.now();
+  _sealFailMsg = 'the server keeps losing the encrypted channel';
+  _seal = null;
+  renderSealedState();
+  return _sealErr(_sealFailMsg);
+}
+
+function _sealUnavailableResponse(e) {
+  return new Response(JSON.stringify({
+    error: 'encrypted traffic: ' + ((e && e.message) || 'channel unavailable'),
+    code: 'sealed_unavailable'}),
+    {status: 503, headers: {'Content-Type': 'application/json'}});
+}
+
+function _sealReplyError(ch, mutation, context) {
+  if (context && context.error) return context.error;
+  if (_seal === ch) { _seal = null; renderSealedState(); }
+  let message = 'Encrypted reply could not be verified.';
+  if (mutation) message += ' The request may have completed. Check the result before trying again.';
+  let e = new TypeError(message);
+  if (mutation) {
+    e.sealedDeliveryUnknown = true;
+    showToast(message, 'warn');
+  }
+  if (context) context.error = e;
+  return e;
+}
+
+// Room for the header line of a padded (upload) request: the header is
+// space-filled to this length, so a piece's size on the wire does not
+// change with the digits of its offset or with "pad": true.
+const SEALED_HEADER_ROOM = 1024;
+
+async function _sealFrame(ch, hdr, body, padHeader) {
+  let head = _sealEnc.encode(JSON.stringify(hdr));
+  if (padHeader && head.length < SEALED_HEADER_ROOM - 1) {
+    let room = new Uint8Array(SEALED_HEADER_ROOM - 1).fill(0x20);
+    room.set(head, 0);
+    head = room;
+  }
+  let pt = _u8cat(head, new Uint8Array([0x0a]), body);
+  let iv = crypto.getRandomValues(new Uint8Array(12));
+  let ct = new Uint8Array(await crypto.subtle.encrypt(
+    {name: 'AES-GCM', iv: iv, additionalData: ch.aadC}, ch.kc, pt));
+  return _u8cat(iv, ct);
+}
+
+// Reads the reply's frames - one SSE event `data: <base64(frame)>` each
+// (text, not binary: an HTTPS-intercepting security product on the
+// owner's machine refused application/octet-stream outright) - from a
+// byte source, as they arrive, and decrypts them. `pull()` gives the
+// next chunk of bytes or null at the end.
+function _sealFrameReader(ch, pull, cancel, requestSeq) {
+  let dec = new TextDecoder();
+  let text = '', scanned = 0, eof = false;
+  let frameIndex = 0;
+  // The next complete event's data, or null at the end of the bytes.
+  async function nextEvent() {
+    for (;;) {
+      let m = /\r?\n\r?\n/g;
+      m.lastIndex = Math.max(0, scanned - 3);
+      let hit = m.exec(text);
+      if (hit) {
+        let ev = text.slice(0, hit.index);
+        text = text.slice(hit.index + hit[0].length);
+        scanned = 0;
+        let data = [];
+        ev.split(/\r?\n/).forEach(line => {
+          if (line.indexOf('data:') === 0) data.push(line.slice(line[5] === ' ' ? 6 : 5));
+        });
+        if (data.length) return data.join('');
+        continue;          // a comment or an empty event
+      }
+      scanned = text.length;
+      if (eof) {
+        if (text.trim()) throw new TypeError('encrypted reply cut short');
+        return null;
+      }
+      let v = await pull();
+      if (v === null) { eof = true; text += dec.decode(); }
+      else if (v.length) text += dec.decode(v, {stream: true});
+    }
+  }
+  return {
+    // The next plaintext, or null when the bytes ended between frames.
+    next: async () => {
+      let b = await nextEvent();
+      if (b === null) return null;
+      let f;
+      try { f = _b64dec(b); } catch (e) { throw new TypeError('bad encrypted frame'); }
+      if (f.length < 28) throw new TypeError('bad encrypted frame');
+      // A page shares its channel among requests. Capture the request's
+      // seq, never ch.seq (which other requests advance), and bind each
+      // header/body/end frame to its exact position in this response.
+      let aad = _u8cat(ch.aadS, _sealEnc.encode(':' + SEALED_WIRE_VERSION + ':' + requestSeq + ':' + frameIndex));
+      let plain = await crypto.subtle.decrypt(
+        {name: 'AES-GCM', iv: f.subarray(0, 12), additionalData: aad}, ch.ks, f.subarray(12));
+      frameIndex++;
+      return new Uint8Array(plain);
+    },
+    cancel: () => { try { cancel && cancel(); } catch (e) {} }
+  };
+}
+
+function _sealReaderOf(ch, raw, requestSeq) {
+  let reader = raw.body && raw.body.getReader ? raw.body.getReader() : null;
+  if (reader) {
+    return _sealFrameReader(ch, async () => {
+      let x = await reader.read();
+      return x.done ? null : x.value;
+    }, () => _quietCancel(reader), requestSeq);
+  }
+  // No streaming body in this browser: the whole reply at once.
+  let whole = raw.arrayBuffer().then(b => new Uint8Array(b));
+  whole.catch(() => {});
+  let given = false;
+  return _sealFrameReader(ch, async () => {
+    if (given) return null;
+    given = true;
+    return await whole;
+  }, null, requestSeq);
+}
+
+// A sealed reply as a normal Response: the inner status and headers,
+// and a body that yields each frame as it is decrypted. Without the
+// empty end frame the body errors, as a cut connection would.
+async function _sealResponse(ch, raw, requestSeq, failure) {
+  let rd = _sealReaderOf(ch, raw, requestSeq);
+  let fail = e => { rd.cancel(); return failure ? failure() : e; };
+  let read = async () => { try { return await rd.next(); } catch (e) { throw fail(e); } };
+  let head = await read();
+  if (head === null || !head.length) throw fail(new TypeError('encrypted reply cut short'));
+  let h;
+  try { h = JSON.parse(new TextDecoder().decode(head)); }
+  catch (e) { throw fail(e); }
+  let status = h && h.status | 0;
+  if (!(status >= 200 && status <= 599)) throw fail(new TypeError('bad encrypted reply'));
+  let headers = new Headers();
+  let hh = (h && h.headers) || {};
+  Object.keys(hh).forEach(k => { try { headers.set(k, String(hh[k])); } catch (e) {} });
+  if (status === 204 || status === 205 || status === 304) {
+    let end = await read();
+    if (end === null || end.length) throw fail(new TypeError('encrypted reply cut short'));
+    rd.cancel();
+    return new Response(null, {status: status, headers: headers});
+  }
+  let body = new ReadableStream({
+    pull: async ctl => {
+      let p;
+      try { p = await read(); } catch (e) { ctl.error(e); return; }
+      if (p === null) { ctl.error(fail(new TypeError('encrypted reply cut short'))); return; }
+      if (!p.length) { ctl.close(); return; }
+      ctl.enqueue(p);
+    },
+    cancel: () => rd.cancel()
+  });
+  return new Response(body, {status: status, headers: headers});
+}
+
+// Only authenticated inner replies describe an API outcome. An outer
+// 410/503 can be forged after execution: renew for future requests, but
+// never resend a mutation or expose an unverified busy/restarting code.
+// Read-only GET requests may safely reopen a lost channel and retry.
+async function sealedFetch(method, action, query, body, opts) {
+  opts = opts || {};
+  let asked = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    let ch;
+    try { ch = await sealChannel(); }
+    catch (e) { return _sealUnavailableResponse(e); }
+    // The channel can take long to come (the "key changed" dialog left
+    // open, a slow open): a call its caller gave up on meanwhile is not
+    // sent, and keys are never delivered late (I3: held keys are never
+    // older than INPUT_HOLD_MS) - they are dropped, and the user told.
+    if (opts.signal && opts.signal.aborted) {
+      if (action === 'input') showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
+      throw new DOMException('aborted', 'AbortError');
+    }
+    if (action === 'input' && Date.now() - asked > INPUT_HOLD_MS) {
+      showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
+      return new Response(JSON.stringify({error: 'encrypted traffic: keys too old to send',
+                                          code: 'sealed_stale'}),
+                          {status: 408, headers: {'Content-Type': 'application/json'}});
+    }
+    let hdr = Object.assign({seq: ++ch.seq, method: method, action: action, query: query || {}},
+                            opts.extra || {});
+    let frame = await _sealFrame(ch, hdr, body || new Uint8Array(0));
+    let mutation = method !== 'GET';
+    let context = {ch: ch, error: null};
+    if (mutation && opts.signal) _sealSentRequests.set(opts.signal, context);
+    let r;
+    try {
+      r = await fetch(`${API}?action=sealed&c=${ch.id}`, {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{"f":"' + _b64enc(frame) + '"}', signal: opts.signal});
+    } catch (e) { throw _sealReplyError(ch, mutation, context); }
+    if (r.status === 410 && !mutation) {
+      if (attempt > 0) return _sealUnavailableResponse(_sealLostAgain());
+      if (_seal === ch) { _seal = null; renderSealedState(); }
+      continue;
+    }
+    if (r.status !== 200) {
+      _quietCancel(r.body);
+      throw _sealReplyError(ch, mutation, context);
+    }
+    _sealLost = 0;
+    return await _sealResponse(ch, r, hdr.seq, () => _sealReplyError(ch, mutation, context));
+  }
+}
+
+async function _sealBodyBytes(b) {
+  if (b === undefined || b === null) return new Uint8Array(0);
+  if (typeof b === 'string') return _sealEnc.encode(b);
+  if (b instanceof Uint8Array) return b;
+  if (b instanceof ArrayBuffer) return new Uint8Array(b);
+  if (ArrayBuffer.isView(b)) return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  if (typeof Blob !== 'undefined' && b instanceof Blob) return new Uint8Array(await b.arrayBuffer());
+  return _sealEnc.encode(String(b));
+}
+
+// fetch() for every API URL (`${API}?action=...`): plain while the
+// setting is off, sealed while it is on.
+function apiFetch(url, init) {
+  if (!sealedOn()) return fetch(url, init);
+  let u = new URL(url, location.href);
+  let action = u.searchParams.get('action') || '';
+  if (SEALED_PLAIN_ACTIONS[action]) return fetch(url, init);
+  let query = {};
+  u.searchParams.forEach((v, k) => { if (k !== 'action') query[k] = v; });
+  init = init || {};
+  let method = String(init.method || 'GET').toUpperCase();
+  return _sealBodyBytes(init.body).then(b =>
+    sealedFetch(method, action, query, b, {signal: init.signal}));
+}
+
+// The output stream read over a sealed request: the EventSource surface
+// websh uses (addEventListener, onerror/onopen/onmessage, readyState,
+// close) with its behaviour - a dropped or ended connection is retried
+// after ~3 s from the id of the last event (Last-Event-ID semantics,
+// sent as since=), a non-200 reply closes it for good (readyState 2).
+function SealedEventSource(url) {
+  this.url = url;
+  this.readyState = 0;
+  this.onopen = this.onerror = this.onmessage = null;
+  this._l = {};
+  this._ctl = null;
+  this._lastId = null;
+  this._retryMs = 3000;
+  this._timer = null;
+  this._connect();
+}
+SealedEventSource.prototype.addEventListener = function (t, fn) {
+  (this._l[t] = this._l[t] || []).push(fn);
+};
+SealedEventSource.prototype.removeEventListener = function (t, fn) {
+  let a = this._l[t]; if (!a) return;
+  let i = a.indexOf(fn); if (i >= 0) a.splice(i, 1);
+};
+SealedEventSource.prototype._fire = function (type, ev) {
+  ev.type = type;
+  ev.target = this;
+  let run = fn => { try { fn.call(this, ev); } catch (e) { setTimeout(() => { throw e; }); } };
+  (this._l[type] || []).slice().forEach(run);
+  let h = (type === 'open' || type === 'error' || type === 'message') ? this['on' + type] : null;
+  if (typeof h === 'function') run(h);
+};
+SealedEventSource.prototype.close = function () {
+  this.readyState = 2;
+  clearTimeout(this._timer);
+  if (this._ctl) { try { this._ctl.abort(); } catch (e) {} this._ctl = null; }
+};
+SealedEventSource.prototype._connect = function () {
+  if (this.readyState === 2) return;
+  let u = new URL(this.url, location.href);
+  if (this._lastId !== null && this._lastId !== '') u.searchParams.set('since', this._lastId);
+  let ctl = this._ctl = new AbortController();
+  let mine = () => this._ctl === ctl && this.readyState !== 2;
+  apiFetch(u.toString(), {signal: ctl.signal}).then(r => {
+    if (!mine()) { _quietCancel(r.body); return; }
+    let ct = (r.headers.get('Content-Type') || '').toLowerCase();
+    if (r.status !== 200 || ct.indexOf('text/event-stream') !== 0 || !r.body) {
+      _quietCancel(r.body);
+      this.readyState = 2;
+      this._ctl = null;
+      this._fire('error', {});
+      return;
+    }
+    this.readyState = 1;
+    this._fire('open', {});
+    return this._read(r.body.getReader(), mine);
+  }).then(() => {
+    if (mine()) this._dropped();        // the stream ended: reconnect
+  }, () => {
+    if (mine()) this._dropped();        // network error: reconnect
+  });
+};
+SealedEventSource.prototype._dropped = function () {
+  this.readyState = 0;
+  this._ctl = null;
+  this._fire('error', {});
+  if (this.readyState === 2) return;    // a listener closed it
+  clearTimeout(this._timer);
+  this._timer = setTimeout(() => this._connect(), this._retryMs);
+};
+SealedEventSource.prototype._read = async function (reader, mine) {
+  let dec = new TextDecoder();
+  let text = '', ev = '', data = [], hasData = false;
+  for (;;) {
+    let x = await reader.read();
+    if (!mine()) { _quietCancel(reader); return; }
+    if (x.done) return;
+    text += dec.decode(x.value, {stream: true});
+    let m;
+    while ((m = /\r\n|\r|\n/.exec(text)) !== null) {
+      // A lone \r at the very end may be the first half of \r\n.
+      if (m[0] === '\r' && m.index === text.length - 1) break;
+      let line = text.slice(0, m.index);
+      text = text.slice(m.index + m[0].length);
+      if (line === '') {
+        if (hasData) {
+          this._fire(ev || 'message', {data: data.join('\n'), lastEventId: this._lastId || ''});
+          if (!mine()) { _quietCancel(reader); return; }
+        }
+        ev = ''; data = []; hasData = false;
+        continue;
+      }
+      if (line[0] === ':') continue;
+      let c = line.indexOf(':');
+      let field = c < 0 ? line : line.slice(0, c);
+      let val = c < 0 ? '' : line.slice(c + 1);
+      if (val[0] === ' ') val = val.slice(1);
+      if (field === 'event') ev = val;
+      else if (field === 'data') { data.push(val); hasData = true; }
+      else if (field === 'id') { if (val.indexOf('\0') < 0) this._lastId = val; }
+      else if (field === 'retry') { if (/^\d+$/.test(val)) this._retryMs = parseInt(val, 10); }
+    }
+  }
+};
+
+// EventSource for the output stream (`${API}?action=stream&...`).
+function openEventSource(url) {
+  return sealedOn() ? new SealedEventSource(url) : new EventSource(url);
+}
+
+// ── Sealed uploads: same-size pieces ────────────────────────────────
+// What crosses the network must not tell a file's size. Within one
+// file every piece is padded to the same size P = min(piece size, T),
+// where T is the file's size rounded up to a bucket (64 KiB x 2^k x
+// {1, 1.25, 1.5, 1.75}, at least 64 KiB); after the real data, pad-only
+// pieces ("pad": true, nothing written) are sent until T is covered,
+// plus one more half of the time. Two files in the same bucket look
+// the same on the wire (up to that extra piece). "len" in the header
+// tells the server how many bytes of the piece are real.
+function sealedUploadBucket(size) {
+  let base = 64 * 1024;
+  if (size <= base) return base;
+  let p = base;
+  while (p * 2 < size) p *= 2;     // p < size <= 2p
+  for (let f of [1.25, 1.5, 1.75, 2]) {
+    if (p * f >= size) return Math.ceil(p * f);
+  }
+  return p * 2;
+}
+
+// An XMLHttpRequest look-alike for one sealed upload request: open() /
+// setRequestHeader() / send(blob) / abort(), timeout, upload.onprogress,
+// onload / onerror / ontimeout, status and responseText. The real XHR
+// underneath carries the frame (so upload progress events stay real);
+// progress is reported in real bytes of this piece. `pad` = {to, pad}:
+// pad the body to `to` bytes, or send a pad-only piece.
+function SealedXhr(pad) {
+  this._pad = pad || null;
+  this.status = 0;
+  this.responseText = '';
+  this.readyState = 0;
+  this.timeout = 0;
+  this.upload = {onprogress: null};
+  this.onload = this.onerror = this.ontimeout = this.onabort = null;
+  this._x = null;
+  this._aborted = false;
+}
+SealedXhr.prototype.open = function (method, url) { this._method = method; this._url = url; this.readyState = 1; };
+SealedXhr.prototype.setRequestHeader = function () {};
+SealedXhr.prototype.abort = function () {
+  this._aborted = true;
+  if (this._x) { try { this._x.abort(); } catch (e) {} }
+};
+SealedXhr.prototype._finish = function (status, text) {
+  if (this._aborted) return;
+  this.status = status;
+  this.responseText = text;
+  this.readyState = 4;
+  if (this.onload) this.onload();
+};
+SealedXhr.prototype._fail = function (kind) {
+  if (this._aborted) return;
+  this.status = 0;
+  this.readyState = 4;
+  let h = kind === 'timeout' ? this.ontimeout : this.onerror;
+  if (h) h();
+};
+SealedXhr.prototype.send = function (blob) {
+  let u = new URL(this._url, location.href);
+  let action = u.searchParams.get('action') || '';
+  let query = {};
+  u.searchParams.forEach((v, k) => { if (k !== 'action') query[k] = v; });
+  let pad = this._pad;
+  let deadline = this.timeout > 0 ? Date.now() + this.timeout : 0;
+  let go = async () => {
+    let real = await _sealBodyBytes(blob);
+    if (pad && pad.pad) real = new Uint8Array(0);
+    let body = real, extra = {};
+    if (pad) {
+      let to = Math.max(pad.to || 0, real.length);
+      body = new Uint8Array(to);
+      body.set(real, 0);
+      // getRandomValues fills at most 64 KiB per call.
+      for (let o = real.length; o < to; o += 65536) {
+        crypto.getRandomValues(body.subarray(o, Math.min(to, o + 65536)));
+      }
+      extra.len = real.length;
+      if (pad.pad) extra.pad = true;
+    }
+    for (;;) {
+      if (this._aborted) return;
+      let ch;
+      try { ch = await sealChannel(); }
+      catch (e) {
+        this._finish(503, JSON.stringify({error: 'encrypted traffic: ' + e.message, code: 'sealed_unavailable'}));
+        return;
+      }
+      let hdr = Object.assign({seq: ++ch.seq, method: String(this._method || 'POST').toUpperCase(),
+                               action: action, query: query}, extra);
+      let wire = '{"f":"' + _b64enc(await _sealFrame(ch, hdr, body, !!pad)) + '"}';
+      if (this._aborted) return;
+      let res = await new Promise(resolve => {
+        let x = this._x = new XMLHttpRequest();
+        x.open('POST', `${API}?action=sealed&c=${ch.id}`, true);
+        x.setRequestHeader('Content-Type', 'application/json');
+        if (deadline) x.timeout = Math.max(1, deadline - Date.now());
+        x.upload.onprogress = e => {
+          if (!this.upload.onprogress || !e.total) return;
+          let loaded = Math.floor(real.length * Math.min(1, e.loaded / e.total));
+          this.upload.onprogress({loaded: loaded, total: real.length, lengthComputable: true});
+        };
+        x.onload = () => resolve({x: x});
+        x.onerror = () => resolve({fail: 'error'});
+        x.ontimeout = () => resolve({fail: 'timeout'});
+        x.onabort = () => resolve({fail: 'abort'});
+        x.send(wire);
+      });
+      if (this._aborted || res.fail === 'abort') return;
+      if (res.fail) { this._fail(res.fail); return; }
+      let x = res.x;
+      if (x.status === 200) _sealLost = 0;
+      if (x.status !== 200) {
+        if (_seal === ch) { _seal = null; renderSealedState(); }
+        // This is unverified transport metadata, never an API result:
+        // a forged 409 size could otherwise finalize an incomplete file.
+        // Keep only cut/size signals needed by the safe positional upload
+        // retry layer. It, not this wrapper, decides whether to retry.
+        let t = x.responseText || '';
+        if (x.status === 413) {
+          this._finish(413, JSON.stringify({error: 'Encrypted upload request is too large.'}));
+        } else if (x.status === 400 && /client sent fewer bytes than Content-Length/.test(t)) {
+          this._finish(400, JSON.stringify({error: 'client sent fewer bytes than Content-Length'}));
+        } else if (x.status === 499) {
+          this._finish(499, JSON.stringify({error: 'encrypted upload connection closed'}));
+        } else this._fail('error');
+        return;
+      }
+      try {
+        let resp = await _sealResponse(ch, new Response(x.responseText || ''), hdr.seq,
+                                       () => _sealReplyError(ch, false));
+        let t = await resp.text();
+        this._finish(resp.status, t);
+      } catch (e) { this._fail('error'); }
+      return;
+    }
+  };
+  go().catch(() => this._fail('error'));
+};
+
+// XMLHttpRequest for an upload request: plain while the setting is off.
+function newApiXhr(pad) {
+  return sealedOn() ? new SealedXhr(pad) : new XMLHttpRequest();
+}
+
+// ── Sealed mode: badge and option ───────────────────────────────
+// Badge, pinned fingerprint and checkbox state.
+function renderSealedState() {
+  let on = sealedOn();
+  let b = $('sealedBadge');
+  if (b) {
+    let up = on && !!_seal;
+    b.classList.toggle('h', !up);
+    b.title = up ? 'Traffic is encrypted inside websh. Server key: ' + _seal.fp : '';
+  }
+  let cb = $('optSealed');
+  if (cb) {
+    cb.checked = on;
+    // Unavailable on this server: cannot be turned on, but a setting
+    // that is already on can always be turned off.
+    cb.disabled = !sealedServerAvailable() && !on;
+  }
+  let hint = $('optSealedHint');
+  if (hint) {
+    hint.textContent = sealedServerAvailable()
+      ? 'A second layer under TLS, for networks that inspect HTTPS.'
+      : 'Unavailable: the server has no cryptography module.';
+  }
+  let pinRow = $('optSealedPinRow'), pinEl = $('optSealedPin');
+  if (pinRow && pinEl) {
+    let pin = sealedPin();
+    pinRow.classList.toggle('h', !on);
+    pinEl.textContent = pin || 'none yet (trusted on first use)';
+  }
+}
+
+// The checkbox: takes effect at once. Every output channel restarts
+// through the new path from its cursor (nothing lost or shown twice);
+// a request already in flight finishes the way it was sent.
+function setSealed(on) {
+  settings.sealed = !!on;
+  saveSettings();
+  _sealRefused = null;
+  _sealFailAt = 0;
+  renderSealedState();
+  kickAllOutputs(true);
 }
 
 // ── Pane management ─────────────────────────────────────────────────
@@ -137,7 +890,10 @@ const DEFAULT_SETTINGS = {
   // Dotfiles hidden by default, as in every file manager and `ls`.
   fbShowHidden: false,
   // Ctrl+V pastes instead of sending ^V. See _ctrlVShouldPaste().
-  ctrlVPaste: true
+  ctrlVPaste: true,
+  // "Encrypt traffic inside websh" (see "Sealed channel"). Off: every
+  // request is exactly what it was before the option existed.
+  sealed: false
 };
 // id → [label, webfont-name-or-null, fallback-stack, google-weights]
 // webfont-name is the family loaded via Google Fonts; null = system
@@ -3022,7 +3778,7 @@ function exportTerminal() {
   // export. Pull the real buffer over the ControlMaster side-channel.
   if (p.persistent && p.sid) {
     let url = `${API}?action=tmux_capture&session_id=${encodeURIComponent(p.sid)}`;
-    fetch(url).then(r => {
+    apiFetch(url).then(r => {
       if (!r.ok) {
         return r.json().catch(() => ({error: 'capture failed'}))
           .then(j => Promise.reject(j.error || 'capture failed'));
@@ -3735,6 +4491,8 @@ function paneDiag(p, now) {
 
 function sendDiagBeacon() {
   if (_diagSent || typeof navigator === 'undefined' || !navigator.sendBeacon) return;
+  // Not sent at all while traffic is sealed: a beacon cannot be.
+  if (sealedOn()) return;
   let now = Date.now();
   let list = [];
   Object.values(panes).forEach(p => {
@@ -4047,7 +4805,7 @@ function maybeProbeSse(p, sid) {
   if (Date.now() - (p.sseDisabledAt || 0) < wait) return;
   let es;
   try {
-    es = new EventSource(`${API}?action=stream&session_id=${encodeURIComponent(sid)}` +
+    es = openEventSource(`${API}?action=stream&session_id=${encodeURIComponent(sid)}` +
                          `&since=${p.outCursor || 0}`);
   } catch (e) { return; }
   p.sseProbe = es;
@@ -4090,7 +4848,7 @@ function streamOutput(p) {
   let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}` +
             `&since=${p.outCursor || 0}`;
   let es;
-  try { es = new EventSource(url); }
+  try { es = openEventSource(url); }
   catch (e) {
     console.log('SSE: EventSource construction failed, using long-poll');
     disableSse(p, 'unsupported');
@@ -4348,10 +5106,39 @@ function queueInput(p, data) {
   if(!p.flushTimer && !p.inputInFlight) p.flushTimer = setTimeout(() => flushInput(p), 10);
 }
 
+// Sealed mode: batches the encrypted channel could not carry (a local
+// "sealed_unavailable" reply - nothing was sent) wait in p.sealHeld,
+// ahead of anything typed since, and go out when the channel can be
+// tried again. Never late (I3): if the oldest of them is older than
+// INPUT_HOLD_MS, all of them are dropped, with a notice - never a
+// suffix of a command without its start.
+function takeSealedHeld(p) {
+  let held = p.sealHeld || [];
+  p.sealHeld = [];
+  if (!held.length) return [];
+  if (Date.now() - held[0].at > INPUT_HOLD_MS || held[0].sid !== p.sid) {
+    showToast('Keys typed while the encrypted channel was unavailable were not sent.', 'warn');
+    return [];
+  }
+  return held;
+}
+
 function flushInput(p) {
   p.flushTimer = null;
-  if(p.inputInFlight || !p.sid || p.inputGate || !p.inputQueue.length) return;
-  let d=p.inputQueue.join(''); p.inputQueue=[];
+  let held = p.sealHeld && p.sealHeld.length;
+  if(p.inputInFlight || !p.sid || p.inputGate || (!p.inputQueue.length && !held)) return;
+  let parts = [];
+  if (held) {
+    let wait = _sealWaitMs();
+    if (wait > 0) { p.flushTimer = setTimeout(() => flushInput(p), wait); return; }
+    parts = takeSealedHeld(p);
+  }
+  if (p.inputQueue.length) {
+    parts.push({d: p.inputQueue.join(''), at: Date.now(), sid: p.sid});
+    p.inputQueue = [];
+  }
+  if (!parts.length) return;
+  let d = parts.map(x => x.d).join('');
   // Only a large paste can approach the server body cap; for those, check
   // the real UTF-8 body size and surface an error instead of a silent 400.
   if(d.length > 1048576){
@@ -4361,10 +5148,23 @@ function flushInput(p) {
       return;
     }
   }
-  sendInputBatch(p, p.sid, d, 0);
+  sendInputBatch(p, p.sid, d, 0, parts);
 }
 
-function sendInputBatch(p, sid, d, attempt) {
+// A missing/invalid sealed reply is not proof of non-delivery. Its old
+// command suffix must not become a standalone command. A newer session
+// owns its own keys, so a late failure from the old one cannot drop them.
+function discardUnconfirmedInput(p, sid) {
+  if (p.sid !== sid) return;
+  p.inputQueue = [];
+  p.latKeyAt = 0;
+  p.sealHeld = (p.sealHeld || []).filter(x => x.sid !== sid);
+  clearTimeout(p.flushTimer);
+  p.flushTimer = null;
+}
+
+function sendInputBatch(p, sid, d, attempt, parts) {
+  if (!parts) parts = [{d: d, at: Date.now(), sid: sid}];
   let token = {};
   p.inputInFlight = token;
   let settled = false;
@@ -4385,8 +5185,13 @@ function sendInputBatch(p, sid, d, attempt) {
     // Not answered in time: the connection it went out on is probably
     // dead, and so is the output channel's. Cancel it, so it cannot
     // land later, after keys typed since.
+    let sent = ctl && _sealSentRequests.get(ctl.signal);
+    if (sent) {
+      _sealReplyError(sent.ch, true, sent);
+      discardUnconfirmedInput(p, sid);
+    }
     if (ctl) { try { ctl.abort(); } catch (e) {} }
-    if (d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
+    if (!sent && d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
     release();
     kickOutput(p);
   }, stallMs);
@@ -4403,6 +5208,16 @@ function sendInputBatch(p, sid, d, attempt) {
       return;
     }
     noteServerCursor(p, r, sid);
+    // Sealed and the channel could not be used: nothing was sent. Hold
+    // the batch (see takeSealedHeld) instead of the quick resends below,
+    // which an outage longer than a second would exhaust.
+    if (!settled && r && r.code === 'sealed_unavailable' && p.sid === sid) {
+      settled = true; clearTimeout(stall);
+      if (p.inputInFlight === token) p.inputInFlight = null;
+      p.sealHeld = parts.concat(p.sealHeld || []);
+      if (!p.flushTimer) p.flushTimer = setTimeout(() => flushInput(p), Math.max(250, _sealWaitMs()));
+      return;
+    }
     // Replies that prove the bytes never reached the PTY (the worker
     // pool was full, a rate limit, the proxy could not reach the
     // backend): resend the same batch, ahead of anything typed since.
@@ -4412,11 +5227,14 @@ function sendInputBatch(p, sid, d, attempt) {
     if (!settled && (st === 503 || st === 429 || st === 502) &&
         attempt < INPUT_RETRIES && p.sid === sid) {
       settled = true; clearTimeout(stall);
-      setTimeout(() => sendInputBatch(p, sid, d, attempt + 1), 200 * (attempt + 1));
+      setTimeout(() => sendInputBatch(p, sid, d, attempt + 1, parts), 200 * (attempt + 1));
       return;
     }
     release();
-  }, release);
+  }, e => {
+    if (!settled && e && e.sealedDeliveryUnknown) discardUnconfirmedInput(p, sid);
+    release();
+  });
 }
 
 // ── Unified connect ─────────────────────────────────────────────────
@@ -6173,6 +6991,7 @@ function loadServerConfig() {
     // isolate_storage is off).
     _initVaultBroadcast();
     _applyVaultEnabledClass();
+    renderSealedState();
     // Pre-cache the IDB key presence so the first renderSaved doesn't
     // flash all vault-backed rows as no-key while we wait on IDB.
     await _refreshIdbHasKey();
@@ -6677,6 +7496,13 @@ function uploadNextFile(p) {
   u.floorFails = 0;
   u.cutSeen = false;
   u.lastAdvance = Date.now();
+  // Sealed: the bucket this file's traffic is rounded up to, what has
+  // been sent towards it, and whether one more pad piece follows.
+  u.sealT = sealedUploadBucket(file.size);
+  u.sealSent = 0;
+  u.sealExtra = Math.random() < 0.5;
+  // This browser found binary uploads blocked recently: start as text.
+  if (!u.text && uploadTextAvailable() && uploadTextMarked()) u.text = true;
   if (serverConfig && serverConfig.upload_chunks && file.size > 0) {
     sendUploadPiece(p, u, file, 0);
   } else {
@@ -6728,13 +7554,66 @@ function uploadBodyTruncated(xhr, resp) {
   return typeof t === 'string' && re.test(t);
 }
 
+// ── Uploads as text when binary is blocked ─────────────────────────
+// An endpoint-security product that intercepts HTTPS on the owner's Mac
+// answers every application/octet-stream POST itself (503 text/html);
+// the same bytes as base64 inside JSON pass. Uploads start binary as
+// always; when binary is blocked - a reply that is not websh's, or cuts
+// that go on at the smallest piece size, where the upload would
+// otherwise give up - the upload switches to {"b64": ...} pieces and
+// carries on from the size the server has (409 resume), and the browser
+// remembers it for UPLOAD_TEXT_DAYS. Only with a server that says
+// upload_text: an older one would write the JSON into the file.
+const UPLOAD_TEXT_KEY = 'websh_upload_text';
+const UPLOAD_TEXT_DAYS = 30;
+
+function uploadTextAvailable() {
+  return !!(serverConfig && serverConfig.upload_text);
+}
+
+function uploadTextMarked() {
+  try {
+    let at = parseInt(localStorage.getItem(storageKey(UPLOAD_TEXT_KEY)) || '', 10);
+    if (!at) return false;
+    if (Date.now() - at < UPLOAD_TEXT_DAYS * 86400000) return true;
+    localStorage.removeItem(storageKey(UPLOAD_TEXT_KEY));
+  } catch (e) {}
+  return false;
+}
+
+// Switch this upload to text pieces. False when that is not possible
+// (sealed - already text -, a server without upload_text, or already
+// text): the caller then does what it did before.
+function switchUploadToText(p, u) {
+  if (u.text || sealedOn() || !uploadTextAvailable()) return false;
+  u.text = true;
+  try { localStorage.setItem(storageKey(UPLOAD_TEXT_KEY), String(Date.now())); } catch (e) {}
+  showToast('Binary uploads are blocked on this computer (antivirus or proxy); ' +
+            'sending uploads as text from now on.', 'warn');
+  // Fresh tries for the new form; the piece size stays as it is. The
+  // wall-clock budget does NOT start over (u.lastAdvance is kept): one
+  // upload has one, so a path that fails either way still ends with the
+  // visible failure in time (O7b).
+  u.chunkFails = 0;
+  u.floorFails = 0;
+  u.cutSeen = false;
+  console.log('upload: binary blocked, continuing as text');
+  return true;
+}
+
 function sendUploadPiece(p, u, file, offset) {
   if (!u || u.cancelled || p.upload !== u) return;
-  let end = Math.min(file.size, offset + u.chunkSize);
-  let xhr = new XMLHttpRequest();
+  // Sealed, every piece of the file is the same size on the wire: the
+  // (possibly shrunk) piece size, but never more than the file's bucket.
+  let sealed = sealedOn();
+  let step = sealed ? Math.min(u.chunkSize, u.sealT) : u.chunkSize;
+  let end = Math.min(file.size, offset + step);
+  let xhr = newApiXhr(sealed ? {to: step} : null);
+  // Text piece: the same bytes as {"b64": ...} (sealed mode is text already).
+  let asText = !sealed && !!u.text;
   u.xhr = xhr;
   xhr.open('POST', uploadUrl(p, u, offset), true);
-  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.setRequestHeader('Content-Type', asText ? 'application/json' : 'application/octet-stream');
   xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
 
   // Mid-body stall watchdog. The owner's proxy cut uploads by SIZE while
@@ -6759,7 +7638,7 @@ function sendUploadPiece(p, u, file, offset) {
       xhr.onload = xhr.onerror = xhr.ontimeout = null;   // the abort must not re-enter
       try { xhr.abort(); } catch (e) {}
       u.xhr = null;
-      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true);
+      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true, true);
     }, stallMs);
   };
 
@@ -6772,7 +7651,9 @@ function sendUploadPiece(p, u, file, offset) {
   let lastLoaded = 0;
   xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
-    u.fileOffset = offset + e.loaded;
+    // A text piece is ~4/3 of the bytes it carries: show file bytes.
+    u.fileOffset = offset + (asText && e.total
+      ? Math.floor((end - offset) * Math.min(1, e.loaded / e.total)) : e.loaded);
     updateUploadProgress(p);
     if (e.loaded > lastLoaded) { lastLoaded = e.loaded; armWatchdog(); }
   };
@@ -6788,16 +7669,26 @@ function sendUploadPiece(p, u, file, offset) {
   // probable cause and an action; otherwise fall back to the specific
   // reason the caller computed.
   let giveUp = fallback => {
+    // Cut even at the smallest piece: binary itself may be what is
+    // blocked. Try text before giving up (once; see switchUploadToText).
+    // A stall is not that (no reply says binary was refused).
+    if (u.cutSeen && !u.lastFailStall && switchUploadToText(p, u)) {
+      sendUploadPiece(p, u, file, offset);
+      return;
+    }
     finishUpload(p, false, u.cutSeen
       ? 'blocked or cut short — a proxy or firewall on this network is' +
         ' likely limiting uploads; a smaller file may still go through'
       : fallback);
   };
 
-  let retry = (why, cut) => {
+  // `stall`: no reply at all (the watchdog, a timeout) - a cut, but never
+  // a reason to try text: nothing says binary was refused.
+  let retry = (why, cut, stall) => {
     if (!u || u.cancelled || p.upload !== u) return;
     clearWatchdog();
     if (cut) u.cutSeen = true;
+    u.lastFailStall = !!stall;
     u.chunkFails++;
     // Halve from the first cut (down toward the floor); a non-cut
     // failure (a plain 5xx server blip) keeps the size - the piece is
@@ -6837,7 +7728,7 @@ function sendUploadPiece(p, u, file, offset) {
       }
       u.chunkFails++;
       if (u.chunkFails >= UPLOAD_CHUNK_TRIES) { finishUpload(p, false, 'the upload could not be resumed'); return; }
-      if (resp.size === file.size) { u.fileOffset = file.size; updateUploadProgress(p); uploadFileDone(p, u, file); return; }
+      if (resp.size === file.size) { u.fileOffset = file.size; updateUploadProgress(p); uploadDataDone(p, u, file); return; }
       sendUploadPiece(p, u, file, resp.size);
       return;
     }
@@ -6848,6 +7739,14 @@ function sendUploadPiece(p, u, file, offset) {
       u.throttled = (u.throttled || 0) + 1;     // in a row; a delivered piece resets it
       if (u.throttled > 30) { finishUpload(p, false, 'the server kept asking to slow down'); return; }
       setTimeout(() => sendUploadPiece(p, u, file, offset), 3000);
+      return;
+    }
+    // Not websh's reply at all (an interceptor's own 503 text/html): the
+    // binary body is what is refused. Switch to text at once, no halving.
+    if ((xhr.status < 200 || xhr.status > 299) &&
+        !(resp && typeof resp === 'object' && typeof resp.error === 'string') &&
+        !uploadBodyTruncated(xhr, resp) && switchUploadToText(p, u)) {
+      sendUploadPiece(p, u, file, offset);
       return;
     }
     if (xhr.status !== 200 || !resp || !resp.ok) {
@@ -6872,9 +7771,10 @@ function sendUploadPiece(p, u, file, offset) {
     u.cutSeen = false;
     u.lastAdvance = Date.now();
     u.fileOffset = end;
+    if (sealed) u.sealSent += step;
     updateUploadProgress(p);
     if (end < file.size) sendUploadPiece(p, u, file, end);
-    else uploadFileDone(p, u, file);
+    else uploadDataDone(p, u, file);
   };
   // A dropped connection (status 0, no HTTP reply) and a timeout are both
   // how a proxy/VPN that cuts the body by size/duration shows up when no
@@ -6883,14 +7783,51 @@ function sendUploadPiece(p, u, file, offset) {
   // (describeUploadError keeps that reason for its own callers and the
   // log line here).
   xhr.onerror = () => { clearWatchdog(); retry(describeUploadError(xhr, null, u), true); };
-  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true); };
+  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true, true); };
   armWatchdog();
-  xhr.send(file.slice(offset, end));
+  if (!asText) { xhr.send(file.slice(offset, end)); return; }
+  file.slice(offset, end).arrayBuffer().then(buf => {
+    if (!u || u.cancelled || u.xhr !== xhr) return;
+    xhr.send('{"b64":"' + _b64enc(new Uint8Array(buf)) + '"}');
+  }, () => { if (u.xhr === xhr) { clearWatchdog(); retry('the file could not be read', false); } });
+}
+
+// Every byte of the file is on the target. Sealed, pad-only pieces of
+// the same size follow until the file's bucket is covered (plus one
+// more half of the time), so the number of requests does not tell the
+// size either. They are best effort: the file is already whole, so a
+// failed one ends the padding, not the upload.
+function uploadDataDone(p, u, file) {
+  if (!sealedOn() || !u.sealT) { uploadFileDone(p, u, file); return; }
+  sendUploadPadding(p, u, file);
+}
+
+function sendUploadPadding(p, u, file) {
+  if (!u || u.cancelled || p.upload !== u) return;
+  if (u.sealSent >= u.sealT) {
+    if (!u.sealExtra) { uploadFileDone(p, u, file); return; }
+    u.sealExtra = false;
+  }
+  let step = Math.min(u.chunkSize, u.sealT);
+  let xhr = newApiXhr({to: step, pad: true});
+  if (!(xhr instanceof SealedXhr)) { uploadFileDone(p, u, file); return; }  // turned off meanwhile
+  u.xhr = xhr;
+  xhr.open('POST', uploadUrl(p, u, file.size), true);
+  xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
+  let done = () => { if (u && !u.cancelled && p.upload === u) uploadFileDone(p, u, file); };
+  xhr.onload = () => {
+    if (!u || u.cancelled || p.upload !== u) return;
+    if (xhr.status !== 200) { done(); return; }
+    u.sealSent += step;
+    sendUploadPadding(p, u, file);
+  };
+  xhr.onerror = xhr.ontimeout = done;
+  xhr.send(null);
 }
 
 // Older servers (no config.upload_chunks) and empty files: one request.
 function sendUploadWhole(p, u, file) {
-  let xhr = new XMLHttpRequest();
+  let xhr = newApiXhr(sealedOn() ? {to: u.sealT || sealedUploadBucket(file.size)} : null);
   u.xhr = xhr;
   xhr.open('POST', uploadUrl(p, u), true);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -7094,7 +8031,7 @@ function startFastDownload(id, path, o) {
 
   let url = API + '?action=download&session_id=' + encodeURIComponent(p.sid) +
             '&path=' + encodeURIComponent(path);
-  return fetch(url, {signal: ctrl.signal})
+  return apiFetch(url, {signal: ctrl.signal})
     .then(resp => {
       if (!resp.ok) {
         return resp.json().then(e => { throw new Error(e.error || 'failed'); });
@@ -7345,7 +8282,7 @@ function loadFbDir(path, o) {
   list.setAttribute('aria-busy', 'true');
   let stale = () => req !== _fbSeq || _fbId !== reqPane ||
                     !panes[reqPane] || panes[reqPane].sid !== reqSid;
-  fetch(API + '?action=ls&session_id=' + encodeURIComponent(reqSid) +
+  apiFetch(API + '?action=ls&session_id=' + encodeURIComponent(reqSid) +
         '&path=' + encodeURIComponent(path) +
         ((o && o.paneCwd) ? '&cwd=1' : ''))
     .then(r => r.json())
@@ -8652,6 +9589,7 @@ function openOptions(){
   let cv = $('optCtrlVPaste'); if (cv) cv.checked = !!settings.ctrlVPaste;
   let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
   let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
+  renderSealedState();
   renderOptPreview();
   $('ovOpt').classList.remove('h');
 }
@@ -8783,7 +9721,9 @@ async function confirmSignOut() {
     : 'No saved credentials in this browser to remove.', '');
 }
 function resetOptions(){
+  let wasSealed = sealedOn();
   settings = { ...DEFAULT_SETTINGS };
+  if (wasSealed) setSealed(false);
   fontSize = settings.fontSize;
   saveSettings();
   applySettings();
@@ -8817,6 +9757,8 @@ document.addEventListener('DOMContentLoaded', () => {
   if (cv) cv.addEventListener('change', () => {
     settings.ctrlVPaste = cv.checked; saveSettings();
   });
+  let sc = $('optSealed');
+  if (sc) sc.addEventListener('change', () => setSealed(sc.checked));
   let cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
   if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
   if (ch) ch.addEventListener('change', () => {
