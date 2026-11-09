@@ -115,8 +115,7 @@ test('sealed replies: an earlier connect reply cannot identify a later connectio
   let recorded = null, replaced = false;
   srv.exchange = async (...args) => {
     const out = await exchange(...args);
-    const action = new URL(String(args[1]), 'https://websh.test/').searchParams.get('action');
-    if (action === 'sealed' && srv.inner.length && srv.inner[srv.inner.length - 1].action === 'connect') {
+    if (out.innerRequest && out.innerRequest.action === 'connect') {
       if (!recorded) recorded = out.bytes.slice();
       else { replaced = true; return Object.assign({}, out, {bytes: recorded.slice()}); }
     }
@@ -146,7 +145,7 @@ for (const attack of ['duplicate body', 'reorder body', 'missing body', 'old end
     let previous = null, mutated = false;
     srv.exchange = async (...args) => {
       const out = await exchange(...args);
-      const inner = srv.inner[srv.inner.length - 1];
+      const inner = out.innerRequest;
       if (out.bytes && inner && inner.action === 'download') {
         const frames = encryptedEvents(out.bytes);
         if (!previous) previous = frames;
@@ -263,7 +262,7 @@ test('sealed replies: a forged outer 410 cannot replay already executed input', 
   let replaced = false;
   srv.exchange = async (...args) => {
     const out = await exchange(...args);
-    const inner = srv.inner[srv.inner.length - 1];
+    const inner = out.innerRequest;
     if (!replaced && inner && inner.action === 'input') {
       replaced = true;
       return {status: 410, bytes: enc.encode('{"error":"channel unknown"}'), headers: {'Content-Type': 'application/json'}};
@@ -307,11 +306,27 @@ for (const attack of ['outer 410', 'outer busy 503', 'damaged frame', 'missing e
     const exchange = srv.exchange.bind(srv);
     let release, seen;
     const executed = new Promise(resolve => { seen = resolve; });
+    // A resize starts first but finishes after PREFIX executed. A global
+    // request-log slice used to mistake that resize reply for the input reply.
+    let resizeEntered, prefixHandled, resizeReplied;
+    const resizeStarted = new Promise(resolve => { resizeEntered = resolve; });
+    const prefixDone = new Promise(resolve => { prefixHandled = resolve; });
+    const resizeDone = new Promise(resolve => { resizeReplied = resolve; });
+    const handle = srv.handle.bind(srv);
+    const isResize = req => req && req.action === 'resize' && JSON.parse(dec.decode(req.body)).cols === 333;
+    srv.handle = async req => {
+      if (isResize(req)) { resizeEntered(); await prefixDone; }
+      const result = await handle(req);
+      if (req.action === 'input' && dec.decode(req.body).includes('PREFIX')) {
+        prefixHandled(); await resizeDone;
+      }
+      return result;
+    };
     let intercepted = false;
     srv.exchange = async (...args) => {
-      const start = srv.inner.length;
       const out = await exchange(...args);
-      if (!intercepted && srv.inner.slice(start).some(r => r.action === 'input' && dec.decode(r.body).includes('PREFIX'))) {
+      if (isResize(out.innerRequest)) resizeReplied();
+      if (!intercepted && out.innerRequest && out.innerRequest.action === 'input' && dec.decode(out.innerRequest.body).includes('PREFIX')) {
         intercepted = true;
         seen();
         return new Promise((resolve, reject) => { release = () => {
@@ -327,17 +342,21 @@ for (const attack of ['outer 410', 'outer busy 503', 'damaged frame', 'missing e
       return out;
     };
     try {
+      const unrelated = win.api('resize', {body: {session_id: sid, cols: 333, rows: 22}}).catch(() => null);
+      await resizeStarted;
       typeKeys(win, p, 'PREFIX');
       await executed;
       typeKeys(win, p, 'SUFFIX');
       if (attack !== 'stalled reply') release();
+      const resized = await unrelated;
+      ok(resized && !resized.error, 'overlapping resize keeps its own valid reply');
       ok(await until(() => !p.inputInFlight && !p.flushTimer, 3000), 'uncertain input settled without hanging');
       ok(/may have completed/i.test(win.document.body.textContent), 'delivery uncertainty is visible');
       typeKeys(win, p, 'FRESH');
       ok(await until(() => srv.sessions[sid].input.includes('FRESH'), 3000), 'fresh typing still reaches the session');
       ok(srv.sessions[sid].input === 'PREFIXFRESH',
          'executed prefix is not replayed and its queued suffix is dropped; got ' + JSON.stringify(srv.sessions[sid].input));
-    } finally { if (release) release(); cleanup(env); }
+    } finally { prefixHandled(); resizeReplied(); if (release) release(); cleanup(env); }
   });
 }
 
@@ -352,9 +371,8 @@ test('sealed input queue: a late old-session failure preserves fresh-session que
   const executed = new Promise(resolve => { seen = resolve; });
   let intercepted = false;
   srv.exchange = async (...args) => {
-    const start = srv.inner.length;
     const out = await exchange(...args);
-    if (!intercepted && srv.inner.slice(start).some(r => r.action === 'input' && dec.decode(r.body).includes('OLD'))) {
+    if (!intercepted && out.innerRequest && out.innerRequest.action === 'input' && dec.decode(out.innerRequest.body).includes('OLD')) {
       intercepted = true;
       seen();
       return new Promise(resolve => { release = () => resolve({status: 503, bytes: enc.encode('{"error":"busy"}'), headers: {'Content-Type': 'application/json'}}); });

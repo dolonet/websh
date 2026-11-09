@@ -598,6 +598,13 @@ font baseline falsely reported a persistent underline or lost rows.
 Guards: `linkstyle` and `tabsolo` retain their exact visual, PTY size and
 resize-count assertions after font readiness.
 
+Sealed response fault injection follows the exact decrypted request attached
+to that reply by the private harness. A shared request-log tail can include a
+concurrent input while a resize is completing and replace the wrong reply.
+The input uncertainty guards force this overlap, preserve the resize reply,
+and still require the executed prefix once, its queued suffix discarded, and
+fresh typing delivered.
+
 The frontend harness
 waits on `bootReady`; hand-built windows are closed with `closeDom`.
 Fixed sleeps made one run in six fail. In a browser scenario one synthetic
