@@ -1280,7 +1280,6 @@ function createPane(container) {
         `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
       `</div>` +
       `<div class="pane-bar-r">` +
-      `<button class="pane-btn" onclick="resetMouseReporting('${id}')" title="Reset mouse reporting if moving the pointer types characters. Use after leaving the application." aria-label="Reset mouse reporting" data-mouse-reset disabled>${ic('mouse-reset')}</button>` +
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
@@ -1643,8 +1642,7 @@ function updatePaneBadge(p) {
   // remaining DOM writes depend on, so a skipped call is a true no-op.
   let state = [s, busy ? 1 : 0,
                p.label || '', p.host || '', p.connection || '',
-               p.persistent ? 1 : 0,
-               p.mouseReset && p.mouseReset.sid === p.sid ? 1 : 0].join('');
+               p.persistent ? 1 : 0].join('');
   if (p._badgeState === state) return;
   p._badgeState = state;
   badge.className = 'pane-badge ' + (s==='connected'?'s-on':
@@ -1654,8 +1652,6 @@ function updatePaneBadge(p) {
   if (ub) ub.disabled = !p.sid || busy;
   let db = p.el.querySelector('[data-download-btn]');
   if (db) db.disabled = !p.sid || busy;
-  let mb = p.el.querySelector('[data-mouse-reset]');
-  if (mb) mb.disabled = !p.sid || !!(p.mouseReset && p.mouseReset.sid === p.sid);
   updatePaneTag(p);
   if (activeId === p.id) renderPaneTools();
   // The tab's dot is the worst state of its panes, so ANY pane's change
@@ -2557,7 +2553,7 @@ function renderPaneTools() {
   let tag = p && (p.host || p.connection) ? (p.persistent ? 'persistent' : 'ephemeral') : '';
   let one = tabs.length < 2;
   let key = (one ? '1' : '2') + '\u0002'
-    + (show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag, p.mouseReset && p.mouseReset.sid === p.sid ? 1 : 0].join('\u0001') : '');
+    + (show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag].join('\u0001') : '');
   if (box._key === key) return;
   box._key = key;
   // The group takes width from the tab strip, and its width changes
@@ -2579,8 +2575,6 @@ function fillPaneTools(box, p, busy, tag) {
   let off = !p.sid || busy;
   box.querySelector('[data-act="upload"]').disabled = off;
   box.querySelector('[data-act="download"]').disabled = off;
-  box.querySelector('[data-act="mouse-reset"]').disabled = !p.sid ||
-    !!(p.mouseReset && p.mouseReset.sid === p.sid);
   let tg = box.querySelector('.pane-tag');
   tg.className = 'pane-tag ' + tag + (tag ? '' : ' h');
   // The same words as a pane's own bar (updatePaneTag); the tooltip
@@ -2599,48 +2593,12 @@ function fillPaneTools(box, p, busy, tag) {
     let id = activeId, act = b.getAttribute('data-act');
     if (act === 'upload') triggerUpload(id);
     else if (act === 'download') triggerDownload(id);
-    else if (act === 'mouse-reset') resetMouseReporting(id);
     else if (act === 'split-h') splitPane(id, 'h');
     else if (act === 'split-v') splitPane(id, 'v');
     else if (act === 'close') closePane(id);
     else if (act === 'move-to') openPaneMoveMenu(id, b);
   });
 })();
-
-// Explicit recovery only: an app can leave DEC mouse reports enabled
-// after returning to a shell. Tab switches and alternate-screen exits
-// are not proof that a live app no longer needs mouse events.
-async function resetMouseReporting(id) {
-  let p = panes[id];
-  if (!p || !p.sid || (p.mouseReset && p.mouseReset.sid === p.sid)) return;
-  let sid = p.sid, token = {sid: sid};
-  let current = () => panes[id] === p && p.sid === sid;
-  p.mouseReset = token;
-  updatePaneBadge(p);
-  try {
-    if (p.persistent) {
-      // tmux owns the remote modes and restores its normal drag mode.
-      // Never reset xterm locally before or after that update: an
-      // already-clean tmux need not resend its cached outer mouse mode.
-      let r = await api('mouse_reset', {body: {session_id: sid}});
-      if (!current()) return;
-      if (!r || r.error || r.ok !== true)
-        throw new Error(r && r.error || 'Unexpected mouse reset reply');
-    } else {
-      // Parse terminal output, not keyboard input. Only mouse modes
-      // change: screen/history, focus and bracketed paste are retained.
-      await new Promise(resolve => p.term.write(
-        '\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l', resolve));
-    }
-    if (current()) showToast('Mouse reporting reset.', 'ok');
-  } catch (e) {
-    if (current()) showToast('Could not reset mouse reporting: ' +
-      (e && e.message || 'request failed'), 'err');
-  } finally {
-    if (p.mouseReset === token) p.mouseReset = null;
-    if (panes[id] === p) updatePaneBadge(p);
-  }
-}
 
 // Output reached a pane whose tab is not on screen: mark the tab.
 function noteTabActivity(p) {

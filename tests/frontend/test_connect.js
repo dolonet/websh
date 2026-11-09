@@ -8838,7 +8838,7 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   // step 2), so it is found by its pane id, not by its place.
   const paneIcons = Array.from(p.el.querySelectorAll('.pane-bar .pane-btn svg.ic use'))
     .concat(Array.from(win.document.querySelectorAll('[data-upload-progress="' + p.id + '"] .upload-progress-cancel svg.ic use')));
-  ok(paneIcons.length === 9, 'pane bar buttons (8: upload, download, Reset mouse reporting, Move to new tab, Move to tab, 2 splits, close) + transfer cancel use the sprite; got ' + paneIcons.length);
+  ok(paneIcons.length === 8, 'pane bar buttons (7: upload, download, Move to new tab, Move to tab, 2 splits, close) + transfer cancel use the sprite; got ' + paneIcons.length);
   ok(Array.from(paneIcons).every(u => /^#i-/.test(u.getAttribute('href'))), 'each references a symbol');
   // File rows: icon by type, actions as icons with their labels intact.
   win.showFileBrowser(p.id);
@@ -14630,70 +14630,6 @@ test('hide (break): a tab dragged onto a pane of the last other tab merges, and 
 
 
 // =====================================================================
-// Explicit recovery replies belong to the pane/session that requested them.
-for (const lateError of [false, true]) {
-  test('mouse recovery: stale ' + (lateError ? 'failure' : 'success') + ' cannot affect a newer session or request', async () => {
-    const env = await mkEnv([]), win = env.win;
-    try {
-      const p = win.createPane(win.document.getElementById('panes'));
-      p.sid = 'old-session'; p.persistent = true;
-      const calls = [], notices = [], writes = [];
-      win.showToast = (message, kind) => notices.push([message, kind]);
-      p.term.write = data => writes.push(data);
-      win.api = (action, opts) => new Promise((resolve, reject) => calls.push({action, opts, resolve, reject}));
-      const old = win.resetMouseReporting(p.id);
-      await win.resetMouseReporting(p.id);
-      ok(calls.length === 1, 'repeated click cannot duplicate the same pending request');
-      p.sid = 'new-session';
-      const fresh = win.resetMouseReporting(p.id);
-      ok(calls.length === 2 && calls[0].opts.body.session_id === 'old-session' && calls[1].opts.body.session_id === 'new-session', 'each request captures its own session');
-      if (lateError) calls[0].reject(new Error('old failure'));
-      else calls[0].resolve({ok:true});
-      await old;
-      ok(notices.length === 0, 'late old-session reply shows no misleading success or error');
-      await win.resetMouseReporting(p.id);
-      ok(calls.length === 2, 'late reply cannot unlock the newer in-flight request');
-      calls[1].resolve({ok:true}); await fresh;
-      ok(notices.length === 1 && notices[0][1] === 'ok', 'only current successful recovery is acknowledged');
-      ok(writes.length === 0, 'persistent recovery never performs a late local terminal reset');
-    } finally { cleanup(env); }
-  });
-}
-
-for (const failure of [{error:'remote terminal unavailable'}, null, {ok:false}]) {
-  test('mouse recovery: failed remote reply ' + JSON.stringify(failure) + ' never claims success or changes local modes', async () => {
-    const env = await mkEnv([]), win = env.win;
-    try {
-      const p = win.createPane(win.document.getElementById('panes'));
-      p.sid = 'current-session'; p.persistent = true;
-      const notices = [], writes = [];
-      win.showToast = (message, kind) => notices.push([message, kind]);
-      p.term.write = data => writes.push(data);
-      win.api = async () => failure;
-      await win.resetMouseReporting(p.id);
-      ok(notices.length === 1 && notices[0][1] === 'err', 'remote failure is visible as an error');
-      ok(!notices.some(n => n[1] === 'ok'), 'no false success');
-      ok(writes.length === 0, 'failed tmux recovery does not disable normal outer mouse handling');
-    } finally { cleanup(env); }
-  });
-}
-
-test('mouse recovery: a closed pane ignores its late remote reply', async () => {
-  const env = await mkEnv([]), win = env.win;
-  try {
-    const p = win.createPane(win.document.getElementById('panes'));
-    p.sid = 'closing-session'; p.persistent = true;
-    const notices = [];
-    win.showToast = message => notices.push(message);
-    let resolve;
-    win.api = () => new Promise(r => { resolve = r; });
-    const pending = win.resetMouseReporting(p.id);
-    delete win.eval('panes')[p.id]; p.el.remove();
-    resolve({ok:true}); await pending;
-    ok(notices.length === 0, 'closed pane produces no stale notification');
-  } finally { cleanup(env); }
-});
-
 // A stray rejection used to take node down mid-run with no summary, so
 // a crash looked like "no result" rather than a failure. Count it as a
 // failure against the scenario that was running and keep going.

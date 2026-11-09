@@ -68,26 +68,22 @@ retried in a loop, never shown, never opens a sealed channel.
 Guard: backend and frontend `client_lat` / `input_lat` tests
 (`scripts/codemap.py lat`); I1-I4's guards unchanged.
 
-**I6. Mouse recovery is explicit and preserves the shell.** A terminal
-program can exit while DEC 1003/1006 remains enabled. Real pointer motion
-then sends `ESC[<35;x;yM`; bash displays fragments such as `35;5;2M`.
-In a persistent pane the stale state lives inside tmux, so reconnecting
-can restore it. The per-pane **Reset mouse reporting** action disables
-only mouse modes, without sending shell input, executing or erasing a
-partially typed command, clearing history, changing the shell process,
-or disturbing another pane's mouse-enabled program. It preserves focus
-and bracketed-paste modes. Plain panes recover locally; persistent panes
-recover through output to their validated tmux terminal, leaving normal
-tmux drag handling intact. Failure is visible and never reported as
-success; a late reply cannot affect a newer session. No tab switch or
-alternate-screen exit automatically disables legitimate mouse handling.
-The exact-session tmux lookup needs a trailing colon for pane context:
-`display-message -t '=session'` can exit successfully with an empty pane,
-while `'=session:'` resolves the intended pane. `send-keys -R` changes
-the display/history and is too broad for this action.
-Guards: backend `test_mouse_reset.py` (private character PTYs and a real
-private tmux server), frontend `mouse recovery: …`, and e2e `mouse`
-(real mouse reports, full history, partial input, neighbor and reconnect).
+**I6. Mouse modes remain controlled by terminal applications.** A program
+can exit while DEC 1003/1006 remains enabled. Real pointer motion then
+sends `ESC[<35;x;yM`; bash displays fragments such as `35;5;2M`. In a
+persistent pane this stale state lives inside tmux and can survive a
+reconnect. The current interface has no mouse-reset action or automatic
+reset heuristic: tab switches and alternate-screen exits must not
+silently disable a legitimate application's mouse handling.
+The server's `mouse_reset` endpoint remains for already-cached clients.
+It disables only mouse modes in the owned persistent pane, without
+shell input, history loss, or changes to another pane. Focus and
+bracketed-paste modes remain unchanged. Its exact-session tmux lookup
+needs a trailing colon for pane context: `display-message -t '=session'`
+can exit successfully with an empty pane, while `'=session:'` resolves
+the intended pane. `send-keys -R` changes display/history and is too broad.
+Guard for cached-client compatibility: backend `test_mouse_reset.py`
+(private character PTYs and a real private tmux server).
 
 ## Output
 

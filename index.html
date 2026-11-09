@@ -113,11 +113,11 @@
     #paneTools .pane-tag{margin:0 3px 0 0}
     #paneTools .tbtn:disabled{opacity:.3;cursor:default;pointer-events:none}
     #paneTools .tbtn.close:hover{color:var(--dg)}
-    /* At phone width keep the tools compact and omit the group's outer
-       padding. The mouse recovery button must not leave less than a
-       minimum-width active tab in the strip (96px at a 560px viewport).
-       Button targets and icons keep their existing compact sizes. */
-    @media (max-width:640px){#paneTools{padding:0}#paneTools .tbtn{padding:4px 1px}}
+    /* The top-bar "Move to tab" of a lone pane is a sixth button: 22px
+       the strip lost, which at phone width cut the tab in front below
+       its minimum. There the buttons sit closer (18px each, the icons
+       2px apart), so the six take no more room than the five did. */
+    @media (max-width:640px){#paneTools .tbtn{padding:4px 1px}}
     /* Only colours fade (.tbtn's own transition is `all`): an animated
        padding across 640px made the group's width, and so the strip's,
        settle 150 ms after the tab in front had been scrolled into view,
@@ -611,7 +611,6 @@
     <g id="g-ic" fill="none" stroke="currentColor" stroke-width="1.8"
        stroke-linecap="round" stroke-linejoin="round"></g>
   </defs>
-  <symbol id="i-mouse-reset" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="6" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3v6m-5 3h10" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 15.5 21 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <!-- Export = "write this out as a file": a document with a down arrow, not the
        bare tray arrow, which is already what a plain download looks like. -->
@@ -676,7 +675,6 @@
   <button id="tabNew" class="tbtn" onclick="newTab()" title="New tab (Alt+T)" aria-label="New tab"><svg class="ic"><use href="#i-plus"></use></svg></button>
   <div id="paneTools" class="h" role="group" aria-label="Pane actions">
     <span class="pane-tag h"></span>
-    <button class="tbtn" data-act="mouse-reset" title="Reset mouse reporting if moving the pointer types characters. Use after leaving the application." aria-label="Reset mouse reporting" disabled><svg class="ic"><use href="#i-mouse-reset"></use></svg></button>
     <button class="tbtn" data-act="upload" title="Upload file" aria-label="Upload file" disabled><svg class="ic"><use href="#i-upload"></use></svg></button>
     <button class="tbtn" data-act="download" title="Download file" aria-label="Download file" disabled><svg class="ic"><use href="#i-download"></use></svg></button>
     <button class="tbtn" data-act="move-to" title="Move to tab" aria-label="Move pane to another tab" aria-haspopup="menu"><svg class="ic"><use href="#i-move-to"></use></svg></button>
