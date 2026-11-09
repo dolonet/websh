@@ -123,14 +123,8 @@ session: `Ctrl+B :set -g status on` (resets on next reconnect).
 
 An application that exits without disabling mouse reporting can leave
 coordinate reports appearing at the shell, such as `35;5;2M`. In tmux,
-that pane state can survive reconnecting. Use the mouse button labelled
-**Reset mouse reporting** in the selected pane's toolbar. For a lone
-pane its tools appear beside the tabs. Use it after leaving the affected
-application; a live application may still need mouse events.
+that pane state can survive reconnecting. Launching and cleanly exiting
+the affected application can restore its terminal modes.
 
-Recovery changes only mouse reporting for that pane. It keeps the SSH
-connection, shell, screen, history and partially typed command. Other
-panes keep their modes. Persistent panes reset the state inside tmux;
-plain SSH panes reset the browser terminal's mouse modes. No shell
-command is entered. A failed recovery shows an error; it does not report
-success. Switching tabs never resets mouse modes automatically.
+Switching tabs and leaving an alternate screen do not automatically
+reset mouse reporting: a running application may still need those events.

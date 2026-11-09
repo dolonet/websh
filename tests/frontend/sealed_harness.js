@@ -286,7 +286,7 @@ class FakeWebsh {
       s.streams.add(st);
       (this.sseStreams = this.sseStreams || []).push(st);
       setTimeout(() => st.send(), 1);
-      return {status: 200, stream, headers: SSE_HEADERS};
+      return {status: 200, stream, headers: SSE_HEADERS, innerRequest: req};
     }
     const parts = [await this.frameOut(ch, enc.encode(JSON.stringify({status: r.status, headers: r.headers || {}})))];
     if (r.body && r.body.length) {
@@ -295,7 +295,8 @@ class FakeWebsh {
         parts.push(await this.frameOut(ch, r.body.slice(at, at + step)));
     }
     if (!r.truncate) parts.push(await this.frameOut(ch, new Uint8Array(0)));
-    return {status: 200, bytes: cat(...parts), headers: SSE_HEADERS};
+    // Test-only identity stays outside the wire and binds interception to this reply.
+    return {status: 200, bytes: cat(...parts), headers: SSE_HEADERS, innerRequest: req};
   }
 
   // ── transport: one entry for fetch, XHR and beacons ──

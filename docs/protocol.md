@@ -167,9 +167,9 @@ character tty, opens that tty, and rechecks the pane's session and tty
 before writing fixed mouse-disable terminal output. No caller-supplied
 path or command is accepted. Nothing is typed into the shell. Screen,
 history, partial input, focus reporting and bracketed paste are retained.
-The browser uses a local mouse-only terminal reset for plain SSH panes;
-it does not call this endpoint. Persistent panes rely on tmux output to
-restore normal drag reporting, without a competing local reset.
+This endpoint remains available for cached clients. The current browser
+interface exposes no mouse-reset action and does not reset mouse modes
+automatically.
 
 ### GET /api/tmux_capture?session_id=
 Full scrollback capture over the ControlMaster side-channel. Reply:

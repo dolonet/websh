@@ -15,7 +15,6 @@ and on the network, and unit tests passed while they were live.
 |---|---|
 | `smoke` | the page boots, no script errors |
 | `typing` | keys arrive in the order typed; echo costs one round trip |
-| `mouse` | Explicit per-pane mouse recovery preserves history, partial shell input and neighboring applications. Requires the isolated same-container loopback SSH/tmux fixture and its `WEBSH_HOST_NETNS` marker; the runner reports an explicit skip for normal host or remote SSH configurations. The marker must name a network namespace different from the current container; the scenario also checks this before connecting. Honors the connected pane's private tmux command wrapper. |
 | `connections` | eight panes through private HTTP/1.1 nginx echo promptly, including hidden panes and after output recovery; a seventh and eighth connection cannot exhaust browser sockets. Run plain and `E2E_SEALED=1`; `E2E_CONNECTIONS_NO_SSE=1` also checks the browser without EventSource |
 | `offline` | 8 s without network during output: nothing lost or doubled |
 | `drop` | the stream's connection is reset three times |
