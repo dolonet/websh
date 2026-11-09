@@ -3367,6 +3367,49 @@ class SSHSession(object):
             data = marker + data[-MAX_TMUX_CAPTURE_BYTES:]
         return data, None
 
+    def reset_mouse_reporting(self):
+        """Explicit recovery of a pane left in application mouse mode.
+
+        Write terminal OUTPUT, never send-keys/input: the shell's partial
+        command and the pane's screen/history must remain untouched.
+        Only mouse modes change; focus and bracketed paste stay as-is.
+        """
+        if not self.persistent or not self.slot_id:
+            return False, "not a persistent session"
+        if not self.alive or not self._mux_ready():
+            return False, "control socket not ready"
+        name = "websh-" + self.slot_id
+        # The trailing ':' gives this exact session a pane context.
+        # '=name' alone can succeed with an empty display-message result.
+        query = (self.tmux_cmd + " display-message -p -t " +
+                 shlex.quote("=" + name + ":") + " '#{pane_id} #{pane_tty}'")
+        proc, err = self._mux_run(query, 10, "mouse reset lookup timeout")
+        if err:
+            return False, err
+        if proc.returncode != 0:
+            return False, "could not resolve the tmux pane"
+        fields = proc.stdout.decode("utf-8", "replace").strip().split()
+        if (len(fields) != 2 or not re.fullmatch(r"%[0-9]+", fields[0])
+                or not re.fullmatch(r"/dev/(?:pts/[0-9]+|tty[A-Za-z0-9]+)",
+                                    fields[1])):
+            return False, "invalid tmux pane terminal"
+        pane, tty = fields
+        # Pin the open tty BEFORE revalidating the stable pane ID. A
+        # removed pane's path can be reused; the open fd cannot retarget.
+        # The second lookup must not follow a newly active neighbour.
+        command = ("[ -c " + shlex.quote(tty) + " ] && exec 3>" +
+                   shlex.quote(tty) + " && current=$(" + self.tmux_cmd +
+                   " display-message -p -t " + shlex.quote(pane) +
+                   " '#{session_name} #{pane_tty}') && [ \"$current\" = " +
+                   shlex.quote(name + " " + tty) + " ] && "
+                   "printf '\\033[?9;1000;1001;1002;1003;1005;1006;1015;1016l' >&3")
+        proc, err = self._mux_run(command, 10, "mouse reset timeout")
+        if err:
+            return False, err
+        if proc.returncode != 0:
+            return False, "could not reset mouse reporting for the tmux pane"
+        return True, ""
+
     def push_tmux_options(self, options):
         """Apply per-session tmux options live, without typing into the
         foreground PTY. Runs `tmux set -g …` over the ControlMaster
@@ -4755,6 +4798,7 @@ class Handler(BaseHTTPRequestHandler):
         "upload_finalize": "_upload_finalize",
         "upload_cancel":   "_upload_cancel",
         "tmux_options":    "_tmux_options",
+        "mouse_reset":     "_mouse_reset",
         "rm":              "_rm",
         "mkdir":           "_mkdir",
         "mv":              "_mv",
@@ -6257,6 +6301,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _mouse_reset(self):
+        """POST /api/mouse_reset: explicit, owned-pane mouse recovery."""
+        if self._side_channel_throttled():
+            return
+        body = self._json_body()
+        if body is None:
+            return
+        session = self._require_session(body.get("session_id", ""))
+        if session is None:
+            return
+        if not session.persistent:
+            self._json({"error": "not a persistent session"}, 400)
+            return
+        ok, err = session.reset_mouse_reporting()
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        self._json({"ok": True})
 
     def _tmux_options(self):
         """POST /api/tmux_options — push tmux options live into a

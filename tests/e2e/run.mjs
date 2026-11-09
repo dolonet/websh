@@ -35,6 +35,12 @@ if (list) {
 }
 for (const n of args) if (!all[n]) { console.error(`unknown scenario "${n}" (try --list)`); process.exit(2); }
 
+// Scenarios that inspect SSH-target files or tmux locally need the
+// disposable fixture, never a normal host or remote SSH configuration.
+const isolatedSsh = cfg.host === '127.0.0.1' && !!process.env.WEBSH_HOST_NETNS && (() => {
+  try { return fs.readlinkSync('/proc/self/ns/net') !== process.env.WEBSH_HOST_NETNS; }
+  catch (e) { return false; }
+})();
 const sudoOk = haveSudo();
 let failed = 0, ran = 0, skipped = [], leftovers = [];
 const started = Date.now();
@@ -49,6 +55,7 @@ for (const name of (args.length ? args : names)) {
   const { meta, run } = all[name];
   let why = '';
   if (meta.ssh && !cfg.password) why = 'E2E_SSH_PASSWORD is not set';
+  else if (meta.isolatedSsh && !isolatedSsh) why = 'requires isolated same-container SSH/tmux (loopback and WEBSH_HOST_NETNS distinct from current network namespace)';
   else if (meta.local && url) why = 'injects faults / restarts: private instance only';
   else if (meta.sudo && !sudoOk) why = 'needs sudo (set E2E_SUDO_PASSWORD, or passwordless sudo)';
   if (why) { skipped.push(name); console.log(`\n--- ${name}: SKIPPED - ${why}`); continue; }
