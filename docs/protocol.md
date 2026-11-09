@@ -154,6 +154,23 @@ unknown session is still `{"ok": true}`).
 
 ## Tmux endpoints (persistent sessions)
 
+### POST /api/mouse_reset
+Explicit mouse-reporting recovery for a persistent pane. Body:
+`{"session_id":uuid}`. The session must belong to the caller. Uses the
+same side-channel concurrency/rate limits as tmux options and capture.
+Returns `{"ok":true}` only after the remote operation succeeds; missing
+or foreign sessions return 404/403, a non-persistent session returns 400,
+and a failed lookup or write returns 502 with an error.
+
+The server resolves its exact tmux session to a stable pane ID and
+character tty, opens that tty, and rechecks the pane's session and tty
+before writing fixed mouse-disable terminal output. No caller-supplied
+path or command is accepted. Nothing is typed into the shell. Screen,
+history, partial input, focus reporting and bracketed paste are retained.
+The browser uses a local mouse-only terminal reset for plain SSH panes;
+it does not call this endpoint. Persistent panes rely on tmux output to
+restore normal drag reporting, without a competing local reset.
+
 ### GET /api/tmux_capture?session_id=
 Full scrollback capture over the ControlMaster side-channel. Reply:
 `text/plain` body (NOT JSON), possibly truncated to the freshest tail

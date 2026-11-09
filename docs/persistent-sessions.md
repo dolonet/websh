@@ -118,3 +118,19 @@ connection), not by tmux windows, so the default status bar — slot-id
 session name, empty window list, and a clock — is visual noise that
 just steals a row of terminal real estate. To re-enable for a single
 session: `Ctrl+B :set -g status on` (resets on next reconnect).
+
+## When pointer movement types characters
+
+An application that exits without disabling mouse reporting can leave
+coordinate reports appearing at the shell, such as `35;5;2M`. In tmux,
+that pane state can survive reconnecting. Use the mouse button labelled
+**Reset mouse reporting** in the selected pane's toolbar. For a lone
+pane its tools appear beside the tabs. Use it after leaving the affected
+application; a live application may still need mouse events.
+
+Recovery changes only mouse reporting for that pane. It keeps the SSH
+connection, shell, screen, history and partially typed command. Other
+panes keep their modes. Persistent panes reset the state inside tmux;
+plain SSH panes reset the browser terminal's mouse modes. No shell
+command is entered. A failed recovery shows an error; it does not report
+success. Switching tabs never resets mouse modes automatically.
