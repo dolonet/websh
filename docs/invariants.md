@@ -469,10 +469,12 @@ the existing dismissibility rule; an initial form without a pane stays open.
 Guard: real-browser `connectform`, including both selection directions,
 focus loss, cancelled touch and positive mouse/touch cancellation controls.
 
-**U14. Opening a directory must not spawn one metadata process per entry.**
-Large listings use bounded metadata batches while preserving filename,
-size, timestamp and symlink semantics, including newline-containing names
-and non-GNU `stat` fallback. Listing prefetch is read-only and scoped to one
+**U14. GNU directory listings use bounded metadata batches.**
+GNU `stat` avoids one metadata process per entry while preserving filename,
+size, timestamp and symlink semantics, including newline-containing names.
+Other dialects use the compatibility fallback when raw filename identity
+cannot be preserved; uutils can replace invalid UTF-8 bytes in `%n`, so its
+lossy filename output must never match metadata to the wrong entry. Listing prefetch is read-only and scoped to one
 pane, session and known nonempty OSC 7 directory. With unknown current
 directory, every open resolves a fresh listing; background results cannot
 safely establish that the shell stayed in the same place. Known directories

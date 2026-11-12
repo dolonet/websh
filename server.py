@@ -3809,7 +3809,10 @@ class SSHSession(object):
         # Pure POSIX shell loop (no GNU `find -printf`) so this works on
         # BusyBox / Alpine / dash targets in addition to glibc Linux.
         # GNU stat can emit NUL records for bounded batches, avoiding
-        # one remote process per file. Keep the POSIX per-file fallback
+        # one remote process per file. Verify the GNU implementation:
+        # uutils accepts --printf but %n replaces non-UTF-8 filename bytes,
+        # breaking the raw-name join. Its per-file -c metadata is safe.
+        # Keep the POSIX per-file fallback
         # for BusyBox (-c), BSD/macOS (-f), and no-stat hosts (0/0).
         # Metadata is joined by raw filename, not display-decoded text.
         if pane_cwd:
@@ -3842,7 +3845,10 @@ class SSHSession(object):
             resolve +
             enter +
             'printf "PWD:%s\\0" "$PWD"; '
-            'batch=0; stat --printf "" -- . >/dev/null 2>&1 && batch=1; '
+            'batch=0; case "$(stat --version 2>/dev/null)" in '
+              '"stat (GNU coreutils)"*) '
+                'stat --printf "" -- . >/dev/null 2>&1 && batch=1;; '
+            'esac; '
             'set --; argchars=0; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '

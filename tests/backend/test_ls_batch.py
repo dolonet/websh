@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,6 +30,22 @@ class TestListingMetadataBudget(unittest.TestCase):
         self._wrapper('gnu')
 
     def _wrapper(self, mode):
+        if mode == 'lossy-printf':
+            # uutils accepts GNU's printf option but renders invalid bytes
+            # in %n as U+FFFD. Exercise that public behavior on GNU hosts
+            # too, instead of relying on the CI image to find it again.
+            (self.bin / 'stat').write_text(
+                '#!' + sys.executable + '\n'
+                'import os, subprocess, sys\n'
+                'with open(os.environ["LIST_CALLS"], "a") as f: f.write("call %d\\n" % (len(sys.argv)-1))\n'
+                'if sys.argv[1:] == ["--version"]:\n'
+                ' print("stat (uutils coreutils) 0.10.0"); sys.exit(0)\n'
+                'r = subprocess.run([os.environ["REAL_STAT"]] + sys.argv[1:], capture_output=True)\n'
+                'out = r.stdout\n'
+                'if any(a.startswith("--printf") for a in sys.argv[1:]): out = out.decode("utf-8", "replace").encode("utf-8")\n'
+                'sys.stdout.buffer.write(out); sys.stderr.buffer.write(r.stderr); sys.exit(r.returncode)\n')
+            (self.bin / 'stat').chmod(0o700)
+            return
         # Test doubles expose the supported public stat dialects. Metadata
         # still comes from real private files, including symlinks and names.
         pre = ''
@@ -59,6 +76,9 @@ class TestListingMetadataBudget(unittest.TestCase):
         return entries if raw else {e['name']: e for e in entries}
 
     def test_large_listing_uses_bounded_metadata_processes(self):
+        version = subprocess.run([self.stat, '--version'], capture_output=True).stdout
+        if not version.startswith(b'stat (GNU coreutils)'):
+            self.skipTest('bounded batch fast path requires actual GNU stat; non-GNU fallback is checked separately')
         for i in range(300):
             (self.files / ('entry-%04d' % i)).write_bytes(b'x' * (i % 17))
         entries = self._list()
@@ -105,3 +125,7 @@ class TestListingMetadataBudget(unittest.TestCase):
         entries = self._list(raw=True)
         self.assertEqual(len(entries), 2)
         self.assertEqual(sorted(e['size'] for e in entries), [17, 23])
+
+    def test_non_gnu_printf_preserves_invalid_filename_metadata(self):
+        self._wrapper('lossy-printf')
+        self.test_distinct_non_utf8_names_keep_their_own_metadata()
