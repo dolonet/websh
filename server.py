@@ -3808,9 +3808,10 @@ class SSHSession(object):
         # because every rm/mv/mkdir the browser issues is based on it.
         # Pure POSIX shell loop (no GNU `find -printf`) so this works on
         # BusyBox / Alpine / dash targets in addition to glibc Linux.
-        # `stat -c` covers GNU + BusyBox; `stat -f` is the BSD/macOS
-        # fallback; final fallback yields "0 0" so a host without stat
-        # at all still returns a usable listing (size/mtime degraded).
+        # GNU stat can emit NUL records for bounded batches, avoiding
+        # one remote process per file. Keep the POSIX per-file fallback
+        # for BusyBox (-c), BSD/macOS (-f), and no-stat hosts (0/0).
+        # Metadata is joined by raw filename, not display-decoded text.
         if pane_cwd:
             # $D comes from tmux (empty for a session that can't tell us);
             # the [ -n ] guard turns "no answer" into the historical $HOME
@@ -3841,6 +3842,8 @@ class SSHSession(object):
             resolve +
             enter +
             'printf "PWD:%s\\0" "$PWD"; '
+            'batch=0; stat --printf "" -- . >/dev/null 2>&1 && batch=1; '
+            'set --; argchars=0; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '
               # A link to a directory is "L" here (sent as type "l" +
@@ -3849,12 +3852,26 @@ class SSHSession(object):
               'elif [ -d "$f" ]; then t=d; '
               'elif [ -f "$f" ]; then t=f; '
               'else t=o; fi; '
-              'sm=$(stat -c "%s %Y" -- "$f" 2>/dev/null '
-                    '|| stat -f "%z %m" -- "$f" 2>/dev/null '
-                    '|| echo "0 0"); '
+              'if [ "$batch" -eq 1 ]; then '
+                'sm="0 0"; set -- "$@" "./$f"; '
+                'argchars=$((argchars + ${#f} + 3)); '
+              'else '
+                'sm=$(stat -c "%s %Y" -- "$f" 2>/dev/null '
+                      '|| stat -f "%z %m" -- "$f" 2>/dev/null '
+                      '|| echo "0 0"); '
+              'fi; '
               's=${sm% *}; m=${sm#* }; '
               'printf "%s\\t%s\\t%s\\t%s\\0" "$t" "$s" "$m" "$f"; '
-            'done'
+              # 64 names and ~8 KiB of characters bound each argv. Even
+              # multibyte names stay well below GNU/Linux ARG_MAX.
+              'if [ "$#" -ge 64 ] || [ "$argchars" -ge 8192 ]; then '
+                'stat --printf "S\\t%s\\t%Y\\t%n\\0" -- "$@" 2>/dev/null || :; '
+                'set --; argchars=0; '
+              'fi; '
+            'done; '
+            'if [ "$#" -gt 0 ]; then '
+              'stat --printf "S\\t%s\\t%Y\\t%n\\0" -- "$@" 2>/dev/null || :; '
+            'fi'
         )
         # err_prefix="" keeps this method's historical bare str(e) message.
         result, err = self._mux_run(remote_cmd, 10, "timeout", err_prefix="")
@@ -3874,10 +3891,23 @@ class SSHSession(object):
             abs_path = raw[4:nul].decode("utf-8", "replace")
             raw = raw[nul + 1:]
 
-        entries = []
+        # S records are GNU metadata; all other records are the same
+        # type/size/mtime/name rows as the portable fallback. A file that
+        # disappears between enumeration and stat retains zero metadata.
+        metadata = {}
+        rows = []
         for row in raw.split(b"\0"):
-            if not row:
-                continue
+            parts = row.split(b"\t", 3)
+            if len(parts) == 4 and parts[0] == b"S" and parts[3].startswith(b"./"):
+                metadata[parts[3][2:]] = parts[1:3]
+            elif row:
+                rows.append(row)
+        entries = []
+        for row in rows:
+            raw_parts = row.split(b"\t", 3)
+            if len(raw_parts) == 4 and raw_parts[3] in metadata:
+                raw_parts[1:3] = metadata[raw_parts[3]]
+                row = b"\t".join(raw_parts)
             parts = row.decode("utf-8", "replace").split("\t", 3)
             if len(parts) != 4 or not parts[3]:
                 continue

@@ -1529,7 +1529,7 @@ class TestListDir(unittest.TestCase):
         self.assertNotIn(r'\t%s\n', cmd)
         # Portability marker: the loop must NOT rely on `find -printf`
         # (BusyBox/Alpine/dash targets don't have it).
-        self.assertNotIn('-printf', cmd)
+        self.assertNotRegex(cmd, r'\bfind\b[^;]*\s-printf\b')
 
     def test_dirs_sorted_before_files(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
