@@ -458,6 +458,40 @@ dangling link behave as before; Delete and Rename act on the link only,
 never on its target. Guard: backend `test_fb_links.py`; frontend
 `test_fb_links.js`; e2e `fblinks` (sealed mode off and on).
 
+**U13. Selecting connection details cannot dismiss the form.** A primary
+pointer gesture must both begin and end on the backdrop to cancel the
+add-session form. Chromium can emit a trusted backdrop `click` when text
+selection began inside Host or Username and the mouse was released outside
+the card. The click target alone does not establish cancellation intent.
+Clipboard edits, focus changes and background terminal output preserve the
+form and its values. Escape, Cancel and deliberate backdrop clicks retain
+the existing dismissibility rule; an initial form without a pane stays open.
+Guard: real-browser `connectform`, including both selection directions,
+focus loss, cancelled touch and positive mouse/touch cancellation controls.
+
+**U14. GNU directory listings use bounded metadata batches.**
+GNU `stat` avoids one metadata process per entry while preserving filename,
+size, timestamp and symlink semantics, including newline-containing names.
+Other dialects use the compatibility fallback when raw filename identity
+cannot be preserved; uutils can replace invalid UTF-8 bytes in `%n`, so its
+lossy filename output must never match metadata to the wrong entry. Listing prefetch is read-only and scoped to one
+pane, session and known nonempty OSC 7 directory. With unknown current
+directory, every open resolves a fresh listing; background results cannot
+safely establish that the shell stayed in the same place. Known directories
+reuse one pending request or a short-lived successful result. Across all
+panes, at most one speculative listing is in flight, with typed input taking
+priority. Background failures do not change the UI or
+show errors. Session, directory and mutation changes invalidate it. Cached
+rows must never supply another host's destructive targets or block typing.
+Intentional cancellation of a sealed `GET ls` returns `AbortError` without
+invalidating the shared channel. This exception requires an actually aborted
+caller signal. Uncancelled corrupt replies still fail closed; an aborted
+input POST remains delivery-unknown and is never replayed.
+Guards: backend `test_ls_batch.py`, frontend `test_fb_prefetch.js` and
+`test_ls_sealed_cancel.js`, plus isolated-browser `fileperf` for measured cold
+and prefetched opens and `fileprefetchh1` for input while directory reads are
+held.
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

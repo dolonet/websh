@@ -545,7 +545,9 @@ An outer non-200 reply is unverified transport information. A proxy can
 replace a successfully executed request's reply with a 410 or a busy 503,
 so neither proves non-execution. Read-only GET calls and the explicitly
 read-only POST `output_many` may reopen a lost channel and retry once.
-Cancelling a shared output batch leaves its healthy channel usable.
+Intentional cancellation of a shared output batch or GET `ls` leaves
+its healthy channel usable; abort-shaped network errors without an
+aborted caller signal still fail verification normally.
 The sealed fetch boundary never resends any other POST after an
 unverified response, a post-send network failure, or an invalid or
 truncated encrypted reply. Their outcome is reported as

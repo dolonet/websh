@@ -54,6 +54,11 @@ function api(action, opts) {
       if (j && typeof j === 'object') {
         try { Object.defineProperty(j, '_status', {value: r.status}); } catch (e) {}
       }
+      if (j && !j.error && opts.body &&
+          (action === 'rm' || action === 'mv' || action === 'mkdir' || action === 'upload_finalize')) {
+        // Different panes can show the same remote directory.
+        Object.values(panes).forEach(invalidateFbPrefetch);
+      }
       return j;
     }));
 }
@@ -469,6 +474,7 @@ async function sealedFetch(method, action, query, body, opts) {
   // output_many uses POST only to carry the cursor list. No other POST
   // is granted read-only recovery or cancellation semantics.
   let readOnlyBatch = method === 'POST' && action === 'output_many';
+  let cancellableRead = readOnlyBatch || (method === 'GET' && action === 'ls');
   let asked = Date.now();
   for (let attempt = 0; ; attempt++) {
     let ch;
@@ -494,9 +500,10 @@ async function sealedFetch(method, action, query, body, opts) {
     let mutation = method !== 'GET' && !readOnlyBatch;
     let context = {ch: ch, error: null};
     let replyError = () => {
-      // Joining/leaving panes rebuilds the batch routinely. Cancelling
-      // that read must not invalidate a healthy shared encrypted channel.
-      if (readOnlyBatch && opts.signal && opts.signal.aborted)
+      // Pane joins rebuild output batches; listing close/navigation and
+      // typing cancel ls reads. Intentional cancellation of exactly these
+      // reads must not invalidate a healthy shared encrypted channel.
+      if (cancellableRead && opts.signal && opts.signal.aborted)
         return new DOMException('aborted', 'AbortError');
       return _sealReplyError(ch, mutation, context);
     };
@@ -507,7 +514,7 @@ async function sealedFetch(method, action, query, body, opts) {
         headers: {'Content-Type': 'application/json'},
         body: '{"f":"' + _b64enc(frame) + '"}', signal: opts.signal});
     } catch (e) { throw replyError(); }
-    if (readOnlyBatch && opts.signal && opts.signal.aborted) {
+    if (cancellableRead && opts.signal && opts.signal.aborted) {
       _quietCancel(r.body);
       throw replyError();
     }
@@ -985,19 +992,24 @@ function _isMacLike() {
 // (~5 s in Chromium); writeText() runs after as a best-effort upgrade
 // for browsers where it's permitted.
 function copyText(text) {
-  if (!text) return;
+  if (!text) return Promise.resolve(false);
+  let handled = false;
   let listener = e => {
     if (e.clipboardData) {
       e.clipboardData.setData('text/plain', text);
       e.preventDefault();
+      handled = true;
     }
   };
+  let copied = false;
   document.addEventListener('copy', listener, true);
-  try { document.execCommand('copy'); } catch (e) {}
+  try { copied = document.execCommand('copy') === true && handled; } catch (e) {}
   document.removeEventListener('copy', listener, true);
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(() => {});
+    try { return navigator.clipboard.writeText(text).then(() => true, () => copied); }
+    catch (e) {}
   }
+  return Promise.resolve(copied);
 }
 
 let settings = loadSettings();
@@ -1522,7 +1534,9 @@ function createPane(container) {
       // nested session exits, the outer shell's own reports apply again.
       if (p.osc7Host === undefined || p.osc7Host === null) p.osc7Host = host;
       else if (host !== p.osc7Host) return true;     // consumed, not applied
+      if (p.cwd !== path) invalidateFbPrefetch(p);
       p.cwd = path;
+      scheduleFbPrefetch(p);
       return true;
     });
   }
@@ -4197,6 +4211,8 @@ function endSession(p, o) {
   stopKeepalive(p);
   p.polling = false;
   p.connecting = false;
+  invalidateFbPrefetch(p);
+  p.fbPrefetchWarmed = null;
   p.sid = null;
   // The tracked cwd belongs to the shell that just went away; a
   // reconnect starts somewhere else and must re-learn it.
@@ -5220,6 +5236,7 @@ function openInputGate(p, why) {
   console.log('input gate: open (' + (why || 'timeout') + '), held keys:', p.inputQueue.join('').length);
   closeInputGate(p);
   p.inputGateAttached = false;
+  scheduleFbPrefetch(p);
   if (!p.inputQueue.length) return;
   if (Date.now() - (p.inputQueuedAt || 0) < INPUT_HOLD_MS) flushInput(p);
   else p.inputQueue = [];
@@ -5235,6 +5252,10 @@ function queueInput(p, data) {
     // Disconnected and nobody is reconnecting: nothing will read this.
     if (!p.connecting || !p.persistent) return;
   }
+  // A command can change files without a file-browser API operation.
+  // Invalidating is synchronous and never starts network work here.
+  cancelFbSpeculative();
+  invalidateFbPrefetch(p);
   // Expiry is a boundary BEFORE this new keystroke. Otherwise a stale
   // held batch waiting for backoff could later discard fresh input
   // typed after the channel recovered along with its old backlog.
@@ -5657,6 +5678,7 @@ function beginSessionIO(p, o) {
   p.inputGateAttached = false;
   if (p.persistent) armInputGate(p);      // held keys go out when it opens
   else p.inputQueue = [];                 // a new shell gets none of the old keys
+  scheduleFbPrefetch(p);
 }
 
 async function connectPane(p, opts) {
@@ -6276,14 +6298,17 @@ function setTitle(label) {
 //   'split'   — the source pane exists (and always will), so yes.
 //   'tab'     — the current tab is still there, so yes.
 //   'initial' — there's no other pane; they must complete auth.
+let _connectBackdropGesture = null;
 function overlayDismissable() { return overlayMode === 'split' || overlayMode === 'tab'; }
 function showOverlay(){
+  _connectBackdropGesture = null;
   $('ov').classList.remove('h');
   $('btnCancel').classList.toggle('h', !overlayDismissable());
   hideErr();
   focusFirst();
 }
 function hideOverlay(){
+  _connectBackdropGesture = null;
   $('ov').classList.add('h');
   // Scrub credentials from the DOM once the overlay is closed so the
   // browser has nothing to offer to save/sync and so a later devtools
@@ -8513,6 +8538,132 @@ let _fbSeq = 0;
 // pane B's session.
 let _fbListedSid = null;
 
+// One short-lived, bounded directory snapshot per pane. Only a known
+// OSC 7 cwd is safe to preload: an unknown tmux cwd can change remotely
+// without any client hint, so that mode always resolves freshly on open.
+const FB_PREFETCH_MS = 5000;
+let _fbSpeculative = null;       // at most one background ls across all panes
+let _fbForeground = null;        // owned by the current modal request generation
+
+function cancelFbSpeculative() {
+  let slot = _fbSpeculative;
+  if (!slot) return;
+  _fbSpeculative = null;
+  slot.invalid = true;
+  if (slot.p.fbPrefetch === slot) slot.p.fbPrefetch = null;
+  slot.ctl.abort();
+}
+
+function cancelFbForeground() {
+  let request = _fbForeground;
+  if (!request) return;
+  _fbForeground = null;
+  if (request.slot && !request.slot.done) {
+    request.slot.invalid = true;
+    if (request.slot.p.fbPrefetch === request.slot) request.slot.p.fbPrefetch = null;
+  }
+  request.ctl.abort();
+}
+
+function invalidateFbPrefetch(p) {
+  if (p.fbPrefetch) p.fbPrefetch.invalid = true;
+  p.fbPrefetch = null;
+  if (p.fbPrefetchTimer) clearTimeout(p.fbPrefetchTimer);
+  p.fbPrefetchTimer = null;
+}
+
+function fetchFbListing(p, path, o, signal) {
+  return apiFetch(API + '?action=ls&session_id=' + encodeURIComponent(p.sid) +
+    '&path=' + encodeURIComponent(path) + ((o && o.paneCwd) ? '&cwd=1' : ''), {signal: signal})
+    .then(r => r.json());
+}
+
+function fbPrefetch(p) {
+  if (!p || !p.sid || !p.cwd || p.inputGate || p.connecting ||
+      p.inputInFlight || p.inputQueue.length) return null;
+  let slot = p.fbPrefetch;
+  if (slot && slot.sid === p.sid && slot.cwd === p.cwd &&
+      (!slot.done || Date.now() - slot.at < FB_PREFETCH_MS)) return slot;
+  invalidateFbPrefetch(p);
+  // Extra preloads are skipped, never queued or periodically retried.
+  // Foreground listings and typing cancel speculation to reserve an
+  // HTTP/1.x slot even when four output connections are already open.
+  if (_fbSpeculative) return null;
+  slot = {p: p, sid: p.sid, cwd: p.cwd, done: false, at: 0, ctl: new AbortController()};
+  p.fbPrefetch = slot;
+  _fbSpeculative = slot;
+  slot.promise = fetchFbListing(p, slot.cwd, null, slot.ctl.signal).then(r => {
+    slot.done = true;
+    slot.at = Date.now();
+    if (!r || r.error || !r.path || !Array.isArray(r.entries) ||
+        p.sid !== slot.sid || p.cwd !== slot.cwd) {
+      slot.invalid = true;
+      if (p.fbPrefetch === slot) p.fbPrefetch = null;
+    } else if (r.entries.length > 4096 || JSON.stringify(r).length > 1048576) {
+      // A waiting foreground open may use it, but no pane retains it.
+      if (p.fbPrefetch === slot) p.fbPrefetch = null;
+    }
+    return r;
+  }, e => {
+    if (p.fbPrefetch === slot) p.fbPrefetch = null;
+    throw e;
+  }).finally(() => { if (_fbSpeculative === slot) _fbSpeculative = null; });
+  // A speculative error is silent and is never retained as a cache hit.
+  slot.promise.catch(() => {});
+  return slot;
+}
+
+function scheduleFbPrefetch(p) {
+  if (!p.sid || !p.cwd || p.inputGate || p.connecting) return;
+  let key = p.sid + '\n' + p.cwd;
+  if (p.fbPrefetchWarmed === key) return;
+  p.fbPrefetchWarmed = key;
+  if (p.fbPrefetchTimer) clearTimeout(p.fbPrefetchTimer);
+  p.fbPrefetchTimer = setTimeout(() => {
+    p.fbPrefetchTimer = null;
+    if (panes[p.id] === p && p.sid + '\n' + p.cwd === key &&
+        !p.inputInFlight && !p.inputQueue.length) fbPrefetch(p);
+  }, 250);
+}
+
+function fbListingForOpen(p, path, o, request, live) {
+  let sid = p.sid;
+  let slot = o && o.usePrefetch ? p.fbPrefetch : null;
+  let fresh = () => {
+    // A rejected shared preload can settle after close/navigation. Do
+    // not refill the freed browser connection for a stale UI generation.
+    if (!live() || p.sid !== sid)
+      return Promise.reject(new DOMException('stale listing', 'AbortError'));
+    cancelFbSpeculative();
+    return fetchFbListing(p, path, o, request.ctl.signal);
+  };
+  if (!p.cwd || path !== p.cwd || (o && o.paneCwd) || !slot ||
+      slot.sid !== sid || slot.cwd !== p.cwd || slot.invalid ||
+      (slot.done && Date.now() - slot.at >= FB_PREFETCH_MS)) return fresh();
+  if (!slot.done) {
+    // Adopt the exact request: it is now foreground, so unrelated
+    // typing must not mistake it for a speculative request to cancel.
+    if (_fbSpeculative === slot) _fbSpeculative = null;
+    request.ctl = slot.ctl;
+    request.slot = slot;
+  }
+  return slot.promise.then(r => {
+    if (!live()) throw new DOMException('stale listing', 'AbortError');
+    return !slot.invalid && p.sid === sid && p.cwd === slot.cwd ? r : fresh();
+  }, e => {
+    if (e && e.name === 'AbortError') throw e;
+    return fresh();
+  });
+}
+
+// Hover/focus can warm the selected pane before its download dialog opens.
+['pointerover', 'focusin'].forEach(type => document.addEventListener(type, e => {
+  let b = e.target.closest && e.target.closest('[data-download-btn], #paneTools [data-act="download"]');
+  if (!b || b.disabled) return;
+  let el = b.closest('.pane');
+  fbPrefetch(panes[el ? el.getAttribute('data-pane') : activeId]);
+}));
+
 // The `done` closure of the row currently showing an inline editor — a
 // delete confirmation, a rename field, or the new-folder input — or
 // null. At most one is open at a time: opening a second runs this to
@@ -8568,7 +8719,7 @@ function showFileBrowser(id) {
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
   // fall back to the historical ~.
-  if (p.cwd) loadFbDir(p.cwd, {fallbackHome: true});
+  if (p.cwd) loadFbDir(p.cwd, {fallbackHome: true, usePrefetch: true});
   else loadFbDir('~', {paneCwd: true});
 }
 
@@ -8577,6 +8728,8 @@ function showFileBrowser(id) {
 // have one unambiguous place to read it.
 function setFbPath(path) {
   _fbCurPath = path || '';
+  let copy = $('fbCopyPath');
+  if (copy) copy.disabled = !_fbCurPath;
   let nav = $('fbPath');
   if (!nav) return;
   nav.innerHTML = '';
@@ -8613,7 +8766,17 @@ function setFbPath(path) {
   nav.scrollLeft = nav.scrollWidth;
 }
 
+function fbCopyPath() {
+  // The committed breadcrumb path, never an unsubmitted manual path or
+  // an in-flight destination. Copy exactly what this click refers to.
+  let path = _fbCurPath;
+  if (!path || !_fbId) return;
+  copyText(path).then(ok => showToast(ok ? 'Path copied.' :
+    'Could not copy the path. Allow clipboard access and try again.', ok ? 'ok' : 'err'));
+}
+
 function closeFb() {
+  cancelFbForeground();
   // Drop any armed confirmation without running its DOM restore — the
   // list is about to be discarded, and a stale closure would otherwise
   // keep a detached row alive.
@@ -8641,6 +8804,9 @@ function loadFbDir(path, o) {
   let p = _fbId && panes[_fbId];
   if (!p || !p.sid) return;
   let list = $('fbList');
+  cancelFbForeground();
+  let request = {ctl: new AbortController(), slot: null};
+  _fbForeground = request;
   let req = ++_fbSeq, reqPane = _fbId, reqSid = p.sid;
   // Keep the current listing on screen until the new one arrives, then
   // swap path + rows in one go. Replacing the list with a "Loading…"
@@ -8653,10 +8819,11 @@ function loadFbDir(path, o) {
   list.setAttribute('aria-busy', 'true');
   let stale = () => req !== _fbSeq || _fbId !== reqPane ||
                     !panes[reqPane] || panes[reqPane].sid !== reqSid;
-  apiFetch(API + '?action=ls&session_id=' + encodeURIComponent(reqSid) +
-        '&path=' + encodeURIComponent(path) +
-        ((o && o.paneCwd) ? '&cwd=1' : ''))
-    .then(r => r.json())
+  // Reload/navigation must always be fresh. Only opening at the known
+  // shell cwd may reuse the snapshot warmed by idle/hover/focus.
+  if (!(o && o.usePrefetch)) invalidateFbPrefetch(p);
+  let live = () => !stale() && _fbForeground === request && !request.ctl.signal.aborted;
+  fbListingForOpen(p, path, o, request, live)
     .then(r => {
       if (stale()) return;
       list.removeAttribute('aria-busy');
@@ -8677,11 +8844,12 @@ function loadFbDir(path, o) {
       _fbListedSid = reqSid;
       renderFbEntries(r.entries, r.path);
     })
-    .catch(() => {
-      if (stale()) return;
+    .catch(e => {
+      if (stale() || (e && e.name === 'AbortError')) return;
       list.removeAttribute('aria-busy');
       fbLoadFailed(list, path, o, 'Failed to load');
-    });
+    })
+    .finally(() => { if (_fbForeground === request) _fbForeground = null; });
 }
 
 // A listing that could not be loaded. If a usable listing is still on
@@ -10389,9 +10557,31 @@ document.addEventListener('keydown', e => {
     e.preventDefault(); cancelConnect();
   }
 });
-// Backdrop click on the overlay also dismisses (same dismissable rule).
+// A text selection can start in Host/Username and finish outside the
+// card: the browser then clicks their common ancestor, the backdrop.
+// Dismiss only a primary gesture that both starts and ends on it.
+document.addEventListener('pointerdown', e => {
+  let ov = $('ov');
+  _connectBackdropGesture = e.target === ov && e.button === 0 &&
+    e.isPrimary !== false && !ov.classList.contains('h') && overlayDismissable()
+      ? {id: e.pointerId, ended: false} : null;
+}, true);
+document.addEventListener('pointerup', e => {
+  let g = _connectBackdropGesture;
+  if (!g || g.id !== e.pointerId) { _connectBackdropGesture = null; return; }
+  // Touch may implicitly capture the pointer to the backdrop, so use
+  // the actual release position as well as the event target.
+  g.ended = e.button === 0 && e.target === $('ov') &&
+    document.elementFromPoint(e.clientX, e.clientY) === $('ov');
+}, true);
+document.addEventListener('pointercancel', () => { _connectBackdropGesture = null; }, true);
+window.addEventListener('blur', () => { _connectBackdropGesture = null; });
+document.addEventListener('visibilitychange', () => { _connectBackdropGesture = null; });
 $('ov').addEventListener('click', e => {
-  if(e.target === e.currentTarget && overlayDismissable()) cancelConnect();
+  let g = _connectBackdropGesture;
+  _connectBackdropGesture = null;
+  if (g && g.ended && e.target === e.currentTarget &&
+      !$('ov').classList.contains('h') && overlayDismissable()) cancelConnect();
 });
 
 // ── Enter to connect ────────────────────────────────────────────────

@@ -104,7 +104,8 @@ timer, the stall detector and the cursor logic are the same code.
 Sealed wire 2 authenticates each response against its request seq and
 frame index. A lost channel can be reopened automatically for these
 read-only output requests, including POST `output_many`. Cancelling that
-shared read leaves the channel usable. This exception does not authorize
+shared read leaves the channel usable. Intentional GET `ls` cancellation
+likewise preserves the channel when a listing closes or gives input priority. This exception does not authorize
 replaying any other POST: an unverified outer 410/503 or damaged reply
 may follow successful execution.
 Such input reports an uncertain outcome and drops its already queued
