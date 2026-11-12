@@ -29,12 +29,18 @@ const names = Object.keys(all).sort((a, b) => (ORDER.indexOf(a) + 99) % 99 - (OR
 if (list) {
   for (const n of names) {
     const m = all[n].meta;
-    console.log(n.padEnd(9), [m.ssh && 'ssh', m.local && 'private instance', m.sudo && 'sudo'].filter(Boolean).join(', ').padEnd(30), m.about);
+    console.log(n.padEnd(9), [m.ssh && 'ssh', m.local && 'private instance', m.isolatedSsh && 'isolated SSH', m.sudo && 'sudo'].filter(Boolean).join(', ').padEnd(30), m.about);
   }
   process.exit(0);
 }
 for (const n of args) if (!all[n]) { console.error(`unknown scenario "${n}" (try --list)`); process.exit(2); }
 
+// Files created locally must be on the disposable SSH target, never on
+// the host whose normal E2E credentials happen to be configured.
+const isolatedSsh = cfg.host === '127.0.0.1' && !!process.env.WEBSH_HOST_NETNS && (() => {
+  try { return fs.readlinkSync('/proc/self/ns/net') !== process.env.WEBSH_HOST_NETNS; }
+  catch (e) { return false; }
+})();
 const sudoOk = haveSudo();
 let failed = 0, ran = 0, skipped = [], leftovers = [];
 const started = Date.now();
@@ -48,7 +54,8 @@ process.on('exit', () => {
 for (const name of (args.length ? args : names)) {
   const { meta, run } = all[name];
   let why = '';
-  if (meta.ssh && !cfg.password) why = 'E2E_SSH_PASSWORD is not set';
+  if (meta.isolatedSsh && !isolatedSsh) why = 'requires isolated same-container SSH (loopback and WEBSH_HOST_NETNS distinct from current network namespace)';
+  else if (meta.ssh && !cfg.password) why = 'E2E_SSH_PASSWORD is not set';
   else if (meta.local && url) why = 'injects faults / restarts: private instance only';
   else if (meta.sudo && !sudoOk) why = 'needs sudo (set E2E_SUDO_PASSWORD, or passwordless sudo)';
   if (why) { skipped.push(name); console.log(`\n--- ${name}: SKIPPED - ${why}`); continue; }

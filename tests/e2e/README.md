@@ -13,6 +13,10 @@ and on the network, and unit tests passed while they were live.
 
 | Scenario | What it proves |
 |---|---|
+| `fileprefetchh1` | four real SSH panes over HTTP/1.1, held background and foreground directory responses, then a closed dialog: input reaches the proxy once and executes in the real shell while listing gates remain held; requires the isolated SSH fixture below |
+| `fileperf` | private directories up to 2500 entries: exact row counts and bounded first/repeated loading; hovering Download preloads an unopened directory known through OSC 7 and its first open reuses that result; requires the isolated SSH fixture below |
+| `filepath` | real clipboard receives the current committed directory, including root; manual input is ignored; copy button stays accessible left of breadcrumbs at 1200/560/360 px |
+| `connectform` | real selection drags from Host/Username across both card edges keep the form and values; clipboard editing, browser tab switches, context menus and background output preserve it; deliberate backdrop click, Escape and Cancel still dismiss; initial form remains non-dismissible |
 | `smoke` | the page boots, no script errors |
 | `typing` | keys arrive in the order typed; echo costs one round trip |
 | `connections` | eight panes through private HTTP/1.1 nginx echo promptly, including hidden panes and after output recovery; a seventh and eighth connection cannot exhaust browser sockets. Run plain and `E2E_SEALED=1`; `E2E_CONNECTIONS_NO_SSE=1` also checks the browser without EventSource |
@@ -72,6 +76,15 @@ header line (`lib.mjs` `_countSealed`), so `b.requests.input`, `.upload`,
 Put the exports in `tests/e2e/local.env.sh` (ignored by git);
 `scripts/e2e.sh` sources it. Do not store the password itself - read it
 from wherever it lives (`"$(pass show …)"`).
+
+`fileperf` and `fileprefetchh1` are marked `isolatedSsh`: they create
+temporary files beside the SSH target and therefore requires `E2E_SSH_HOST=127.0.0.1`, a nonempty
+`WEBSH_HOST_NETNS` containing the host network namespace identifier, and
+`/proc/self/ns/net` identifying a different namespace. The isolated Docker
+fixture supplies these values. The runner explicitly skips these scenarios
+before starting a server when the prerequisite is absent; the required
+private acceptance run must report zero skips. A loopback target alone is
+not sufficient.
 
 ## What they touch
 
