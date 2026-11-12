@@ -458,6 +458,17 @@ dangling link behave as before; Delete and Rename act on the link only,
 never on its target. Guard: backend `test_fb_links.py`; frontend
 `test_fb_links.js`; e2e `fblinks` (sealed mode off and on).
 
+**U13. Selecting connection details cannot dismiss the form.** A primary
+pointer gesture must both begin and end on the backdrop to cancel the
+add-session form. Chromium can emit a trusted backdrop `click` when text
+selection began inside Host or Username and the mouse was released outside
+the card. The click target alone does not establish cancellation intent.
+Clipboard edits, focus changes and background terminal output preserve the
+form and its values. Escape, Cancel and deliberate backdrop clicks retain
+the existing dismissibility rule; an initial form without a pane stays open.
+Guard: real-browser `connectform`, including both selection directions,
+focus loss, cancelled touch and positive mouse/touch cancellation controls.
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

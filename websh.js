@@ -6281,14 +6281,17 @@ function setTitle(label) {
 //   'split'   — the source pane exists (and always will), so yes.
 //   'tab'     — the current tab is still there, so yes.
 //   'initial' — there's no other pane; they must complete auth.
+let _connectBackdropGesture = null;
 function overlayDismissable() { return overlayMode === 'split' || overlayMode === 'tab'; }
 function showOverlay(){
+  _connectBackdropGesture = null;
   $('ov').classList.remove('h');
   $('btnCancel').classList.toggle('h', !overlayDismissable());
   hideErr();
   focusFirst();
 }
 function hideOverlay(){
+  _connectBackdropGesture = null;
   $('ov').classList.add('h');
   // Scrub credentials from the DOM once the overlay is closed so the
   // browser has nothing to offer to save/sync and so a later devtools
@@ -10405,9 +10408,31 @@ document.addEventListener('keydown', e => {
     e.preventDefault(); cancelConnect();
   }
 });
-// Backdrop click on the overlay also dismisses (same dismissable rule).
+// A text selection can start in Host/Username and finish outside the
+// card: the browser then clicks their common ancestor, the backdrop.
+// Dismiss only a primary gesture that both starts and ends on it.
+document.addEventListener('pointerdown', e => {
+  let ov = $('ov');
+  _connectBackdropGesture = e.target === ov && e.button === 0 &&
+    e.isPrimary !== false && !ov.classList.contains('h') && overlayDismissable()
+      ? {id: e.pointerId, ended: false} : null;
+}, true);
+document.addEventListener('pointerup', e => {
+  let g = _connectBackdropGesture;
+  if (!g || g.id !== e.pointerId) { _connectBackdropGesture = null; return; }
+  // Touch may implicitly capture the pointer to the backdrop, so use
+  // the actual release position as well as the event target.
+  g.ended = e.button === 0 && e.target === $('ov') &&
+    document.elementFromPoint(e.clientX, e.clientY) === $('ov');
+}, true);
+document.addEventListener('pointercancel', () => { _connectBackdropGesture = null; }, true);
+window.addEventListener('blur', () => { _connectBackdropGesture = null; });
+document.addEventListener('visibilitychange', () => { _connectBackdropGesture = null; });
 $('ov').addEventListener('click', e => {
-  if(e.target === e.currentTarget && overlayDismissable()) cancelConnect();
+  let g = _connectBackdropGesture;
+  _connectBackdropGesture = null;
+  if (g && g.ended && e.target === e.currentTarget &&
+      !$('ov').classList.contains('h') && overlayDismissable()) cancelConnect();
 });
 
 // ── Enter to connect ────────────────────────────────────────────────
