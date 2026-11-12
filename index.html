@@ -517,6 +517,7 @@
     .fb-sort button:hover{color:var(--tx);border-color:var(--bd)}
     .fb-sort button.on{color:var(--ac);border-color:var(--bd);background:rgba(255,255,255,.04)}
     .fb-up{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 10px;border-radius:4px;font-size:14px;flex-shrink:0;transition:.15s}
+    .fb-up:disabled{opacity:.3;cursor:default}
     .fb-up:hover{color:var(--tx);border-color:var(--dim)}
     .fb-list{flex:1;overflow-y:auto;padding:4px 0;min-height:180px}
     .fb-row{display:flex;align-items:center;gap:8px;padding:7px 14px;cursor:pointer;font-size:13px;transition:.1s}
@@ -611,6 +612,7 @@
     <g id="g-ic" fill="none" stroke="currentColor" stroke-width="1.8"
        stroke-linecap="round" stroke-linejoin="round"></g>
   </defs>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 15.5 21 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <!-- Export = "write this out as a file": a document with a down arrow, not the
        bare tray arrow, which is already what a plain download looks like. -->
@@ -936,6 +938,7 @@
       <!-- Clickable path segments (breadcrumbs), rendered by setFbPath.
            data-path carries the full resolved path for scripts/tests. -->
       <span class="fb-host" id="fbHost" hidden></span>
+      <button type="button" class="fb-up" id="fbCopyPath" onclick="fbCopyPath()" title="Copy current path" aria-label="Copy current path" disabled><svg class="ic"><use href="#i-copy"></use></svg></button>
       <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
       <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser"><svg class="ic"><use href="#i-close"></use></svg></button>
     </div>

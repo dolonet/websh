@@ -985,19 +985,24 @@ function _isMacLike() {
 // (~5 s in Chromium); writeText() runs after as a best-effort upgrade
 // for browsers where it's permitted.
 function copyText(text) {
-  if (!text) return;
+  if (!text) return Promise.resolve(false);
+  let handled = false;
   let listener = e => {
     if (e.clipboardData) {
       e.clipboardData.setData('text/plain', text);
       e.preventDefault();
+      handled = true;
     }
   };
+  let copied = false;
   document.addEventListener('copy', listener, true);
-  try { document.execCommand('copy'); } catch (e) {}
+  try { copied = document.execCommand('copy') === true && handled; } catch (e) {}
   document.removeEventListener('copy', listener, true);
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(() => {});
+    try { return navigator.clipboard.writeText(text).then(() => true, () => copied); }
+    catch (e) {}
   }
+  return Promise.resolve(copied);
 }
 
 let settings = loadSettings();
@@ -8577,6 +8582,8 @@ function showFileBrowser(id) {
 // have one unambiguous place to read it.
 function setFbPath(path) {
   _fbCurPath = path || '';
+  let copy = $('fbCopyPath');
+  if (copy) copy.disabled = !_fbCurPath;
   let nav = $('fbPath');
   if (!nav) return;
   nav.innerHTML = '';
@@ -8611,6 +8618,15 @@ function setFbPath(path) {
   });
   // Keep the deepest crumb in view on a long path.
   nav.scrollLeft = nav.scrollWidth;
+}
+
+function fbCopyPath() {
+  // The committed breadcrumb path, never an unsubmitted manual path or
+  // an in-flight destination. Copy exactly what this click refers to.
+  let path = _fbCurPath;
+  if (!path || !_fbId) return;
+  copyText(path).then(ok => showToast(ok ? 'Path copied.' :
+    'Could not copy the path. Allow clipboard access and try again.', ok ? 'ok' : 'err'));
 }
 
 function closeFb() {
